@@ -203,6 +203,23 @@ def interrupt_subagent(subagent_id: str) -> bool:
     return True
 
 
+def _interrupt_async_children(children: List[Any]) -> None:
+    """Signal every detached async child or raise on any unproven delivery."""
+    failures: list[str] = []
+    for index, child in enumerate(children):
+        try:
+            if hasattr(child, "interrupt"):
+                child.interrupt("Async delegation cancelled")
+            elif hasattr(child, "_interrupt_requested"):
+                child._interrupt_requested = True
+            else:
+                failures.append(f"child[{index}] has no interrupt seam")
+        except Exception as exc:
+            failures.append(f"child[{index}] {type(exc).__name__}: {exc}")
+    if failures:
+        raise RuntimeError("; ".join(failures))
+
+
 def list_active_subagents() -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
@@ -910,6 +927,20 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
+def _configured_child_disabled_toolsets() -> List[str]:
+    """Operator-configured toolsets that delegated children must not inherit."""
+    raw = _load_config().get("disabled_toolsets", [])
+    if not isinstance(raw, list):
+        return []
+    return list(
+        dict.fromkeys(
+            str(name).strip()
+            for name in raw
+            if isinstance(name, str) and str(name).strip()
+        )
+    )
+
+
 def _blocked_toolsets_for_role(role: str) -> List[str]:
     """Return one-tool deny toolsets for a delegated child role.
 
@@ -1283,6 +1314,12 @@ def _build_child_agent(
         child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+    configured_child_disabled = _configured_child_disabled_toolsets()
+    if configured_child_disabled:
+        child_toolsets = [
+            name for name in child_toolsets
+            if name not in configured_child_disabled
+        ]
 
     # Blocked tools also live inside mixed platform bundles (hermes-cli,
     # hermes-telegram, etc.) that _strip_blocked_tools must keep because they
@@ -1303,6 +1340,7 @@ def _build_child_agent(
     child_disabled_toolsets = list(
         dict.fromkeys(
             inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"]
+            + configured_child_disabled
         )
     )
 
@@ -3273,14 +3311,7 @@ def delegate_task(
             return _execute_and_aggregate(honor_parent_interrupt=False)
 
         def _batch_interrupt():
-            for _c in _child_agents:
-                try:
-                    if hasattr(_c, "interrupt"):
-                        _c.interrupt("Async delegation cancelled")
-                    elif hasattr(_c, "_interrupt_requested"):
-                        _c._interrupt_requested = True
-                except Exception:
-                    pass
+            _interrupt_async_children(_child_agents)
 
         def _batch_progress():
             # Progress token for the async registry's stale monitor: the

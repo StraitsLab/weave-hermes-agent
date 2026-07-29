@@ -4456,6 +4456,10 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    require_terminated: bool = False,
+    expected_status: Optional[str] = None,
+    request_id: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Operator-driven reclaim: release the claim and reset to ``ready``.
 
@@ -4469,25 +4473,43 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, current_run_id FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
         return False
+    if expected_status is not None and row["status"] != expected_status:
+        return False
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
+    if expected_run_id is None:
+        expected_run_id = row["current_run_id"]
+    prior_status = str(row["status"])
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
+    if require_terminated and prev_lock and not termination.get("terminated"):
+        _log.warning(
+            "Refusing to reclaim task %s: its active worker could not be "
+            "proven terminated (%s)",
+            task_id,
+            termination,
+        )
+        return False
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            "WHERE id = ? AND status = ? "
+            "AND claim_lock IS ? AND current_run_id IS ?",
+            (
+                task_id,
+                prior_status,
+                prev_lock,
+                expected_run_id,
+            ),
         )
         if cur.rowcount != 1:
             return False
@@ -4505,6 +4527,9 @@ def reclaim_task(
             "reason": reason,
             "prev_lock": prev_lock,
         }
+        if request_id:
+            payload["request_id"] = request_id
+            payload["control_action"] = "interrupt"
         payload.update(termination)
         _append_event(
             conn, task_id, "reclaimed",
@@ -4516,6 +4541,108 @@ def reclaim_task(
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
     # so it runs after the enclosing one commits.)
     _clear_failure_counter(conn, task_id)
+    return True
+
+
+def cancel_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    signal_fn=None,
+    expected_status: Optional[str] = None,
+    request_id: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Cancel one non-terminal task without leaving a worker running.
+
+    Running work is signalled before the terminal state is committed.  The
+    final update compares both the previously observed state and claim lock,
+    so a concurrent completion wins cleanly instead of being overwritten.
+    A worker that is remote, unidentifiable, or survives termination leaves
+    the task untouched and returns ``False``.
+
+    Kanban's existing terminal storage uses ``archived`` for operator-stopped
+    tasks.  The distinct ``cancelled`` event and run outcome preserve the user
+    intent without adding a partially-supported board status.
+    """
+    row = conn.execute(
+        "SELECT status, claim_lock, worker_pid, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["status"] in {"done", "archived"}:
+        return False
+
+    prior_status = str(row["status"])
+    if expected_status is not None and prior_status != expected_status:
+        return False
+    if expected_run_id is None:
+        expected_run_id = row["current_run_id"]
+    prior_lock = row["claim_lock"]
+    termination: dict[str, Any] = {
+        "prev_pid": int(row["worker_pid"]) if row["worker_pid"] else None,
+        "host_local": False,
+        "termination_attempted": False,
+        "terminated": False,
+        "sigkill": False,
+    }
+    if prior_status == "running" or prior_lock is not None:
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], prior_lock, signal_fn=signal_fn,
+        )
+        if (
+            (prior_status == "running" or prior_lock is not None)
+            and not termination.get("terminated")
+        ):
+            _log.warning(
+                "Refusing to cancel task %s: its active worker could not be "
+                "proven terminated (%s)",
+                task_id,
+                termination,
+            )
+            return False
+
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """UPDATE tasks
+               SET status='archived', claim_lock=NULL, claim_expires=NULL,
+                   worker_pid=NULL, completed_at=COALESCE(completed_at, ?)
+               WHERE id=? AND status=? AND claim_lock IS ?
+                 AND current_run_id IS ?""",
+            (
+                now,
+                task_id,
+                prior_status,
+                prior_lock,
+                expected_run_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="cancelled",
+            status="cancelled",
+            error=reason or "cancelled by operator",
+            metadata=termination,
+        )
+        payload = {"reason": reason or ""}
+        if request_id:
+            payload["request_id"] = request_id
+            payload["control_action"] = "cancel"
+        payload.update(termination)
+        _append_event(
+            conn,
+            task_id,
+            "cancelled",
+            payload,
+            run_id=run_id,
+        )
+
+    # Preserve the board's existing archived-parent dependency semantics.
+    recompute_ready(conn)
     return True
 
 

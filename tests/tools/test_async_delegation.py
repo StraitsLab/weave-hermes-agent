@@ -92,6 +92,102 @@ def test_dispatch_returns_immediately_without_blocking():
     gate.set()
 
 
+def test_targeted_cancel_is_idempotent_and_wins_completion_race():
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "late success"}
+
+    res = ad.dispatch_async_delegation(
+        goal="cancel me",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=runner,
+        interrupt_fn=gate.set,
+        max_async_children=1,
+    )
+    delegation_id = res["delegation_id"]
+
+    accepted = ad.control_async_delegation(
+        delegation_id,
+        action="cancel",
+        request_id="message-17",
+        expected_revision=1,
+        reason="user cancelled",
+    )
+    assert accepted == {
+        "ok": True,
+        "idempotent": False,
+        "delegation_id": delegation_id,
+        "state": "cancel_requested",
+        "action": "cancel",
+        "action_committed": True,
+        "signal_applied": True,
+    }
+    repeated = ad.control_async_delegation(
+        delegation_id,
+        action="cancel",
+        request_id="message-17",
+        expected_revision=1,
+        reason="user cancelled",
+    )
+    assert repeated["ok"] is True
+    assert repeated["idempotent"] is True
+
+    event = _drain_for(delegation_id)
+    assert event["status"] == "cancelled"
+    durable = ad.get_durable_delegation(delegation_id)
+    assert durable["state"] == "cancelled"
+    assert durable["result"]["status"] == "cancelled"
+    assert durable["control_action"] == "cancel"
+    assert durable["control_request_id"] == "message-17"
+
+
+def test_targeted_control_rejects_conflicting_request():
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    res = ad.dispatch_async_delegation(
+        goal="one winner",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=runner,
+        interrupt_fn=gate.set,
+        max_async_children=1,
+    )
+    delegation_id = res["delegation_id"]
+    first = ad.control_async_delegation(
+        delegation_id,
+        action="cancel",
+        request_id="message-A",
+        expected_revision=1,
+    )
+    assert first["ok"] is True
+    second = ad.control_async_delegation(
+        delegation_id,
+        action="cancel",
+        request_id="message-B",
+        expected_revision=1,
+    )
+    assert second["ok"] is False
+    assert second["error"] in {
+        "control_already_requested",
+        "not_running",
+        "stale_state_token",
+    }
+    assert _drain_for(delegation_id)["status"] == "cancelled"
+
+
 def test_async_executor_workers_are_daemon_threads():
     gate = threading.Event()
 
@@ -728,4 +824,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-

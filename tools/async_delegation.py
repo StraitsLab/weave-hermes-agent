@@ -37,6 +37,7 @@ logic stays in one place.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import sqlite3
 import threading
@@ -158,7 +159,12 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            control_action TEXT NOT NULL DEFAULT '',
+            control_request_id TEXT NOT NULL DEFAULT '',
+            control_fingerprint TEXT NOT NULL DEFAULT '',
+            control_requested_at REAL,
+            revision INTEGER NOT NULL DEFAULT 1
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -173,6 +179,11 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
         ("origin_session_id", "TEXT"),
+        ("control_action", "TEXT NOT NULL DEFAULT ''"),
+        ("control_request_id", "TEXT NOT NULL DEFAULT ''"),
+        ("control_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+        ("control_requested_at", "REAL"),
+        ("revision", "INTEGER NOT NULL DEFAULT 1"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -215,8 +226,8 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_started_at, task_json, origin_session_id, revision)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, 1)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, __import__("os").getpid(),
@@ -275,7 +286,8 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
+               event_json=?, result_json=?, delivery_state='pending',
+               revision=revision+1
                WHERE delegation_id=?""",
             (event.get("status", "completed"), event.get("completed_at", now), now,
              json.dumps(event), json.dumps(result), event["delegation_id"]),
@@ -333,7 +345,8 @@ def recover_abandoned_delegations() -> int:
             result = {"status": "unknown", "summary": None, "error": event["error"]}
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
-                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                   updated_at=?, event_json=?, result_json=?, delivery_state='pending',
+                   revision=revision+1
                    WHERE delegation_id=?""",
                 (now, now, json.dumps(event), json.dumps(result), delegation_id),
             )
@@ -499,7 +512,8 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
-                      origin_session_id
+                      origin_session_id, control_action, control_request_id,
+                      control_requested_at, revision, control_fingerprint
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -510,6 +524,194 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
         "origin_session_id": row[7] or "",
+        "authority": str(_db_path().resolve()),
+        "control_action": row[8] or "",
+        "control_request_id": row[9] or "",
+        "control_requested_at": row[10],
+        "revision": int(row[11] or 1),
+        "control_fingerprint": row[12] or "",
+    }
+
+
+def is_async_delegation_controllable(delegation_id: str) -> bool:
+    """Whether this process owns a live native interrupt seam for the id."""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        return bool(
+            record
+            and record.get("status") == "running"
+            and callable(record.get("interrupt_fn"))
+        )
+
+
+def control_async_delegation(
+    delegation_id: str,
+    *,
+    action: str,
+    request_id: str,
+    expected_revision: int,
+    reason: str = "",
+) -> Dict[str, Any]:
+    """Cancel exactly one live async delegation with fail-closed CAS semantics."""
+    delegation_id = str(delegation_id or "").strip()
+    request_id = str(request_id or "").strip()
+    action = str(action or "").strip().lower()
+    if not delegation_id or len(delegation_id) > 128:
+        return {"ok": False, "error": "invalid_execution_id"}
+    if not request_id or len(request_id) > 256:
+        return {"ok": False, "error": "invalid_request_id"}
+    if action != "cancel":
+        return {"ok": False, "error": "unsupported_action"}
+
+    requested_at = time.time()
+    fingerprint = hashlib.sha256(
+        f"{action}\0{reason}".encode("utf-8")
+    ).hexdigest()
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None:
+            durable = get_durable_delegation(delegation_id)
+            if durable is None:
+                return {"ok": False, "error": "not_found"}
+            if (
+                durable.get("control_action") == action
+                and durable.get("control_request_id") == request_id
+            ):
+                if durable.get("control_fingerprint") != fingerprint:
+                    return {"ok": False, "error": "idempotency_conflict"}
+                return {
+                    "ok": True,
+                    "idempotent": True,
+                    "delegation_id": delegation_id,
+                    "state": durable.get("state"),
+                    "action": action,
+                }
+            return {
+                "ok": False,
+                "error": "not_live_in_this_process",
+                "state": durable.get("state"),
+            }
+
+        state = str(record.get("status") or "")
+        revision = int(record.get("revision") or 1)
+        prior_action = str(record.get("control_action") or "")
+        prior_request = str(record.get("control_request_id") or "")
+        if prior_action == action and prior_request == request_id:
+            if str(record.get("control_fingerprint") or "") != fingerprint:
+                return {"ok": False, "error": "idempotency_conflict"}
+            return {
+                "ok": True,
+                "idempotent": True,
+                "delegation_id": delegation_id,
+                "state": state,
+                "action": action,
+            }
+        if revision != expected_revision:
+            return {
+                "ok": False,
+                "error": "stale_state_token",
+                "revision": revision,
+                "state": state,
+            }
+        if state != "running":
+            return {"ok": False, "error": "not_running", "state": state}
+        if prior_action or prior_request:
+            return {
+                "ok": False,
+                "error": "control_already_requested",
+                "state": state,
+                "action": prior_action,
+            }
+
+        interrupt_fn = record.get("interrupt_fn")
+        if not callable(interrupt_fn):
+            return {"ok": False, "error": "not_interruptible", "state": state}
+
+        try:
+            interrupt_fn()
+        except Exception as exc:
+            logger.exception(
+                "Async delegation %s cancel signalling failed",
+                delegation_id,
+            )
+            return {
+                "ok": False,
+                "error": "signal_failed",
+                "detail": f"{type(exc).__name__}: {exc}",
+                "delegation_id": delegation_id,
+                "action": action,
+                "state": state,
+                "action_committed": False,
+                "signal_applied": False,
+            }
+
+        with _DB_LOCK, _transaction() as conn:
+            cur = conn.execute(
+                """UPDATE async_delegations
+                   SET control_action=?, control_request_id=?,
+                       control_fingerprint=?,
+                       control_requested_at=?, updated_at=?,
+                       revision=revision+1
+                   WHERE delegation_id=? AND state='running'
+                     AND control_action='' AND control_request_id=''
+                     AND revision=?""",
+                (
+                    action,
+                    request_id,
+                    fingerprint,
+                    requested_at,
+                    requested_at,
+                    delegation_id,
+                    expected_revision,
+                ),
+            )
+            if cur.rowcount != 1:
+                durable = conn.execute(
+                    """SELECT state, control_action, control_request_id,
+                              control_fingerprint
+                       FROM async_delegations WHERE delegation_id=?""",
+                    (delegation_id,),
+                ).fetchone()
+                if (
+                    durable
+                    and durable[1] == action
+                    and durable[2] == request_id
+                ):
+                    if durable[3] != fingerprint:
+                        return {"ok": False, "error": "idempotency_conflict"}
+                    return {
+                        "ok": True,
+                        "idempotent": True,
+                        "delegation_id": delegation_id,
+                        "state": durable[0],
+                        "action": action,
+                    }
+                return {
+                    "ok": False,
+                    "error": "state_changed",
+                    "state": durable[0] if durable else "missing",
+                }
+
+        record["control_action"] = action
+        record["control_request_id"] = request_id
+        record["control_fingerprint"] = fingerprint
+        record["control_requested_at"] = requested_at
+        record["revision"] = expected_revision + 1
+
+    logger.info(
+        "Accepted async delegation %s for %s (%s)",
+        action,
+        delegation_id,
+        reason[:160] if reason else request_id,
+    )
+    return {
+        "ok": True,
+        "idempotent": False,
+        "delegation_id": delegation_id,
+        "state": f"{action}_requested",
+        "action": action,
+        "action_committed": True,
+        "signal_applied": True,
     }
 
 
@@ -701,6 +903,7 @@ def dispatch_async_delegation(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        "revision": 1,
     }
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
@@ -774,6 +977,14 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn = claimed
 
+    control_action = str(event_record.get("control_action") or "")
+    if control_action == "cancel":
+        status = "cancelled"
+        result = dict(result)
+        result["status"] = status
+        result["control_action"] = control_action
+        result["control_request_id"] = event_record.get("control_request_id")
+        result["exit_reason"] = status
     _push_completion_event(event_record, result, status)
     _finish_finalization(delegation_id, status)
 
@@ -804,6 +1015,7 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
         record = _records.get(delegation_id)
         if record is not None:
             record["status"] = status
+            record["revision"] = int(record.get("revision") or 1) + 1
         _prune_completed_locked()
 
 
@@ -941,6 +1153,7 @@ def dispatch_async_delegation_batch(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        "revision": 1,
     }
     with _records_lock:
         running = sum(
@@ -1017,6 +1230,13 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
+    control_action = str(event_record.get("control_action") or "")
+    if control_action == "cancel":
+        status = "cancelled"
+        combined = dict(combined)
+        combined["status"] = status
+        combined["control_action"] = control_action
+        combined["control_request_id"] = event_record.get("control_request_id")
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)
 
