@@ -17,6 +17,25 @@ def _load_package_data():
     return tool["setuptools"]["package-data"]
 
 
+def _load_py_modules():
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject_path.open("rb") as handle:
+        tool = tomllib.load(handle)["tool"]
+    return tool["setuptools"]["py-modules"]
+
+
+def test_state_facade_dependencies_ship_in_wheel():
+    """Every top-level module imported by hermes_state must ship in wheels."""
+    py_modules = set(_load_py_modules())
+    assert {
+        "hermes_state",
+        "hermes_state_common",
+        "hermes_state_portability",
+        "hermes_state_schema",
+        "hermes_state_search",
+    } <= py_modules
+
+
 def test_matrix_extra_not_in_all():
     """The [matrix] extra pulls `mautrix[encryption]` -> `python-olm`,
     which has Linux-only wheels and no native build path on Windows or
