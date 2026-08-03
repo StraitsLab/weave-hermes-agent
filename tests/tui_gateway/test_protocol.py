@@ -118,6 +118,60 @@ def test_err_envelope(server):
     }
 
 
+def test_async_completion_status_keeps_native_delegation_id(server, monkeypatch):
+    import queue
+    import tools.async_delegation as delegation
+    import tools.process_registry as processes
+
+    events = queue.Queue()
+    events.put({
+        "type": "async_delegation",
+        "delegation_id": "delegation-authoritative",
+        "origin_ui_session_id": "sid",
+        "session_key": "session-a",
+    })
+    fake_registry = types.SimpleNamespace(
+        completion_queue=events,
+        is_completion_consumed=lambda _session_id: False,
+    )
+    emitted = []
+    stop = threading.Event()
+    session = {
+        "history_lock": threading.Lock(),
+        "running": False,
+        "session_key": "session-a",
+    }
+    monkeypatch.setattr(processes, "process_registry", fake_registry)
+    monkeypatch.setattr(
+        processes,
+        "format_process_notification",
+        lambda _event: "delegation finished",
+    )
+    monkeypatch.setattr(delegation, "claim_event_delivery", lambda *_args: "claim")
+    monkeypatch.setattr(delegation, "complete_event_delivery", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload)))
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args, **_kwargs: stop.set())
+
+    thread = threading.Thread(
+        target=server._notification_poller_loop,
+        args=(stop, "sid", session),
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert (
+        "status.update",
+        "sid",
+        {
+            "kind": "process",
+            "text": "delegation finished",
+            "delegation_id": "delegation-authoritative",
+        },
+    ) in emitted
+
+
 # ── write_json ───────────────────────────────────────────────────────
 
 
@@ -614,5 +668,4 @@ def test_unregister_live_transport_stops_delivery(capture):
     assert a.frames == []
     # No live transports left → fell back to stdio.
     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
-
 

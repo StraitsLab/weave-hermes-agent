@@ -1624,7 +1624,13 @@ def _status_update(sid: str, kind: str, text: str | None = None):
 
         if COMPACTION_STATUS_MARKER in body:
             out_kind = "compacting"
-    _emit("status.update", sid, {"kind": out_kind, "text": body})
+    payload: dict[str, str] = {"kind": out_kind, "text": body}
+    with _sessions_lock:
+        agent = (_sessions.get(sid) or {}).get("agent")
+    task_id = getattr(agent, "_current_task_id", None)
+    if isinstance(task_id, str) and task_id:
+        payload["task_id"] = task_id
+    _emit("status.update", sid, payload)
 
 
 def _estimate_image_tokens(width: int, height: int) -> int:
@@ -5140,6 +5146,10 @@ def _on_tool_progress(
         # emitters that omit them fall back to flat rendering client-side.
         if _kwargs.get("subagent_id"):
             payload["subagent_id"] = str(_kwargs["subagent_id"])
+            # delegate_tool uses this same immutable identity as the child's
+            # task_id. Preserve it for observer clients instead of deriving a
+            # second key.
+            payload["task_id"] = str(_kwargs["subagent_id"])
         if _kwargs.get("parent_id"):
             payload["parent_id"] = str(_kwargs["parent_id"])
         if _kwargs.get("child_session_id"):
@@ -8465,7 +8475,7 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     return None
 
 
-def _collect_kanban_notifications(session: dict) -> list:
+def _collect_kanban_notifications(session: dict) -> list[dict]:
     """Claim unseen terminal kanban events for this TUI session's subscriptions.
 
     ``kanban_create`` auto-subscribes TUI/desktop sessions with
@@ -8477,7 +8487,7 @@ def _collect_kanban_notifications(session: dict) -> list:
     notifier, so a subscription is delivered exactly once even if a gateway
     and a TUI poll the same board DB.
 
-    Returns the list of formatted notification texts (may be empty).
+    Returns formatted notifications with their native task/event identities.
     """
     session_key = str(session.get("session_key") or "")
     if not session_key or session.get("_finalized"):
@@ -8486,7 +8496,7 @@ def _collect_kanban_notifications(session: dict) -> list:
         from hermes_cli import kanban_db as _kb
     except Exception:
         return []
-    texts: list = []
+    notifications: list[dict] = []
     try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
@@ -8539,7 +8549,16 @@ def _collect_kanban_notifications(session: dict) -> list:
                 for ev in events:
                     text = _format_kanban_event_text(sub, task, ev, slug)
                     if text:
-                        texts.append(text)
+                        item = {
+                            "text": text,
+                            "task_id": str(sub["task_id"]),
+                            "board_slug": str(slug),
+                            "event_kind": str(getattr(ev, "kind", "") or ""),
+                        }
+                        event_id = getattr(ev, "id", None)
+                        if event_id is not None:
+                            item["event_id"] = str(event_id)
+                        notifications.append(item)
                 # Unsubscribe only at a truly final status (done/archived);
                 # blocked/crashed subs stay live so a respawned task's next
                 # terminal event still reaches the user (same rule as the
@@ -8557,7 +8576,7 @@ def _collect_kanban_notifications(session: dict) -> list:
                         pass
         finally:
             conn.close()
-    return texts
+    return notifications
 
 
 def _notification_poller_loop(
@@ -8587,20 +8606,20 @@ def _notification_poller_loop(
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
             try:
-                _kanban_texts = _collect_kanban_notifications(session)
+                _kanban_notifications = _collect_kanban_notifications(session)
             except Exception as _kb_exc:
                 print(
                     f"[tui_gateway] kanban notification poll failed: "
                     f"{type(_kb_exc).__name__}: {_kb_exc}",
                     file=sys.stderr,
                 )
-                _kanban_texts = []
-            if _kanban_texts:
-                for _kb_text in _kanban_texts:
-                    _emit("status.update", sid, {"kind": "process", "text": _kb_text})
+                _kanban_notifications = []
+            if _kanban_notifications:
+                for _kb_notification in _kanban_notifications:
+                    _emit("status.update", sid, {"kind": "process", **_kb_notification})
                 # Events are cursor-claimed (never re-queued), so buffer them
                 # until the session is idle instead of dropping the agent turn.
-                session.setdefault("_kanban_pending", []).extend(_kanban_texts)
+                session.setdefault("_kanban_pending", []).extend(_kanban_notifications)
             _pending = session.get("_kanban_pending") or []
             if _pending:
                 _batch: list = []
@@ -8613,7 +8632,12 @@ def _notification_poller_loop(
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            "\n".join(item["text"] for item in _batch),
+                        )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
@@ -8673,7 +8697,10 @@ def _notification_poller_loop(
         # visible independently.
         _dedup_key = _notification_event_dedup_key(evt)
         if _dedup_key not in _emitted:
-            _emit("status.update", sid, {"kind": "process", "text": text})
+            payload = {"kind": "process", "text": text}
+            if evt.get("type") == "async_delegation" and evt.get("delegation_id"):
+                payload["delegation_id"] = str(evt["delegation_id"])
+            _emit("status.update", sid, payload)
             _emitted.add(_dedup_key)
 
         _requeued = False
@@ -8759,7 +8786,10 @@ def _notification_poller_loop(
 
         _dedup_key = _notification_event_dedup_key(evt)
         if _dedup_key not in _emitted:
-            _emit("status.update", sid, {"kind": "process", "text": text})
+            payload = {"kind": "process", "text": text}
+            if evt.get("type") == "async_delegation" and evt.get("delegation_id"):
+                payload["delegation_id"] = str(evt["delegation_id"])
+            _emit("status.update", sid, payload)
             _emitted.add(_dedup_key)
 
         with session["history_lock"]:

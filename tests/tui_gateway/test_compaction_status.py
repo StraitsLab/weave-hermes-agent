@@ -9,6 +9,7 @@ silently reset mid-turn.
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 
 from unittest.mock import MagicMock, patch
 
@@ -46,9 +47,17 @@ def test_compaction_lifecycle_is_retagged(server, monkeypatch):
     from agent.conversation_compression import COMPACTION_STATUS
 
     events = _capture(server, monkeypatch)
+    server._sessions["sid"] = {
+        "agent": SimpleNamespace(_current_task_id="task-authoritative")
+    }
     server._status_update("sid", "lifecycle", COMPACTION_STATUS)
 
-    assert events == [{"kind": "compacting", "text": COMPACTION_STATUS}]
+    assert events == [{
+        "kind": "compacting",
+        "text": COMPACTION_STATUS,
+        "task_id": "task-authoritative",
+    }]
+    server._sessions.pop("sid", None)
 
 
 def test_other_lifecycle_status_stays_lifecycle(server, monkeypatch):
@@ -63,5 +72,4 @@ def test_manual_compressing_kind_is_preserved(server, monkeypatch):
     server._status_update("sid", "compressing", "⠋ compressing 40 messages…")
 
     assert events[0]["kind"] == "compressing"
-
 

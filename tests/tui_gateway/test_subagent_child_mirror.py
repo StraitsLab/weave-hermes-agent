@@ -70,10 +70,18 @@ def _relay(server, event_type, **payload):
 
 
 def test_no_live_child_session_no_mirror(server, emits):
-    _relay(server, "subagent.tool", tool_name="terminal", child_session_id="child-1")
+    _relay(
+        server,
+        "subagent.tool",
+        tool_name="terminal",
+        child_session_id="child-1",
+        subagent_id="subagent-native-1",
+    )
 
     # Only the parent-sid relay event — nothing mirrored, no state retained.
     assert [(e, s) for e, s, _ in emits] == [("subagent.tool", "parent-sid")]
+    assert emits[0][2]["subagent_id"] == "subagent-native-1"
+    assert emits[0][2]["task_id"] == "subagent-native-1"
     assert server._child_mirrors == {}
 
 
@@ -236,5 +244,4 @@ def test_text_mirrors_as_message_delta(server, emits):
         ("message.delta", {"text": "Here is "}),
         ("message.delta", {"text": "the answer."}),
     ]
-
 

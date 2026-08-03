@@ -57,12 +57,17 @@ class TestCollectKanbanNotifications:
         tid = _create_subscribed_task()
         _complete(tid, summary="shipped the fix")
 
-        texts = _collect_kanban_notifications(_session())
+        notifications = _collect_kanban_notifications(_session())
 
-        assert len(texts) == 1
-        assert tid in texts[0]
-        assert "done" in texts[0]
-        assert "shipped the fix" in texts[0]
+        assert len(notifications) == 1
+        notification = notifications[0]
+        assert tid in notification["text"]
+        assert "done" in notification["text"]
+        assert "shipped the fix" in notification["text"]
+        assert notification["task_id"] == tid
+        assert notification["board_slug"] == kb.DEFAULT_BOARD
+        assert notification["event_kind"] == "completed"
+        assert notification["event_id"]
         # Task is at a final status -> subscription removed.
         assert _sub_rows(tid) == []
 
@@ -78,8 +83,8 @@ class TestCollectKanbanNotifications:
         second = _collect_kanban_notifications(_session())
 
         assert len(first) == 1
-        assert "blocked" in first[0]
-        assert "waiting on review" in first[0]
+        assert "blocked" in first[0]["text"]
+        assert "waiting on review" in first[0]["text"]
         assert second == []
         # Blocked is not a final status -> subscription stays alive so a
         # respawned task's next terminal event still reaches the user.
@@ -141,13 +146,13 @@ class TestCollectKanbanNotifications:
         # active while the poller collects (as a profile-bound RPC would set).
         token = set_hermes_home_override(str(other_profile_home))
         try:
-            texts = _collect_kanban_notifications(session)
+            notifications = _collect_kanban_notifications(session)
         finally:
             reset_hermes_home_override(token)
 
-        assert len(texts) == 1
-        assert tid in texts[0]
-        assert "cross-profile delivery" in texts[0]
+        assert len(notifications) == 1
+        assert tid in notifications[0]["text"]
+        assert "cross-profile delivery" in notifications[0]["text"]
         assert _sub_rows(tid) == []
 
 
@@ -248,6 +253,13 @@ class TestNotificationPollerLoopKanbanWiring:
 
         status_texts = [p["text"] for e, p in emits if e == "status.update" and p]
         assert any(tid in t for t in status_texts), status_texts
+        status_payloads = [p for e, p in emits if e == "status.update" and p]
+        assert any(
+            p.get("task_id") == tid
+            and p.get("board_slug") == kb.DEFAULT_BOARD
+            and p.get("event_kind") == "completed"
+            for p in status_payloads
+        )
         assert any(e == "message.start" for e, _ in emits)
         assert any(tid in text for text in submits), submits
         assert session["running"] is True  # poller claimed the turn
