@@ -8549,11 +8549,22 @@ def _collect_kanban_notifications(session: dict) -> list[dict]:
                 for ev in events:
                     text = _format_kanban_event_text(sub, task, ev, slug)
                     if text:
+                        event_payload = getattr(ev, "payload", None)
+                        event_status = (
+                            event_payload.get("status")
+                            if isinstance(event_payload, dict)
+                            else None
+                        )
                         item = {
                             "text": text,
                             "task_id": str(sub["task_id"]),
                             "board_slug": str(slug),
                             "event_kind": str(getattr(ev, "kind", "") or ""),
+                            "status": str(
+                                event_status
+                                if event_status is not None
+                                else getattr(task, "status", "") or ""
+                            ),
                         }
                         event_id = getattr(ev, "id", None)
                         if event_id is not None:
@@ -8700,6 +8711,8 @@ def _notification_poller_loop(
             payload = {"kind": "process", "text": text}
             if evt.get("type") == "async_delegation" and evt.get("delegation_id"):
                 payload["delegation_id"] = str(evt["delegation_id"])
+            if evt.get("type") == "async_delegation" and evt.get("status") is not None:
+                payload["status"] = str(evt["status"])
             _emit("status.update", sid, payload)
             _emitted.add(_dedup_key)
 
@@ -8789,6 +8802,8 @@ def _notification_poller_loop(
             payload = {"kind": "process", "text": text}
             if evt.get("type") == "async_delegation" and evt.get("delegation_id"):
                 payload["delegation_id"] = str(evt["delegation_id"])
+            if evt.get("type") == "async_delegation" and evt.get("status") is not None:
+                payload["status"] = str(evt["status"])
             _emit("status.update", sid, payload)
             _emitted.add(_dedup_key)
 

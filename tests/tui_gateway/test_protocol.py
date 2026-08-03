@@ -127,6 +127,7 @@ def test_async_completion_status_keeps_native_delegation_id(server, monkeypatch)
     events.put({
         "type": "async_delegation",
         "delegation_id": "delegation-authoritative",
+        "status": "completed",
         "origin_ui_session_id": "sid",
         "session_key": "session-a",
     })
@@ -168,6 +169,7 @@ def test_async_completion_status_keeps_native_delegation_id(server, monkeypatch)
             "kind": "process",
             "text": "delegation finished",
             "delegation_id": "delegation-authoritative",
+            "status": "completed",
         },
     ) in emitted
 
@@ -668,4 +670,3 @@ def test_unregister_live_transport_stops_delivery(capture):
     assert a.frames == []
     # No live transports left → fell back to stdio.
     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
-

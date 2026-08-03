@@ -67,6 +67,7 @@ class TestCollectKanbanNotifications:
         assert notification["task_id"] == tid
         assert notification["board_slug"] == kb.DEFAULT_BOARD
         assert notification["event_kind"] == "completed"
+        assert notification["status"] == "done"
         assert notification["event_id"]
         # Task is at a final status -> subscription removed.
         assert _sub_rows(tid) == []
