@@ -49,6 +49,28 @@ describe("api.getModelOptions", () => {
   });
 });
 
+describe("api toolset platform scope", () => {
+  it("reads and writes the selected profile and runtime surface", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock([]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getToolsets("mailroom", "weave_desk");
+    await api.toggleToolset("terminal", true, "mailroom", "weave_desk");
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/tools/toolsets?profile=mailroom&platform=weave_desk",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "/api/tools/toolsets/terminal?platform=weave_desk",
+    );
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+      enabled: true,
+      profile: "mailroom",
+    });
+  });
+});
+
 describe("api OAuth helpers", () => {
   it("starts OAuth login in gated mode without requiring an injected session token", async () => {
     vi.stubGlobal("window", { __HERMES_AUTH_REQUIRED__: true });

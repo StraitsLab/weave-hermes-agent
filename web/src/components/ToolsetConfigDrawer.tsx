@@ -23,6 +23,8 @@ interface Props {
   /** Optional profile to scope config reads/writes to (Skills page profile
    *  selector). Omitted = the dashboard process's own profile. */
   profile?: string;
+  /** Platform whose effective tool inventory is being configured. */
+  platform?: string;
   onClose: () => void;
   /** Called after a toggle/provider/key change so the parent grid refreshes. */
   onChanged: () => void;
@@ -34,7 +36,7 @@ interface Props {
  * the toolset on/off, pick a provider, enter API keys, and run a provider's
  * post-setup install hook (npm/pip/binary) with a live log tail.
  */
-export function ToolsetConfigDrawer({ toolset, profile, onClose, onChanged }: Props) {
+export function ToolsetConfigDrawer({ toolset, profile, platform, onClose, onChanged }: Props) {
   const { toast, showToast } = useToast();
   const [config, setConfig] = useState<ToolsetConfig | null>(null);
   const [loading, setLoading] = useState(true);
@@ -124,7 +126,7 @@ export function ToolsetConfigDrawer({ toolset, profile, onClose, onChanged }: Pr
   const handleToggle = async (next: boolean) => {
     setToggling(true);
     try {
-      await api.toggleToolset(toolset.name, next, profile);
+      await api.toggleToolset(toolset.name, next, profile, platform);
       setEnabled(next);
       showToast(
         `${toolset.label || toolset.name} ${next ? "enabled" : "disabled"}`,

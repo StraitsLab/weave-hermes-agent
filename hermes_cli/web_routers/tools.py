@@ -50,12 +50,49 @@ _TERMINAL_BACKENDS = LateState("_TERMINAL_BACKENDS")
 _TERMINAL_BACKEND_NAMES = LateState("_TERMINAL_BACKEND_NAMES")
 
 
+def _platform_rows(config: dict) -> list[dict[str, Any]]:
+    """Return registered and explicitly configured toolset platforms."""
+    from hermes_cli.platforms import get_all_platforms, platform_label
+    from hermes_cli.tools_config import gui_toolset_label
+
+    registered = get_all_platforms()
+    configured = config.get("platform_toolsets")
+    configured_names = configured.keys() if isinstance(configured, dict) else ()
+    names = list(registered)
+    names.extend(sorted(str(name) for name in configured_names if str(name) not in registered))
+    return [
+        {
+            "name": name,
+            "label": gui_toolset_label(platform_label(name, name)),
+            "configured": name in configured_names,
+        }
+        for name in names
+    ]
+
+
+def _selected_platform(config: dict, platform: Optional[str]) -> Optional[str]:
+    selected = str(platform or "").strip()
+    if not selected:
+        return None
+    if selected not in {row["name"] for row in _platform_rows(config)}:
+        raise HTTPException(status_code=400, detail=f"Unknown platform: {selected}")
+    return selected
+
+
+@router.get("/api/tools/platforms")
+async def get_toolset_platforms(profile: Optional[str] = None):
+    """List valid platform scopes for the selected profile's toolsets."""
+    with _profile_scope(profile):
+        return _platform_rows(load_config())
+
+
 @router.get("/api/tools/toolsets")
-async def get_toolsets(profile: Optional[str] = None):
+async def get_toolsets(profile: Optional[str] = None, platform: Optional[str] = None):
     from hermes_cli.tools_config import (
         _CONFIG_ONLY_TOOLSETS,
         _get_effective_configurable_toolsets,
         _get_platform_tools,
+        _toolset_allowed_for_platform,
         _toolset_configuration_platform,
         _toolset_has_keys,
         gui_toolset_label,
@@ -66,8 +103,16 @@ async def get_toolsets(profile: Optional[str] = None):
     with _profile_scope(profile):
         config = load_config()
         toolset_rows = _get_effective_configurable_toolsets()
+        selected_platform = _selected_platform(config, platform)
         target_platforms = {
-            _toolset_configuration_platform(name) for name, _, _ in toolset_rows
+            (
+                selected_platform
+                if selected_platform and name not in _CONFIG_ONLY_TOOLSETS
+                else _toolset_configuration_platform(name)
+            )
+            for name, _, _ in toolset_rows
+            if not selected_platform or name in _CONFIG_ONLY_TOOLSETS
+            or _toolset_allowed_for_platform(name, selected_platform)
         }
         enabled_by_platform = {
             platform: _get_platform_tools(
@@ -79,11 +124,17 @@ async def get_toolsets(profile: Optional[str] = None):
         }
     result = []
     for name, label, desc in toolset_rows:
+        if selected_platform and name not in _CONFIG_ONLY_TOOLSETS and not _toolset_allowed_for_platform(name, selected_platform):
+            continue
         try:
             tools = sorted(set(resolve_toolset(name)))
         except Exception:
             tools = []
-        target_platform = _toolset_configuration_platform(name)
+        target_platform = (
+            selected_platform
+            if selected_platform and name not in _CONFIG_ONLY_TOOLSETS
+            else _toolset_configuration_platform(name)
+        )
         if name in _CONFIG_ONLY_TOOLSETS:
             # Config-only capabilities (stt) have no per-platform toolset —
             # their switch is their own config section (e.g. stt.enabled).
@@ -111,7 +162,12 @@ async def get_toolsets(profile: Optional[str] = None):
 
 
 @router.put("/api/tools/toolsets/{name}")
-async def toggle_toolset(name: str, body: ToolsetToggle, profile: Optional[str] = None):
+async def toggle_toolset(
+    name: str,
+    body: ToolsetToggle,
+    profile: Optional[str] = None,
+    platform: Optional[str] = None,
+):
     """Enable/disable a configurable toolset for its configuration platform.
 
     Most toolsets persist to ``platform_toolsets.cli``. Platform-restricted
@@ -125,6 +181,7 @@ async def toggle_toolset(name: str, body: ToolsetToggle, profile: Optional[str] 
         _get_effective_configurable_toolsets,
         _get_platform_tools,
         _save_platform_tools,
+        _toolset_allowed_for_platform,
         _toolset_configuration_platform,
     )
 
@@ -132,8 +189,8 @@ async def toggle_toolset(name: str, body: ToolsetToggle, profile: Optional[str] 
     if name not in valid:
         raise HTTPException(status_code=400, detail=f"Unknown toolset: {name}")
 
-    target_platform = _toolset_configuration_platform(name)
     if name in _CONFIG_ONLY_TOOLSETS:
+        target_platform = _toolset_configuration_platform(name)
         # Config-only capabilities (stt) toggle their own config section's
         # ``enabled`` flag — there is no platform_toolsets entry to write.
         with _profile_scope(body.profile or profile):
@@ -152,6 +209,12 @@ async def toggle_toolset(name: str, body: ToolsetToggle, profile: Optional[str] 
         }
     with _profile_scope(body.profile or profile):
         config = load_config()
+        target_platform = _selected_platform(config, platform) or _toolset_configuration_platform(name)
+        if not _toolset_allowed_for_platform(name, target_platform):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Toolset {name} is unavailable for platform {target_platform}",
+            )
         enabled = set(
             _get_platform_tools(
                 config,

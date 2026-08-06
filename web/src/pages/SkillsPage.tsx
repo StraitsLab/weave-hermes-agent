@@ -33,6 +33,7 @@ import { api } from "@/lib/api";
 import type {
   SkillInfo,
   ToolsetInfo,
+  ToolsetPlatformInfo,
   SkillHubResult,
   SkillHubSource,
   SkillHubInstalledEntry,
@@ -50,6 +51,7 @@ import { Button } from "@nous-research/ui/ui/components/button";
 import { ListItem } from "@nous-research/ui/ui/components/list-item";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { Switch } from "@nous-research/ui/ui/components/switch";
+import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
 import {
   Dialog,
   DialogContent,
@@ -128,6 +130,8 @@ function toolsetIcon(
 export default function SkillsPage() {
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [toolsets, setToolsets] = useState<ToolsetInfo[]>([]);
+  const [toolsetPlatforms, setToolsetPlatforms] = useState<ToolsetPlatformInfo[]>([]);
+  const [selectedToolsetPlatform, setSelectedToolsetPlatform] = useState("cli");
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [view, setView] = useState<"skills" | "toolsets" | "hub">("skills");
@@ -159,11 +163,20 @@ export default function SkillsPage() {
     let cancelled = false;
     Promise.all([
       api.getSkills(selectedProfile || undefined),
-      api.getToolsets(selectedProfile || undefined),
+      api.getToolsetPlatforms(selectedProfile || undefined),
     ])
-      .then(([s, tsets]) => {
+      .then(async ([s, platforms]) => {
+        const nextPlatform = platforms.some((item) => item.name === "cli")
+          ? "cli"
+          : platforms[0]?.name || "";
+        const tsets = await api.getToolsets(
+          selectedProfile || undefined,
+          nextPlatform || undefined,
+        );
         if (cancelled) return;
         setSkills(s);
+        setToolsetPlatforms(platforms);
+        setSelectedToolsetPlatform(nextPlatform);
         setToolsets(tsets);
       })
       .catch(() => !cancelled && showToast(t.common.loading, "error"))
@@ -201,10 +214,24 @@ export default function SkillsPage() {
   /* ---- Refresh toolsets after a config change ---- */
   const refreshToolsets = async () => {
     try {
-      const tsets = await api.getToolsets(selectedProfile || undefined);
+      const tsets = await api.getToolsets(
+        selectedProfile || undefined,
+        selectedToolsetPlatform || undefined,
+      );
       setToolsets(tsets);
     } catch {
       /* non-fatal: the drawer already toasted on the failing write */
+    }
+  };
+
+  const handleToolsetPlatformChange = async (platform: string) => {
+    try {
+      const tsets = await api.getToolsets(selectedProfile || undefined, platform);
+      setConfigToolset(null);
+      setSelectedToolsetPlatform(platform);
+      setToolsets(tsets);
+    } catch {
+      showToast("Failed to load platform tools", "error");
     }
   };
 
@@ -569,6 +596,29 @@ export default function SkillsPage() {
           ) : view === "toolsets" ? (
             /* Toolsets grid */
             <>
+              <Card className="rounded-none">
+                <CardContent className="py-4">
+                  <div className="grid gap-2 sm:max-w-sm">
+                    <label htmlFor="toolset-platform" className="text-xs font-medium text-muted-foreground">
+                      Runtime surface
+                    </label>
+                    <Select
+                      id="toolset-platform"
+                      value={selectedToolsetPlatform}
+                      onValueChange={(value) => void handleToolsetPlatformChange(value)}
+                    >
+                      {toolsetPlatforms.map((platform) => (
+                        <SelectOption key={platform.name} value={platform.name}>
+                          {platform.label}
+                        </SelectOption>
+                      ))}
+                    </Select>
+                    <p className="text-xs text-text-tertiary">
+                      Tool changes apply to new sessions. Embedded runtimes require a restart.
+                    </p>
+                  </div>
+                </CardContent>
+              </Card>
               {filteredToolsets.length === 0 ? (
                 <Card className="rounded-none">
                   <CardContent className="py-8 text-center text-sm text-muted-foreground">
@@ -659,6 +709,7 @@ export default function SkillsPage() {
         <ToolsetConfigDrawer
           toolset={configToolset}
           profile={selectedProfile || undefined}
+          platform={selectedToolsetPlatform || undefined}
           onClose={() => setConfigToolset(null)}
           onChanged={() => void refreshToolsets()}
         />

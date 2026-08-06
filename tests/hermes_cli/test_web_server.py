@@ -398,7 +398,16 @@ class TestWebServerEndpoints:
         assert response.json()["sessions"] == []
         assert response.json()["total"] == 0
 
-    @pytest.mark.parametrize("missing_column", ["archived", "pinned"])
+    @pytest.mark.parametrize(
+        "missing_column",
+        [
+            "archived",
+            "pinned",
+            "last_activity_at",
+            "last_activity_description",
+            "last_activity_provenance",
+        ],
+    )
     def test_get_sessions_heals_stale_schema_store(self, missing_column):
         import sqlite3
 
@@ -1947,6 +1956,41 @@ class TestNewEndpoints:
         assert {"discord", "discord_admin"} <= set(
             config["platform_toolsets"]["discord"]
         )
+
+    def test_toolsets_read_and_write_an_explicit_configured_platform(self):
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        config.setdefault("platform_toolsets", {})["weave_desk"] = ["terminal"]
+        save_config(config)
+
+        platforms = self.client.get("/api/tools/platforms").json()
+        assert any(row == {
+            "name": "weave_desk",
+            "label": "weave_desk",
+            "configured": True,
+        } for row in platforms)
+
+        listing = {
+            row["name"]: row
+            for row in self.client.get(
+                "/api/tools/toolsets?platform=weave_desk"
+            ).json()
+        }
+        assert listing["terminal"]["enabled"] is True
+        assert listing["terminal"]["platform"] == "weave_desk"
+
+        response = self.client.put(
+            "/api/tools/toolsets/terminal?platform=weave_desk",
+            json={"enabled": False},
+        )
+        assert response.status_code == 200
+        assert response.json()["platform"] == "weave_desk"
+        assert "terminal" not in load_config()["platform_toolsets"]["weave_desk"]
+
+    def test_toolsets_reject_unknown_explicit_platform(self):
+        response = self.client.get("/api/tools/toolsets?platform=not-real")
+        assert response.status_code == 400
 
 
     def test_get_toolset_config_returns_provider_matrix(self):

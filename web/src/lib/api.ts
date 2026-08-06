@@ -303,6 +303,14 @@ function profileQuery(profile?: string): string {
   return profile ? `?profile=${encodeURIComponent(profile)}` : "";
 }
 
+function toolsetScopeQuery(profile?: string, platform?: string): string {
+  const params = new URLSearchParams();
+  if (profile) params.set("profile", profile);
+  if (platform) params.set("platform", platform);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
 function appendProfileParam(url: string, profile?: string): string {
   if (!profile || url.includes("profile=")) return url;
   return `${url}${url.includes("?") ? "&" : "?"}profile=${encodeURIComponent(profile)}`;
@@ -774,11 +782,13 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, content, profile: profile || undefined }),
     }),
-  getToolsets: (profile?: string) =>
-    fetchJSON<ToolsetInfo[]>(`/api/tools/toolsets${profileQuery(profile)}`),
-  toggleToolset: (name: string, enabled: boolean, profile?: string) =>
+  getToolsetPlatforms: (profile?: string) =>
+    fetchJSON<ToolsetPlatformInfo[]>(`/api/tools/platforms${profileQuery(profile)}`),
+  getToolsets: (profile?: string, platform?: string) =>
+    fetchJSON<ToolsetInfo[]>(`/api/tools/toolsets${toolsetScopeQuery(profile, platform)}`),
+  toggleToolset: (name: string, enabled: boolean, profile?: string, platform?: string) =>
     fetchJSON<{ ok: boolean; name: string; platform: string; enabled: boolean }>(
-      `/api/tools/toolsets/${encodeURIComponent(name)}`,
+      `/api/tools/toolsets/${encodeURIComponent(name)}${toolsetScopeQuery(undefined, platform)}`,
       {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -2294,6 +2304,12 @@ export interface ToolsetInfo {
   enabled: boolean;
   configured: boolean;
   tools: string[];
+}
+
+export interface ToolsetPlatformInfo {
+  name: string;
+  label: string;
+  configured: boolean;
 }
 
 export interface ToolsetProviderEnvVar {
