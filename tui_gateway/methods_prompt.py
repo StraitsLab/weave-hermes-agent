@@ -69,6 +69,19 @@ def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
 
     sid = params.get("session_id", "")
+    client_request_ids = params.get("client_request_ids", [])
+    if (
+        not isinstance(client_request_ids, list)
+        or len(client_request_ids) > 64
+        or any(
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value) > 256
+            for value in client_request_ids
+        )
+        or len(set(client_request_ids)) != len(client_request_ids)
+    ):
+        return _err(rid, 4004, "client_request_ids must be at most 64 unique non-empty strings")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
     # Typed bare stop phrase while backend voice mode is active ends the
@@ -142,6 +155,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            client_request_ids=client_request_ids,
         )
         if busy_response is not None:
             return busy_response
@@ -223,7 +237,13 @@ def _(rid, params: dict) -> dict:
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        isolated_response = _submit_prompt_to_compute_host(
+            rid,
+            sid,
+            session,
+            text,
+            client_request_ids=client_request_ids,
+        )
         if not isolated_response.get("error"):
             return isolated_response
         logger.warning(
@@ -280,7 +300,13 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            client_request_ids=client_request_ids,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck

@@ -1454,12 +1454,18 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
         return _compute_host_supervisor
 
 
-def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> dict:
+def _compute_host_turn_frame(
+    rid: str,
+    sid: str,
+    session: dict,
+    text: Any,
+    client_request_ids: list[str] | None = None,
+) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
         attached_images = list(session.get("attached_images", []))
-    return {
+    frame = {
         "type": "turn.start",
         "sid": sid,
         "request_id": rid,
@@ -1476,6 +1482,9 @@ def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> di
         "source": _session_source(session),
         "attached_images": attached_images,
     }
+    if client_request_ids:
+        frame["client_request_ids"] = list(client_request_ids)
+    return frame
 
 
 def _metadata_mirror(session: dict | None) -> dict:
@@ -1534,7 +1543,10 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         _clear_inflight_turn(session)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
-        _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+        payload = {"text": f"Error: {message}", "status": "error"}
+        if frame.get("client_request_ids"):
+            payload["client_request_ids"] = frame["client_request_ids"]
+        _emit("message.complete", sid, payload)
     _apply_compute_host_metadata_mirror(session, frame)
     try:
         info = _session_info(session.get("agent"), session)
@@ -1545,9 +1557,21 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
     _drain_queued_prompt(rid, sid, session)
 
 
-def _submit_prompt_to_compute_host(rid: str, sid: str, session: dict, text: Any) -> dict:
+def _submit_prompt_to_compute_host(
+    rid: str,
+    sid: str,
+    session: dict,
+    text: Any,
+    client_request_ids: list[str] | None = None,
+) -> dict:
     cfg = _load_dashboard_process_isolation_config()
-    frame = _compute_host_turn_frame(rid, sid, session, text)
+    frame = _compute_host_turn_frame(
+        rid,
+        sid,
+        session,
+        text,
+        client_request_ids=client_request_ids,
+    )
 
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure through the callback
@@ -6989,7 +7013,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _enqueue_prompt(
+    session: dict,
+    text: Any,
+    transport: Any,
+    client_request_ids: list[str] | None = None,
+) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
@@ -7006,7 +7035,17 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     ):
         prev = existing["text"]
         text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+    request_ids = list(existing.get("client_request_ids", [])) if existing else []
+    for value in client_request_ids or []:
+        if value not in request_ids:
+            request_ids.append(value)
+    queued_prompt = {
+        "text": text,
+        "transport": transport,
+    }
+    if request_ids:
+        queued_prompt["client_request_ids"] = request_ids
+    session["queued_prompt"] = queued_prompt
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -7045,7 +7084,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    client_request_ids: list[str] | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -7108,7 +7153,7 @@ def _handle_busy_submit(
     with session["history_lock"]:
         if not session.get("running"):
             return None
-        _enqueue_prompt(session, text, transport)
+        _enqueue_prompt(session, text, transport, client_request_ids)
         session["last_active"] = time.time()
 
     if mode != "queue":
@@ -7133,7 +7178,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["transport"] = queued["transport"]
     try:
         if _session_uses_compute_host(session):
-            resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
+            resp = _submit_prompt_to_compute_host(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                client_request_ids=queued.get("client_request_ids"),
+            )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
                 with session["history_lock"]:
@@ -7141,7 +7192,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     _clear_inflight_turn(session)
                 _emit("error", sid, {"message": message})
         else:
-            _run_prompt_submit(rid, sid, session, queued["text"])
+            if queued.get("client_request_ids"):
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    client_request_ids=queued["client_request_ids"],
+                )
+            else:
+                _run_prompt_submit(rid, sid, session, queued["text"])
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -7183,7 +7243,12 @@ def _inflight_snapshot(session: dict) -> dict | None:
     return snapshot
 
 
-def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
+def _emit_terminal_turn_error(
+    sid: str,
+    session: dict,
+    error: Any,
+    client_request_ids: list[str] | tuple[str, ...] | None = None,
+) -> None:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
     Emits the same ``status: "error"`` frame shape the returned-error path in
@@ -7207,6 +7272,8 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
         "error": message,
         "recoverable": True,
     }
+    if client_request_ids:
+        payload["client_request_ids"] = list(client_request_ids)
     if partial:
         payload["partial"] = True
     try:
@@ -8960,7 +9027,9 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None,
+    client_request_ids: list[str] | None = None,
 ) -> None:
+    client_request_ids = list(client_request_ids or [])
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
@@ -9381,6 +9450,8 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if client_request_ids:
+                payload["client_request_ids"] = client_request_ids
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -9581,7 +9652,12 @@ def _run_prompt_submit(
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining
                 # the failed turn for resume replay.
-                _emit_terminal_turn_error(sid, session, e)
+                _emit_terminal_turn_error(
+                    sid,
+                    session,
+                    e,
+                    client_request_ids=client_request_ids,
+                )
                 turn_error_retained = True
             except Exception as emit_exc:
                 print(

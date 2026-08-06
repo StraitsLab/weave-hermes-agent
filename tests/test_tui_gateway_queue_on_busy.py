@@ -39,6 +39,18 @@ def test_enqueue_pins_text_and_transport():
     assert session["queued_prompt"] == {"text": "hello", "transport": "ws-1"}
 
 
+def test_enqueue_merges_client_request_ids_with_merged_prompt():
+    session = _session()
+    server._enqueue_prompt(session, "first", "ws-1", ["handoff:first"])
+    server._enqueue_prompt(session, "second", "ws-2", ["handoff:second"])
+
+    assert session["queued_prompt"] == {
+        "text": "first\n\nsecond",
+        "transport": "ws-2",
+        "client_request_ids": ["handoff:first", "handoff:second"],
+    }
+
+
 
 
 # ── _handle_busy_submit (policy) ───────────────────────────────────────────
@@ -180,5 +192,4 @@ def test_drain_releases_running_on_dispatch_failure(monkeypatch):
     assert server._drain_queued_prompt("r1", "sid", session) is True
     # Failure must not leave the session wedged as running.
     assert session["running"] is False
-
 

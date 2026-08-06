@@ -153,7 +153,13 @@ def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "do the thing")
 
-    server._run_prompt_submit("rid", "sid", session, "do the thing")
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        client_request_ids=["handoff:2404e705-b1fa-4d3d-8d13-6e3a7eff16c1"],
+    )
 
     completes = _events(emits, "message.complete")
     assert len(completes) == 1
@@ -161,6 +167,9 @@ def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
     assert payload["status"] == "error"
     assert payload["error"] == "provider 402: billing wall"
     assert payload["recoverable"] is True
+    assert payload["client_request_ids"] == [
+        "handoff:2404e705-b1fa-4d3d-8d13-6e3a7eff16c1"
+    ]
 
     # The retained snapshot survives the finally block for resume replay.
     snapshot = server._inflight_snapshot(session)
@@ -180,11 +189,18 @@ def test_completed_turn_still_clears_inflight(emits, turn_env):
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "do the thing")
 
-    server._run_prompt_submit("rid", "sid", session, "do the thing")
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        client_request_ids=["handoff:completed"],
+    )
 
     completes = _events(emits, "message.complete")
     assert len(completes) == 1
     assert completes[0]["status"] == "complete"
+    assert completes[0]["client_request_ids"] == ["handoff:completed"]
     assert "error" not in completes[0]
     assert server._inflight_snapshot(session) is None
 
@@ -206,7 +222,13 @@ def test_exception_closes_turn_with_terminal_complete_and_partial(emits, turn_en
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "do the thing")
 
-    server._run_prompt_submit("rid", "sid", session, "do the thing")
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        client_request_ids=["handoff:exception"],
+    )
 
     # Terminal frame, not a bare error event.
     assert not _events(emits, "error")
@@ -218,6 +240,7 @@ def test_exception_closes_turn_with_terminal_complete_and_partial(emits, turn_en
     assert payload["recoverable"] is True
     assert payload["partial"] is True
     assert payload["text"] == "half an ans"
+    assert payload["client_request_ids"] == ["handoff:exception"]
 
     snapshot = server._inflight_snapshot(session)
     assert snapshot is not None
