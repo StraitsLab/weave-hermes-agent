@@ -2833,6 +2833,7 @@ def _set_session_context(
         # it instead of falling back to the gateway launch dir.
         resolved = cwd if cwd is not None else _cwd_for_session_key(session_key)
         source = _resolve_session_platform()
+        profile = ""
         # Derive the live conversation id so terminal/execute_code subprocesses
         # can read HERMES_SESSION_ID. Without this, set_session_vars leaves the
         # session-id contextvar as "" (explicitly empty), and the subprocess-env
@@ -2847,6 +2848,11 @@ def _set_session_context(
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
                     source = _session_source(sess)
+                    profile_home = (
+                        Path(sess["profile_home"]) if sess.get("profile_home") else None
+                    )
+                    if profile_home is not None and profile_home.parent.name == "profiles":
+                        profile = profile_home.name
                     session_id = (
                         getattr(sess.get("agent"), "session_id", None) or session_key
                     )
@@ -2855,6 +2861,7 @@ def _set_session_context(
             session_key=session_key,
             session_id=session_id,
             source=source,
+            profile=profile,
             cwd=resolved,
             ui_session_id=ui_session_id,
         )

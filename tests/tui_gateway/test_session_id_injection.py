@@ -37,13 +37,16 @@ class _FakeAgent:
         self.session_id = session_id
 
 
-def _install_session(monkeypatch, *, session_key, agent_session_id, source="cli"):
+def _install_session(
+    monkeypatch, *, session_key, agent_session_id, source="cli", profile_home=None
+):
     """Register a fake session in server._sessions for the duration of a test."""
     sess = {
         "session_key": session_key,
         "source": source,
         "agent": _FakeAgent(agent_session_id) if agent_session_id is not None else None,
         "cwd": "/home/user",
+        "profile_home": profile_home,
     }
     monkeypatch.setattr(server, "_sessions", {session_key: sess}, raising=False)
     return sess
@@ -69,4 +72,18 @@ def test_set_session_context_falls_back_to_session_key(monkeypatch):
 
     assert get_session_env("HERMES_SESSION_ID") == "skey-xyz"
 
+
+def test_set_session_context_injects_named_profile(monkeypatch, tmp_path):
+    """The active session's named profile must reach tool subprocesses."""
+    profile_home = tmp_path / ".hermes" / "profiles" / "mailroom"
+    _install_session(
+        monkeypatch,
+        session_key="skey-mailroom",
+        agent_session_id="20260807_mailroom",
+        profile_home=str(profile_home),
+    )
+
+    server._set_session_context("skey-mailroom")
+
+    assert get_session_env("HERMES_SESSION_PROFILE") == "mailroom"
 
