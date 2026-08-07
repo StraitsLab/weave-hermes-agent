@@ -4890,6 +4890,7 @@ def _emit_session_info_for_session(sid: str, session: dict) -> None:
 # Full output stays in the agent context and the SQLite session, untouched.
 _TUI_VERBOSE_TEXT_MAX_CHARS = 1_000
 _TUI_VERBOSE_TEXT_MAX_LINES = 16
+_TUI_TOOL_EVENT_RESULT_MAX_BYTES = 64 * 1024
 
 
 def _cap_tui_verbose_text(text: str) -> str:
@@ -4954,6 +4955,23 @@ def _tool_result_text(result: object) -> str:
     except Exception:
         raw = str(result)
     return _redact_tui_verbose_text(raw)
+
+
+def _tool_event_result(result: str) -> object:
+    """Keep lifecycle telemetry below the bounded JSON-RPC line size.
+
+    The agent retains the complete in-memory tool result; normal persistence
+    policy still decides whether any image is durable.  The TUI event is only
+    an observability copy, so large results (notably inline screenshots) carry
+    a redacted text preview instead of duplicate bytes.
+    """
+    try:
+        parsed: object = json.loads(result)
+    except Exception:
+        parsed = result
+    if len(result.encode("utf-8")) > _TUI_TOOL_EVENT_RESULT_MAX_BYTES:
+        return {"omitted": True, "preview": _tool_result_text(parsed)}
+    return parsed
 
 
 def _fmt_tool_duration(seconds: float | None) -> str:
@@ -5042,10 +5060,7 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     duration_s = time.time() - started_at if started_at else None
     if duration_s is not None:
         payload["duration_s"] = duration_s
-    try:
-        payload["result"] = json.loads(result)
-    except Exception:
-        payload["result"] = result
+    payload["result"] = _tool_event_result(result)
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary

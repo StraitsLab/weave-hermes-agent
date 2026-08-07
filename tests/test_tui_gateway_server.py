@@ -960,6 +960,34 @@ def test_tui_verbose_default_cap_stays_small(monkeypatch):
     assert capped.startswith("[showing verbose tail; omitted ")
 
 
+def test_tui_tool_event_omits_large_result_without_changing_agent_result(monkeypatch):
+    monkeypatch.setattr(server, "_TUI_TOOL_EVENT_RESULT_MAX_BYTES", 32)
+    events: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+    )
+    monkeypatch.setitem(
+        server._sessions,
+        "large-result-test",
+        {"tool_progress_mode": "all", "tool_started_at": {}},
+    )
+    result = json.dumps({
+        "_multimodal": True,
+        "content": [{"type": "image_url", "image_url": {"url": "x" * 256}}],
+        "text_summary": "Captured Safari",
+    })
+
+    server._on_tool_complete(
+        "large-result-test", "tool-screen", "capture_screen_context", {}, result
+    )
+
+    emitted = events[0][2]["result"]
+    assert emitted["omitted"] is True
+    assert emitted["preview"] == "Captured Safari"
+    assert "x" * 64 not in json.dumps(emitted)
+    assert json.loads(result)["content"][0]["image_url"]["url"] == "x" * 256
+
+
 def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
     redact_module = types.ModuleType("agent.redact")
 
