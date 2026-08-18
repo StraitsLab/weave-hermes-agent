@@ -12,6 +12,7 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
+- POST /api/sessions/{session_id}/append — passively append one finalized message
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
@@ -2068,6 +2069,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            ("POST", "/api/sessions/{session_id}/append", self._handle_session_append),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -3138,6 +3140,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "session_passive_append": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -3173,6 +3176,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "session_passive_append": {"method": "POST", "path": "/api/sessions/{session_id}/append"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
             },
         })
@@ -3610,6 +3614,145 @@ class APIServerAdapter(BasePlatformAdapter):
                 "returned": len(messages),
             },
         })
+
+    async def _handle_session_append(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/append — passive native append."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        if set(body) != {"request", "content"} or not isinstance(body.get("request"), dict):
+            return web.json_response(
+                _openai_error("Invalid append schema", code="invalid_append_schema"),
+                status=400,
+            )
+        append_request = body["request"]
+        content = body["content"]
+        required = {
+            "kind", "authenticated", "external_item_id", "external_identity_scope",
+            "transcript_row", "atomic_insert_or_return", "target_bem_session_id",
+            "role", "canonical_sha256", "participant_id",
+        }
+        if (
+            set(append_request) - required - {"predecessor_sequence"}
+            or not required <= set(append_request)
+            or not isinstance(content, str)
+        ):
+            return web.json_response(
+                _openai_error("Invalid append schema", code="invalid_append_schema"),
+                status=400,
+            )
+        try:
+            content.encode("utf-8")
+        except UnicodeEncodeError:
+            return web.json_response(
+                _openai_error("Invalid append content", code="invalid_content"), status=400
+            )
+        if len(content.encode("utf-8")) > 65_536:
+            return web.json_response(
+                _openai_error("Append content exceeds the 64 KiB limit", code="content_too_large"),
+                status=400,
+            )
+        def uuid7(value):
+            return isinstance(value, str) and bool(re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", value
+            ))
+        if (
+            append_request["kind"] != "hermes_append_request"
+            or append_request["authenticated"] is not True
+            or append_request["external_identity_scope"] != "global"
+            or append_request["transcript_row"] != "normal"
+            or append_request["atomic_insert_or_return"] is not True
+            or not uuid7(append_request["external_item_id"])
+            or not uuid7(append_request["target_bem_session_id"])
+            or append_request["target_bem_session_id"] != session_id
+            or not isinstance(append_request["role"], str)
+            or append_request["role"] not in {"user", "assistant"}
+            or not uuid7(append_request["participant_id"])
+            or not isinstance(append_request["canonical_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", append_request["canonical_sha256"])
+            or hashlib.sha256(content.encode("utf-8")).hexdigest()
+            != append_request["canonical_sha256"]
+        ):
+            return web.json_response(
+                _openai_error("Invalid append schema", code="invalid_append_schema"),
+                status=400,
+            )
+        predecessor = append_request.get("predecessor_sequence")
+        if predecessor is not None and (
+            isinstance(predecessor, bool) or not isinstance(predecessor, int) or predecessor < 1
+        ):
+            return web.json_response(
+                _openai_error("Invalid append schema", code="invalid_append_schema"),
+                status=400,
+            )
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+            )
+        try:
+            result = await asyncio.to_thread(
+                db.append_passive_message,
+                session_id,
+                external_item_id=append_request["external_item_id"],
+                role=append_request["role"],
+                content=content,
+                canonical_sha256=append_request["canonical_sha256"],
+                participant_id=append_request["participant_id"],
+                predecessor_sequence=predecessor,
+            )
+        except Exception as exc:
+            from hermes_state import SessionPassiveAppendError
+
+            if isinstance(exc, SessionPassiveAppendError):
+                if exc.code == "session_not_found":
+                    return web.json_response(
+                        _openai_error("Target session was not found", code="session_not_found"),
+                        status=404,
+                    )
+                return web.json_response(
+                    _openai_error("Invalid append schema", code=exc.code),
+                    status=400,
+                )
+            logger.warning("[%s] passive session append failed: %s", self.name, type(exc).__name__)
+            return web.json_response(
+                _openai_error("Session append unavailable", code="session_append_unavailable"),
+                status=503,
+            )
+
+        outcome = result["outcome"]
+        external_item_id = append_request["external_item_id"]
+        receipt = {
+            "kind": "hermes_append_receipt",
+            "receipt_id": external_item_id,
+            "external_item_id": external_item_id,
+            "outcome": outcome,
+            "terminal": outcome != "sequence_gap",
+            "retryable": outcome == "sequence_gap",
+            "ledger_recording": "idempotent",
+            "cross_service_2pc": False,
+        }
+        if outcome in {"inserted", "identical_retry"}:
+            receipt["native_item_ref"] = f"message:{result['message_id']}"
+            if outcome == "identical_retry":
+                receipt["same_native_ref_on_identical_retry"] = True
+            return web.json_response(receipt, status=201 if outcome == "inserted" else 200)
+        if outcome == "sequence_gap":
+            return web.json_response(
+                receipt,
+                status=409,
+            )
+        return web.json_response(
+            receipt,
+            status=409,
+        )
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
