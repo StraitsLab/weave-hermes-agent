@@ -3778,7 +3778,6 @@ class APIServerAdapter(BasePlatformAdapter):
             or append_request["atomic_insert_or_return"] is not True
             or not uuid7(append_request["external_item_id"])
             or not uuid7(append_request["target_bem_session_id"])
-            or append_request["target_bem_session_id"] != session_id
             or not isinstance(append_request["role"], str)
             or append_request["role"] not in {"user", "assistant"}
             or not uuid7(append_request["participant_id"])
@@ -3810,6 +3809,7 @@ class APIServerAdapter(BasePlatformAdapter):
             result = await asyncio.to_thread(
                 db.append_passive_message,
                 session_id,
+                target_bem_session_id=append_request["target_bem_session_id"],
                 external_item_id=append_request["external_item_id"],
                 role=append_request["role"],
                 content=content,

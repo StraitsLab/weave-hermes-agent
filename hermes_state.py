@@ -9420,6 +9420,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         *,
+        target_bem_session_id: str,
         external_item_id: str,
         role: str,
         content: str,
@@ -9442,6 +9443,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not isinstance(session_id, str) or not session_id:
             raise SessionPassiveAppendError("invalid_session", "session_id is required")
+        if not isinstance(target_bem_session_id, str) or not re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            target_bem_session_id,
+        ):
+            raise SessionPassiveAppendError("invalid_bem_session_id", "target_bem_session_id must be a UUIDv7")
         if not isinstance(role, str) or role not in {"user", "assistant"}:
             raise SessionPassiveAppendError("invalid_role", "role must be user or assistant")
         if not isinstance(content, str) or not content:
@@ -9483,6 +9489,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """CREATE TABLE IF NOT EXISTS passive_append_idempotency (
                    external_item_id TEXT PRIMARY KEY,
                    session_id TEXT NOT NULL,
+                   target_bem_session_id TEXT NOT NULL,
                    native_message_id INTEGER NOT NULL,
                    canonical_sha256 TEXT NOT NULL,
                    role TEXT NOT NULL,
@@ -9490,8 +9497,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    predecessor_sequence INTEGER
                 )"""
             )
+            columns = {row["name"] for row in conn.execute(
+                "PRAGMA table_info(passive_append_idempotency)"
+            ).fetchall()}
+            if "target_bem_session_id" not in columns:
+                conn.execute("ALTER TABLE passive_append_idempotency ADD COLUMN target_bem_session_id TEXT")
+                conn.execute("UPDATE passive_append_idempotency SET target_bem_session_id = session_id")
             existing = conn.execute(
-                "SELECT external_item_id, session_id, native_message_id, "
+                "SELECT external_item_id, session_id, target_bem_session_id, native_message_id, "
                 "canonical_sha256, role, participant_id, predecessor_sequence "
                 "FROM passive_append_idempotency WHERE external_item_id = ?",
                 (external_item_id,),
@@ -9499,6 +9512,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if existing is not None:
                 same_payload = (
                     existing["session_id"] == session_id
+                    and existing["target_bem_session_id"] == target_bem_session_id
                     and existing["canonical_sha256"] == canonical_sha256
                     and existing["role"] == role
                     and existing["participant_id"] == participant_id
@@ -9557,12 +9571,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             message_id = cursor.lastrowid
             conn.execute(
                 """INSERT INTO passive_append_idempotency (
-                   external_item_id, session_id, native_message_id,
+                   external_item_id, session_id, target_bem_session_id, native_message_id,
                    canonical_sha256, role, participant_id, predecessor_sequence
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     external_item_id,
                     session_id,
+                    target_bem_session_id,
                     message_id,
                     canonical_sha256,
                     role,
