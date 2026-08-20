@@ -14,6 +14,7 @@ from hermes_state import SessionDB, SessionPassiveAppendError
 
 SESSION_ID = "018f22e2-7c00-7001-8001-000000000010"
 OTHER_SESSION_ID = "018f22e2-7c00-7001-8001-000000000011"
+HERMES_SESSION_ID = "weave-018f22e2-7c00-7001-8001-000000000099"
 ITEM_ONE = "018f22e2-7c00-7001-8001-000000000001"
 ITEM_TWO = "018f22e2-7c00-7001-8001-000000000002"
 PARTICIPANT_ID = "018f22e2-7c00-7001-8001-000000000003"
@@ -55,13 +56,15 @@ def _append(
     db,
     item_id=ITEM_ONE,
     *,
-    target=SESSION_ID,
+    session_id=SESSION_ID,
+    target_bem_session_id=SESSION_ID,
     role="user",
     content="hello",
     predecessor=None,
 ):
     return db.append_passive_message(
-        target,
+        session_id,
+        target_bem_session_id=target_bem_session_id,
         external_item_id=item_id,
         role=role,
         content=content,
@@ -102,6 +105,41 @@ def test_native_insert_replay_conflict_and_order(session_db):
     assert "display_kind" not in conversation[0]
 
 
+def test_identical_replay_ignores_advanced_predecessor_cursor(session_db):
+    session_db.append_message(SESSION_ID, "user", "prior")
+    inserted = _append(
+        session_db,
+        ITEM_TWO,
+        role="assistant",
+        content="answer",
+        predecessor=1,
+    )
+    assert inserted["outcome"] == "inserted"
+    assert inserted["sequence"] == 2
+
+    replay = _append(
+        session_db,
+        ITEM_TWO,
+        role="assistant",
+        content="answer",
+        predecessor=2,
+    )
+    assert replay == {
+        "outcome": "identical_retry",
+        "message_id": inserted["message_id"],
+        "sequence": 2,
+    }
+    changed = _append(
+        session_db,
+        ITEM_TWO,
+        role="assistant",
+        content="changed",
+        predecessor=2,
+    )
+    assert changed["outcome"] == "idempotency_conflict"
+    assert session_db.message_count(SESSION_ID) == 2
+
+
 def test_idempotency_survives_message_and_session_deletion(session_db):
     inserted = _append(session_db)
     session_db.replace_messages(SESSION_ID, [])
@@ -121,9 +159,55 @@ def test_idempotency_survives_message_and_session_deletion(session_db):
     assert _append(session_db, content="changed")["outcome"] == "idempotency_conflict"
 
     session_db.create_session(OTHER_SESSION_ID, "api_server")
-    assert _append(session_db, target=OTHER_SESSION_ID)["outcome"] == "idempotency_conflict"
+    assert _append(session_db, session_id=OTHER_SESSION_ID,
+        target_bem_session_id=OTHER_SESSION_ID)["outcome"] == "idempotency_conflict"
     assert session_db.delete_session(SESSION_ID)
     assert _append(session_db)["outcome"] == "identical_retry"
+
+
+def test_legacy_mapping_recovers_derivable_bem_identity(session_db):
+    def seed_legacy(conn):
+        conn.execute(
+            """CREATE TABLE passive_append_idempotency (
+               external_item_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               native_message_id INTEGER NOT NULL, canonical_sha256 TEXT NOT NULL,
+               role TEXT NOT NULL, participant_id TEXT NOT NULL,
+               predecessor_sequence INTEGER)"""
+        )
+        conn.execute(
+            "INSERT INTO passive_append_idempotency VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ITEM_ONE, SESSION_ID, 77, _digest("hello"), "user", PARTICIPANT_ID, None),
+        )
+
+    session_db._execute_write(seed_legacy)
+    assert _append(session_db) == {
+        "outcome": "identical_retry", "message_id": 77, "sequence": 1,
+    }
+    assert _append(session_db,
+        target_bem_session_id=OTHER_SESSION_ID)["outcome"] == "idempotency_conflict"
+    with session_db._read_ctx() as conn:
+        row = conn.execute(
+            "SELECT target_bem_session_id FROM passive_append_idempotency"
+        ).fetchone()
+    assert row["target_bem_session_id"] == SESSION_ID
+
+
+def test_legacy_opaque_native_ref_fails_closed(session_db):
+    def seed_legacy(conn):
+        conn.execute(
+            """CREATE TABLE passive_append_idempotency (
+               external_item_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               native_message_id INTEGER NOT NULL, canonical_sha256 TEXT NOT NULL,
+               role TEXT NOT NULL, participant_id TEXT NOT NULL,
+               predecessor_sequence INTEGER)"""
+        )
+        conn.execute(
+            "INSERT INTO passive_append_idempotency VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ITEM_ONE, HERMES_SESSION_ID, 77, _digest("hello"), "user", PARTICIPANT_ID, None),
+        )
+
+    session_db._execute_write(seed_legacy)
+    assert _append(session_db)["outcome"] == "idempotency_conflict"
 
 
 def test_passive_metadata_is_native_display_only(session_db):
@@ -146,6 +230,7 @@ def test_predecessor_gap_roles_and_digest_fail_closed(session_db):
     with pytest.raises(SessionPassiveAppendError) as participant_error:
         session_db.append_passive_message(
             SESSION_ID,
+            target_bem_session_id=SESSION_ID,
             external_item_id=ITEM_ONE,
             role="user",
             content="hello",
@@ -156,6 +241,7 @@ def test_predecessor_gap_roles_and_digest_fail_closed(session_db):
     with pytest.raises(SessionPassiveAppendError) as digest_error:
         session_db.append_passive_message(
             SESSION_ID,
+            target_bem_session_id=SESSION_ID,
             external_item_id=ITEM_ONE,
             role="user",
             content="hello",
@@ -181,6 +267,7 @@ def test_passive_identity_is_global_but_native_platform_ids_coexist(session_db):
 
     collision = session_db.append_passive_message(
         OTHER_SESSION_ID,
+        target_bem_session_id=OTHER_SESSION_ID,
         external_item_id=ITEM_ONE,
         role="user",
         content="passive",
@@ -221,6 +308,7 @@ async def test_http_exact_wrapper_constants_target_and_direct_receipt(session_db
         PlatformConfig(enabled=True, extra={"key": "sk-passive-append-test"})
     )
     adapter._session_db = session_db
+    session_db.create_session(HERMES_SESSION_ID, "api_server")
     headers = {"Authorization": "Bearer sk-passive-append-test"}
     app = _app(adapter)
     async with TestClient(TestServer(app)) as client:
@@ -230,7 +318,7 @@ async def test_http_exact_wrapper_constants_target_and_direct_receipt(session_db
         assert unauthorized.status == 401
 
         first = await client.post(
-            f"/api/sessions/{SESSION_ID}/append", headers=headers, json=_request()
+            f"/api/sessions/{HERMES_SESSION_ID}/append", headers=headers, json=_request()
         )
         assert first.status == 201
         receipt = await first.json()
@@ -243,7 +331,7 @@ async def test_http_exact_wrapper_constants_target_and_direct_receipt(session_db
         native_ref = receipt["native_item_ref"]
 
         replay = await client.post(
-            f"/api/sessions/{SESSION_ID}/append", headers=headers, json=_request()
+            f"/api/sessions/{HERMES_SESSION_ID}/append", headers=headers, json=_request()
         )
         assert replay.status == 200
         replay_receipt = await replay.json()
@@ -251,19 +339,26 @@ async def test_http_exact_wrapper_constants_target_and_direct_receipt(session_db
         assert replay_receipt["native_item_ref"] == native_ref
         assert replay_receipt["same_native_ref_on_identical_retry"] is True
 
-        assert session_db.delete_session(SESSION_ID)
-        assert session_db.message_count(SESSION_ID) == 0
+        changed_bem = await client.post(
+            f"/api/sessions/{HERMES_SESSION_ID}/append", headers=headers,
+            json=_request(target=OTHER_SESSION_ID),
+        )
+        assert changed_bem.status == 409
+        assert (await changed_bem.json())["outcome"] == "idempotency_conflict"
+
+        assert session_db.delete_session(HERMES_SESSION_ID)
+        assert session_db.message_count(HERMES_SESSION_ID) == 0
         tombstone_replay = await client.post(
-            f"/api/sessions/{SESSION_ID}/append", headers=headers, json=_request()
+            f"/api/sessions/{HERMES_SESSION_ID}/append", headers=headers, json=_request()
         )
         assert tombstone_replay.status == 200
         tombstone_receipt = await tombstone_replay.json()
         assert tombstone_receipt["outcome"] == "identical_retry"
         assert tombstone_receipt["native_item_ref"] == native_ref
-        assert session_db.message_count(SESSION_ID) == 0
+        assert session_db.message_count(HERMES_SESSION_ID) == 0
 
         changed = await client.post(
-            f"/api/sessions/{SESSION_ID}/append",
+            f"/api/sessions/{HERMES_SESSION_ID}/append",
             headers=headers,
             json=_request(content="changed"),
         )
@@ -271,20 +366,20 @@ async def test_http_exact_wrapper_constants_target_and_direct_receipt(session_db
         assert (await changed.json())["outcome"] == "idempotency_conflict"
 
         unknown = await client.post(
-            f"/api/sessions/{SESSION_ID}/append",
+            f"/api/sessions/{HERMES_SESSION_ID}/append",
             headers=headers,
             json=_request(item_id=ITEM_TWO),
         )
         assert unknown.status == 404
         assert (await unknown.json())["error"]["code"] == "session_not_found"
 
-        mismatch = await client.post(
-            f"/api/sessions/{SESSION_ID}/append",
+        invalid_target = await client.post(
+            f"/api/sessions/{HERMES_SESSION_ID}/append",
             headers=headers,
-            json=_request(target=OTHER_SESSION_ID),
+            json=_request(target="not-a-uuid"),
         )
-        assert mismatch.status == 400
-        assert (await mismatch.json())["error"]["code"] == "invalid_append_schema"
+        assert invalid_target.status == 400
+        assert (await invalid_target.json())["error"]["code"] == "invalid_append_schema"
 
         extra = _request()
         extra["request"]["unexpected"] = True
