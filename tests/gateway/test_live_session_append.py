@@ -192,6 +192,24 @@ def test_legacy_mapping_recovers_derivable_bem_identity(session_db):
     assert row["target_bem_session_id"] == SESSION_ID
 
 
+def test_legacy_opaque_native_ref_fails_closed(session_db):
+    def seed_legacy(conn):
+        conn.execute(
+            """CREATE TABLE passive_append_idempotency (
+               external_item_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               native_message_id INTEGER NOT NULL, canonical_sha256 TEXT NOT NULL,
+               role TEXT NOT NULL, participant_id TEXT NOT NULL,
+               predecessor_sequence INTEGER)"""
+        )
+        conn.execute(
+            "INSERT INTO passive_append_idempotency VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ITEM_ONE, HERMES_SESSION_ID, 77, _digest("hello"), "user", PARTICIPANT_ID, None),
+        )
+
+    session_db._execute_write(seed_legacy)
+    assert _append(session_db)["outcome"] == "idempotency_conflict"
+
+
 def test_passive_metadata_is_native_display_only(session_db):
     _append(session_db)
     model_history, display_history = session_db.get_resume_conversations(SESSION_ID)
