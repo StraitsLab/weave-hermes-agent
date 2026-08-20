@@ -105,6 +105,41 @@ def test_native_insert_replay_conflict_and_order(session_db):
     assert "display_kind" not in conversation[0]
 
 
+def test_identical_replay_ignores_advanced_predecessor_cursor(session_db):
+    session_db.append_message(SESSION_ID, "user", "prior")
+    inserted = _append(
+        session_db,
+        ITEM_TWO,
+        role="assistant",
+        content="answer",
+        predecessor=1,
+    )
+    assert inserted["outcome"] == "inserted"
+    assert inserted["sequence"] == 2
+
+    replay = _append(
+        session_db,
+        ITEM_TWO,
+        role="assistant",
+        content="answer",
+        predecessor=2,
+    )
+    assert replay == {
+        "outcome": "identical_retry",
+        "message_id": inserted["message_id"],
+        "sequence": 2,
+    }
+    changed = _append(
+        session_db,
+        ITEM_TWO,
+        role="assistant",
+        content="changed",
+        predecessor=2,
+    )
+    assert changed["outcome"] == "idempotency_conflict"
+    assert session_db.message_count(SESSION_ID) == 2
+
+
 def test_idempotency_survives_message_and_session_deletion(session_db):
     inserted = _append(session_db)
     session_db.replace_messages(SESSION_ID, [])

@@ -9516,7 +9516,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     and existing["canonical_sha256"] == canonical_sha256
                     and existing["role"] == role
                     and existing["participant_id"] == participant_id
-                    and existing["predecessor_sequence"] == predecessor_sequence
                 )
                 if same_payload:
                     return {
