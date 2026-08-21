@@ -2833,6 +2833,58 @@ class SessionStore:
 
         return entry
 
+    def bind_existing_session(
+        self, source: SessionSource, session_id: str
+    ) -> Optional[SessionEntry]:
+        """Atomically bind one source key to an already-existing session row.
+
+        Unlike ``get_or_create_session()`` followed by ``switch_session()``,
+        this never creates an intermediate session or ends a ghost row.
+        """
+        if not isinstance(session_id, str) or not session_id or self._db is None:
+            return None
+        try:
+            if self._db.get_session(session_id) is None:
+                return None
+        except Exception:
+            return None
+
+        session_key = self._generate_session_key(source)
+        now = _now()
+        with self._lock:
+            self._ensure_loaded_locked()
+            existing = self._entries.get(session_key)
+            if existing is not None:
+                if existing.session_id != session_id:
+                    return None
+                existing.origin = source
+                existing.platform = source.platform
+                existing.chat_type = source.chat_type
+                existing.display_name = source.chat_name
+                existing.updated_at = now
+                entry = existing
+            else:
+                entry = SessionEntry(
+                    session_key=session_key,
+                    session_id=session_id,
+                    created_at=now,
+                    updated_at=now,
+                    origin=source,
+                    display_name=source.chat_name,
+                    platform=source.platform,
+                    chat_type=source.chat_type,
+                )
+                self._entries[session_key] = entry
+        self._save_entries()
+        try:
+            self._db.reopen_session(session_id)
+            self._record_gateway_session_peer(
+                session_id, session_key, source, display_name=entry.display_name
+            )
+        except Exception:
+            return None
+        return entry
+
     def update_session(
         self,
         session_key: str,
