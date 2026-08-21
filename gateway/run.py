@@ -16304,6 +16304,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
+        # Authenticated API admission is still an ordinary user turn: it must
+        # obey pause/drain/turn-lease semantics, but its bearer token already
+        # authenticated the caller before the API adapter created this event.
+        # Keep that narrow transport assertion separate from ``internal`` so
+        # it cannot inherit synthetic-event bypasses.
+        is_authenticated_native_submit = (
+            source.platform == Platform.API_SERVER
+            and (getattr(event, "metadata", None) or {}).get(
+                "native_submit_authenticated"
+            ) is True
+        )
 
         # Ignored-channel guard runs FIRST — before startup-restore queueing,
         # plugin hooks, auth, and session setup — so a configured ignored
@@ -16384,7 +16395,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "allow":
                     break
 
-        if is_internal:
+        if is_internal or is_authenticated_native_submit:
             pass
         elif source.user_id is None:
             # Messages with no user identity (Telegram service messages,
@@ -18660,6 +18671,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if resolved_entry is None:
                 return
             session_entry = resolved_entry
+        native_request_ref = str(event_metadata.get("native_request_ref") or "")
+        if native_request_ref and event.message_id:
+            if await self.async_session_store.has_platform_message_id(
+                session_entry.session_id, str(event.message_id)
+            ):
+                logger.info(
+                    "Skipping recovered native admission %s already present in %s",
+                    native_request_ref, session_entry.session_id,
+                )
+                return
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:

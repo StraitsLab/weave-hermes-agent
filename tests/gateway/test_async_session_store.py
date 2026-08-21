@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from gateway.session import AsyncSessionStore
+from gateway.config import GatewayConfig, Platform
+from gateway.session import AsyncSessionStore, SessionSource, SessionStore
+from hermes_state import SessionDB
 
 
 class _SpyStore:
@@ -97,3 +99,25 @@ def test_gateway_async_code_uses_one_awaited_session_store_boundary() -> None:
 def test_no_repository_local_claude_permissions_file() -> None:
     root = Path(__file__).resolve().parents[2]
     assert not (root / ".claude" / "settings.json").exists()
+
+
+def test_bind_existing_session_never_creates_a_ghost_session(tmp_path, monkeypatch) -> None:
+    """Direct API binding must publish only the requested existing session."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("existing-api-session", "api_server")
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    store._db = db
+    source = SessionSource(
+        platform=Platform.API_SERVER, chat_id="existing-api-session",
+        chat_type="dm", user_id="api_server",
+    )
+
+    entry = store.bind_existing_session(source, "existing-api-session")
+
+    assert entry is not None
+    assert entry.session_id == "existing-api-session"
+    assert [row["id"] for row in db.list_sessions_rich(limit=20)] == [
+        "existing-api-session"
+    ]
+    db.close()
