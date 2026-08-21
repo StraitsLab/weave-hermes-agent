@@ -12,6 +12,7 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
+- POST /api/sessions/{session_id}/append — passively append one finalized message
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
@@ -88,10 +89,13 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
     SendResult,
     is_network_accessible,
     validate_media_delivery_path,
 )
+from gateway.session import SessionSource
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
@@ -1520,6 +1524,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # Short-lived per-request locks serialize HTTP retries through the
+        # durable idempotency index before they touch the native session queue.
+        self._native_submit_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+        self._native_submit_active_refs: Dict[str, str] = {}
+        self._native_submit_ref_sessions: Dict[str, tuple[str, str]] = {}
+        self._native_submit_events: Dict[str, List[Dict[str, Any]]] = {}
+        self._native_submit_clarifies: Dict[tuple[str, str], str] = {}
+        self._native_submit_started: Dict[str, "asyncio.Future[str]"] = {}
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -2116,6 +2128,10 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            ("POST", "/api/sessions/{session_id}/append", self._handle_session_append),
+            ("POST", "/api/sessions/{session_id}/submit", self._handle_session_submit),
+            ("GET", "/api/sessions/{session_id}/submit/{native_request_ref}/clarify", self._handle_native_submit_clarify_events),
+            ("POST", "/api/sessions/{session_id}/submit/{native_request_ref}/clarify/{clarify_id}", self._handle_native_submit_clarify_response),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -3230,6 +3246,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "session_passive_append": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -3265,6 +3282,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "session_passive_append": {"method": "POST", "path": "/api/sessions/{session_id}/append"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
             },
         })
@@ -3719,6 +3737,430 @@ class APIServerAdapter(BasePlatformAdapter):
                 "returned": len(messages),
             },
         })
+
+    async def _handle_session_append(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/append — passive native append."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        if set(body) != {"request", "content"} or not isinstance(body.get("request"), dict):
+            return web.json_response(
+                _openai_error("Invalid append schema", code="invalid_append_schema"),
+                status=400,
+            )
+        append_request = body["request"]
+        content = body["content"]
+        required = {
+            "kind", "authenticated", "external_item_id", "external_identity_scope",
+            "transcript_row", "atomic_insert_or_return", "target_bem_session_id",
+            "role", "canonical_sha256", "participant_id",
+        }
+        if (
+            set(append_request) - required - {"predecessor_sequence"}
+            or not required <= set(append_request)
+            or not isinstance(content, str)
+        ):
+            return web.json_response(
+                _openai_error("Invalid append schema", code="invalid_append_schema"),
+                status=400,
+            )
+        try:
+            content.encode("utf-8")
+        except UnicodeEncodeError:
+            return web.json_response(
+                _openai_error("Invalid append content", code="invalid_content"), status=400
+            )
+        if len(content.encode("utf-8")) > 65_536:
+            return web.json_response(
+                _openai_error("Append content exceeds the 64 KiB limit", code="content_too_large"),
+                status=400,
+            )
+        def uuid7(value):
+            return isinstance(value, str) and bool(re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", value
+            ))
+        if (
+            append_request["kind"] != "hermes_append_request"
+            or append_request["authenticated"] is not True
+            or append_request["external_identity_scope"] != "global"
+            or append_request["transcript_row"] != "normal"
+            or append_request["atomic_insert_or_return"] is not True
+            or not uuid7(append_request["external_item_id"])
+            or not uuid7(append_request["target_bem_session_id"])
+            or not isinstance(append_request["role"], str)
+            or append_request["role"] not in {"user", "assistant"}
+            or not uuid7(append_request["participant_id"])
+            or not isinstance(append_request["canonical_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", append_request["canonical_sha256"])
+            or hashlib.sha256(content.encode("utf-8")).hexdigest()
+            != append_request["canonical_sha256"]
+        ):
+            return web.json_response(
+                _openai_error("Invalid append schema", code="invalid_append_schema"),
+                status=400,
+            )
+        predecessor = append_request.get("predecessor_sequence")
+        if predecessor is not None and (
+            isinstance(predecessor, bool) or not isinstance(predecessor, int) or predecessor < 1
+        ):
+            return web.json_response(
+                _openai_error("Invalid append schema", code="invalid_append_schema"),
+                status=400,
+            )
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+            )
+        try:
+            result = await asyncio.to_thread(
+                db.append_passive_message,
+                session_id,
+                target_bem_session_id=append_request["target_bem_session_id"],
+                external_item_id=append_request["external_item_id"],
+                role=append_request["role"],
+                content=content,
+                canonical_sha256=append_request["canonical_sha256"],
+                participant_id=append_request["participant_id"],
+                predecessor_sequence=predecessor,
+            )
+        except Exception as exc:
+            from hermes_state import SessionPassiveAppendError
+
+            if isinstance(exc, SessionPassiveAppendError):
+                if exc.code == "session_not_found":
+                    return web.json_response(
+                        _openai_error("Target session was not found", code="session_not_found"),
+                        status=404,
+                    )
+                return web.json_response(
+                    _openai_error("Invalid append schema", code=exc.code),
+                    status=400,
+                )
+            logger.warning("[%s] passive session append failed: %s", self.name, type(exc).__name__)
+            return web.json_response(
+                _openai_error("Session append unavailable", code="session_append_unavailable"),
+                status=503,
+            )
+
+        outcome = result["outcome"]
+        external_item_id = append_request["external_item_id"]
+        receipt = {
+            "kind": "hermes_append_receipt",
+            "receipt_id": external_item_id,
+            "external_item_id": external_item_id,
+            "outcome": outcome,
+            "terminal": outcome != "sequence_gap",
+            "retryable": outcome == "sequence_gap",
+            "ledger_recording": "idempotent",
+            "cross_service_2pc": False,
+        }
+        if outcome in {"inserted", "identical_retry"}:
+            receipt["native_item_ref"] = f"message:{result['message_id']}"
+            if outcome == "identical_retry":
+                receipt["same_native_ref_on_identical_retry"] = True
+            return web.json_response(receipt, status=201 if outcome == "inserted" else 200)
+        if outcome == "sequence_gap":
+            return web.json_response(
+                receipt,
+                status=409,
+            )
+        return web.json_response(
+            receipt,
+            status=409,
+        )
+
+    @staticmethod
+    def _native_submit_request(body: Dict[str, Any]) -> tuple[Optional[tuple[str, str]], Optional["web.Response"]]:
+        """Validate the deliberately narrow native-admission request shape."""
+        if set(body) != {"kind", "external_request_id", "message", "busy_mode"}:
+            return None, web.json_response(
+                _openai_error("Invalid native submit schema", code="invalid_native_submit_schema"), status=400
+            )
+        request_id = body.get("external_request_id")
+        message = body.get("message")
+        if (
+            body.get("kind") != "hermes.session.submit"
+            or body.get("busy_mode") != "queue"
+            or not isinstance(request_id, str)
+            or not re.fullmatch(r"[\x21-\x7e]{1,128}", request_id)
+            or not isinstance(message, str)
+            or not message.strip()
+        ):
+            return None, web.json_response(
+                _openai_error("Invalid native submit schema", code="invalid_native_submit_schema"), status=400
+            )
+        try:
+            if len(message.encode("utf-8")) > 65_536:
+                raise ValueError
+        except (UnicodeEncodeError, ValueError):
+            return None, web.json_response(
+                _openai_error("Invalid native submit schema", code="invalid_native_submit_schema"), status=400
+            )
+        return (request_id, message), None
+
+    async def _admit_native_session_submit(
+        self, session_id: str, message: str, native_request_ref: str
+    ) -> str:
+        """Submit one ordinary turn through the running gateway's writer lease."""
+        runner = self.gateway_runner
+        if (
+            runner is None
+            or not getattr(runner, "_running", False)
+            or getattr(runner, "_draining", False)
+        ):
+            raise RuntimeError("native gateway runner is unavailable")
+
+        existing_start = self._native_submit_started.get(native_request_ref)
+        if existing_start is not None:
+            return await asyncio.shield(existing_start)
+
+        source = SessionSource(
+            platform=Platform.API_SERVER,
+            chat_id=session_id,
+            chat_type="dm",
+            user_id="api_server",
+            user_name="API server",
+            profile=_api_request_profile.get() or None,
+        )
+        entry = await runner.async_session_store.bind_existing_session(
+            source, session_id
+        )
+        if entry is None or entry.session_id != session_id:
+            raise RuntimeError("native session binding was rejected")
+        self._native_submit_ref_sessions[native_request_ref] = (
+            _api_request_profile.get() or "default", session_id,
+        )
+
+        event = MessageEvent(
+            text=message,
+            message_type=MessageType.TEXT,
+            user_id=source.user_id,
+            user_name=source.user_name,
+            source=source,
+            message_id=native_request_ref,
+            allow_gateway_control=False,
+            metadata={
+                "gateway_session_key": entry.session_key,
+                "gateway_session_id": session_id,
+                "gateway_session_strict": True,
+                "native_request_ref": native_request_ref,
+                "native_submit_authenticated": True,
+            },
+        )
+        # The adapter guard is set synchronously before its background task is
+        # spawned.  Queue directly through the runner's existing FIFO helper,
+        # never through its ambient steer/interrupt policy.
+        busy = entry.session_key in self._active_sessions
+        is_session_running = getattr(runner, "_is_session_running", None)
+        if not busy and callable(is_session_running):
+            busy = bool(is_session_running(entry.session_key))
+        if busy:
+            runner._enqueue_fifo(entry.session_key, event, self)
+            return "queued"
+        started = asyncio.get_running_loop().create_future()
+        self._native_submit_started[native_request_ref] = started
+        try:
+            await self.handle_message(event)
+            return await asyncio.wait_for(asyncio.shield(started), timeout=5.0)
+        except Exception:
+            if not started.done():
+                started.cancel()
+            raise
+
+    async def _handle_session_submit(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{id}/submit — native gateway admission receipt."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        parsed, err = self._native_submit_request(body)
+        if err:
+            return err
+        assert parsed is not None
+        external_request_id, message = parsed
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+
+        profile = _api_request_profile.get() or "default"
+        lock_key = (profile, external_request_id)
+        lock = self._native_submit_locks.setdefault(lock_key, asyncio.Lock())
+        try:
+            async with lock:
+                native_request_ref = uuid.uuid4().hex
+                result = await asyncio.to_thread(
+                    db.register_native_session_submit,
+                    session_id,
+                    external_request_id=external_request_id,
+                    message_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                    native_request_ref=native_request_ref,
+                )
+                outcome = result["outcome"]
+                if outcome == "session_not_found":
+                    return web.json_response(_openai_error("Session not found", code="session_not_found"), status=404)
+                if outcome == "idempotency_conflict":
+                    return web.json_response(
+                        _openai_error("external_request_id was reused with different input", code="native_submit_idempotency_conflict"), status=409
+                    )
+                native_request_ref = result["native_request_ref"]
+                if outcome == "identical_retry" and result.get("admission") in {"streaming", "queued"}:
+                    admission = result["admission"]
+                else:
+                    try:
+                        admission = await self._admit_native_session_submit(
+                            session_id, message, native_request_ref
+                        )
+                    except Exception:
+                        await asyncio.to_thread(
+                            db.remove_native_session_submit,
+                            external_request_id=external_request_id,
+                            native_request_ref=native_request_ref,
+                        )
+                        return web.json_response(
+                            _openai_error("Native gateway admission unavailable", code="native_admission_unavailable"), status=503
+                        )
+                    if admission == "queued":
+                        self.__dict__.setdefault("_native_queued_submit_refs", set()).add(native_request_ref)
+                    await asyncio.to_thread(
+                        db.set_native_session_submit_admission,
+                        native_request_ref=native_request_ref,
+                        admission=admission,
+                    )
+                return web.json_response({
+                    "object": "hermes.session.admission",
+                    "session_id": session_id,
+                    "external_request_id": external_request_id,
+                    "admission": admission,
+                    "native_request_ref": native_request_ref,
+                }, status=202)
+        finally:
+            if self._native_submit_locks.get(lock_key) is lock and not lock.locked():
+                self._native_submit_locks.pop(lock_key, None)
+
+    async def _handle_native_submit_clarify_events(self, request: "web.Request") -> "web.Response":
+        """Return only pending native clarification requests for one admission."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        native_request_ref = request.match_info["native_request_ref"]
+        if self._native_submit_ref_sessions.get(native_request_ref) != (
+            _api_request_profile.get() or "default", session_id
+        ):
+            return web.json_response(_openai_error("Native admission was not found", code="native_admission_not_found"), status=404)
+        events = self._native_submit_events.get(native_request_ref, [])
+        return web.json_response({"object": "list", "data": events})
+
+    async def _handle_native_submit_clarify_response(self, request: "web.Request") -> "web.Response":
+        """Resolve exactly the native waiter named by admission ref and clarify id."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        native_request_ref = request.match_info["native_request_ref"]
+        clarify_id = request.match_info["clarify_id"]
+        if self._native_submit_ref_sessions.get(native_request_ref) != (
+            _api_request_profile.get() or "default", session_id
+        ):
+            return web.json_response(_openai_error("Native admission was not found", code="native_admission_not_found"), status=404)
+        state = self._native_submit_clarifies.get((native_request_ref, clarify_id))
+        if state is None:
+            return web.json_response(_openai_error("Native clarification was not found", code="native_clarify_not_found"), status=404)
+        if state != "pending":
+            return web.json_response(_openai_error("Native clarification is terminal", code="native_clarify_terminal"), status=409)
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        if set(body) != {"response"} or not isinstance(body.get("response"), str) or not body["response"].strip():
+            return web.json_response(_openai_error("Invalid clarification response", code="invalid_native_clarify_response"), status=400)
+        try:
+            if len(body["response"].encode("utf-8")) > 65_536:
+                raise ValueError
+        except (UnicodeEncodeError, ValueError):
+            return web.json_response(_openai_error("Invalid clarification response", code="invalid_native_clarify_response"), status=400)
+        from tools.clarify_gateway import resolve_gateway_clarify
+
+        if not resolve_gateway_clarify(clarify_id, body["response"]):
+            self._native_submit_clarifies[(native_request_ref, clarify_id)] = "terminal"
+            self._native_submit_events.pop(native_request_ref, None)
+            return web.json_response(_openai_error("Native clarification is terminal", code="native_clarify_terminal"), status=409)
+        self._native_submit_clarifies[(native_request_ref, clarify_id)] = "resolved"
+        self._native_submit_events.pop(native_request_ref, None)
+        return web.json_response({"object": "hermes.session.clarify.response", "resolved": True})
+
+    async def send_clarify(
+        self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
+        session_key: str, metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Expose the existing clarify waiter without inventing a prompt system."""
+        native_request_ref = self._native_submit_active_refs.get(session_key)
+        if not native_request_ref:
+            return SendResult(success=False, error="native admission reference unavailable")
+        from tools.clarify_gateway import get_clarify_metadata
+
+        clarify = get_clarify_metadata(clarify_id) or {}
+        safe_choices = [str(choice)[:512] for choice in clarify.get("choices", choices or [])[:32]]
+        self._native_submit_events.setdefault(native_request_ref, []).append({
+            "type": "clarify.request",
+            "native_request_ref": native_request_ref,
+            "clarify_id": clarify_id,
+            "question": str(clarify.get("question", question))[:4096],
+            "choices": safe_choices,
+            "multi_select": bool(clarify.get("multi_select", False)),
+        })
+        self._native_submit_clarifies[(native_request_ref, clarify_id)] = "pending"
+        return SendResult(success=True, message_id=clarify_id)
+
+    async def _on_native_submit_started(self, event: MessageEvent, session_key: str) -> None:
+        native_request_ref = (getattr(event, "metadata", None) or {}).get("native_request_ref")
+        if isinstance(native_request_ref, str) and native_request_ref:
+            self._native_submit_active_refs[session_key] = native_request_ref
+            source = getattr(event, "source", None)
+            chat_id = getattr(source, "chat_id", None)
+            if isinstance(chat_id, str) and chat_id:
+                self._native_submit_ref_sessions.setdefault(
+                    native_request_ref,
+                    (getattr(source, "profile", None) or "default", chat_id),
+                )
+            started = self._native_submit_started.get(native_request_ref)
+            try:
+                db = await self._ensure_session_db_async()
+                if db is None:
+                    raise RuntimeError("session database unavailable")
+                await asyncio.to_thread(
+                    db.set_native_session_submit_admission,
+                    native_request_ref=native_request_ref,
+                    admission="streaming",
+                )
+            except Exception as exc:
+                if started is not None and not started.done():
+                    started.set_exception(exc)
+                raise
+            else:
+                if started is not None and not started.done():
+                    started.set_result("streaming")
+
+    async def _on_native_submit_finished(self, event: MessageEvent, session_key: str) -> None:
+        native_request_ref = (getattr(event, "metadata", None) or {}).get("native_request_ref")
+        if not isinstance(native_request_ref, str) or not native_request_ref:
+            return
+        if self._native_submit_active_refs.get(session_key) == native_request_ref:
+            self._native_submit_active_refs.pop(session_key, None)
+        for key, state in list(self._native_submit_clarifies.items()):
+            if key[0] == native_request_ref and state == "pending":
+                self._native_submit_clarifies[key] = "terminal"
+        self._native_submit_events.pop(native_request_ref, None)
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
