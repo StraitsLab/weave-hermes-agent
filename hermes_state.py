@@ -8351,6 +8351,85 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
+    def register_native_session_submit(
+        self,
+        session_id: str,
+        *,
+        external_request_id: str,
+        message_sha256: str,
+        native_request_ref: str,
+    ) -> Dict[str, Any]:
+        """Atomically reserve-or-return one native gateway admission request.
+
+        The record is deliberately only an idempotency index.  The gateway's
+        existing session queue retains the message payload and remains the
+        sole execution/transcript authority.
+        """
+        def _do(conn):
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS native_session_submit_idempotency (
+                   external_request_id TEXT PRIMARY KEY,
+                   session_id TEXT NOT NULL,
+                   message_sha256 TEXT NOT NULL,
+                   native_request_ref TEXT NOT NULL,
+                   admission TEXT
+                )"""
+            )
+            columns = {row["name"] for row in conn.execute(
+                "PRAGMA table_info(native_session_submit_idempotency)"
+            ).fetchall()}
+            if "admission" not in columns:
+                conn.execute("ALTER TABLE native_session_submit_idempotency ADD COLUMN admission TEXT")
+            existing = conn.execute(
+                "SELECT session_id, message_sha256, native_request_ref, admission "
+                "FROM native_session_submit_idempotency WHERE external_request_id = ?",
+                (external_request_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["session_id"] == session_id
+                    and existing["message_sha256"] == message_sha256
+                ):
+                    return {"outcome": "identical_retry", "native_request_ref": existing["native_request_ref"], "admission": existing["admission"]}
+                return {"outcome": "idempotency_conflict", "native_request_ref": None, "admission": None}
+            if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is None:
+                return {"outcome": "session_not_found", "native_request_ref": None, "admission": None}
+            conn.execute(
+                "INSERT INTO native_session_submit_idempotency "
+                "(external_request_id, session_id, message_sha256, native_request_ref) "
+                "VALUES (?, ?, ?, ?)",
+                (external_request_id, session_id, message_sha256, native_request_ref),
+            )
+            return {"outcome": "inserted", "native_request_ref": native_request_ref, "admission": None}
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def set_native_session_submit_admission(
+        self, *, native_request_ref: str, admission: str
+    ) -> None:
+        """Persist the one native admission outcome for durable retries."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE native_session_submit_idempotency SET admission = ? "
+                "WHERE native_request_ref = ? AND admission IS NULL",
+                (admission, native_request_ref),
+            )
+
+        self._execute_write(_do)
+
+    def remove_native_session_submit(
+        self, *, external_request_id: str, native_request_ref: str
+    ) -> None:
+        """Release an unadmitted reservation after a native admission failure."""
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM native_session_submit_idempotency "
+                "WHERE external_request_id = ? AND native_request_ref = ?",
+                (external_request_id, native_request_ref),
+            )
+
+        self._execute_write(_do)
+
     def append_messages_batch(
         self,
         session_id: str,

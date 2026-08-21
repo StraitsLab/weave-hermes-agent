@@ -6215,6 +6215,14 @@ class BasePlatformAdapter(ABC):
         # Fall back to a new Event only if the entry was removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
+        _native_started = getattr(self, "_on_native_submit_started", None)
+        if callable(_native_started):
+            try:
+                result = _native_started(event, session_key)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.debug("Native submit start notification failed", exc_info=True)
         
         # Start continuous typing indicator (refreshes every 2 seconds).
         # Gated per-platform: when typing_indicator=False the refresh loop is
@@ -6919,6 +6927,14 @@ class BasePlatformAdapter(ABC):
                 current_task = asyncio.current_task()
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, interrupt_event)
+            _native_finished = getattr(self, "_on_native_submit_finished", None)
+            if callable(_native_finished):
+                try:
+                    result = _native_finished(event, session_key)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.debug("Native submit finish notification failed", exc_info=True)
     
     def _cleanup_finished_session_task(
         self, session_key: str, interrupt_event: Optional[asyncio.Event]
