@@ -3915,6 +3915,7 @@ class APIServerAdapter(BasePlatformAdapter):
             runner is None
             or not getattr(runner, "_running", False)
             or getattr(runner, "_draining", False)
+            or getattr(runner, "_startup_restore_in_progress", False)
         ):
             raise RuntimeError("native gateway runner is unavailable")
 
