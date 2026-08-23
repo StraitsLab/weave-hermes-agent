@@ -378,3 +378,60 @@ async def test_raised_native_execution_marks_terminal_failure(
     assert event.metadata["native_submit_failed"] is True
     assert queue.get_nowait()["type"] == "turn.failed"
     assert queue.get_nowait() is None
+
+
+@pytest.mark.asyncio
+async def test_native_profile_submit_handler_persists_fresh_turn_in_admitted_profile(
+    tmp_path, monkeypatch,
+):
+    """A native /p/general turn keeps its transcript out of root state.db."""
+    import hermes_state
+    from pathlib import Path
+
+    root = tmp_path / ".hermes"
+    general = root / "profiles" / "general"
+    root.mkdir()
+    general.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH,
+    )
+
+    profile_db = SessionDB(general / "state.db")
+    profile_db.create_session(SESSION_ID, "api_server")
+    runner = gateway_run.GatewayRunner(GatewayConfig(multiplex_profiles=True))
+    event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.API_SERVER,
+            chat_id=SESSION_ID,
+            chat_type="dm",
+            user_id="api_server",
+            profile="general",
+        ),
+        message_id=REQUEST_REF,
+        metadata={"native_submit_authenticated": True},
+    )
+
+    async def append_fresh_turn(_event):
+        for message in (
+            {"role": "session_meta", "tools": [], "model": "hermes"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ):
+            await runner.async_session_store.append_to_transcript(SESSION_ID, message)
+
+    runner._handle_message = append_fresh_turn
+    root_db = SessionDB(root / "state.db")
+    try:
+        await runner._make_default_profile_message_handler()(event)
+        assert [row["role"] for row in profile_db.get_messages(SESSION_ID)] == [
+            "session_meta", "user", "assistant",
+        ]
+        assert root_db.get_session(SESSION_ID) is None
+        assert root_db.get_messages(SESSION_ID) == []
+    finally:
+        root_db.close()
+        profile_db.close()
+        runner.session_store.close_all_db_handles()
