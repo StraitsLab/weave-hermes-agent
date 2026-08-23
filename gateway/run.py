@@ -5348,6 +5348,19 @@ class TurnRunner:
                 if ctx._run_still_current():
                     _stts_consumer_ref.on_delta(text)
 
+        _native_submit_delta = getattr(
+            self._runner._adapter_for_source(ctx.source), "_native_submit_delta", None,
+        )
+        if callable(_native_submit_delta):
+            _existing_stream_delta_cb = _stream_delta_cb
+
+            def _stream_delta_cb(text: str) -> None:
+                if not ctx._run_still_current():
+                    return
+                if _existing_stream_delta_cb is not None:
+                    _existing_stream_delta_cb(text)
+                _native_submit_delta(ctx.session_key, text)
+
         def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
                 return
@@ -5678,20 +5691,43 @@ class TurnRunner:
         # ack and Slack's native task cards both ride the authoritative
         # start callback, so neither has to infer identity from tool names.
         _combined_start_cb = ctx.native_tool_start_callback or ctx.voice_ack_callback
+        _native_submit_tool_start = getattr(
+            self._runner._adapter_for_source(ctx.source),
+            "_native_submit_tool_started",
+            None,
+        )
+        if callable(_native_submit_tool_start):
+            _existing_start_cb = _combined_start_cb
+
+            def _combined_start_cb(call_id, tool_name, args):
+                if _existing_start_cb is not None:
+                    _existing_start_cb(call_id, tool_name, args)
+                _native_submit_tool_start(ctx.session_key, call_id, tool_name)
         agent.tool_start_callback = (
             _combined_start_cb
             if (
                 ctx._voice_ack_guild[0] is not None
                 or ctx._native_slack_task_cards
+                or callable(_native_submit_tool_start)
             )
             else None
         )
-        agent.tool_complete_callback = (
-            ctx.native_tool_complete_callback
-            if ctx._native_slack_task_cards
-            and ctx.native_tool_complete_callback is not None
-            else None
+        _native_submit_tool_complete = getattr(
+            self._runner._adapter_for_source(ctx.source),
+            "_native_submit_tool_completed",
+            None,
         )
+        _existing_complete_cb = ctx.native_tool_complete_callback
+        if callable(_native_submit_tool_complete):
+            def _combined_complete_cb(call_id, tool_name, args, result):
+                if ctx._native_slack_task_cards and _existing_complete_cb is not None:
+                    _existing_complete_cb(call_id, tool_name, args, result)
+                _native_submit_tool_complete(ctx.session_key, call_id, tool_name, result)
+            agent.tool_complete_callback = _combined_complete_cb
+        elif ctx._native_slack_task_cards and _existing_complete_cb is not None:
+            agent.tool_complete_callback = _existing_complete_cb
+        else:
+            agent.tool_complete_callback = None
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
@@ -6294,6 +6330,11 @@ class TurnRunner:
         
         # Return final response, or a message if something went wrong
         final_response = result.get("final_response")
+        _native_submit_final = getattr(
+            ctx._status_adapter, "_native_submit_final", None,
+        )
+        if callable(_native_submit_final):
+            _native_submit_final(ctx.session_key, final_response)
 
         # Extract actual token counts from the agent instance used for this run
         _last_prompt_toks = 0
@@ -19963,22 +20004,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=_run_start_session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
-                moa_config=getattr(event, "_moa_config", None),
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                persist_user_display_kind=persist_user_display_kind,
-                message_type=event.message_type,
-            )
+            native_metadata = getattr(event, "metadata", None)
+            try:
+                agent_result = await self._run_agent(
+                    message=message_text,
+                    context_prompt=context_prompt,
+                    history=history,
+                    source=source,
+                    session_id=_run_start_session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=self._reply_anchor_for_event(event),
+                    channel_prompt=event.channel_prompt,
+                    moa_config=getattr(event, "_moa_config", None),
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    persist_user_display_kind=persist_user_display_kind,
+                    message_type=event.message_type,
+                )
+            except Exception:
+                if isinstance(native_metadata, dict) and native_metadata.get("native_request_ref"):
+                    native_metadata["native_submit_failed"] = True
+                raise
+            if agent_result.get("failed") and isinstance(native_metadata, dict) \
+                    and native_metadata.get("native_request_ref"):
+                native_metadata["native_submit_failed"] = True
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # Stop persistent typing indicator now that the agent is done.
