@@ -4152,9 +4152,9 @@ class APIServerAdapter(BasePlatformAdapter):
     ) -> None:
         native_request_ref = self._native_submit_active_ref(session_key)
         if native_request_ref:
-            failed = (
-                isinstance(result, dict) and bool(result.get("error"))
-            ) or str(result).lstrip().lower().startswith(("error", "[tool execution"))
+            from agent.display import _detect_tool_failure
+
+            failed, _ = _detect_tool_failure(str(tool_name or "tool"), result)
             self._native_submit_event(
                 native_request_ref,
                 "tool.failed" if failed else "tool.completed",

@@ -110,6 +110,30 @@ async def test_native_turn_callbacks_emit_one_ordered_bounded_projection(adapter
 
 
 @pytest.mark.asyncio
+async def test_native_tool_failure_callback_emits_bounded_failed_event(adapter):
+    queue = asyncio.Queue(maxsize=32)
+    adapter._native_submit_subscribers[REQUEST_REF] = (
+        queue, asyncio.get_running_loop(),
+    )
+    adapter._native_submit_active_refs["native-session-key"] = REQUEST_REF
+
+    adapter._native_submit_tool_completed(
+        "native-session-key",
+        "call-failed",
+        "search",
+        '{"success": false, "error": "File not found"}',
+    )
+
+    assert queue.get_nowait() == {
+        "native_request_ref": REQUEST_REF,
+        "sequence": 1,
+        "type": "tool.failed",
+        "tool_call_id": "call-failed",
+        "tool_name": "search",
+    }
+
+
+@pytest.mark.asyncio
 async def test_native_turn_failure_closes_the_live_feed_as_failed(adapter):
     adapter._session_db.register_native_session_submit(
         SESSION_ID,
