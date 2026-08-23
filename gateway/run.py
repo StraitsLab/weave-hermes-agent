@@ -6330,10 +6330,6 @@ class TurnRunner:
         
         # Return final response, or a message if something went wrong
         final_response = result.get("final_response")
-        if result.get("failed"):
-            metadata = getattr(ctx.message, "metadata", None)
-            if isinstance(metadata, dict):
-                metadata["native_submit_failed"] = True
         _native_submit_final = getattr(
             ctx._status_adapter, "_native_submit_final", None,
         )
@@ -20008,22 +20004,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=_run_start_session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
-                moa_config=getattr(event, "_moa_config", None),
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                persist_user_display_kind=persist_user_display_kind,
-                message_type=event.message_type,
-            )
+            native_metadata = getattr(event, "metadata", None)
+            try:
+                agent_result = await self._run_agent(
+                    message=message_text,
+                    context_prompt=context_prompt,
+                    history=history,
+                    source=source,
+                    session_id=_run_start_session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=self._reply_anchor_for_event(event),
+                    channel_prompt=event.channel_prompt,
+                    moa_config=getattr(event, "_moa_config", None),
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    persist_user_display_kind=persist_user_display_kind,
+                    message_type=event.message_type,
+                )
+            except Exception:
+                if isinstance(native_metadata, dict) and native_metadata.get("native_request_ref"):
+                    native_metadata["native_submit_failed"] = True
+                raise
+            if agent_result.get("failed") and isinstance(native_metadata, dict) \
+                    and native_metadata.get("native_request_ref"):
+                native_metadata["native_submit_failed"] = True
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # Stop persistent typing indicator now that the agent is done.

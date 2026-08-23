@@ -1532,10 +1532,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._native_submit_events: Dict[str, List[Dict[str, Any]]] = {}
         self._native_submit_clarifies: Dict[tuple[str, str], str] = {}
         self._native_submit_started: Dict[str, "asyncio.Future[str]"] = {}
-        self._native_submit_subscribers: Dict[str, Dict[int, tuple[asyncio.Queue, asyncio.AbstractEventLoop]]] = {}
+        self._native_submit_subscribers: Dict[str, tuple[asyncio.Queue, asyncio.AbstractEventLoop]] = {}
         self._native_submit_sequences: Dict[str, int] = {}
         self._native_submit_event_lock = threading.Lock()
-        self._native_submit_terminals: set[str] = set()
+        self._native_submit_terminals: Dict[str, None] = {}
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -4053,7 +4053,25 @@ class APIServerAdapter(BasePlatformAdapter):
             if self._native_submit_locks.get(lock_key) is lock and not lock.locked():
                 self._native_submit_locks.pop(lock_key, None)
 
-    def _native_submit_event(self, native_request_ref: str, event_type: str, **fields: Any) -> Dict[str, Any]:
+    @staticmethod
+    def _native_submit_end_subscriber(
+        queue: asyncio.Queue, loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        def _close() -> None:
+            with suppress(asyncio.QueueEmpty):
+                while True:
+                    queue.get_nowait()
+            queue.put_nowait(None)
+        try:
+            on_subscriber_loop = asyncio.get_running_loop() is loop
+        except RuntimeError:
+            on_subscriber_loop = False
+        _close() if on_subscriber_loop else loop.call_soon_threadsafe(_close)
+
+    def _native_submit_event(
+        self, native_request_ref: str, event_type: str, *, _broadcast: bool = True,
+        **fields: Any,
+    ) -> Dict[str, Any]:
         """Publish one bounded live projection without retaining an event log."""
         with self._native_submit_event_lock:
             sequence = self._native_submit_sequences.get(native_request_ref, 0) + 1
@@ -4064,24 +4082,19 @@ class APIServerAdapter(BasePlatformAdapter):
             "type": event_type,
             **fields,
         }
-        for subscriber_id, (queue, loop) in list(
-            self._native_submit_subscribers.get(native_request_ref, {}).items()
-        ):
-            def _enqueue(
-                queue=queue, subscriber_id=subscriber_id, event=event,
-            ) -> None:
-                subscribers = self._native_submit_subscribers.get(native_request_ref, {})
-                if subscribers.get(subscriber_id, (None,))[0] is not queue:
+        subscriber = self._native_submit_subscribers.get(native_request_ref)
+        if _broadcast and subscriber is not None:
+            queue, loop = subscriber
+
+            def _enqueue(queue=queue, event=event) -> None:
+                current = self._native_submit_subscribers.get(native_request_ref)
+                if current is None or current[0] is not queue:
                     return
                 try:
                     queue.put_nowait(event)
                 except asyncio.QueueFull:
-                    # A client that cannot keep up loses this live-only feed;
-                    # its native turn keeps running and its queue is released.
-                    with suppress(asyncio.QueueEmpty):
-                        queue.get_nowait()
-                    queue.put_nowait(None)
-                    subscribers.pop(subscriber_id, None)
+                    self._native_submit_subscribers.pop(native_request_ref, None)
+                    self._native_submit_end_subscriber(queue, loop)
             try:
                 on_subscriber_loop = asyncio.get_running_loop() is loop
             except RuntimeError:
@@ -4094,29 +4107,26 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _native_submit_close(self, native_request_ref: str, event_type: str) -> None:
         self._native_submit_event(native_request_ref, event_type)
-        self._native_submit_terminals.add(native_request_ref)
+        self._native_submit_terminals[native_request_ref] = None
+        if len(self._native_submit_terminals) > 1_024:
+            evicted = next(iter(self._native_submit_terminals))
+            self._native_submit_terminals.pop(evicted, None)
+            self._native_submit_ref_sessions.pop(evicted, None)
         self._native_submit_events.pop(native_request_ref, None)
         self._native_submit_sequences.pop(native_request_ref, None)
-        for subscriber_id, (queue, loop) in list(
-            self._native_submit_subscribers.pop(native_request_ref, {}).items()
-        ):
-            def _close(queue=queue) -> None:
-                with suppress(asyncio.QueueFull):
-                    queue.put_nowait(None)
+        subscriber = self._native_submit_subscribers.pop(native_request_ref, None)
+        if subscriber is not None:
+            queue, _loop = subscriber
             try:
-                on_subscriber_loop = asyncio.get_running_loop() is loop
-            except RuntimeError:
-                on_subscriber_loop = False
-            if on_subscriber_loop:
-                _close()
-            else:
-                loop.call_soon_threadsafe(_close)
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                with suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+                queue.put_nowait(None)
 
     def _native_submit_active_ref(self, session_key: str) -> Optional[str]:
         native_request_ref = self._native_submit_active_refs.get(session_key)
-        if native_request_ref in self._native_submit_terminals:
-            return None
-        return native_request_ref
+        return None if native_request_ref in self._native_submit_terminals else native_request_ref
 
     def _native_submit_delta(self, session_key: str, delta: Any) -> None:
         native_request_ref = self._native_submit_active_ref(session_key)
@@ -4174,14 +4184,16 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Native admission is terminal", code="native_admission_terminal"), status=409)
 
         queue: asyncio.Queue = asyncio.Queue(maxsize=32)
-        subscriber_id = id(queue)
-        self._native_submit_subscribers.setdefault(native_request_ref, {})[subscriber_id] = (
+        old_subscriber = self._native_submit_subscribers.pop(native_request_ref, None)
+        if old_subscriber is not None:
+            self._native_submit_end_subscriber(*old_subscriber)
+        self._native_submit_subscribers[native_request_ref] = (
             queue, asyncio.get_running_loop(),
         )
         # A reconnect gets only the one currently pending clarification; all
         # other events are live-only projections of the existing native turn.
         for clarify in self._native_submit_events.get(native_request_ref, []):
-            queue.put_nowait(self._native_submit_event(native_request_ref, "clarify.request", **{
+            queue.put_nowait(self._native_submit_event(native_request_ref, "clarify.request", _broadcast=False, **{
                 key: value for key, value in clarify.items() if key not in {"type", "native_request_ref"}
             }))
 
@@ -4206,7 +4218,9 @@ class APIServerAdapter(BasePlatformAdapter):
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             pass
         finally:
-            self._native_submit_subscribers.get(native_request_ref, {}).pop(subscriber_id, None)
+            current = self._native_submit_subscribers.get(native_request_ref)
+            if current is not None and current[0] is queue:
+                self._native_submit_subscribers.pop(native_request_ref, None)
         return response
 
     async def _handle_native_submit_clarify_events(self, request: "web.Request") -> "web.Response":
@@ -4319,7 +4333,10 @@ class APIServerAdapter(BasePlatformAdapter):
             else:
                 if started is not None and not started.done():
                     started.set_result("streaming")
-                self._native_submit_event(native_request_ref, "turn.started")
+                queued_refs = self.__dict__.setdefault("_native_queued_submit_refs", set())
+                if native_request_ref in queued_refs:
+                    queued_refs.discard(native_request_ref)
+                    self._native_submit_event(native_request_ref, "turn.started")
 
     async def _on_native_submit_finished(self, event: MessageEvent, session_key: str) -> None:
         native_request_ref = (getattr(event, "metadata", None) or {}).get("native_request_ref")
