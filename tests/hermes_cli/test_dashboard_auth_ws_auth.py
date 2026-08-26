@@ -13,6 +13,7 @@ pre-existing regression unrelated to dashboard-auth.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -427,3 +428,21 @@ class TestGatewayWsUrl:
         sc_cred = sc.split("internal=")[1].split("&")[0]
         assert gw_cred == sc_cred
 
+
+def test_authenticated_gateway_ws_marks_the_transport_as_trusted(monkeypatch):
+    from tui_gateway import ws as gateway_ws
+
+    seen = {}
+
+    async def fake_handle(ws, *, trusted_controller=False):
+        seen["ws"] = ws
+        seen["trusted_controller"] = trusted_controller
+
+    monkeypatch.setattr(web_server, "_ws_auth_ok", lambda ws: True)
+    monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda ws: True)
+    monkeypatch.setattr(gateway_ws, "handle_ws", fake_handle)
+    ws = SimpleNamespace()
+
+    asyncio.run(web_server.gateway_ws(ws))
+
+    assert seen == {"ws": ws, "trusted_controller": True}

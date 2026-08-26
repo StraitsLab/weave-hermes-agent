@@ -39,7 +39,6 @@ _log = logging.getLogger(__name__)
 # to flush a WS frame before we mark the transport dead. Protects handler
 # threads from a wedged socket.
 _WS_WRITE_TIMEOUT_S = 10.0
-_WS_LOG_PAYLOAD_PREVIEW = 240
 
 # Per-token streaming frames are coalesced: buffered and flushed as a batch on
 # a short timer instead of waking the event loop once per token. A model reply
@@ -89,10 +88,12 @@ class WSTransport:
         loop: asyncio.AbstractEventLoop,
         *,
         peer: str = "unknown",
+        trusted_controller: bool = False,
     ) -> None:
         self._ws = ws
         self._loop = loop
         self._peer = peer
+        self._trusted_controller = trusted_controller
         self._closed = False
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
         # short timer flushes the batch. The lock guards the buffer + the
@@ -106,6 +107,10 @@ class WSTransport:
         # writes need an async boundary because several batches can be queued on
         # the owning loop while it recovers from a stall.
         self._send_lock = asyncio.Lock()
+
+    @property
+    def trusted_controller(self) -> bool:
+        return self._trusted_controller
 
     @staticmethod
     def _is_streaming_frame(obj: dict) -> bool:
@@ -283,7 +288,7 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
-async def handle_ws(ws: Any) -> None:
+async def handle_ws(ws: Any, *, trusted_controller: bool = False) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``."""
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
@@ -301,7 +306,12 @@ async def handle_ws(ws: Any) -> None:
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
 
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        transport = WSTransport(
+            ws,
+            asyncio.get_running_loop(),
+            peer=peer,
+            trusted_controller=trusted_controller,
+        )
 
         # resolve_skin() reads config + initializes the skin engine —
         # synchronous I/O + CPU work that should not block the event loop
@@ -361,11 +371,10 @@ async def handle_ws(ws: Any) -> None:
             except json.JSONDecodeError as exc:
                 parse_errors += 1
                 _log.warning(
-                    "ws parse error peer=%s index=%d error=%s payload=%r",
+                    "ws parse error peer=%s index=%d error=%s",
                     peer,
                     messages,
                     exc,
-                    line[:_WS_LOG_PAYLOAD_PREVIEW],
                 )
                 ok = await transport.write_async(
                     {

@@ -9,12 +9,13 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
 
@@ -159,6 +160,95 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+
+
+class _SessionCredential:
+    """One redacted, revocable callable bearer for a live session only."""
+
+    def __init__(self, bearer: str, expires_at: datetime) -> None:
+        self._lock = threading.Lock()
+        self._bearer = bearer
+        self._expires_at = expires_at
+        self._revoked = False
+
+    def __call__(self) -> str:
+        with self._lock:
+            if self._revoked or self._expires_at <= datetime.now(timezone.utc):
+                raise RuntimeError("credential unavailable")
+            return self._bearer
+
+    def refresh(self, bearer: str, expires_at: datetime) -> bool:
+        with self._lock:
+            if self._revoked or self._expires_at <= datetime.now(timezone.utc):
+                return False
+            self._bearer = bearer
+            self._expires_at = expires_at
+            return True
+
+    def revoke(self) -> None:
+        with self._lock:
+            self._revoked = True
+            self._bearer = ""
+
+    def __repr__(self) -> str:
+        return "<SessionCredential redacted>"
+
+
+_CREDENTIAL_EXPIRY_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _parse_credential_expiry(value: object) -> datetime | None:
+    if not isinstance(value, str) or not _CREDENTIAL_EXPIRY_RE.fullmatch(value):
+        return None
+    try:
+        expires_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return expires_at if expires_at > datetime.now(timezone.utc) else None
+
+
+def _trusted_controller() -> bool:
+    return bool(getattr(current_transport(), "trusted_controller", False))
+
+
+def _activate_session_credential(session: dict, agent=None) -> None:
+    holder = session.get("credential_holder")
+    agent = agent or session.get("agent")
+    if holder is None or agent is None or session.get("credential_activated"):
+        return
+    try:
+        agent.switch_model(
+            new_model=agent.model,
+            new_provider=agent.provider,
+            api_key=holder,
+            base_url=agent.base_url,
+            api_mode=agent.api_mode,
+        )
+    except Exception as exc:
+        holder.revoke()
+        raise RuntimeError("credential unavailable") from exc
+    session["credential_activated"] = True
+
+
+def _bound_session_access_error(reference: object, rid) -> dict | None:
+    if not isinstance(reference, str) or not reference:
+        return None
+    with _sessions_lock:
+        session = _sessions.get(reference)
+        if session is None:
+            for candidate in _sessions.values():
+                if (
+                    candidate.get("session_key") == reference
+                    or _session_lookup_key(candidate) == reference
+                ):
+                    session = candidate
+                    break
+        bound = session is not None and session.get("credential_holder") is not None
+    if bound and not _trusted_controller():
+        return _err(rid, 4003, "session unavailable")
+    return None
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -972,6 +1062,9 @@ def _pop_session_by_id(sid: str) -> dict | None:
         session = _sessions.get(sid)
         if session is not None:
             session["_closing"] = True
+            holder = session.get("credential_holder")
+            if holder is not None:
+                holder.revoke()
             _sessions.pop(sid, None)
     if session is None:
         return None
@@ -2127,6 +2220,8 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
+        if access_error := _bound_session_access_error(_params.get("session_id"), _rid):
+            return access_error
         if method not in _LONG_HANDLERS:
             return handle_request(req)
 
@@ -2400,6 +2495,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
+            _activate_session_credential(current, agent)
             current["agent"] = agent
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
@@ -2516,6 +2612,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
 
 def _sess_nowait(params, rid):
+    if access_error := _bound_session_access_error(params.get("session_id"), rid):
+        return (None, access_error)
     s = _sessions.get(params.get("session_id") or "")
     return (s, None) if s else (None, _err(rid, 4001, "session not found"))
 

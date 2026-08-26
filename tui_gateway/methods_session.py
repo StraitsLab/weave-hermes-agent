@@ -160,6 +160,53 @@ def _(rid, params: dict) -> dict:
     )
 
 
+@method("session.credential.bind")
+def _(rid, params: dict) -> dict:
+    required = {
+        "session_id",
+        "credential_slot",
+        "bearer",
+        "expires_at",
+        "provider_route_revision_id",
+    }
+    if set(params) != required or not _trusted_controller():
+        return _err(rid, 4003, "credential unavailable")
+    sid = params["session_id"]
+    bearer = params["bearer"]
+    revision = params["provider_route_revision_id"]
+    expires_at = _parse_credential_expiry(params["expires_at"])
+    if (
+        not isinstance(sid, str)
+        or not sid
+        or params["credential_slot"] != "GATE_B_API_KEY"
+        or not isinstance(bearer, str)
+        or not bearer.strip()
+        or not isinstance(revision, str)
+        or not revision.strip()
+        or expires_at is None
+    ):
+        return _err(rid, 4003, "credential unavailable")
+
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if session is None or session.get("_closing"):
+            return _err(rid, 4003, "credential unavailable")
+        holder = session.get("credential_holder")
+        if holder is None:
+            holder = _SessionCredential(bearer, expires_at)
+            session["credential_holder"] = holder
+            session["provider_route_revision_id"] = revision
+        elif session.get("provider_route_revision_id") != revision or not holder.refresh(
+            bearer, expires_at
+        ):
+            return _err(rid, 4003, "credential unavailable")
+        try:
+            _activate_session_credential(session)
+        except RuntimeError:
+            return _err(rid, 4003, "credential unavailable")
+    return _ok(rid, {"status": "ready", "credential_slot": "GATE_B_API_KEY"})
+
+
 @method("session.list")
 def _(rid, params: dict) -> dict:
     with _profile_db(params) as db:
@@ -385,6 +432,9 @@ def _(rid, params: dict) -> dict:
             if tip and tip != target:
                 target = tip
                 found = db.get_session(target) or found
+
+        if access_error := _bound_session_access_error(target, rid):
+            return access_error
 
         # Every interactive resume path materializes the model history, even when
         # omit_messages suppresses the response copy. Count the complete lineage

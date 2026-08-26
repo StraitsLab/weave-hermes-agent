@@ -17097,7 +17097,7 @@ async def gateway_ws(ws: WebSocket) -> None:
 
     from tui_gateway.ws import handle_ws
 
-    await handle_ws(ws)
+    await handle_ws(ws, trusted_controller=True)
 
 
 # ---------------------------------------------------------------------------

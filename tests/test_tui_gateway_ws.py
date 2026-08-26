@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import json
+import logging
 import threading
 import time
 
@@ -153,6 +154,48 @@ def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
     assert events == ["accept", "ready_after_0"]
 
 
+def test_ws_transport_defaults_untrusted_and_exposes_controller_fact():
+    class FakeWS:
+        pass
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        assert ws_mod.WSTransport(FakeWS(), loop).trusted_controller is False
+        assert ws_mod.WSTransport(FakeWS(), loop, trusted_controller=True).trusted_controller is True
+
+    asyncio.run(scenario())
+
+
+def test_malformed_websocket_frame_never_logs_its_payload(monkeypatch, caplog):
+    secret = "malformed-frame-bearer"
+    monkeypatch.setattr(server, "resolve_skin", lambda: {})
+    monkeypatch.setattr(server, "_ensure_skin_watcher", lambda: None)
+    monkeypatch.setattr(server, "_close_sessions_for_transport", lambda *args, **kwargs: (0, 0))
+
+    class FakeWS:
+        received = False
+
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            pass
+
+        async def receive_text(self):
+            if not self.received:
+                self.received = True
+                return '{"bearer":"' + secret + '"'
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    caplog.set_level(logging.WARNING, logger=ws_mod.__name__)
+    asyncio.run(ws_mod.handle_ws(FakeWS()))
+
+    assert secret not in caplog.text
+
+
 def test_ws_transport_serializes_concurrent_sends():
     active_sends = 0
     max_active_sends = 0
@@ -226,5 +269,3 @@ def test_ws_transport_preserves_cross_batch_order():
         assert entered == ["A1", "A2", "B1", "B2"]
 
     asyncio.run(scenario())
-
-
