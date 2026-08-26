@@ -34,15 +34,21 @@ def _read_progress(url: str, *, timeout: float = 5) -> dict[str, object]:
 
 def _wait_for_progress(url: str, process: subprocess.Popen, output_path: Path) -> dict[str, object]:
     deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         if process.poll() is not None:
             pytest.fail(output_path.read_text(encoding="utf-8", errors="replace"))
         try:
-            return _read_progress(url, timeout=1)
+            return _read_progress(url, timeout=min(1.0, remaining))
         except HTTPError:
             raise
         except (TimeoutError, URLError):
-            time.sleep(0.1)
+            remaining = max(0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
     pytest.fail(output_path.read_text(encoding="utf-8", errors="replace"))
 
 
