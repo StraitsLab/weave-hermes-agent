@@ -7,7 +7,6 @@ import pytest
 
 from agent.native_mutation_journal import NativeMutationJournal
 
-
 def test_pending_then_completed_retry_returns_exact_result(tmp_path):
     journal = NativeMutationJournal(tmp_path)
     assert journal.begin("op-1") is None
@@ -44,11 +43,7 @@ def test_failure_record_is_structured_and_content_free(tmp_path):
     journal.begin("op-1")
     journal.fail("op-1", "writer exploded")
     result = journal.begin("op-1")
-    assert result == {
-        "success": False,
-        "operation_id": "op-1",
-        "error": "native_mutation_failed",
-    }
+    assert result == {"success": False, "operation_id": "op-1", "error": "native_mutation_failed"}
     raw = json.loads((tmp_path / "memories" / "native-operation-journal.json").read_text())
     assert raw["records"][0]["operation_id"] == "op-1"
     assert "content" not in raw["records"][0]
@@ -80,14 +75,23 @@ def test_hostile_terminal_result_is_compact_in_replay_and_bytes(tmp_path):
     assert sentinel not in journal.path.read_text(encoding="utf-8")
 
 
-def test_corrupt_journal_fails_closed_without_overwriting(tmp_path):
+@pytest.mark.parametrize("record", [
+    "{broken",
+    {"operation_id": "op-1", "status": "completed"},
+    {"operation_id": "op-1", "status": "completed", "result": []},
+    {"operation_id": "op-1", "status": "completed", "result": {"success": True, "operation_id": "other"}},
+    {"operation_id": "op-1", "status": "completed", "result": {"success": 1, "operation_id": "op-1"}},
+    {"operation_id": "op-1", "status": "completed", "result": {"success": True, "operation_id": "op-1", "current_entries": ["SENTINEL"]}},
+    {"operation_id": "op-1", "status": "pending", "result": {"success": True, "operation_id": "op-1"}},
+])
+def test_corrupt_journal_fails_closed_without_overwriting(tmp_path, record):
     journal = NativeMutationJournal(tmp_path)
     journal.directory.mkdir(parents=True, exist_ok=True)
-    journal.path.write_text("{broken", encoding="utf-8")
+    original = record if isinstance(record, str) else json.dumps({"records": [record]})
+    journal.path.write_text(original, encoding="utf-8")
     with pytest.raises(RuntimeError, match="native_operation_in_doubt"):
         journal.begin("op-1")
-    assert journal.path.read_text(encoding="utf-8") == "{broken"
-
+    assert journal.path.read_text(encoding="utf-8") == original
 
 def test_terminal_records_are_bounded(tmp_path):
     journal = NativeMutationJournal(tmp_path)
@@ -111,8 +115,4 @@ def test_windows_journal_lifecycle_skips_directory_descriptor(tmp_path, monkeypa
     journal = NativeMutationJournal(tmp_path)
     assert journal.begin("op-windows") is None
     journal.complete("op-windows", {"success": True, "revision": 11})
-    assert journal.begin("op-windows") == {
-        "success": True,
-        "operation_id": "op-windows",
-        "revision": 11,
-    }
+    assert journal.begin("op-windows") == {"success": True, "operation_id": "op-windows", "revision": 11}

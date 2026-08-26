@@ -4,7 +4,6 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
-
 _NAME = "native-operation-journal.json"
 _MAX_TERMINAL = 256
 _ERROR_CODES = {"native_mutation_failed", "native_operation_in_doubt",
@@ -17,20 +16,27 @@ def compact_native_result(result: Any, *, operation_id: Optional[str] = None) ->
     for key in ("success", "provider_acknowledged"):
         if isinstance(source.get(key), bool): compact[key] = source[key]
     for key in ("revision", "native_revision"):
-        if isinstance(source.get(key), int): compact[key] = source[key]
-    for key in ("provider_name",):
-        value = source.get(key)
-        if isinstance(value, str) and 0 < len(value) <= 64 and all(
-                char.isalnum() or char in "._-" for char in value): compact[key] = value
+        if type(source.get(key)) is int: compact[key] = source[key]
+    value = source.get("provider_name")
+    if isinstance(value, str) and 0 < len(value) <= 64 and all(
+            char.isalnum() or char in "._-" for char in value): compact["provider_name"] = value
     for key, allowed in (("status", _STATUS_CODES), ("provider_status", {
             "acknowledged", "failed", "not_configured"}), ("error", _ERROR_CODES)):
         if source.get(key) in allowed: compact[key] = source[key]
     identity = operation_id or source.get("operation_id")
     if isinstance(identity, str) and identity: compact["operation_id"] = identity
-    if source.get("success") is False and compact.get("error") not in _ERROR_CODES:
-        compact["error"] = "native_mutation_failed"
+    if source.get("success") is False and compact.get("error") not in _ERROR_CODES: compact["error"] = "native_mutation_failed"
     return compact
 
+def _valid_record(record: Any) -> bool:
+    if not isinstance(record, dict) or not isinstance(record.get("operation_id"), str) or not record["operation_id"]:
+        return False
+    status, result = record.get("status"), record.get("result")
+    if status == "pending":
+        return set(record) == {"operation_id", "status"}
+    return (status == "completed" and set(record) == {"operation_id", "status", "result"}
+            and isinstance(result, dict) and result.get("operation_id") == record["operation_id"]
+            and isinstance(result.get("success"), bool) and compact_native_result(result) == result)
 class NativeMutationJournal:
     def __init__(self, hermes_home: Optional[Path] = None) -> None:
         if hermes_home is None:
@@ -38,12 +44,10 @@ class NativeMutationJournal:
             hermes_home = get_hermes_home()
         self.directory = Path(hermes_home) / "memories"
         self.path = self.directory / _NAME
-
     def _locked(self):
         from tools.memory_tool import MemoryStore
         self.directory.mkdir(parents=True, exist_ok=True)
         return MemoryStore._file_lock(self.path)
-
     def _read(self) -> list[Dict[str, Any]]:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -54,8 +58,7 @@ class NativeMutationJournal:
         if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
             raise RuntimeError("native_operation_in_doubt")
         records = payload["records"]
-        if not all(isinstance(record, dict) and isinstance(record.get("operation_id"), str)
-                   and record.get("status") in {"pending", "completed"} for record in records):
+        if not all(_valid_record(record) for record in records):
             raise RuntimeError("native_operation_in_doubt")
         return records
 
@@ -79,7 +82,6 @@ class NativeMutationJournal:
                 os.unlink(temporary)
             except FileNotFoundError:
                 pass
-
     @staticmethod
     def _find(records: list[Dict[str, Any]], operation_id: str) -> Optional[Dict[str, Any]]:
         return next((record for record in records if record.get("operation_id") == operation_id), None)
@@ -93,7 +95,7 @@ class NativeMutationJournal:
             if existing is not None:
                 if existing.get("status") == "pending":
                     raise RuntimeError("native_operation_in_doubt")
-                return compact_native_result(existing.get("result"))
+                return dict(existing["result"])
             records.append({"operation_id": operation_id, "status": "pending"})
             self._write(records)
         return None
@@ -114,7 +116,5 @@ class NativeMutationJournal:
 
     def complete(self, operation_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
         return self._finish(operation_id, result)
-
     def fail(self, operation_id: str, _detail: str) -> None:
-        self._finish(operation_id, {"success": False, "operation_id": operation_id,
-                                    "error": "native_mutation_failed"})
+        self._finish(operation_id, {"success": False, "operation_id": operation_id, "error": "native_mutation_failed"})
