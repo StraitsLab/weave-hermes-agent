@@ -917,11 +917,11 @@ class TestRegisterSessionMcpServers:
         assert state.session_id in str(raised.value)
         assert state.mcp_server_names == {"srv"}
 
+    @pytest.mark.parametrize("sdk_available,http_available", [(False, False), (True, True)])
     @pytest.mark.asyncio
-    async def test_initialize_omits_http_when_strict_transport_is_unavailable(self, agent):
-        with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", False), patch(
-            "tools.mcp_tool._MCP_NEW_HTTP", False
-        ):
+    async def test_initialize_omits_http_when_strict_transport_is_unavailable(self, agent, sdk_available, http_available):
+        with patch("tools.mcp_tool._ensure_mcp_sdk", return_value=sdk_available), patch(
+            "tools.mcp_tool._MCP_HTTP_AVAILABLE", http_available
+        ), patch("tools.mcp_tool._MCP_NEW_HTTP", False):
             response = await agent.initialize()
-
         assert response.agent_capabilities.mcp_capabilities.http is False
