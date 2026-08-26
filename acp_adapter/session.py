@@ -186,6 +186,7 @@ class SessionState:
     credential_holder: SessionCredential | None = None
     credential_route_revision_id: str | None = None
     mcp_server_names: set[str] = field(default_factory=set)
+    closing: bool = False
 
 
 class SessionManager:

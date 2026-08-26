@@ -1,6 +1,7 @@
 """Session-scoped ownership for ACP-supplied MCP transports."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -128,3 +129,35 @@ def test_full_shutdown_clears_transient_ownership_without_live_servers():
     assert mcp_tool._session_mcp_fingerprints == {}
     assert mcp_tool._session_mcp_owners == {}
     assert mcp_tool._session_mcp_managed == set()
+
+
+def test_full_shutdown_timeout_still_clears_transient_ownership():
+    server = _Server({})
+    mcp_tool._servers["attempt"] = server
+    mcp_tool._session_mcp_fingerprints["attempt"] = "digest"
+    mcp_tool._session_mcp_owners["attempt"] = {"session-a"}
+    mcp_tool._session_mcp_managed.add("attempt")
+
+    class _Future:
+        def result(self, timeout):
+            raise TimeoutError
+
+    def schedule(coro, loop, **kwargs):
+        coro.close()
+        return _Future()
+
+    loop = SimpleNamespace(is_running=lambda: True)
+    with patch.object(mcp_tool, "_mcp_loop", loop), patch(
+        "agent.async_utils.safe_schedule_threadsafe", side_effect=schedule
+    ), patch.object(mcp_tool, "_stop_mcp_loop"):
+        mcp_tool.shutdown_mcp_servers()
+
+    assert mcp_tool._session_mcp_fingerprints == {}
+    assert mcp_tool._session_mcp_owners == {}
+
+
+def test_http_session_support_requires_new_strict_redirect_transport():
+    with patch.object(mcp_tool, "_ensure_mcp_sdk", return_value=True), patch.object(
+        mcp_tool, "_MCP_HTTP_AVAILABLE", True
+    ), patch.object(mcp_tool, "_MCP_NEW_HTTP", False):
+        assert mcp_tool.supports_session_http_mcp() is False

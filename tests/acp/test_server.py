@@ -738,10 +738,19 @@ class TestRegisterSessionMcpServers:
     async def test_explicit_empty_list_releases_session_servers(self, agent, mock_manager):
         state = mock_manager.create_session(cwd="/tmp")
         state.mcp_server_names = {"attempt"}
-        with patch("tools.mcp_tool.release_session_mcp_servers") as release:
+        state.agent.enabled_toolsets = ["hermes-acp", "mcp-attempt"]
+        state.agent.tools = [{"function": {"name": "mcp__attempt__ping"}}]
+        state.agent.valid_tool_names = {"mcp__attempt__ping"}
+        base_tools = [{"function": {"name": "terminal"}}]
+        with patch("tools.mcp_tool.release_session_mcp_servers") as release, patch(
+            "tools.mcp_tool.acquire_session_mcp_servers"
+        ), patch("model_tools.get_tool_definitions", return_value=base_tools):
             await agent._register_session_mcp_servers(state, [])
-        release.assert_called_once_with(state.session_id)
+        release.assert_called_once_with(state.session_id, names={"attempt"})
         assert state.mcp_server_names == set()
+        assert state.agent.enabled_toolsets == ["hermes-acp"]
+        assert state.agent.tools == base_tools
+        assert state.agent.valid_tool_names == {"terminal"}
 
     @pytest.mark.asyncio
     async def test_http_descriptor_enforces_loopback_cleartext_and_redirect_safety(
@@ -823,6 +832,23 @@ class TestRegisterSessionMcpServers:
         assert order == ["turn-finished", "released"]
 
     @pytest.mark.asyncio
+    async def test_close_discards_queued_fallback_before_release(self, agent, mock_manager):
+        state = mock_manager.create_session(cwd="/tmp")
+        state.is_running = True
+        state.queued_prompts = ["must-not-run"]
+        async def finish_turn():
+            await asyncio.sleep(0.02)
+            with state.runtime_lock:
+                state.is_running = False
+
+        finisher = asyncio.create_task(finish_turn())
+        with patch("tools.mcp_tool.release_session_mcp_servers"):
+            await agent.close_session(session_id=state.session_id)
+        await finisher
+        assert state.queued_prompts == []
+        assert state.closing is True
+
+    @pytest.mark.asyncio
     async def test_invalid_http_header_never_reaches_error_or_log(
         self, agent, mock_manager, caplog
     ):
@@ -871,3 +897,31 @@ class TestRegisterSessionMcpServers:
         assert "refresh secret" not in str(raised.value)
         release.assert_called_once_with(state.session_id, names={"srv"})
         assert state.mcp_server_names == set()
+
+    @pytest.mark.asyncio
+    async def test_failed_new_session_rollback_keeps_retryable_handle(
+        self, agent, mock_manager
+    ):
+        from acp.schema import McpServerStdio
+        server = McpServerStdio(name="srv", command="/bin/test", args=[], env=[])
+        with patch("tools.mcp_tool.acquire_session_mcp_servers"), patch(
+            "tools.mcp_tool.release_session_mcp_servers",
+            side_effect=RuntimeError("secret release detail"),
+        ), patch("model_tools.get_tool_definitions", side_effect=RuntimeError("refresh")):
+            with pytest.raises(RuntimeError, match="retry close for session") as raised:
+                await agent.new_session(cwd="/tmp", mcp_servers=[server])
+
+        assert "secret release detail" not in str(raised.value)
+        assert len(mock_manager._sessions) == 1
+        state = next(iter(mock_manager._sessions.values()))
+        assert state.session_id in str(raised.value)
+        assert state.mcp_server_names == {"srv"}
+
+    @pytest.mark.asyncio
+    async def test_initialize_omits_http_when_strict_transport_is_unavailable(self, agent):
+        with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", False), patch(
+            "tools.mcp_tool._MCP_NEW_HTTP", False
+        ):
+            response = await agent.initialize()
+
+        assert response.agent_capabilities.mcp_capabilities.http is False

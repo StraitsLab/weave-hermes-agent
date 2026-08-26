@@ -1140,17 +1140,15 @@ class HermesACPAgent(acp.Agent):
         """Replace one ACP session's transient MCP ownership, fail closed."""
         if mcp_servers is None:
             return
+        old_names = set(state.mcp_server_names)
+        new_names: set[str] = set()
 
         try:
             from tools.mcp_tool import (
                 acquire_session_mcp_servers,
                 release_session_mcp_servers,
+                session_mcp_server_names,
             )
-
-            if not mcp_servers:
-                await asyncio.to_thread(release_session_mcp_servers, state.session_id)
-                state.mcp_server_names.clear()
-                return
 
             config_map: dict[str, dict] = {}
             for server in mcp_servers:
@@ -1204,27 +1202,43 @@ class HermesACPAgent(acp.Agent):
                 config_map[name] = config
 
             new_names = set(config_map)
-            old_names = set(state.mcp_server_names)
-            if old_names and new_names != old_names:
+            if old_names and new_names and new_names != old_names:
                 raise ValueError("replace MCP servers with [] before changing descriptors")
             await asyncio.to_thread(
                 acquire_session_mcp_servers, state.session_id, config_map
             )
         except Exception:
+            try:
+                orphaned = session_mcp_server_names(state.session_id) - old_names
+                state.mcp_server_names.update(orphaned)
+            except Exception:
+                logger.warning("Session %s: ACP MCP rollback incomplete", state.session_id)
+                raise RuntimeError(
+                    f"MCP rollback incomplete; retry close for session {state.session_id}"
+                ) from None
             logger.warning(
                 "Session %s: ACP MCP registration failed",
                 state.session_id,
             )
+            if orphaned:
+                raise RuntimeError(
+                    f"MCP rollback incomplete; retry close for session {state.session_id}"
+                ) from None
             raise RuntimeError("MCP server registration failed") from None
 
+        state.mcp_server_names.update(new_names)
         previous_surface = tuple(getattr(state.agent, name, None) for name in
                                  ("enabled_toolsets", "tools", "valid_tool_names"))
         try:
             from model_tools import get_tool_definitions
             from agent.memory_manager import inject_memory_provider_tools
 
+            old_toolsets = {f"mcp-{name}" for name in old_names}
+            base_toolsets = [name for name in (
+                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+            ) if name not in old_toolsets]
             enabled_toolsets = _expand_acp_enabled_toolsets(
-                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
+                base_toolsets,
                 mcp_server_names=[server.name for server in mcp_servers],
             )
             state.agent.enabled_toolsets = enabled_toolsets
@@ -1255,13 +1269,27 @@ class HermesACPAgent(acp.Agent):
                     names=new_names - old_names,
                 )
             except Exception:
-                pass
+                logger.warning("Session %s: ACP MCP rollback incomplete", state.session_id)
+                raise RuntimeError(
+                    f"MCP rollback incomplete; retry close for session {state.session_id}"
+                ) from None
+            state.mcp_server_names.difference_update(new_names - old_names)
             logger.warning(
                 "Session %s: ACP MCP tool refresh failed",
                 state.session_id,
             )
             raise RuntimeError("MCP tool refresh failed") from None
 
+        removed = old_names - new_names
+        if removed:
+            try:
+                await asyncio.to_thread(
+                    release_session_mcp_servers, state.session_id, names=removed
+                )
+            except Exception:
+                (state.agent.enabled_toolsets, state.agent.tools,
+                 state.agent.valid_tool_names) = previous_surface
+                raise RuntimeError("MCP server replacement failed") from None
         state.mcp_server_names = new_names
 
     def _schedule_mcp_late_refresh(self, state: SessionState) -> None:
@@ -1380,13 +1408,14 @@ class HermesACPAgent(acp.Agent):
             client_name,
             resolved_protocol_version,
         )
+        from tools.mcp_tool import supports_session_http_mcp
 
         response = InitializeResponse(
             protocol_version=acp.PROTOCOL_VERSION,
             agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
             agent_capabilities=AgentCapabilities(
                 load_session=True,
-                mcp_capabilities=McpCapabilities(http=True),
+                mcp_capabilities=McpCapabilities(http=supports_session_http_mcp()),
                 prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(
                     fork=SessionForkCapabilities(),
@@ -1459,6 +1488,9 @@ class HermesACPAgent(acp.Agent):
     async def close_session(self, session_id: str, **kwargs: Any) -> CloseSessionResponse:
         state = self.session_manager.get_session(session_id)
         if state is not None:
+            with state.runtime_lock:
+                state.closing = True
+                state.queued_prompts.clear()
             await self.cancel(session_id)
             for _ in range(100):
                 with state.runtime_lock:
@@ -1726,6 +1758,10 @@ class HermesACPAgent(acp.Agent):
         try:
             await self._register_session_mcp_servers(state, mcp_servers)
         except Exception:
+            if state.mcp_server_names:
+                raise RuntimeError(
+                    f"MCP rollback incomplete; retry close for session {state.session_id}"
+                ) from None
             self.session_manager.remove_session(state.session_id)
             raise
         self._schedule_mcp_late_refresh(state)
@@ -1930,6 +1966,9 @@ class HermesACPAgent(acp.Agent):
         if state is None:
             logger.error("prompt: session %s not found", session_id)
             return PromptResponse(stop_reason="refusal")
+        with state.runtime_lock:
+            if state.closing:
+                return PromptResponse(stop_reason="refusal")
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
@@ -2012,6 +2051,8 @@ class HermesACPAgent(acp.Agent):
         redirected = False
         queued_depth: int | None = None
         with state.runtime_lock:
+            if state.closing:
+                return PromptResponse(stop_reason="refusal")
             if state.is_running:
                 if (
                     text_only_prompt

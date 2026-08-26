@@ -7174,6 +7174,15 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
+def supports_session_http_mcp() -> bool:
+    """Whether transient HTTP sessions have the strict redirect-safe client."""
+    return bool(_ensure_mcp_sdk() and _MCP_HTTP_AVAILABLE and _MCP_NEW_HTTP and sdk_httpx())
+
+
+def session_mcp_server_names(owner_id: str) -> Set[str]:
+    with _lock:
+        return {name for name, owners in _session_mcp_owners.items() if owner_id in owners}
+
 def _session_mcp_fingerprint(config: dict) -> str:
     """Return a secret-safe identity for one transient session descriptor."""
     raw = json.dumps(config, sort_keys=True, separators=(",", ":"))
@@ -7186,6 +7195,8 @@ def acquire_session_mcp_servers(owner_id: str, servers: Dict[str, dict]) -> List
         raise RuntimeError("MCP session owner is invalid")
     if not isinstance(servers, dict):
         raise RuntimeError("MCP server descriptors are invalid")
+    if any("url" in config for config in servers.values()) and not supports_session_http_mcp():
+        raise RuntimeError("HTTP MCP transport is unavailable")
 
     for raw_name, raw_config in servers.items():
         if not isinstance(raw_name, str) or not raw_name.strip():
@@ -8042,6 +8053,9 @@ def shutdown_mcp_servers():
     with _lock:
         _server_connect_retry_after.clear()
         _server_connect_failures.clear()
+        for state in (_session_mcp_fingerprints, _session_mcp_owners,
+                      _session_mcp_managed, _session_mcp_releasing):
+            state.clear()
 
     _stop_mcp_loop()
 
