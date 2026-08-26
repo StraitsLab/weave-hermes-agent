@@ -279,15 +279,24 @@ async def test_close_wins_queued_submit_without_reopen_or_durable_admission(adap
     client = await _client(adapter)
     headers = {"Authorization": "Bearer sk-native-bind-test"}
     try:
-        for suffix, delete in (("end", False),):
+        for suffix, delete in (("end", False), ("delete", True)):
             session_id = f"barrier-{suffix}"
             runner._session_db._db.create_session(session_id, "api_server")
             assert (await client.post(f"/api/sessions/{session_id}/credential/bind", headers=headers, json=_bind_body())).status == 200
             async with adapter._native_lifecycle_lock(session_id):
                 closed_task = asyncio.create_task(client.delete(f"/api/sessions/{session_id}", headers=headers) if delete else client.patch(f"/api/sessions/{session_id}", headers=headers, json={"end_reason": "closed"}))
-                await asyncio.sleep(0)
+                key = ("default", session_id)
+                for _ in range(100):
+                    if adapter._native_submit_lock_refs.get(key, 0) == 2:
+                        break
+                    await asyncio.sleep(0.001)
+                assert adapter._native_submit_lock_refs.get(key, 0) == 2
                 submit_task = asyncio.create_task(client.post(f"/api/sessions/{session_id}/submit", headers=headers, json={"kind": "hermes.session.submit", "external_request_id": f"barrier-{suffix}", "message": "hello", "busy_mode": "queue"}))
-                await asyncio.sleep(0)
+                for _ in range(100):
+                    if adapter._native_submit_lock_refs.get(key, 0) == 3:
+                        break
+                    await asyncio.sleep(0.001)
+                assert adapter._native_submit_lock_refs.get(key, 0) == 3
             closed, submit = await asyncio.gather(closed_task, submit_task)
             assert closed.status == 200
             assert submit.status == 409
