@@ -5803,17 +5803,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
-    def safe_fork_session(
-        self, parent_session_id: str, child_session_id: str, *, before_commit=None
-    ) -> str:
+    def safe_fork_session(self, parent_session_id: str, child_session_id: str, *, before_commit=None) -> str:
         """Atomically publish or replay one explicit native fork."""
         def _do(conn):
-            parent = conn.execute(
-                "SELECT * FROM sessions WHERE id = ?", (parent_session_id,)
-            ).fetchone()
-            child = conn.execute(
-                "SELECT * FROM sessions WHERE id = ?", (child_session_id,)
-            ).fetchone()
+            parent = conn.execute("SELECT * FROM sessions WHERE id = ?", (parent_session_id,)).fetchone()
+            child = conn.execute("SELECT * FROM sessions WHERE id = ?", (child_session_id,)).fetchone()
             if child is not None:
                 try:
                     config = json.loads(child["model_config"] or "{}")
@@ -5835,16 +5829,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             now = time.time()
             compression = conn.execute(
-                "SELECT 1 FROM compression_locks WHERE session_id = ? "
-                "AND expires_at > ? LIMIT 1",
+                "SELECT 1 FROM compression_locks WHERE session_id = ? AND expires_at > ? LIMIT 1",
                 (parent_session_id, now),
             ).fetchone()
-            conversation_id = self._session_turn_lease_key_on_conn(
-                conn, parent_session_id
-            )
+            conversation_id = self._session_turn_lease_key_on_conn(conn, parent_session_id)
             turn = conn.execute(
-                "SELECT 1 FROM session_turn_leases WHERE conversation_id = ? "
-                "AND expires_at > ? LIMIT 1",
+                "SELECT 1 FROM session_turn_leases WHERE conversation_id = ? AND expires_at > ? LIMIT 1",
                 (conversation_id, now),
             ).fetchone()
             if compression is not None or turn is not None:
@@ -5874,29 +5864,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     parent["message_count"], parent["tool_call_count"],
                 ),
             )
-            columns = [
-                name for name in self._message_column_names(conn)
-                if name not in {"id", "session_id"}
-            ]
+            columns = [name for name in self._message_column_names(conn) if name not in {"id", "session_id"}]
             names = ", ".join(columns)
             conn.execute(
-                f"INSERT INTO messages (session_id, {names}) "
-                f"SELECT ?, {names} FROM messages "
+                f"INSERT INTO messages (session_id, {names}) SELECT ?, {names} FROM messages "
                 "WHERE session_id = ? AND active = 1 ORDER BY id",
                 (child_session_id, parent_session_id),
             )
             updated = conn.execute(
-                "UPDATE sessions SET ended_at = ?, end_reason = 'branched' "
-                "WHERE id = ? AND ended_at IS NULL",
+                "UPDATE sessions SET ended_at = ?, end_reason = 'branched' WHERE id = ? AND ended_at IS NULL",
                 (now, parent_session_id),
             )
             if updated.rowcount != 1:
                 raise RuntimeError("safe fork predecessor changed")
             return "forked"
 
-        return self._execute_write(
-            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
-        )
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.

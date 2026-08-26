@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import threading
 
 import pytest
 from aiohttp import web
@@ -28,11 +29,8 @@ def _request(**changes):
 
 def _source(session_id=PREDECESSOR):
     return SessionSource(
-        platform=Platform.API_SERVER,
-        chat_id=session_id,
-        chat_type="dm",
-        user_id="api_server",
-        user_name="API server",
+        platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
+        user_id="api_server", user_name="API server",
     )
 
 
@@ -45,12 +43,8 @@ def setup(tmp_path, monkeypatch):
     db.create_session(PREDECESSOR, "api_server")
     db.append_message(PREDECESSOR, "user", "secret-free transcript")
     expires = datetime.now(timezone.utc) + timedelta(minutes=5)
-    assert runner.bind_session_credential(
-        _source(), PREDECESSOR, "bearer-must-not-escape", expires, "route-a"
-    )
-    adapter = APIServerAdapter(
-        PlatformConfig(enabled=True, extra={"key": "sk-safe-fork-test"})
-    )
+    assert runner.bind_session_credential(_source(), PREDECESSOR, "bearer-must-not-escape", expires, "route-a")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-safe-fork-test"}))
     adapter._session_db = db
     adapter.gateway_runner = runner
     try:
@@ -74,12 +68,9 @@ async def test_fork_requires_auth_and_exact_closed_request(setup):
     client = await _client(adapter)
     try:
         unauthenticated = await client.post(f"/api/sessions/{PREDECESSOR}/fork", json=_request())
-        unknown = await client.post(
-            f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH,
-            json=_request(extra="rejected"),
-        )
-        malformed = await client.post(f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH,
-                                      json=_request(external_rotation_id="not-a-uuid"))
+        unknown = await client.post(f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH,
+                                    json=_request(extra="rejected"))
+        malformed = await client.post(f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request(external_rotation_id="not-a-uuid"))
     finally:
         await client.close()
 
@@ -112,7 +103,9 @@ async def test_fork_repoints_evicts_revokes_and_returns_closed_receipt(setup):
         "no_compression_or_session_mutation_lock": True,
     }
     assert "bearer-must-not-escape" not in repr(body)
-    assert runner.session_store._entries[key].session_id == SUCCESSOR
+    successor_key = runner.session_store._generate_session_key(_source(SUCCESSOR))
+    assert runner.session_store._entries[successor_key].session_id == SUCCESSOR
+    assert key not in runner.session_store._entries
     assert key not in runner._agent_cache
     assert not runner.session_credential_available(_source(), PREDECESSOR)
     assert db.get_session(SUCCESSOR)["ended_at"] is None
@@ -125,14 +118,10 @@ async def test_busy_memory_queue_and_active_turn_are_retryable(setup):
     adapter._pending_messages[key] = object()
     client = await _client(adapter)
     try:
-        queued = await client.post(
-            f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request()
-        )
+        queued = await client.post(f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request())
         adapter._pending_messages.clear()
         runner._session_state(key).turn.agent = object()
-        active = await client.post(
-            f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request()
-        )
+        active = await client.post(f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request())
         queued_body, active_body = await queued.json(), await active.json()
     finally:
         await client.close()
@@ -157,12 +146,8 @@ async def test_postcommit_repoint_failure_repairs_on_identical_replay(setup, mon
     monkeypatch.setattr(store, "switch_session", fail_once)
     client = await _client(adapter)
     try:
-        failed = await client.post(
-            f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request()
-        )
-        replay = await client.post(
-            f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request()
-        )
+        failed = await client.post(f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request())
+        replay = await client.post(f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request())
         failed_body, replay_body = await failed.json(), await replay.json()
     finally:
         await client.close()
@@ -171,7 +156,7 @@ async def test_postcommit_repoint_failure_repairs_on_identical_replay(setup, mon
     assert failed_body["error"]["code"] == "session_boundary_unavailable"
     assert replay.status == 200
     assert replay_body["outcome"] == "identical_retry"
-    key = store._generate_session_key(_source())
+    key = store._generate_session_key(_source(SUCCESSOR))
     assert store._entries[key].session_id == SUCCESSOR
     assert db.get_session(PREDECESSOR)["end_reason"] == "branched"
 
@@ -198,18 +183,10 @@ async def test_successor_can_bind_and_submit_while_predecessor_is_denied(setup, 
     }
     client = await _client(adapter)
     try:
-        await client.post(
-            f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request()
-        )
-        old = await client.post(
-            f"/api/sessions/{PREDECESSOR}/credential/bind", headers=AUTH, json=credential
-        )
-        bound = await client.post(
-            f"/api/sessions/{SUCCESSOR}/credential/bind", headers=AUTH, json=credential
-        )
-        accepted = await client.post(
-            f"/api/sessions/{SUCCESSOR}/submit", headers=AUTH, json=submit
-        )
+        await client.post(f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request())
+        old = await client.post(f"/api/sessions/{PREDECESSOR}/credential/bind", headers=AUTH, json=credential)
+        bound = await client.post(f"/api/sessions/{SUCCESSOR}/credential/bind", headers=AUTH, json=credential)
+        accepted = await client.post(f"/api/sessions/{SUCCESSOR}/submit", headers=AUTH, json=submit)
     finally:
         await client.close()
 
@@ -228,17 +205,40 @@ async def test_successor_can_bind_and_submit_while_predecessor_is_denied(setup, 
     ("PATCH", "", {"end_reason": "closed"}),
     ("DELETE", "", None),
 ])
-async def test_bind_submit_end_and_delete_wait_for_the_fork_boundary(setup, method, suffix, payload):
-    adapter, _, _ = setup
-    path = f"/api/sessions/{PREDECESSOR}" + (f"/{suffix}" if suffix else "")
+async def test_successor_lifecycle_waits_for_fork_repoint(setup, monkeypatch, method, suffix, payload):
+    adapter, runner, db = setup
+    store = runner.session_store
+    real_switch = store.switch_session
+    switch_entered = threading.Event()
+    release_switch = threading.Event()
+
+    def paused_switch(session_key, successor):
+        switch_entered.set()
+        assert release_switch.wait(2)
+        return real_switch(session_key, successor)
+
+    monkeypatch.setattr(store, "switch_session", paused_switch)
+    path = f"/api/sessions/{SUCCESSOR}" + (f"/{suffix}" if suffix else "")
     client = await _client(adapter)
     try:
-        async with adapter._native_lifecycle_lock(PREDECESSOR):
-            task = asyncio.create_task(client.request(method, path, headers=AUTH, json=payload))
-            await asyncio.sleep(0)
-            assert not task.done()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        fork = asyncio.create_task(client.post(f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request()))
+        assert await asyncio.to_thread(switch_entered.wait, 2)
+        operation = asyncio.create_task(client.request(method, path, headers=AUTH, json=payload))
+        successor_lock = ("default", SUCCESSOR)
+        async def operation_observed():
+            while not operation.done() and adapter._native_submit_lock_refs.get(successor_lock) != 2:
+                await asyncio.sleep(0)
+        await asyncio.wait_for(operation_observed(), 2)
+        assert not operation.done()
+        assert adapter._native_submit_lock_refs[successor_lock] == 2
+        release_switch.set()
+        fork_response, operation_response = await asyncio.gather(fork, operation)
+        assert fork_response.status == 201
+        assert operation_response.status in {200, 409}
+        if method != "DELETE":
+            keys = [key for key, entry in store._entries.items() if entry.session_id == SUCCESSOR]
+            assert keys == [store._generate_session_key(_source(SUCCESSOR))]
+            assert db.get_session(SUCCESSOR) is not None
     finally:
+        release_switch.set()
         await client.close()

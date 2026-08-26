@@ -4472,22 +4472,19 @@ class APIServerAdapter(BasePlatformAdapter):
             return err
         if set(body) != {"external_rotation_id", "boundary_turn_id"}:
             return web.json_response(
-                _openai_error("Invalid session fork schema", code="invalid_session_fork_schema"),
-                status=400,
+                _openai_error("Invalid session fork schema", code="invalid_session_fork_schema"), status=400,
             )
         rotation_id = body["external_rotation_id"]
         boundary_turn_id = body["boundary_turn_id"]
         try:
             valid_ids = all(
-                isinstance(value, str) and str(uuid.UUID(value)) == value
-                for value in (rotation_id, boundary_turn_id)
+                isinstance(value, str) and str(uuid.UUID(value)) == value for value in (rotation_id, boundary_turn_id)
             )
         except (ValueError, AttributeError):
             valid_ids = False
         if not valid_ids:
             return web.json_response(
-                _openai_error("Invalid session fork schema", code="invalid_session_fork_schema"),
-                status=400,
+                _openai_error("Invalid session fork schema", code="invalid_session_fork_schema"), status=400,
             )
         _, err = await self._get_existing_session_or_404(source_id)
         if err:
@@ -4499,21 +4496,27 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error("Native gateway unavailable", code="native_gateway_unavailable"), status=503,
             )
         successor_id = f"weave-{rotation_id}"
-        native_source = SessionSource(
-            platform=Platform.API_SERVER, chat_id=source_id, chat_type="dm",
-            user_id="api_server", user_name="API server",
-            profile=_api_request_profile.get() or None,
-        )
-        session_key = runner.session_store._generate_session_key(native_source)
+        if successor_id == source_id:
+            return web.json_response(
+                _openai_error("Session fork conflicts with native lineage", code="session_fork_conflict"), status=409,
+            )
+        source_kwargs = dict(platform=Platform.API_SERVER, chat_type="dm", user_id="api_server",
+                             user_name="API server", profile=_api_request_profile.get() or None)
+        source = SessionSource(chat_id=source_id, **source_kwargs)
+        successor = SessionSource(chat_id=successor_id, **source_kwargs)
+        store = runner.session_store
+        session_key = store._generate_session_key(source)
+        successor_key = store._generate_session_key(successor)
         await runner.async_session_store._ensure_loaded()
 
         def unavailable():
             return web.json_response(
-                _openai_error("Session boundary unavailable", code="session_boundary_unavailable"),
-                status=409, headers={"Retry-After": "1"},
+                _openai_error("Session boundary unavailable", code="session_boundary_unavailable"), status=409,
+                headers={"Retry-After": "1"},
             )
 
-        async with self._native_lifecycle_lock(source_id):
+        first_lock, second_lock = sorted((source_id, successor_id))
+        async with self._native_lifecycle_lock(first_lock), self._native_lifecycle_lock(second_lock):
             queued = session_key in self._pending_messages or bool(
                 getattr(runner._peek_session_state(session_key), "conversation", None)
                 and runner._queue_depth(session_key, adapter=self)
@@ -4530,7 +4533,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 outcome = await asyncio.to_thread(
                     db.safe_fork_session, source_id, successor_id,
                     before_commit=lambda: runner.revoke_session_credential(
-                        native_source, source_id
+                        source, source_id
                     ),
                 )
             except Exception:
@@ -4539,14 +4542,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 return unavailable()
             if outcome == "conflict":
                 return web.json_response(
-                    _openai_error("Session fork conflicts with native lineage", code="session_fork_conflict"),
-                    status=409,
+                    _openai_error("Session fork conflicts with native lineage", code="session_fork_conflict"), status=409,
                 )
             try:
-                switched = await runner.async_session_store.switch_session(
-                    session_key, successor_id
-                )
+                switched = store.lookup_by_session_key(successor_key)
+                if switched is None:
+                    switched = await runner.async_session_store.switch_session(session_key, successor_id)
                 if switched is None or switched.session_id != successor_id:
+                    return unavailable()
+                with store._lock:
+                    current = store._entries.get(successor_key)
+                    if current is None:
+                        current = store._entries.pop(session_key, None)
+                        if current is switched:
+                            switched.session_key = successor_key
+                            store._entries[successor_key] = switched
+                    if current is not switched:
+                        return unavailable()
+                    store._entries.pop(session_key, None)
+                rebound = await runner.async_session_store.bind_existing_session(successor, successor_id, reopen=False)
+                if rebound is not switched:
                     return unavailable()
                 runner._evict_cached_agent(session_key)
             except Exception:
