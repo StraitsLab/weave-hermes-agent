@@ -4517,6 +4517,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         first_lock, second_lock = sorted((source_id, successor_id))
         async with self._native_lifecycle_lock(first_lock), self._native_lifecycle_lock(second_lock):
+            if await asyncio.to_thread(db.get_session, successor_id) is None:
+                bound = await runner.async_session_store.bind_existing_session(
+                    source, source_id, reopen=False,
+                )
+                if bound is None or bound.session_id != source_id:
+                    return unavailable()
             queued = session_key in self._pending_messages or bool(
                 getattr(runner._peek_session_state(session_key), "conversation", None)
                 and runner._queue_depth(session_key, adapter=self)
@@ -4581,13 +4587,23 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
+        session_id = request.match_info["session_id"]
+        async with self._native_lifecycle_lock(session_id):
+            session, err = await self._get_existing_session_or_404(session_id)
+            if err:
+                return err
+            if session.get("ended_at") is not None:
+                return web.json_response(
+                    _openai_error("Session has ended", code="session_ended"), status=409,
+                )
+            return await self._run_session_chat(request, session, session_id)
+
+    async def _run_session_chat(
+        self, request: "web.Request", session: Dict[str, Any], session_id: str,
+    ) -> "web.Response":
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
-        session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
-        if err:
-            return err
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -4723,14 +4739,6 @@ class APIServerAdapter(BasePlatformAdapter):
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return lock_error
-        if not self._persist_session_runtime_lock(session_id, runtime_request):
-            return web.json_response(
-                _openai_error(
-                    "Could not persist the requested session model lock",
-                    code="model_lock_persistence_failed",
-                ),
-                status=500,
-            )
         lock_active = bool(runtime_request.get("require_model_lock"))
         if lock_active:
             route = runtime_request.get("route")
@@ -4765,6 +4773,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         loop = asyncio.get_running_loop()
+        admission = loop.create_future()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
@@ -4810,7 +4819,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 event_name = event_type.replace("tool.", "tool.")
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
-        async def _run_and_signal() -> None:
+        async def _run_locked() -> None:
             try:
                 await queue.put(_event_payload("run.started", {
                     "user_message": {"role": "user", "content": user_message},
@@ -4905,6 +4914,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
+        async def _run_and_signal() -> None:
+            async with self._native_lifecycle_lock(session_id):
+                current, rejection = await self._get_existing_session_or_404(session_id)
+                if rejection is None and current.get("ended_at") is not None:
+                    rejection = web.json_response(
+                        _openai_error("Session has ended", code="session_ended"), status=409,
+                    )
+                if rejection is None and not self._persist_session_runtime_lock(session_id, runtime_request):
+                    rejection = web.json_response(
+                        _openai_error(
+                            "Could not persist the requested session model lock",
+                            code="model_lock_persistence_failed",
+                        ),
+                        status=500,
+                    )
+                admission.set_result(rejection)
+                if rejection is None:
+                    await _run_locked()
+
         # NOTE: deliberately NOT registered in _active_run_tasks — this turn
         # is already counted by active_agent_work_count() via
         # _inflight_agent_runs (_run_agent), and a second task-based entry
@@ -4917,6 +4945,11 @@ class APIServerAdapter(BasePlatformAdapter):
             pass
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
+
+        rejection = await admission
+        if rejection is not None:
+            await task
+            return rejection
 
         headers = {
             "Content-Type": "text/event-stream",

@@ -162,6 +162,26 @@ async def test_postcommit_repoint_failure_repairs_on_identical_replay(setup, mon
 
 
 @pytest.mark.asyncio
+async def test_db_only_predecessor_forks_and_replays(setup):
+    adapter, runner, db = setup
+    source_id = "db-only-predecessor"
+    db.create_session(source_id, "api_server")
+    assert runner.session_store.lookup_by_session_key(
+        runner.session_store._generate_session_key(_source(source_id))
+    ) is None
+    client = await _client(adapter)
+    try:
+        first = await client.post(f"/api/sessions/{source_id}/fork", headers=AUTH, json=_request())
+        replay = await client.post(f"/api/sessions/{source_id}/fork", headers=AUTH, json=_request())
+        replay_body = await replay.json()
+    finally:
+        await client.close()
+    assert first.status == 201
+    assert replay.status == 200
+    assert replay_body["outcome"] == "identical_retry"
+
+
+@pytest.mark.asyncio
 async def test_successor_can_bind_and_submit_while_predecessor_is_denied(setup, monkeypatch):
     adapter, _, _ = setup
     admitted = []
@@ -242,3 +262,58 @@ async def test_successor_lifecycle_waits_for_fork_repoint(setup, monkeypatch, me
     finally:
         release_switch.set()
         await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", ["chat", "chat/stream"], ids=["sync", "stream"])
+@pytest.mark.parametrize("winner", ["chat", "fork"], ids=["chat_wins", "fork_wins"])
+async def test_chat_and_fork_share_the_native_lifecycle_fence(setup, monkeypatch, suffix, winner):
+    adapter, runner, _ = setup
+    turn_entered, release_turn = asyncio.Event(), asyncio.Event()
+    switch_entered, release_switch = threading.Event(), threading.Event()
+    calls, persisted = [], []
+
+    async def run_agent(**_kwargs):
+        calls.append(True)
+        turn_entered.set()
+        await release_turn.wait()
+        return {"final_response": "ok", "messages": []}, {}
+
+    async def assert_waiting(task):
+        key = ("default", PREDECESSOR)
+        while not task.done() and adapter._native_submit_lock_refs.get(key) != 2:
+            await asyncio.sleep(0)
+        assert not task.done() and adapter._native_submit_lock_refs[key] == 2
+
+    real_switch = runner.session_store.switch_session
+    def paused_switch(session_key, successor):
+        switch_entered.set()
+        assert release_switch.wait(2)
+        return real_switch(session_key, successor)
+
+    monkeypatch.setattr(adapter, "_run_agent", run_agent)
+    monkeypatch.setattr(adapter, "_persist_session_runtime_lock", lambda *_args: persisted.append(True) or True)
+    if winner == "fork":
+        monkeypatch.setattr(runner.session_store, "switch_session", paused_switch)
+    client = await _client(adapter)
+    try:
+        if winner == "chat":
+            chat = asyncio.create_task(client.post(f"/api/sessions/{PREDECESSOR}/{suffix}", headers=AUTH, json={"message": "hello"}))
+            await asyncio.wait_for(turn_entered.wait(), 2)
+            fork = asyncio.create_task(client.post(f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request()))
+            await asyncio.wait_for(assert_waiting(fork), 2)
+            release_turn.set()
+        else:
+            fork = asyncio.create_task(client.post(f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request()))
+            assert await asyncio.to_thread(switch_entered.wait, 2)
+            chat = asyncio.create_task(client.post(f"/api/sessions/{PREDECESSOR}/{suffix}", headers=AUTH, json={"message": "hello"}))
+            await asyncio.wait_for(assert_waiting(chat), 2)
+            release_switch.set()
+        chat_response, fork_response = await asyncio.gather(chat, fork)
+        await chat_response.read()
+    finally:
+        release_turn.set()
+        release_switch.set()
+        await client.close()
+    assert (chat_response.status, fork_response.status) == ((200, 201) if winner == "chat" else (409, 201))
+    assert (len(calls), len(persisted)) == ((1, 1) if winner == "chat" else (0, 0))
