@@ -281,12 +281,28 @@ class CuratorPause(BaseModel):
 class LearningNodeRef(BaseModel):
     id: str
     profile: Optional[str] = None
+    operation_id: Optional[str] = None
+
+    @field_validator("operation_id")
+    @classmethod
+    def _validate_operation_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not value.strip():
+            raise ValueError("operation_id must not be blank")
+        return value
 
 
 class LearningNodeEdit(BaseModel):
     id: str
     content: str
     profile: Optional[str] = None
+    operation_id: Optional[str] = None
+
+    @field_validator("operation_id")
+    @classmethod
+    def _validate_operation_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not value.strip():
+            raise ValueError("operation_id must not be blank")
+        return value
 
 
 # --- from web_server.py (originally lines 3786-3792) ---
@@ -738,4 +754,3 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
-

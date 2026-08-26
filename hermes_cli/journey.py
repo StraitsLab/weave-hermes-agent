@@ -253,7 +253,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
 def _cmd_delete(args: argparse.Namespace) -> int:
     from agent.learning_mutations import delete_node, node_detail
-    from agent.memory_manager import MemoryManager
+    from agent.memory_manager import configured_memory_manager
 
     detail = node_detail(args.node)
     if not detail.get("ok"):
@@ -267,7 +267,7 @@ def _cmd_delete(args: argparse.Namespace) -> int:
         except (EOFError, KeyboardInterrupt):
             print("\n  aborted")
             return 1
-    manager = MemoryManager()
+    manager = configured_memory_manager()
     try:
         res = delete_node(args.node, memory_manager=manager)
     finally:
@@ -278,7 +278,7 @@ def _cmd_delete(args: argparse.Namespace) -> int:
 
 def _cmd_edit(args: argparse.Namespace) -> int:
     from agent.learning_mutations import edit_node, node_detail
-    from agent.memory_manager import MemoryManager
+    from agent.memory_manager import configured_memory_manager
 
     detail = node_detail(args.node)
     if not detail.get("ok"):
@@ -289,7 +289,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     if edited is None or edited.strip() == detail["content"].strip():
         print("  no changes")
         return 0
-    manager = MemoryManager()
+    manager = configured_memory_manager()
     try:
         res = edit_node(args.node, edited, memory_manager=manager)
     finally:

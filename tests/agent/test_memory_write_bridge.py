@@ -10,6 +10,7 @@ external provider and assert which ``on_memory_write`` calls land.
 import json
 
 import pytest
+from agent.native_mutation_journal import NativeMutationJournal
 
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
@@ -129,3 +130,18 @@ def test_native_mutation_reports_native_commit_when_provider_fails():
     )
     assert result["success"] is True
     assert result["provider_acknowledged"] is False
+
+
+def test_native_writer_failure_is_replayable_without_keyerror(tmp_path):
+    mgr = MemoryManager(native_journal=NativeMutationJournal(tmp_path))
+    calls = []
+
+    def write():
+        calls.append(1)
+        raise ValueError("disk broke")
+
+    first = mgr.commit_native_mutation("op-fail", "add", "memory", "x", write)
+    second = mgr.commit_native_mutation("op-fail", "add", "memory", "x", write)
+    assert first == second
+    assert first["error"] == "native_mutation_failed"
+    assert calls == [1]

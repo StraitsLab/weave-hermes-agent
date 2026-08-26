@@ -723,6 +723,10 @@ class MemoryStore:
             "usage": f"{pct}% — {current:,}/{limit:,} chars",
             "entry_count": len(entries),
         }
+        try:
+            resp["revision"] = self._path_for(target).stat().st_mtime_ns
+        except OSError:
+            pass
         if message:
             resp["message"] = message
         resp["note"] = "Write saved. This update is complete — do not repeat it."
@@ -1276,6 +1280,5 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
