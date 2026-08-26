@@ -121,9 +121,9 @@ def _node_detail(node_id: str) -> dict[str, Any]:
 # ── Delete ──────────────────────────────────────────────────────────────────
 
 
-def delete_node(node_id: str) -> dict[str, Any]:
+def delete_node(node_id: str, *, memory_manager=None, operation_id: str | None = None) -> dict[str, Any]:
     try:
-        return _delete_memory(node_id) if parse_node_kind(node_id) == "memory" else _delete_skill(node_id)
+        return _delete_memory(node_id, memory_manager=memory_manager, operation_id=operation_id) if parse_node_kind(node_id) == "memory" else _delete_skill(node_id)
     except (ValueError, IndexError) as exc:
         return {"ok": False, "message": str(exc)}
 
@@ -141,12 +141,32 @@ def _delete_skill(name: str) -> dict[str, Any]:
     return {"ok": ok, "message": f"archived '{name}' — restore with: hermes curator restore {name}" if ok else message}
 
 
-def _delete_memory(node_id: str) -> dict[str, Any]:
+def _delete_memory(node_id: str, *, memory_manager=None, operation_id: str | None = None) -> dict[str, Any]:
+    if memory_manager is None:
+        return {"ok": False, "message": "native memory manager unavailable"}
     source, gidx = _parse_memory_id(node_id)
-    path, chunks, local = _locate_memory(source, gidx)
+    path, old_text = _prepare_memory_mutation(source, gidx)
 
-    del chunks[local]
-    _write_memory(path, chunks)
+    def writer():
+        from tools.memory_tool import MemoryStore
+        with MemoryStore._file_lock(path):
+            chunks = MemoryStore._read_file(path)
+            local = _memory_local_index(source, gidx)
+            if not 0 <= local < len(chunks) or chunks[local] != old_text:
+                return {"success": False, "error": "native_mutation_conflict"}
+            del chunks[local]
+            _write_memory(path, chunks)
+            return {"success": True, "revision": path.stat().st_mtime_ns}
+
+    if memory_manager is not None:
+        import uuid
+        result = memory_manager.commit_native_mutation(
+            operation_id or uuid.uuid4().hex, "remove", source, "", writer, old_text=old_text
+        )
+        if not result.get("success"):
+            return {"ok": False, "message": result.get("error", "delete failed")}
+    else:
+        writer()
 
     return {"ok": True, "message": f"deleted memory from {path.name}"}
 
@@ -154,9 +174,9 @@ def _delete_memory(node_id: str) -> dict[str, Any]:
 # ── Edit ────────────────────────────────────────────────────────────────────
 
 
-def edit_node(node_id: str, content: str) -> dict[str, Any]:
+def edit_node(node_id: str, content: str, *, memory_manager=None, operation_id: str | None = None) -> dict[str, Any]:
     try:
-        return _edit_memory(node_id, content) if parse_node_kind(node_id) == "memory" else _edit_skill(node_id, content)
+        return _edit_memory(node_id, content, memory_manager=memory_manager, operation_id=operation_id) if parse_node_kind(node_id) == "memory" else _edit_skill(node_id, content)
     except (ValueError, IndexError) as exc:
         return {"ok": False, "message": str(exc)}
 
@@ -173,20 +193,55 @@ def _edit_skill(name: str, content: str) -> dict[str, Any]:
     return {"ok": False, "message": result.get("error", "edit failed")}
 
 
-def _edit_memory(node_id: str, content: str) -> dict[str, Any]:
+def _edit_memory(node_id: str, content: str, *, memory_manager=None, operation_id: str | None = None) -> dict[str, Any]:
+    if memory_manager is None:
+        return {"ok": False, "message": "native memory manager unavailable"}
     source, gidx = _parse_memory_id(node_id)
     body = content.strip()
     if not body:
         return {"ok": False, "message": "empty memory — use delete to remove it"}
-    path, chunks, local = _locate_memory(source, gidx)
+    path, old_text = _prepare_memory_mutation(source, gidx)
 
-    chunks[local] = body
-    _write_memory(path, chunks)
+    def writer():
+        from tools.memory_tool import MemoryStore
+        with MemoryStore._file_lock(path):
+            chunks = MemoryStore._read_file(path)
+            local = _memory_local_index(source, gidx)
+            if not 0 <= local < len(chunks) or chunks[local] != old_text:
+                return {"success": False, "error": "native_mutation_conflict"}
+            chunks[local] = body
+            _write_memory(path, chunks)
+            return {"success": True, "revision": path.stat().st_mtime_ns}
+
+    if memory_manager is not None:
+        import uuid
+        result = memory_manager.commit_native_mutation(
+            operation_id or uuid.uuid4().hex, "replace", source, body, writer, old_text=old_text
+        )
+        if not result.get("success"):
+            return {"ok": False, "message": result.get("error", "edit failed")}
+    else:
+        writer()
 
     return {"ok": True, "message": f"updated memory in {path.name}"}
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _prepare_memory_mutation(source: str, gidx: int) -> tuple[Path, str]:
+    """Read and validate the target only while holding its native file lock."""
+    from tools.memory_tool import MemoryStore
+
+    path = _memories_dir() / _MEMORY_FILES[source]
+    if not path.exists():
+        raise ValueError(f"{path.name} not found")
+    with MemoryStore._file_lock(path):
+        chunks = MemoryStore._read_file(path)
+        local = _memory_local_index(source, gidx)
+        if not 0 <= local < len(chunks):
+            raise ValueError("memory node id is stale — refresh the graph")
+        return path, chunks[local]
 
 
 def _write_memory(path: Path, chunks: list[str]) -> None:

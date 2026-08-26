@@ -4179,10 +4179,15 @@ async def get_learning_node(id: str, profile: Optional[str] = None):
 async def delete_learning_node(body: LearningNodeRef):
     """Delete a journey node — skills are archived (restorable), memories removed."""
     from agent.learning_mutations import delete_node
+    from agent.memory_manager import configured_memory_manager
 
     def _run():
         with _profile_scope(body.profile):
-            return delete_node(body.id)
+            manager = configured_memory_manager(platform="desktop")
+            try:
+                return delete_node(body.id, memory_manager=manager, operation_id=getattr(body, "operation_id", None))
+            finally:
+                manager.shutdown_all()
 
     res = await asyncio.to_thread(_run)
     if not res.get("ok"):
@@ -4194,10 +4199,15 @@ async def delete_learning_node(body: LearningNodeRef):
 async def update_learning_node(body: LearningNodeEdit):
     """Rewrite a journey node's content (SKILL.md or memory chunk)."""
     from agent.learning_mutations import edit_node
+    from agent.memory_manager import configured_memory_manager
 
     def _run():
         with _profile_scope(body.profile):
-            return edit_node(body.id, body.content)
+            manager = configured_memory_manager(platform="desktop")
+            try:
+                return edit_node(body.id, body.content, memory_manager=manager, operation_id=getattr(body, "operation_id", None))
+            finally:
+                manager.shutdown_all()
 
     res = await asyncio.to_thread(_run)
     if not res.get("ok"):
