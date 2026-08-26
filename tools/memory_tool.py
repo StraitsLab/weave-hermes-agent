@@ -1061,6 +1061,8 @@ def memory_tool(
     new_text: str = None,
     operations: Optional[List[Dict[str, Any]]] = None,
     store: Optional[MemoryStore] = None,
+    memory_manager=None,
+    operation_id: Optional[str] = None,
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
@@ -1102,7 +1104,14 @@ def memory_tool(
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
-        result = store.apply_batch(target, operations)
+        if memory_manager is not None:
+            import uuid
+            op_id = operation_id or uuid.uuid4().hex
+            result = memory_manager.commit_native_mutation(
+                op_id, "batch", target, "", lambda: store.apply_batch(target, operations)
+            )
+        else:
+            result = store.apply_batch(target, operations)
         return json.dumps(result, ensure_ascii=False)
 
     # --- Single-op path ---------------------------------------------------
@@ -1129,17 +1138,23 @@ def memory_tool(
         return gate_result
 
     if action == "add":
-        result = store.add(target, content)
-
+        writer = lambda: store.add(target, content)
     elif action == "replace":
-        result = store.replace(target, old_text, content)
-
+        writer = lambda: store.replace(target, old_text, content)
     elif action == "remove":
-        result = store.remove(target, old_text)
+        writer = lambda: store.remove(target, old_text)
 
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
 
+    if memory_manager is not None:
+        import uuid
+        result = memory_manager.commit_native_mutation(
+            operation_id or uuid.uuid4().hex, action, target, content or "", writer,
+            old_text=old_text or "",
+        )
+    else:
+        result = writer()
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1261,7 +1276,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

@@ -1805,8 +1805,13 @@ def _(rid, params: dict) -> dict:
     """Delete a journey node — skills are archived (restorable), memories removed."""
     try:
         from agent.learning_mutations import delete_node
+        from agent.memory_manager import MemoryManager
 
-        return _ok(rid, delete_node(str(params.get("id", ""))))
+        manager = MemoryManager()
+        try:
+            return _ok(rid, delete_node(str(params.get("id", "")), memory_manager=manager, operation_id=params.get("operation_id")))
+        finally:
+            manager.shutdown_all()
     except Exception as exc:  # noqa: BLE001
         return _err(rid, 5000, f"learning.delete failed: {exc}")
 
@@ -1816,8 +1821,13 @@ def _(rid, params: dict) -> dict:
     """Rewrite a journey node's content (SKILL.md or memory chunk)."""
     try:
         from agent.learning_mutations import edit_node
+        from agent.memory_manager import MemoryManager
 
-        return _ok(rid, edit_node(str(params.get("id", "")), str(params.get("content", ""))))
+        manager = MemoryManager()
+        try:
+            return _ok(rid, edit_node(str(params.get("id", "")), str(params.get("content", "")), memory_manager=manager, operation_id=params.get("operation_id")))
+        finally:
+            manager.shutdown_all()
     except Exception as exc:  # noqa: BLE001
         return _err(rid, 5000, f"learning.edit failed: {exc}")
 

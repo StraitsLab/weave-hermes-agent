@@ -253,6 +253,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
 def _cmd_delete(args: argparse.Namespace) -> int:
     from agent.learning_mutations import delete_node, node_detail
+    from agent.memory_manager import MemoryManager
 
     detail = node_detail(args.node)
     if not detail.get("ok"):
@@ -266,13 +267,18 @@ def _cmd_delete(args: argparse.Namespace) -> int:
         except (EOFError, KeyboardInterrupt):
             print("\n  aborted")
             return 1
-    res = delete_node(args.node)
+    manager = MemoryManager()
+    try:
+        res = delete_node(args.node, memory_manager=manager)
+    finally:
+        manager.shutdown_all()
     print(f"  {res['message']}")
     return 0 if res.get("ok") else 1
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
     from agent.learning_mutations import edit_node, node_detail
+    from agent.memory_manager import MemoryManager
 
     detail = node_detail(args.node)
     if not detail.get("ok"):
@@ -283,7 +289,11 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     if edited is None or edited.strip() == detail["content"].strip():
         print("  no changes")
         return 0
-    res = edit_node(args.node, edited)
+    manager = MemoryManager()
+    try:
+        res = edit_node(args.node, edited, memory_manager=manager)
+    finally:
+        manager.shutdown_all()
     print(f"  {res['message']}")
     return 0 if res.get("ok") else 1
 

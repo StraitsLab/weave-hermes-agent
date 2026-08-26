@@ -102,3 +102,30 @@ def test_build_metadata_callback_is_merged_per_op():
             "metadata": {"session_id": "s1", "tool_name": "memory"},
         }
     ]
+
+
+def test_native_mutation_reuses_operation_and_calls_provider_after_commit():
+    mgr, provider = _manager_with_provider()
+    seen = []
+
+    def write():
+        seen.append("native")
+        return {"success": True, "revision": 4, "value": "fact"}
+
+    first = mgr.commit_native_mutation("op-1", "add", "memory", "fact", write)
+    second = mgr.commit_native_mutation("op-1", "add", "memory", "fact", write)
+
+    assert first == second
+    assert seen == ["native"]
+    assert provider.calls[0]["metadata"]["operation_id"] == "op-1"
+    assert provider.calls[0]["metadata"]["revision"] == 4
+
+
+def test_native_mutation_reports_native_commit_when_provider_fails():
+    mgr, provider = _manager_with_provider()
+    provider.on_memory_write = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("down"))
+    result = mgr.commit_native_mutation(
+        "op-2", "replace", "memory", "new", lambda: {"success": True, "revision": 5}
+    )
+    assert result["success"] is True
+    assert result["provider_acknowledged"] is False

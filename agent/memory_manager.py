@@ -398,6 +398,11 @@ class MemoryManager:
             "abandoned_prefetches": 0,
             "active_tasks": 0,
         }
+        # Native mutation coordination is scoped to this request/runtime
+        # manager. It must never become a process-global or profile lookup.
+        self._native_lock = threading.Lock()
+        self._native_completed: Dict[str, Dict[str, Any]] = {}
+        self._native_inflight: Dict[str, threading.Event] = {}
 
     # -- Registration --------------------------------------------------------
 
@@ -1066,17 +1071,76 @@ class MemoryManager:
             return "positional"
         return "legacy"
 
+    def commit_native_mutation(
+        self,
+        operation_id: str,
+        action: str,
+        target: str,
+        content: str,
+        native_writer: Callable[[], Dict[str, Any]],
+        *,
+        old_text: str = "",
+    ) -> Dict[str, Any]:
+        """Commit one native mutation, then mirror it outside coordination.
+
+        ``operation_id`` belongs to the caller and is the sole retry key;
+        content is intentionally never used as identity. Followers wait for
+        an in-flight operation and receive its exact native result.
+        """
+        if not operation_id:
+            raise ValueError("operation_id is required")
+        with self._native_lock:
+            cached = self._native_completed.get(operation_id)
+            if cached is not None:
+                return dict(cached)
+            waiter = self._native_inflight.get(operation_id)
+            if waiter is None:
+                waiter = threading.Event()
+                self._native_inflight[operation_id] = waiter
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            waiter.wait()
+            with self._native_lock:
+                return dict(self._native_completed[operation_id])
+
+        try:
+            result = dict(native_writer())
+            if result.get("success") is True:
+                result["operation_id"] = operation_id
+                result.setdefault("provider_acknowledged", True)
+                metadata = {"operation_id": operation_id}
+                if "revision" in result:
+                    metadata["revision"] = result["revision"]
+                if old_text:
+                    metadata["old_text"] = old_text
+                try:
+                    if not self.on_memory_write(action, target, content, metadata=metadata):
+                        result["provider_acknowledged"] = False
+                except Exception:
+                    result["provider_acknowledged"] = False
+            with self._native_lock:
+                self._native_completed[operation_id] = dict(result)
+            return result
+        finally:
+            with self._native_lock:
+                event = self._native_inflight.pop(operation_id, None)
+                if event is not None:
+                    event.set()
+
     def on_memory_write(
         self,
         action: str,
         target: str,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         """Notify external providers when the built-in memory tool writes.
 
         Skips the builtin provider itself (it's the source of the write).
         """
+        acknowledged = True
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
@@ -1091,10 +1155,12 @@ class MemoryManager:
                 else:
                     provider.on_memory_write(action, target, content)
             except Exception as e:
+                acknowledged = False
                 logger.debug(
                     "Memory provider '%s' on_memory_write failed: %s",
                     provider.name, e,
                 )
+        return acknowledged
 
     # Actions the bridge mirrors to external providers. The built-in memory
     # tool can also return non-mutating shapes (errors, staged-for-approval
