@@ -166,7 +166,8 @@ def test_native_mutation_reuses_operation_and_calls_provider_after_commit():
     assert "value" not in first
 
 
-def test_hostile_native_failure_is_compact_for_owner_follower_and_journal(tmp_path):
+@pytest.mark.parametrize("success", [False, "HOSTILE MEMORY TEXT", 1, None, ...])
+def test_hostile_native_failure_is_compact_for_owner_follower_cache_and_journal(tmp_path, success):
     sentinel = "HOSTILE MEMORY TEXT"
     journal = NativeMutationJournal(tmp_path)
     mgr = MemoryManager(native_journal=journal)
@@ -177,14 +178,10 @@ def test_hostile_native_failure_is_compact_for_owner_follower_and_journal(tmp_pa
     def write():
         entered.set()
         assert release.wait(timeout=2)
-        return {
-            "success": False,
-            "status": "conflict",
-            "revision": 12,
-            "current_entries": [sentinel],
-            "message": sentinel,
-            "error": sentinel,
-        }
+        result = {"status": "conflict", "revision": 12,
+                  "current_entries": [sentinel], "message": sentinel, "error": sentinel}
+        if success is not ...: result["success"] = success
+        return result
 
     owner = threading.Thread(target=lambda: results.append(
         mgr.commit_native_mutation("op-hostile", "replace", "memory", sentinel, write)
@@ -199,14 +196,14 @@ def test_hostile_native_failure_is_compact_for_owner_follower_and_journal(tmp_pa
     owner.join(timeout=2)
     follower.join(timeout=2)
 
-    expected = {
-        "success": False,
-        "operation_id": "op-hostile",
-        "revision": 12,
-        "status": "conflict",
-        "error": "native_mutation_failed",
+    valid_failure = {"success": False, "operation_id": "op-hostile", "revision": 12,
+                     "status": "conflict", "error": "native_mutation_failed"}
+    expected = valid_failure if success is False else {
+        "success": False, "operation_id": "op-hostile", "error": "native_mutation_failed",
     }
-    assert results == [expected, expected]
+    results.append(mgr.commit_native_mutation("op-hostile", "replace", "memory", sentinel,
+                   lambda: pytest.fail("cache must not call writer")))
+    assert results == [expected, expected, expected]
     assert sentinel not in journal.path.read_text(encoding="utf-8")
     replay = MemoryManager(native_journal=NativeMutationJournal(tmp_path))
     assert replay.commit_native_mutation(

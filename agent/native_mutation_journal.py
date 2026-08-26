@@ -12,6 +12,7 @@ _STATUS_CODES = {"ok", "success", "failed", "error", "conflict", "not_found"}
 def compact_native_result(result: Any, *, operation_id: Optional[str] = None) -> Dict[str, Any]:
     """Reduce a terminal result to content-free coordination metadata."""
     source = result if isinstance(result, dict) else {}
+    if not isinstance(source.get("success"), bool): return {"success": False, "operation_id": operation_id or source.get("operation_id"), "error": "native_mutation_failed"}
     compact: Dict[str, Any] = {}
     for key in ("success", "provider_acknowledged"):
         if isinstance(source.get(key), bool): compact[key] = source[key]
@@ -27,7 +28,6 @@ def compact_native_result(result: Any, *, operation_id: Optional[str] = None) ->
     if isinstance(identity, str) and identity: compact["operation_id"] = identity
     if source.get("success") is False and compact.get("error") not in _ERROR_CODES: compact["error"] = "native_mutation_failed"
     return compact
-
 def _valid_record(record: Any) -> bool:
     if not isinstance(record, dict) or not isinstance(record.get("operation_id"), str) or not record["operation_id"]:
         return False
