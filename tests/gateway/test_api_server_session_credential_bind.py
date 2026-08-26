@@ -175,7 +175,8 @@ async def test_bind_refreshes_one_same_revision_holder_and_boundary_revokes_it(
             f"/api/sessions/{SESSION_ID}/credential/bind", headers=headers,
             json=_bind_body(expires_at="2000-01-01T00:00:00Z"),
         )
-        changed_body, expired_body = await changed.json(), await expired.json()
+        malformed_time = await client.post(f"/api/sessions/{SESSION_ID}/credential/bind", headers=headers, json=_bind_body(expires_at="2026-99-01T00:00:00Z"))
+        changed_body, expired_body, malformed_time_body = await changed.json(), await expired.json(), await malformed_time.json()
     finally:
         await client.close()
 
@@ -184,6 +185,8 @@ async def test_bind_refreshes_one_same_revision_holder_and_boundary_revokes_it(
     assert holder() == "replacement-bearer"
     assert changed.status == expired.status == 409
     assert changed_body["error"]["code"] == expired_body["error"]["code"] == "credential_unavailable"
+    assert malformed_time.status == 400
+    assert malformed_time_body["error"]["code"] == "invalid_session_credential_schema"
     runner._clear_conversation_scope(
         "agent:main:api_server:dm:native-bind-session", reason="test"
     )
