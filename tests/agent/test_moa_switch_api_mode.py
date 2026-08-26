@@ -33,6 +33,7 @@ def _make_fake_agent():
     agent._client_kwargs = {"base_url": "https://old.example/v1"}
     agent._config_context_length = 123456
     agent._transport_cache = {}
+    agent._read_reasoning_echo_from_config = lambda: False
     agent.quiet_mode = True
     return agent
 
