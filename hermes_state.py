@@ -5803,6 +5803,84 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    def safe_fork_session(self, parent_session_id: str, child_session_id: str, *, before_commit=None) -> str:
+        """Atomically publish or replay one explicit native fork."""
+        def _do(conn):
+            parent = conn.execute("SELECT * FROM sessions WHERE id = ?", (parent_session_id,)).fetchone()
+            child = conn.execute("SELECT * FROM sessions WHERE id = ?", (child_session_id,)).fetchone()
+            if child is not None:
+                try:
+                    config = json.loads(child["model_config"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    config = {}
+                if not (
+                    parent is not None
+                    and child["parent_session_id"] == parent_session_id
+                    and config.get("_branched_from") == parent_session_id
+                    and child["ended_at"] is None
+                    and parent["ended_at"] is not None and parent["end_reason"] == "branched"
+                ):
+                    return "conflict"
+                if before_commit:
+                    before_commit()
+                return "identical_retry"
+            if parent is None or parent["ended_at"] is not None:
+                return "conflict"
+
+            now = time.time()
+            compression = conn.execute(
+                "SELECT 1 FROM compression_locks WHERE session_id = ? AND expires_at > ? LIMIT 1",
+                (parent_session_id, now),
+            ).fetchone()
+            conversation_id = self._session_turn_lease_key_on_conn(conn, parent_session_id)
+            turn = conn.execute(
+                "SELECT 1 FROM session_turn_leases WHERE conversation_id = ? AND expires_at > ? LIMIT 1",
+                (conversation_id, now),
+            ).fetchone()
+            if compression is not None or turn is not None:
+                return "boundary_unavailable"
+            if before_commit:
+                before_commit()
+
+            config = json.loads(parent["model_config"] or "{}")
+            if not isinstance(config, dict):
+                config = {}
+            config["_branched_from"] = parent_session_id
+            conn.execute(
+                """INSERT INTO sessions (
+                   id, source, model, model_config, system_prompt, system_prompt_hash,
+                   parent_session_id, cwd, git_branch, git_repo_root, profile_name,
+                   user_id, session_key, chat_id, chat_type, thread_id, display_name,
+                   origin_json, started_at, message_count, tool_call_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    child_session_id, parent["source"], parent["model"],
+                    json.dumps(config), parent["system_prompt"],
+                    parent["system_prompt_hash"], parent_session_id, parent["cwd"],
+                    parent["git_branch"], parent["git_repo_root"],
+                    parent["profile_name"], parent["user_id"], parent["session_key"],
+                    parent["chat_id"], parent["chat_type"], parent["thread_id"],
+                    parent["display_name"], parent["origin_json"], now,
+                    parent["message_count"], parent["tool_call_count"],
+                ),
+            )
+            columns = [name for name in self._message_column_names(conn) if name not in {"id", "session_id"}]
+            names = ", ".join(columns)
+            conn.execute(
+                f"INSERT INTO messages (session_id, {names}) SELECT ?, {names} FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                (child_session_id, parent_session_id),
+            )
+            updated = conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = 'branched' WHERE id = ? AND ended_at IS NULL",
+                (now, parent_session_id),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("safe fork predecessor changed")
+            return "forked"
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.
 
