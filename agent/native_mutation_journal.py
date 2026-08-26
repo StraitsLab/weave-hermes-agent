@@ -5,9 +5,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Optional
 
 _NAME = "native-operation-journal.json"
 _MAX_TERMINAL = 256
@@ -22,18 +21,12 @@ class NativeMutationJournal:
             hermes_home = get_hermes_home()
         self.directory = Path(hermes_home) / "memories"
         self.path = self.directory / _NAME
-        self.lock_path = self.directory / (_NAME + ".lock")
 
-    @contextmanager
-    def _locked(self) -> Iterator[None]:
-        import fcntl
+    def _locked(self):
+        from tools.memory_tool import MemoryStore
+
         self.directory.mkdir(parents=True, exist_ok=True)
-        with self.lock_path.open("a+") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        return MemoryStore._file_lock(self.path)
 
     def _read(self) -> list[Dict[str, Any]]:
         try:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 import pytest
 
@@ -20,6 +21,22 @@ def test_orphan_pending_fails_closed(tmp_path):
     journal.begin("op-1")
     with pytest.raises(RuntimeError, match="native_operation_in_doubt"):
         journal.begin("op-1")
+
+
+def test_journal_reuses_portable_memory_store_lock(tmp_path, monkeypatch):
+    from tools.memory_tool import MemoryStore
+
+    locked = []
+
+    @contextmanager
+    def portable_lock(path):
+        locked.append(path)
+        yield
+
+    monkeypatch.setattr(MemoryStore, "_file_lock", portable_lock)
+    journal = NativeMutationJournal(tmp_path)
+    journal.begin("op-portable")
+    assert locked == [journal.path]
 
 
 def test_failure_record_is_structured_and_content_free(tmp_path):

@@ -4183,7 +4183,7 @@ async def delete_learning_node(body: LearningNodeRef):
 
     def _run():
         with _profile_scope(body.profile):
-            manager = configured_memory_manager()
+            manager = configured_memory_manager(platform="desktop")
             try:
                 return delete_node(body.id, memory_manager=manager, operation_id=getattr(body, "operation_id", None))
             finally:
@@ -4203,7 +4203,7 @@ async def update_learning_node(body: LearningNodeEdit):
 
     def _run():
         with _profile_scope(body.profile):
-            manager = configured_memory_manager()
+            manager = configured_memory_manager(platform="desktop")
             try:
                 return edit_node(body.id, body.content, memory_manager=manager, operation_id=getattr(body, "operation_id", None))
             finally:

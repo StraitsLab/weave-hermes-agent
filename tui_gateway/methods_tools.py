@@ -1809,8 +1809,6 @@ def _(rid, params: dict) -> dict:
         manager = getattr(session.get("agent"), "_memory_manager", None) if session else None
         if not params.get("operation_id"):
             return _err(rid, 4001, "operation_id required")
-        if manager is None:
-            return _err(rid, 4001, "session memory manager unavailable")
         return _ok(rid, delete_node(str(params.get("id", "")), memory_manager=manager, operation_id=params.get("operation_id")))
     except Exception as exc:  # noqa: BLE001
         return _err(rid, 5000, f"learning.delete failed: {exc}")
@@ -1825,8 +1823,6 @@ def _(rid, params: dict) -> dict:
         manager = getattr(session.get("agent"), "_memory_manager", None) if session else None
         if not params.get("operation_id"):
             return _err(rid, 4001, "operation_id required")
-        if manager is None:
-            return _err(rid, 4001, "session memory manager unavailable")
         return _ok(rid, edit_node(str(params.get("id", "")), str(params.get("content", "")), memory_manager=manager, operation_id=params.get("operation_id")))
     except Exception as exc:  # noqa: BLE001
         return _err(rid, 5000, f"learning.edit failed: {exc}")

@@ -12,7 +12,7 @@ import json
 import pytest
 from agent.native_mutation_journal import NativeMutationJournal
 
-from agent.memory_manager import MemoryManager
+from agent.memory_manager import MemoryManager, configured_memory_manager
 from agent.memory_provider import MemoryProvider
 
 
@@ -30,7 +30,7 @@ class _RecordingProvider(MemoryProvider):
         return True
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        pass
+        self.initialized = {"session_id": session_id, **kwargs}
 
     def get_tool_schemas(self):
         return []
@@ -52,6 +52,48 @@ def _manager_with_provider():
     provider = _RecordingProvider()
     mgr.add_provider(provider)
     return mgr, provider
+
+
+def test_configured_manager_loads_and_initializes_active_provider(monkeypatch, tmp_path):
+    provider = _RecordingProvider()
+    monkeypatch.setattr("plugins.memory._get_active_memory_provider", lambda: "recording")
+    monkeypatch.setattr("plugins.memory.load_memory_provider", lambda name: provider)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "work")
+
+    manager = configured_memory_manager(session_id="session-1", platform="desktop")
+    result = manager.commit_native_mutation(
+        "op-configured", "add", "memory", "fact", lambda: {"success": True}
+    )
+
+    assert manager.providers == [provider]
+    assert result["provider_status"] == "acknowledged"
+    assert provider.calls[0]["metadata"]["operation_id"] == "op-configured"
+    assert provider.initialized == {
+        "session_id": "session-1",
+        "platform": "desktop",
+        "hermes_home": str(tmp_path),
+        "agent_context": "primary",
+        "agent_identity": "work",
+        "agent_workspace": "hermes",
+    }
+
+
+@pytest.mark.parametrize("provider", [None, _RecordingProvider()])
+def test_configured_manager_leaves_unavailable_provider_unconfigured(monkeypatch, provider):
+    monkeypatch.setattr("plugins.memory._get_active_memory_provider", lambda: "recording")
+    monkeypatch.setattr("plugins.memory.load_memory_provider", lambda name: provider)
+    if provider is not None:
+        monkeypatch.setattr(provider, "is_available", lambda: False)
+
+    manager = configured_memory_manager()
+    result = manager.commit_native_mutation(
+        "op-unavailable", "add", "memory", "fact", lambda: {"success": True}
+    )
+
+    assert manager.providers == []
+    assert result["provider_status"] == "not_configured"
+    assert result["provider_acknowledged"] is False
 
 
 def test_notifies_remove_with_old_text_after_success():

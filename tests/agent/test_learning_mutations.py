@@ -43,6 +43,13 @@ def test_parse_node_kind():
 def test_memory_mutation_without_manager_is_rejected(home):
     result = lm.edit_node("memory:memory:0", "should not write")
     assert result == {"ok": False, "message": "native memory manager unavailable"}
+    assert (home / "memories" / "MEMORY.md").read_text(encoding="utf-8").startswith("alpha note")
+
+
+def test_skill_mutation_without_manager_is_preserved(home):
+    result = lm.edit_node("my-skill", _SKILL.replace("Body.", "Updated."))
+    assert result["ok"] is True
+    assert "Updated." in (home / "skills" / "my-skill" / "SKILL.md").read_text(encoding="utf-8")
 
 
 

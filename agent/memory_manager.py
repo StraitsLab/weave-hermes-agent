@@ -47,9 +47,35 @@ _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
 
 
-def configured_memory_manager(*, native_journal=None) -> "MemoryManager":
+def configured_memory_manager(
+    *, native_journal=None, session_id: str = "", platform: str = "cli"
+) -> "MemoryManager":
     """Create the request-owned manager for an already-scoped profile."""
-    return MemoryManager(native_journal=native_journal)
+    from hermes_constants import get_hermes_home
+    from hermes_cli.profiles import get_active_profile_name
+    from plugins.memory import _get_active_memory_provider, load_memory_provider
+
+    manager = MemoryManager(native_journal=native_journal)
+    name = _get_active_memory_provider()
+    if not name:
+        return manager
+    try:
+        provider = load_memory_provider(name)
+        available = provider is not None and provider.is_available()
+    except Exception:
+        available = False
+    if not available:
+        return manager
+    manager.add_provider(provider)
+    manager.initialize_all(
+        session_id=session_id,
+        platform=platform,
+        hermes_home=str(get_hermes_home()),
+        agent_context="primary",
+        agent_identity=get_active_profile_name(),
+        agent_workspace="hermes",
+    )
+    return manager
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
