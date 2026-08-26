@@ -366,7 +366,7 @@ def test_deferred_build_closes_the_handle_when_the_session_is_reaped_midbuild(
 
     db = build_env.opened[0]
     assert db.closed == 1
-    assert session["agent"]._owns_session_db is False
+    assert session.get("agent") is None
 
 
 def test_deferred_build_never_opens_or_closes_for_the_launch_profile(
