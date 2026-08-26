@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
 
@@ -23,6 +23,10 @@ from agent.secret_scope import (
     build_profile_secret_scope,
     reset_secret_scope,
     set_secret_scope,
+)
+from agent.session_credential import (
+    SessionCredential as _SessionCredential,
+    parse_credential_expiry as _parse_credential_expiry,
 )
 from hermes_constants import (
     DEFAULT_INDICATOR_STYLE,
@@ -160,53 +164,6 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
-
-
-class _SessionCredential:
-    """One redacted, revocable callable bearer for a live session only."""
-
-    def __init__(self, bearer: str, expires_at: datetime) -> None:
-        self._lock = threading.Lock()
-        self._bearer = bearer
-        self._expires_at = expires_at
-        self._revoked = False
-
-    def __call__(self) -> str:
-        with self._lock:
-            if self._revoked or self._expires_at <= datetime.now(timezone.utc):
-                raise RuntimeError("credential unavailable")
-            return self._bearer
-
-    def refresh(self, bearer: str, expires_at: datetime) -> bool:
-        with self._lock:
-            if self._revoked or self._expires_at <= datetime.now(timezone.utc):
-                return False
-            self._bearer = bearer
-            self._expires_at = expires_at
-            return True
-
-    def revoke(self) -> None:
-        with self._lock:
-            self._revoked = True
-            self._bearer = ""
-
-    def __repr__(self) -> str:
-        return "<SessionCredential redacted>"
-
-
-_CREDENTIAL_EXPIRY_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
-)
-
-
-def _parse_credential_expiry(value: object) -> datetime | None:
-    if not isinstance(value, str) or not _CREDENTIAL_EXPIRY_RE.fullmatch(value):
-        return None
-    try:
-        expires_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return expires_at if expires_at > datetime.now(timezone.utc) else None
 
 
 def _trusted_controller() -> bool:

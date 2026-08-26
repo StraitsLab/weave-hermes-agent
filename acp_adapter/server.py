@@ -25,6 +25,7 @@ from acp.schema import (
     AvailableCommandsUpdate,
     BlobResourceContents,
     ClientCapabilities,
+    CloseSessionResponse,
     EmbeddedResourceContentBlock,
     ForkSessionResponse,
     ImageContentBlock,
@@ -74,6 +75,7 @@ from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
 from acp_adapter.tools import build_tool_complete, build_tool_start
+from agent.session_credential import parse_credential_expiry
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
@@ -670,12 +672,16 @@ class HermesACPAgent(acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        self._credential_transport_authenticated = False
 
     # ---- Connection lifecycle -----------------------------------------------
 
     def on_connect(self, conn: acp.Client) -> None:
         """Store the client connection for sending session updates."""
+        if self._conn is not None and self._conn is not conn:
+            self.session_manager.revoke_live_credentials()
         self._conn = conn
+        self._credential_transport_authenticated = False
         logger.info("ACP client connected")
 
 
@@ -1311,7 +1317,7 @@ class HermesACPAgent(acp.Agent):
             resolved_protocol_version,
         )
 
-        return InitializeResponse(
+        response = InitializeResponse(
             protocol_version=acp.PROTOCOL_VERSION,
             agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
             agent_capabilities=AgentCapabilities(
@@ -1325,6 +1331,8 @@ class HermesACPAgent(acp.Agent):
             ),
             auth_methods=auth_methods,
         )
+        self._credential_transport_authenticated = self._conn is not None
+        return response
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
         # Only accept authenticate() calls whose method_id matches the
@@ -1348,7 +1356,38 @@ class HermesACPAgent(acp.Agent):
             return None
         return AuthenticateResponse()
 
+    async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle the private, connection-bound ACP credential extension."""
+        unavailable = {"error": "credential unavailable"}
+        if method != "session/credential/bind" or not self._credential_transport_authenticated:
+            return unavailable
+        if not isinstance(params, dict):
+            return unavailable
+        session_id = params.get("session_id")
+        credential_slot = params.get("credential_slot")
+        bearer = params.get("bearer")
+        revision = params.get("provider_route_revision_id")
+        expires_at = parse_credential_expiry(params.get("expires_at"))
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or credential_slot != "GATE_B_API_KEY"
+            or not isinstance(bearer, str)
+            or not bearer
+            or not isinstance(revision, str)
+            or not revision
+            or expires_at is None
+        ):
+            return unavailable
+        if not self.session_manager.bind_credential(session_id, bearer, expires_at, revision):
+            return unavailable
+        return {"status": "ready", "credential_slot": credential_slot}
+
     # ---- Session management -------------------------------------------------
+
+    async def close_session(self, session_id: str, **kwargs: Any) -> CloseSessionResponse:
+        self.session_manager.remove_session(session_id)
+        return CloseSessionResponse()
 
     @staticmethod
     def _flatten_history_text(value: Any) -> str:
