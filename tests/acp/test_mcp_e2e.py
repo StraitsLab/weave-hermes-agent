@@ -71,7 +71,7 @@ class TestMcpRegistrationE2E:
 
         registered_configs = {}
 
-        def mock_register(config_map):
+        def mock_register(owner_id, config_map):
             registered_configs.update(config_map)
             return ["mcp_test_fs_read", "mcp_test_fs_write", "mcp_test_api_search"]
 
@@ -82,7 +82,7 @@ class TestMcpRegistrationE2E:
             {"function": {"name": "terminal"}},
         ]
 
-        with patch("tools.mcp_tool.register_mcp_servers", side_effect=mock_register), \
+        with patch("tools.mcp_tool.acquire_session_mcp_servers", side_effect=mock_register), \
              patch("model_tools.get_tool_definitions", return_value=fake_tools):
             resp = await acp_agent.new_session(cwd="/tmp", mcp_servers=servers)
 
@@ -211,13 +211,13 @@ class TestMcpSanitizationE2E:
         ]
 
         registered_configs = {}
-        def mock_register(config_map):
+        def mock_register(owner_id, config_map):
             registered_configs.update(config_map)
             return ["mcp_ai_exa_exa_search"]
 
         fake_tools = [{"function": {"name": "mcp_ai_exa_exa_search"}}]
 
-        with patch("tools.mcp_tool.register_mcp_servers", side_effect=mock_register), \
+        with patch("tools.mcp_tool.acquire_session_mcp_servers", side_effect=mock_register), \
              patch("model_tools.get_tool_definitions", return_value=fake_tools):
             resp = await acp_agent.new_session(cwd="/tmp", mcp_servers=servers)
 
@@ -244,7 +244,7 @@ class TestSessionLifecycleMcpE2E:
         ]
 
         registered = {}
-        def mock_register(config_map):
+        def mock_register(owner_id, config_map):
             registered.update(config_map)
             return []
 
@@ -254,7 +254,7 @@ class TestSessionLifecycleMcpE2E:
         state.agent.tools = []
         state.agent.valid_tool_names = set()
 
-        with patch("tools.mcp_tool.register_mcp_servers", side_effect=mock_register), \
+        with patch("tools.mcp_tool.acquire_session_mcp_servers", side_effect=mock_register), \
              patch("model_tools.get_tool_definitions", return_value=[]):
             await acp_agent.load_session(cwd="/tmp", session_id=sid, mcp_servers=servers)
 
@@ -271,7 +271,7 @@ class TestSessionLifecycleMcpE2E:
         ]
 
         registered = {}
-        def mock_register(config_map):
+        def mock_register(owner_id, config_map):
             registered.update(config_map)
             return []
 
@@ -281,7 +281,7 @@ class TestSessionLifecycleMcpE2E:
         state.agent.tools = []
         state.agent.valid_tool_names = set()
 
-        with patch("tools.mcp_tool.register_mcp_servers", side_effect=mock_register), \
+        with patch("tools.mcp_tool.acquire_session_mcp_servers", side_effect=mock_register), \
              patch("model_tools.get_tool_definitions", return_value=[]):
             await acp_agent.resume_session(cwd="/tmp", session_id=sid, mcp_servers=servers)
 
@@ -298,12 +298,12 @@ class TestSessionLifecycleMcpE2E:
         ]
 
         registered = {}
-        def mock_register(config_map):
+        def mock_register(owner_id, config_map):
             registered.update(config_map)
             return []
 
         # Need to set up the forked session's agent too
-        with patch("tools.mcp_tool.register_mcp_servers", side_effect=mock_register), \
+        with patch("tools.mcp_tool.acquire_session_mcp_servers", side_effect=mock_register), \
              patch("model_tools.get_tool_definitions", return_value=[]):
             fork_resp = await acp_agent.fork_session(
                 cwd="/tmp", session_id=sid, mcp_servers=servers

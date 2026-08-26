@@ -6,9 +6,11 @@ import asyncio
 from datetime import datetime, timezone
 import base64
 import contextvars
+import ipaddress
 import json
 import logging
 import os
+import re
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -34,6 +36,7 @@ from acp.schema import (
     InitializeResponse,
     ListSessionsResponse,
     LoadSessionResponse,
+    McpCapabilities,
     McpServerHttp,
     McpServerSse,
     McpServerStdio,
@@ -1134,44 +1137,108 @@ class HermesACPAgent(acp.Agent):
         state: SessionState,
         mcp_servers: list[McpServerStdio | McpServerHttp | McpServerSse] | None,
     ) -> None:
-        """Register ACP-provided MCP servers and refresh the agent tool surface."""
-        if not mcp_servers:
+        """Replace one ACP session's transient MCP ownership, fail closed."""
+        if mcp_servers is None:
             return
+        old_names = set(state.mcp_server_names)
+        new_names: set[str] = set()
 
         try:
-            from tools.mcp_tool import register_mcp_servers
+            from tools.mcp_tool import (
+                acquire_session_mcp_servers,
+                release_session_mcp_servers,
+                session_mcp_server_names,
+            )
 
             config_map: dict[str, dict] = {}
             for server in mcp_servers:
-                name = server.name
+                name = str(server.name)
+                invalid_name = not name or name != name.strip() or name in config_map
+                if invalid_name or any(ord(char) < 32 or ord(char) == 127 for char in name):
+                    raise ValueError("invalid MCP server name")
                 if isinstance(server, McpServerStdio):
                     config = {
                         "command": server.command,
                         "args": list(server.args),
                         "env": {item.name: item.value for item in server.env},
                     }
-                else:
+                elif isinstance(server, McpServerHttp):
+                    parsed = urlparse(server.url)
+                    endpoint_parts = (parsed.scheme.lower(), parsed.hostname, parsed.username,
+                                      parsed.password, parsed.fragment)
+                    if endpoint_parts[0] not in {"http", "https"} or not endpoint_parts[1] or any(endpoint_parts[2:]) or any(ord(char) < 32 or ord(char) == 127 for char in server.url):
+                        raise ValueError("invalid HTTP MCP endpoint")
+                    if parsed.scheme.lower() == "http":
+                        host = parsed.hostname.lower()
+                        try:
+                            loopback = ipaddress.ip_address(host).is_loopback
+                        except ValueError:
+                            loopback = host == "localhost"
+                        if not loopback:
+                            raise ValueError("cleartext HTTP MCP must be loopback")
+                    headers: dict[str, str] = {}
+                    header_names: set[str] = set()
+                    reserved = {
+                        "accept", "connection", "content-length", "content-type",
+                        "host", "mcp-protocol-version", "proxy-authorization", "transfer-encoding",
+                    }
+                    for item in server.headers:
+                        header_name = item.name.strip()
+                        lowered = header_name.lower()
+                        valid_name = re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", header_name)
+                        if (not valid_name or lowered in reserved or lowered in header_names
+                                or "\r" in item.value or "\n" in item.value):
+                            raise ValueError("invalid HTTP MCP header")
+                        header_names.add(lowered)
+                        headers[header_name] = item.value
                     config = {
                         "url": server.url,
-                        "headers": {item.name: item.value for item in server.headers},
+                        "headers": headers,
+                        "strict_redirect_headers": True,
+                        "skip_preflight": True,
                     }
+                else:
+                    raise ValueError("unsupported MCP transport")
                 config_map[name] = config
 
-            await asyncio.to_thread(register_mcp_servers, config_map)
-        except Exception:
-            logger.warning(
-                "Session %s: failed to register ACP MCP servers",
-                state.session_id,
-                exc_info=True,
+            new_names = set(config_map)
+            if old_names and new_names and new_names != old_names:
+                raise ValueError("replace MCP servers with [] before changing descriptors")
+            await asyncio.to_thread(
+                acquire_session_mcp_servers, state.session_id, config_map
             )
-            return
+        except Exception:
+            try:
+                orphaned = session_mcp_server_names(state.session_id) - old_names
+                state.mcp_server_names.update(orphaned)
+            except Exception:
+                logger.warning("Session %s: ACP MCP rollback incomplete", state.session_id)
+                raise RuntimeError(
+                    f"MCP rollback incomplete; retry close for session {state.session_id}"
+                ) from None
+            logger.warning(
+                "Session %s: ACP MCP registration failed",
+                state.session_id,
+            )
+            if orphaned:
+                raise RuntimeError(
+                    f"MCP rollback incomplete; retry close for session {state.session_id}"
+                ) from None
+            raise RuntimeError("MCP server registration failed") from None
 
+        state.mcp_server_names.update(new_names)
+        previous_surface = tuple(getattr(state.agent, name, None) for name in
+                                 ("enabled_toolsets", "tools", "valid_tool_names"))
         try:
             from model_tools import get_tool_definitions
             from agent.memory_manager import inject_memory_provider_tools
 
+            old_toolsets = {f"mcp-{name}" for name in old_names}
+            base_toolsets = [name for name in (
+                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+            ) if name not in old_toolsets]
             enabled_toolsets = _expand_acp_enabled_toolsets(
-                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
+                base_toolsets,
                 mcp_server_names=[server.name for server in mcp_servers],
             )
             state.agent.enabled_toolsets = enabled_toolsets
@@ -1194,11 +1261,36 @@ class HermesACPAgent(acp.Agent):
                 len(state.agent.tools or []),
             )
         except Exception:
+            (state.agent.enabled_toolsets, state.agent.tools, state.agent.valid_tool_names) = previous_surface
+            try:
+                await asyncio.to_thread(
+                    release_session_mcp_servers,
+                    state.session_id,
+                    names=new_names - old_names,
+                )
+            except Exception:
+                logger.warning("Session %s: ACP MCP rollback incomplete", state.session_id)
+                raise RuntimeError(
+                    f"MCP rollback incomplete; retry close for session {state.session_id}"
+                ) from None
+            state.mcp_server_names.difference_update(new_names - old_names)
             logger.warning(
-                "Session %s: failed to refresh tool surface after ACP MCP registration",
+                "Session %s: ACP MCP tool refresh failed",
                 state.session_id,
-                exc_info=True,
             )
+            raise RuntimeError("MCP tool refresh failed") from None
+
+        removed = old_names - new_names
+        if removed:
+            try:
+                await asyncio.to_thread(
+                    release_session_mcp_servers, state.session_id, names=removed
+                )
+            except Exception:
+                (state.agent.enabled_toolsets, state.agent.tools,
+                 state.agent.valid_tool_names) = previous_surface
+                raise RuntimeError("MCP server replacement failed") from None
+        state.mcp_server_names = new_names
 
     def _schedule_mcp_late_refresh(self, state: SessionState) -> None:
         """Refresh the agent's tool snapshot when background MCP discovery lands late.
@@ -1316,12 +1408,14 @@ class HermesACPAgent(acp.Agent):
             client_name,
             resolved_protocol_version,
         )
+        from tools.mcp_tool import supports_session_http_mcp
 
         response = InitializeResponse(
             protocol_version=acp.PROTOCOL_VERSION,
             agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
             agent_capabilities=AgentCapabilities(
                 load_session=True,
+                mcp_capabilities=McpCapabilities(http=supports_session_http_mcp()),
                 prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(
                     fork=SessionForkCapabilities(),
@@ -1392,6 +1486,27 @@ class HermesACPAgent(acp.Agent):
     # ---- Session management -------------------------------------------------
 
     async def close_session(self, session_id: str, **kwargs: Any) -> CloseSessionResponse:
+        state = self.session_manager.get_session(session_id)
+        if state is not None:
+            with state.runtime_lock:
+                state.closing = True
+                state.queued_prompts.clear()
+            await self.cancel(session_id)
+            for _ in range(100):
+                with state.runtime_lock:
+                    running = state.is_running
+                if not running:
+                    break
+                await asyncio.sleep(0.05)
+            if running:
+                raise RuntimeError("ACP session close timed out")
+            try:
+                from tools.mcp_tool import release_session_mcp_servers
+
+                await asyncio.to_thread(release_session_mcp_servers, session_id)
+            except Exception:
+                logger.warning("Session %s: ACP MCP release failed", session_id)
+                raise RuntimeError("MCP server release failed") from None
         self.session_manager.remove_session(session_id)
         return CloseSessionResponse()
 
@@ -1640,7 +1755,15 @@ class HermesACPAgent(acp.Agent):
         **kwargs: Any,
     ) -> NewSessionResponse:
         state = self.session_manager.create_session(cwd=cwd)
-        await self._register_session_mcp_servers(state, mcp_servers)
+        try:
+            await self._register_session_mcp_servers(state, mcp_servers)
+        except Exception:
+            if state.mcp_server_names:
+                raise RuntimeError(
+                    f"MCP rollback incomplete; retry close for session {state.session_id}"
+                ) from None
+            self.session_manager.remove_session(state.session_id)
+            raise
         self._schedule_mcp_late_refresh(state)
         logger.info("New session %s (cwd=%s)", state.session_id, cwd)
         self._schedule_available_commands_update(state.session_id)
@@ -1843,6 +1966,9 @@ class HermesACPAgent(acp.Agent):
         if state is None:
             logger.error("prompt: session %s not found", session_id)
             return PromptResponse(stop_reason="refusal")
+        with state.runtime_lock:
+            if state.closing:
+                return PromptResponse(stop_reason="refusal")
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
@@ -1925,6 +2051,8 @@ class HermesACPAgent(acp.Agent):
         redirected = False
         queued_depth: int | None = None
         with state.runtime_lock:
+            if state.closing:
+                return PromptResponse(stop_reason="refusal")
             if state.is_running:
                 if (
                     text_only_prompt
