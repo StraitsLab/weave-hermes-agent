@@ -48,11 +48,36 @@ def test_failure_record_is_structured_and_content_free(tmp_path):
         "success": False,
         "operation_id": "op-1",
         "error": "native_mutation_failed",
-        "detail": "writer exploded",
     }
     raw = json.loads((tmp_path / "memories" / "native-operation-journal.json").read_text())
     assert raw["records"][0]["operation_id"] == "op-1"
     assert "content" not in raw["records"][0]
+
+
+def test_hostile_terminal_result_is_compact_in_replay_and_bytes(tmp_path):
+    sentinel = "HOSTILE MEMORY TEXT"
+    journal = NativeMutationJournal(tmp_path)
+    journal.begin("op-hostile")
+    journal.complete("op-hostile", {
+        "success": False,
+        "operation_id": "op-hostile",
+        "status": "conflict",
+        "revision": 9,
+        "error": sentinel,
+        "current_entries": [sentinel],
+        "message": sentinel,
+        "provider_status": "failed",
+    })
+
+    assert journal.begin("op-hostile") == {
+        "success": False,
+        "operation_id": "op-hostile",
+        "revision": 9,
+        "status": "conflict",
+        "provider_status": "failed",
+        "error": "native_mutation_failed",
+    }
+    assert sentinel not in journal.path.read_text(encoding="utf-8")
 
 
 def test_corrupt_journal_fails_closed_without_overwriting(tmp_path):
@@ -72,3 +97,22 @@ def test_terminal_records_are_bounded(tmp_path):
         journal.complete(op, {"success": True, "operation_id": op})
     payload = json.loads((tmp_path / "memories" / "native-operation-journal.json").read_text())
     assert len(payload["records"]) == 256
+
+
+@pytest.mark.windows_only
+def test_windows_journal_lifecycle_skips_directory_descriptor(tmp_path, monkeypatch):
+    real_open = __import__("os").open
+    def reject_directory_open(path, flags, *args, **kwargs):
+        if path == tmp_path / "memories":
+            raise AssertionError("Windows journal must not open the directory")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr("agent.native_mutation_journal.os.open", reject_directory_open)
+    journal = NativeMutationJournal(tmp_path)
+    assert journal.begin("op-windows") is None
+    journal.complete("op-windows", {"success": True, "revision": 11})
+    assert journal.begin("op-windows") == {
+        "success": True,
+        "operation_id": "op-windows",
+        "revision": 11,
+    }

@@ -1175,8 +1175,9 @@ class MemoryManager:
                         result["provider_status"] = "acknowledged"
                 except Exception:
                     result["provider_acknowledged"] = False
+                    result["provider_status"] = "failed"
             if self._native_journal is not None:
-                self._native_journal.complete(operation_id, result)
+                result = self._native_journal.complete(operation_id, result)
             with self._native_lock:
                 self._native_completed[operation_id] = dict(result)
             return result
@@ -1185,7 +1186,7 @@ class MemoryManager:
                 result = {"success": False, "operation_id": operation_id, "error": str(exc)}
             else:
                 result = {"success": False, "operation_id": operation_id,
-                          "error": "native_mutation_failed", "detail": str(exc)}
+                          "error": "native_mutation_failed"}
                 if self._native_journal is not None:
                     self._native_journal.fail(operation_id, str(exc))
             with self._native_lock:
@@ -1193,7 +1194,7 @@ class MemoryManager:
             return result
         except Exception as exc:
             result = {"success": False, "operation_id": operation_id,
-                      "error": "native_mutation_failed", "detail": str(exc)}
+                      "error": "native_mutation_failed"}
             try:
                 if self._native_journal is not None:
                     self._native_journal.fail(operation_id, str(exc))
