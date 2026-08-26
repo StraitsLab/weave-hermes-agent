@@ -2495,8 +2495,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
-            _activate_session_credential(current, agent)
-            current["agent"] = agent
+            with _sessions_lock:
+                if _sessions.get(sid) is not current:
+                    if hasattr(agent, "close"):
+                        agent.close()
+                    return
+                _activate_session_credential(current, agent)
+                current["agent"] = agent
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
