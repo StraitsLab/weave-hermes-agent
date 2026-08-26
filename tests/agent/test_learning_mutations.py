@@ -40,6 +40,11 @@ def test_parse_node_kind():
     assert lm.parse_node_kind("debugging-hermes") == "skill"
 
 
+def test_memory_mutation_without_manager_is_rejected(home):
+    result = lm.edit_node("memory:memory:0", "should not write")
+    assert result == {"ok": False, "message": "native memory manager unavailable"}
+
+
 
 
 
@@ -47,7 +52,14 @@ def test_parse_node_kind():
 
 
 def test_edit_memory_replaces_chunk(home):
-    assert lm.edit_node("memory:profile:2", "rewritten profile")["ok"]
+    from agent.memory_manager import MemoryManager
+
+    manager = MemoryManager()
+    try:
+        result = lm.edit_node("memory:profile:2", "rewritten profile", memory_manager=manager, operation_id="edit-profile")
+    finally:
+        manager.shutdown_all()
+    assert result["ok"]
     assert (home / "memories" / "USER.md").read_text(encoding="utf-8").strip() == "rewritten profile"
 
 
@@ -85,7 +97,14 @@ def test_memory_writes_match_memory_tool_format(home):
     surfaces never fight over format and indices stay aligned."""
     from tools.memory_tool import ENTRY_DELIMITER, MemoryStore
 
-    assert lm.edit_node("memory:memory:0", "alpha rewritten")["ok"]
+    from agent.memory_manager import MemoryManager
+
+    manager = MemoryManager()
+    try:
+        result = lm.edit_node("memory:memory:0", "alpha rewritten", memory_manager=manager, operation_id="edit-memory")
+    finally:
+        manager.shutdown_all()
+    assert result["ok"]
     path = home / "memories" / "MEMORY.md"
     entries = MemoryStore._read_file(path)
 

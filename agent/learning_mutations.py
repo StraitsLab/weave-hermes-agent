@@ -142,6 +142,8 @@ def _delete_skill(name: str) -> dict[str, Any]:
 
 
 def _delete_memory(node_id: str, *, memory_manager=None, operation_id: str | None = None) -> dict[str, Any]:
+    if memory_manager is None:
+        return {"ok": False, "message": "native memory manager unavailable"}
     source, gidx = _parse_memory_id(node_id)
     path, old_text = _prepare_memory_mutation(source, gidx)
 
@@ -192,6 +194,8 @@ def _edit_skill(name: str, content: str) -> dict[str, Any]:
 
 
 def _edit_memory(node_id: str, content: str, *, memory_manager=None, operation_id: str | None = None) -> dict[str, Any]:
+    if memory_manager is None:
+        return {"ok": False, "message": "native memory manager unavailable"}
     source, gidx = _parse_memory_id(node_id)
     body = content.strip()
     if not body:

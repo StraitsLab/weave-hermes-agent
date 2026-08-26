@@ -1,4 +1,5 @@
 import { Box, NoSelect, ScrollBox, type ScrollBoxHandle, Text, useInput, useStdout } from '@hermes/ink'
+import { randomUUID } from 'node:crypto'
 import { useEffect, useRef, useState } from 'react'
 
 import type { GatewayClient } from '../gatewayClient.js'
@@ -64,6 +65,7 @@ interface FramesResponse {
 interface JourneyProps {
   gw: GatewayClient
   onClose: () => void
+  sid: string | null
   t: Theme
 }
 
@@ -133,7 +135,7 @@ function ListRow({ active, cells, t }: { active: boolean; cells: Cell[]; t: Them
   )
 }
 
-export function Journey({ gw, onClose, t }: JourneyProps) {
+export function Journey({ gw, onClose, sid, t }: JourneyProps) {
   const { stdout } = useStdout()
   const cols = Math.max(40, (stdout?.columns ?? 90) - 3)
   const rows = Math.max(16, (stdout?.rows ?? 30) - 2)
@@ -190,7 +192,8 @@ export function Journey({ gw, onClose, t }: JourneyProps) {
     }
 
     setBusy(true)
-    gw.request<MutationResult>('learning.delete', { id: node.id })
+    const params = { id: node.id, session_id: sid, operation_id: randomUUID() }
+    gw.request<MutationResult>('learning.delete', params)
       .then(res => {
         setNotice(res.message)
 
@@ -228,7 +231,8 @@ export function Journey({ gw, onClose, t }: JourneyProps) {
         return setNotice('no changes')
       }
 
-      const res = await gw.request<MutationResult>('learning.edit', { content: edited, id: node.id })
+      const params = { content: edited, id: node.id, session_id: sid, operation_id: randomUUID() }
+      const res = await gw.request<MutationResult>('learning.edit', params)
       setNotice(res.message)
 
       if (res.ok) {
