@@ -25,7 +25,6 @@ from agent.codex_responses_adapter import _normalize_codex_response
 import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
-from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 
@@ -1546,7 +1545,8 @@ class TestExecuteToolCalls:
         tool_results = [m for m in messages if m["role"] == "tool"]
         assert [m["tool_call_id"] for m in tool_results] == ["c1", "c2"]
 
-    def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
+    def test_sequential_memory_remove_uses_live_manager_boundary(self, agent_with_memory_tool):
+        agent = agent_with_memory_tool
         old_text = "stale preference entry"
         tc = _mock_tool_call(
             name="memory",
@@ -1559,27 +1559,22 @@ class TestExecuteToolCalls:
         )
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
         messages = []
-        calls = []
-
-        class FakeMemoryManager(MemoryManager):
-            def has_tool(self, tool_name):
-                return False
-
-            def on_memory_write(self, action, target, content, metadata=None):
-                calls.append((action, target, content, metadata or {}))
-
-        agent._memory_manager = FakeMemoryManager()
-        agent._memory_store = object()
-
-        with patch("tools.memory_tool.memory_tool", return_value=json.dumps({"success": True})):
+        tool_result = {"success": True, "operation_id": "mem-1"}
+        with patch("tools.memory_tool.memory_tool", return_value=tool_result) as memory_tool:
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
-        assert len(calls) == 1
-        action, target, content, metadata = calls[0]
-        assert (action, target, content) == ("remove", "memory", "")
-        assert metadata["old_text"] == old_text
-        assert metadata["tool_call_id"] == "mem-1"
+        memory_tool.assert_called_once_with(
+            action="remove",
+            target="memory",
+            content=None,
+            old_text=old_text,
+            operations=None,
+            store=agent._memory_store,
+            memory_manager=agent._memory_manager,
+            operation_id="mem-1",
+        )
         assert messages[-1]["tool_call_id"] == "mem-1"
+        assert messages[-1]["content"] == tool_result
 
     def test_keyboard_interrupt_emits_cancelled_post_tool_hook(self, agent, monkeypatch):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
