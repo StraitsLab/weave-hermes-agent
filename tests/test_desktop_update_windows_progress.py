@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 import pytest
@@ -26,9 +27,23 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 WINDOWS_UPDATE_PS1 = REPO_ROOT / "scripts" / "desktop-update" / "windows.ps1"
 
 
-def _read_progress(url: str) -> dict[str, object]:
-    with urlopen(f"{url}progress", timeout=5) as response:
+def _read_progress(url: str, *, timeout: float = 5) -> dict[str, object]:
+    with urlopen(f"{url}progress", timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _wait_for_progress(url: str, process: subprocess.Popen, output_path: Path) -> dict[str, object]:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            pytest.fail(output_path.read_text(encoding="utf-8", errors="replace"))
+        try:
+            return _read_progress(url, timeout=1)
+        except HTTPError:
+            raise
+        except (TimeoutError, URLError):
+            time.sleep(0.1)
+    pytest.fail(output_path.read_text(encoding="utf-8", errors="replace"))
 
 
 def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None:
@@ -39,7 +54,7 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
     env = os.environ.copy()
     env["TEMP"] = str(tmp_path)
     env["TMP"] = str(tmp_path)
-    env["HERMES_SELFTEST_HOLD_SECONDS"] = "4"
+    env["HERMES_SELFTEST_HOLD_SECONDS"] = "15"
 
     with output_path.open("wb") as output:
         process = subprocess.Popen(
@@ -72,7 +87,7 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
             time.sleep(0.1)
 
         assert shim_url, output_path.read_text(encoding="utf-8", errors="replace")
-        first = _read_progress(shim_url)
+        first = _wait_for_progress(shim_url, process, output_path)
         time.sleep(1.5)
         second = _read_progress(shim_url)
 
