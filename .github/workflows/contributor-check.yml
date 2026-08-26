@@ -2,6 +2,10 @@ name: Contributor Attribution Check
 
 on:
   workflow_call:
+    inputs:
+      base_sha:
+        required: true
+        type: string
     outputs:
       review_status:
         description: "JSON array of review status objects"
@@ -23,12 +27,17 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          if [ -z "$BASE_SHA" ] || ! git cat-file -e "${BASE_SHA}^{commit}" ||
+             ! git merge-base --is-ancestor "$BASE_SHA" HEAD; then
+            echo "Invalid contributor audit base: $BASE_SHA"
+            exit 1
+          fi
 
           # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          NEW_EMAILS=$(git log "${BASE_SHA}..HEAD" --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."
@@ -68,7 +77,7 @@ jobs:
             echo -e "$MISSING"
             echo ""
             echo "Add a mapping file (do NOT edit AUTHOR_MAP in release.py):"
-            echo "  python3 scripts/audit_pr_attribution.py --fix   # auto-resolve + create files"
+            echo "  python3 scripts/audit_pr_attribution.py --base-ref ${BASE_SHA} --fix"
             echo "or manually:"
             echo -e "$MISSING" | while read -r line; do
               email=$(echo "$line" | sed 's/^ *//' | cut -d' ' -f1)
@@ -81,7 +90,7 @@ jobs:
 
             # Emit review_status for unmapped emails
             DETAIL=$(echo -e "$MISSING" | sed '/^$/d; s/^  //')
-            HOW_TO_FIX=$'Run from the PR branch:\n```\npython3 scripts/audit_pr_attribution.py --fix\ngit add contributors && git commit -m "chore: map contributor emails" && git push\n```\nOr map one email manually (do NOT edit AUTHOR_MAP in release.py):\n```\npython3 scripts/add_contributor.py <email> <github-username>\n```\nTo find the GitHub username for an email:\n```\ngh api \'search/users?q=EMAIL+in:email\' --jq \'.items[0].login\'\n```\n'
+            HOW_TO_FIX=$'Run from the PR branch:\n```\npython3 scripts/audit_pr_attribution.py --base-ref <PR_BASE_SHA> --fix\ngit add contributors && git commit -m "chore: map contributor emails" && git push\n```\nOr map one email manually (do NOT edit AUTHOR_MAP in release.py):\n```\npython3 scripts/add_contributor.py <email> <github-username>\n```\nTo find the GitHub username for an email:\n```\ngh api \'search/users?q=EMAIL+in:email\' --jq \'.items[0].login\'\n```\n'
             REVIEW_STATUS=$(jq -nc \
               --arg detail "$DETAIL" \
               --arg how_to_fix "$HOW_TO_FIX" \
