@@ -145,3 +145,16 @@ def test_native_writer_failure_is_replayable_without_keyerror(tmp_path):
     assert first == second
     assert first["error"] == "native_mutation_failed"
     assert calls == [1]
+
+
+def test_same_thread_reentry_returns_content_free_result(tmp_path):
+    from agent.native_mutation_journal import NativeMutationJournal
+
+    mgr = MemoryManager(native_journal=NativeMutationJournal(tmp_path))
+
+    def write():
+        return mgr.commit_native_mutation("op-reentrant", "add", "memory", "secret", write)
+
+    result = mgr.commit_native_mutation("op-reentrant", "add", "memory", "secret", write)
+    assert result["error"] == "native_operation_reentrant"
+    assert "content" not in result

@@ -281,12 +281,12 @@ class CuratorPause(BaseModel):
 class LearningNodeRef(BaseModel):
     id: str
     profile: Optional[str] = None
-    operation_id: Optional[str] = None
+    operation_id: str
 
     @field_validator("operation_id")
     @classmethod
-    def _validate_operation_id(cls, value: Optional[str]) -> Optional[str]:
-        if value is not None and not value.strip():
+    def _validate_operation_id(cls, value: str) -> str:
+        if not value.strip():
             raise ValueError("operation_id must not be blank")
         return value
 
@@ -295,12 +295,12 @@ class LearningNodeEdit(BaseModel):
     id: str
     content: str
     profile: Optional[str] = None
-    operation_id: Optional[str] = None
+    operation_id: str
 
     @field_validator("operation_id")
     @classmethod
-    def _validate_operation_id(cls, value: Optional[str]) -> Optional[str]:
-        if value is not None and not value.strip():
+    def _validate_operation_id(cls, value: str) -> str:
+        if not value.strip():
             raise ValueError("operation_id must not be blank")
         return value
 

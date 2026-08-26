@@ -38,6 +38,15 @@ def test_failure_record_is_structured_and_content_free(tmp_path):
     assert "content" not in raw["records"][0]
 
 
+def test_corrupt_journal_fails_closed_without_overwriting(tmp_path):
+    journal = NativeMutationJournal(tmp_path)
+    journal.directory.mkdir(parents=True, exist_ok=True)
+    journal.path.write_text("{broken", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="native_operation_in_doubt"):
+        journal.begin("op-1")
+    assert journal.path.read_text(encoding="utf-8") == "{broken"
+
+
 def test_terminal_records_are_bounded(tmp_path):
     journal = NativeMutationJournal(tmp_path)
     for i in range(300):

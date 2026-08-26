@@ -254,6 +254,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
 def _cmd_delete(args: argparse.Namespace) -> int:
     from agent.learning_mutations import delete_node, node_detail
     from agent.memory_manager import configured_memory_manager
+    import uuid
 
     detail = node_detail(args.node)
     if not detail.get("ok"):
@@ -269,7 +270,7 @@ def _cmd_delete(args: argparse.Namespace) -> int:
             return 1
     manager = configured_memory_manager()
     try:
-        res = delete_node(args.node, memory_manager=manager)
+        res = delete_node(args.node, memory_manager=manager, operation_id=uuid.uuid4().hex)
     finally:
         manager.shutdown_all()
     print(f"  {res['message']}")
@@ -279,6 +280,7 @@ def _cmd_delete(args: argparse.Namespace) -> int:
 def _cmd_edit(args: argparse.Namespace) -> int:
     from agent.learning_mutations import edit_node, node_detail
     from agent.memory_manager import configured_memory_manager
+    import uuid
 
     detail = node_detail(args.node)
     if not detail.get("ok"):
@@ -291,7 +293,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         return 0
     manager = configured_memory_manager()
     try:
-        res = edit_node(args.node, edited, memory_manager=manager)
+        res = edit_node(args.node, edited, memory_manager=manager, operation_id=uuid.uuid4().hex)
     finally:
         manager.shutdown_all()
     print(f"  {res['message']}")

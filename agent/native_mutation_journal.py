@@ -38,10 +38,17 @@ class NativeMutationJournal:
     def _read(self) -> list[Dict[str, Any]]:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-            records = payload.get("records", [])
-            return records if isinstance(records, list) else []
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        except FileNotFoundError:
             return []
+        except (json.JSONDecodeError, OSError) as exc:
+            raise RuntimeError("native_operation_in_doubt") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
+            raise RuntimeError("native_operation_in_doubt")
+        records = payload["records"]
+        if not all(isinstance(record, dict) and isinstance(record.get("operation_id"), str)
+                   and record.get("status") in {"pending", "completed"} for record in records):
+            raise RuntimeError("native_operation_in_doubt")
+        return records
 
     def _write(self, records: list[Dict[str, Any]]) -> None:
         payload = json.dumps({"records": records}, separators=(",", ":"), sort_keys=True)

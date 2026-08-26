@@ -143,11 +143,19 @@ def _delete_skill(name: str) -> dict[str, Any]:
 
 def _delete_memory(node_id: str, *, memory_manager=None, operation_id: str | None = None) -> dict[str, Any]:
     source, gidx = _parse_memory_id(node_id)
-    path, chunks, local = _locate_memory(source, gidx)
+    path, old_text = _prepare_memory_mutation(source, gidx)
 
-    old_text = chunks[local]
-    del chunks[local]
-    writer = lambda: (_write_memory(path, chunks) or {"success": True, "revision": path.stat().st_mtime_ns})
+    def writer():
+        from tools.memory_tool import MemoryStore
+        with MemoryStore._file_lock(path):
+            chunks = MemoryStore._read_file(path)
+            local = _memory_local_index(source, gidx)
+            if not 0 <= local < len(chunks) or chunks[local] != old_text:
+                return {"success": False, "error": "native_mutation_conflict"}
+            del chunks[local]
+            _write_memory(path, chunks)
+            return {"success": True, "revision": path.stat().st_mtime_ns}
+
     if memory_manager is not None:
         import uuid
         result = memory_manager.commit_native_mutation(
@@ -188,11 +196,19 @@ def _edit_memory(node_id: str, content: str, *, memory_manager=None, operation_i
     body = content.strip()
     if not body:
         return {"ok": False, "message": "empty memory — use delete to remove it"}
-    path, chunks, local = _locate_memory(source, gidx)
+    path, old_text = _prepare_memory_mutation(source, gidx)
 
-    old_text = chunks[local]
-    chunks[local] = body
-    writer = lambda: (_write_memory(path, chunks) or {"success": True, "revision": path.stat().st_mtime_ns})
+    def writer():
+        from tools.memory_tool import MemoryStore
+        with MemoryStore._file_lock(path):
+            chunks = MemoryStore._read_file(path)
+            local = _memory_local_index(source, gidx)
+            if not 0 <= local < len(chunks) or chunks[local] != old_text:
+                return {"success": False, "error": "native_mutation_conflict"}
+            chunks[local] = body
+            _write_memory(path, chunks)
+            return {"success": True, "revision": path.stat().st_mtime_ns}
+
     if memory_manager is not None:
         import uuid
         result = memory_manager.commit_native_mutation(
@@ -207,6 +223,21 @@ def _edit_memory(node_id: str, content: str, *, memory_manager=None, operation_i
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _prepare_memory_mutation(source: str, gidx: int) -> tuple[Path, str]:
+    """Read and validate the target only while holding its native file lock."""
+    from tools.memory_tool import MemoryStore
+
+    path = _memories_dir() / _MEMORY_FILES[source]
+    if not path.exists():
+        raise ValueError(f"{path.name} not found")
+    with MemoryStore._file_lock(path):
+        chunks = MemoryStore._read_file(path)
+        local = _memory_local_index(source, gidx)
+        if not 0 <= local < len(chunks):
+            raise ValueError("memory node id is stale — refresh the graph")
+        return path, chunks[local]
 
 
 def _write_memory(path: Path, chunks: list[str]) -> None:

@@ -408,6 +408,7 @@ class MemoryManager:
         self._native_lock = threading.Lock()
         self._native_completed: Dict[str, Dict[str, Any]] = {}
         self._native_inflight: Dict[str, threading.Event] = {}
+        self._native_owners: Dict[str, int] = {}
         self._native_journal = native_journal
 
     # -- Registration --------------------------------------------------------
@@ -1103,13 +1104,20 @@ class MemoryManager:
             if waiter is None:
                 waiter = threading.Event()
                 self._native_inflight[operation_id] = waiter
+                self._native_owners[operation_id] = threading.get_ident()
                 owner = True
             else:
                 owner = False
         if not owner:
+            if self._native_owners.get(operation_id) == threading.get_ident():
+                return {"success": False, "operation_id": operation_id,
+                        "error": "native_operation_reentrant"}
             waiter.wait()
             with self._native_lock:
-                return dict(self._native_completed[operation_id])
+                return dict(self._native_completed.get(operation_id) or {
+                    "success": False, "operation_id": operation_id,
+                    "error": "native_operation_in_doubt",
+                })
 
         try:
             if self._native_journal is None:
@@ -1170,6 +1178,7 @@ class MemoryManager:
         finally:
             with self._native_lock:
                 event = self._native_inflight.pop(operation_id, None)
+                self._native_owners.pop(operation_id, None)
                 if event is not None:
                     event.set()
 
