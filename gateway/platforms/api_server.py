@@ -2133,6 +2133,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("POST", "/api/sessions/{session_id}/append", self._handle_session_append),
+            ("POST", "/api/sessions/{session_id}/credential/bind", self._handle_session_credential_bind),
             ("POST", "/api/sessions/{session_id}/submit", self._handle_session_submit),
             ("GET", "/api/sessions/{session_id}/submit/{native_request_ref}/events", self._handle_native_submit_events),
             ("GET", "/api/sessions/{session_id}/submit/{native_request_ref}/clarify", self._handle_native_submit_clarify_events),
@@ -3667,7 +3668,20 @@ class APIServerAdapter(BasePlatformAdapter):
         if "unread" in body:
             await asyncio.to_thread(db.set_session_read, session_id, read=not body["unread"])
         if body.get("end_reason"):
-            await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
+            lock = self._native_submit_locks.setdefault(
+                (_api_request_profile.get() or "default", session_id), asyncio.Lock(),
+            )
+            async with lock:
+                await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
+                runner = self.gateway_runner
+                revoke = getattr(runner, "revoke_session_credential", None)
+                if callable(revoke):
+                    source = SessionSource(
+                        platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
+                        user_id="api_server", user_name="API server",
+                        profile=_api_request_profile.get() or None,
+                    )
+                    await asyncio.to_thread(revoke, source, session_id)
         session = await asyncio.to_thread(db.get_session, session_id) or session
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
 
@@ -3681,7 +3695,20 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = await self._ensure_session_db_async()
-        deleted = await asyncio.to_thread(db.delete_session, session_id)
+        lock = self._native_submit_locks.setdefault(
+            (_api_request_profile.get() or "default", session_id), asyncio.Lock(),
+        )
+        async with lock:
+            deleted = await asyncio.to_thread(db.delete_session, session_id)
+            runner = self.gateway_runner
+            revoke = getattr(runner, "revoke_session_credential", None)
+            if callable(revoke):
+                source = SessionSource(
+                    platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
+                    user_id="api_server", user_name="API server",
+                    profile=_api_request_profile.get() or None,
+                )
+                await asyncio.to_thread(revoke, source, session_id)
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
@@ -3882,6 +3909,65 @@ class APIServerAdapter(BasePlatformAdapter):
             status=409,
         )
 
+    async def _handle_session_credential_bind(self, request: "web.Request") -> "web.Response":
+        """Bind one controller-supplied bearer to an existing live session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err or set(body) != {
+            "credential_slot", "bearer", "expires_at", "provider_route_revision_id",
+        }:
+            return web.json_response(
+                _openai_error("Invalid session credential schema", code="invalid_session_credential_schema"),
+                status=400,
+            )
+        from agent.session_credential import _CREDENTIAL_EXPIRY_RE, parse_credential_expiry
+
+        bearer = body["bearer"]
+        revision = body["provider_route_revision_id"]
+        expires_at = parse_credential_expiry(body["expires_at"])
+        if expires_at is None and isinstance(body["expires_at"], str) and _CREDENTIAL_EXPIRY_RE.fullmatch(body["expires_at"]):
+            return web.json_response(
+                _openai_error("Credential unavailable", code="credential_unavailable"), status=409
+            )
+        if (
+            body["credential_slot"] != "GATE_B_API_KEY"
+            or not isinstance(bearer, str) or not bearer.strip()
+            or not isinstance(revision, str) or not revision.strip()
+            or expires_at is None
+        ):
+            return web.json_response(
+                _openai_error("Invalid session credential schema", code="invalid_session_credential_schema"),
+                status=400,
+            )
+        runner = self.gateway_runner
+        if runner is None or not getattr(runner, "_running", False):
+            return web.json_response(
+                _openai_error("Native gateway unavailable", code="native_gateway_unavailable"), status=503
+            )
+        session_id = request.match_info["session_id"]
+        _, session_err = await self._get_existing_session_or_404(session_id)
+        if session_err:
+            return session_err
+        source = SessionSource(
+            platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
+            user_id="api_server", user_name="API server",
+            profile=_api_request_profile.get() or None,
+        )
+        lock = self._native_submit_locks.setdefault(
+            (_api_request_profile.get() or "default", session_id), asyncio.Lock(),
+        )
+        async with lock:
+            bound = await asyncio.to_thread(
+                runner.bind_session_credential, source, session_id, bearer, expires_at, revision,
+            )
+        if not bound:
+            return web.json_response(
+                _openai_error("Credential unavailable", code="credential_unavailable"), status=409
+            )
+        return web.json_response({"status": "ready", "credential_slot": "GATE_B_API_KEY"})
+
     @staticmethod
     def _native_submit_request(body: Dict[str, Any]) -> tuple[Optional[tuple[str, str]], Optional["web.Response"]]:
         """Validate the deliberately narrow native-admission request shape."""
@@ -4000,7 +4086,24 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
 
         profile = _api_request_profile.get() or "default"
-        lock_key = (profile, external_request_id)
+        runner = self.gateway_runner
+        if runner is None or not getattr(runner, "_running", False):
+            return web.json_response(
+                _openai_error("Native gateway unavailable", code="native_gateway_unavailable"), status=503
+            )
+        source = SessionSource(
+            platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
+            user_id="api_server", user_name="API server",
+            profile=_api_request_profile.get() or None,
+        )
+        credential_available = getattr(runner, "session_credential_available", None)
+        if not callable(credential_available) or not await asyncio.to_thread(
+            credential_available, source, session_id,
+        ):
+            return web.json_response(
+                _openai_error("Credential unavailable", code="credential_unavailable"), status=409
+            )
+        lock_key = (profile, session_id)
         lock = self._native_submit_locks.setdefault(lock_key, asyncio.Lock())
         try:
             async with lock:

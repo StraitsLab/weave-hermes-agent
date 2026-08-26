@@ -48,6 +48,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
+from agent.session_credential import SessionCredential
 from agent.conversation_compression import (
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -6675,6 +6676,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         return sessions.get(session_key)
 
+    def bind_session_credential(
+        self, source: SessionSource, session_id: str, bearer: str,
+        expires_at: datetime, provider_route_revision_id: str,
+    ) -> bool:
+        """Bind one memory-only credential to an existing strict session."""
+        with self._session_credential_lock:
+            entry = self.session_store.bind_existing_session(
+                source, session_id, reopen=False,
+            )
+            if entry is None or entry.session_id != session_id:
+                return False
+            conversation = self._session_state(entry.session_key).conversation
+            holder = conversation.credential_holder
+            if holder is None:
+                conversation.credential_holder = SessionCredential(bearer, expires_at)
+                conversation.credential_route_revision_id = provider_route_revision_id
+                return True
+            return (
+                conversation.credential_route_revision_id == provider_route_revision_id
+                and holder.refresh(bearer, expires_at)
+            )
+
+    def session_credential_available(
+        self, source: SessionSource, session_id: str,
+    ) -> bool:
+        """Return whether this exact strict session has a usable holder."""
+        with self._session_credential_lock:
+            entry = self.session_store._entries.get(
+                self.session_store._generate_session_key(source)
+            )
+            if entry is None or entry.session_id != session_id:
+                return False
+            state = self._peek_session_state(entry.session_key)
+            holder = state.conversation.credential_holder if state is not None else None
+            if holder is None:
+                return False
+            try:
+                holder()
+            except RuntimeError:
+                return False
+            return True
+
+    def revoke_session_credential(self, source: SessionSource, session_id: str) -> None:
+        """Revoke the holder for one exact strict session, if present."""
+        with self._session_credential_lock:
+            entry = self.session_store._entries.get(
+                self.session_store._generate_session_key(source)
+            )
+            if entry is None or entry.session_id != session_id:
+                return
+            state = self._peek_session_state(entry.session_key)
+            if state is not None and state.conversation.credential_holder is not None:
+                state.conversation.credential_holder.revoke()
+                state.conversation.credential_holder = None
+                state.conversation.credential_route_revision_id = None
+
     def _is_session_running(self, session_key: str) -> bool:
         """True when the session holds a running-turn slot (agent or sentinel)."""
         state = self._peek_session_state(session_key)
@@ -6832,6 +6889,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # self._session_state(key) (get-or-create) or
         # self._peek_session_state(key) (read-only).
         self._sessions: Dict[str, SessionState] = {}
+        self._session_credential_lock = threading.RLock()
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
         # to one session_id (switch_session's many-to-one mapping). The
@@ -8050,6 +8108,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ).conversation.last_resolved_model = model
             self._session_state("*").conversation.last_resolved_model = model
 
+        if resolved_session_key:
+            state = self._peek_session_state(resolved_session_key)
+            holder = state.conversation.credential_holder if state is not None else None
+            if holder is not None:
+                runtime_kwargs["api_key"] = holder
         return model, runtime_kwargs
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:

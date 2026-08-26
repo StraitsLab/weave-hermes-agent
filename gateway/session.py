@@ -2941,7 +2941,7 @@ class SessionStore:
         return entry
 
     def bind_existing_session(
-        self, source: SessionSource, session_id: str
+        self, source: SessionSource, session_id: str, reopen: bool = True,
     ) -> Optional[SessionEntry]:
         """Atomically bind one source key to an already-existing session row.
 
@@ -2951,7 +2951,8 @@ class SessionStore:
         if not isinstance(session_id, str) or not session_id or self._db is None:
             return None
         try:
-            if self._db.get_session(session_id) is None:
+            row = self._db.get_session(session_id)
+            if row is None or (not reopen and row.get("end_reason") is not None):
                 return None
         except Exception:
             return None
@@ -2984,7 +2985,8 @@ class SessionStore:
                 self._entries[session_key] = entry
         self._save_entries()
         try:
-            self._db.reopen_session(session_id)
+            if reopen:
+                self._db.reopen_session(session_id)
             self._record_gateway_session_peer(
                 session_id, session_key, source, display_name=entry.display_name
             )
