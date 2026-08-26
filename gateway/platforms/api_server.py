@@ -4462,51 +4462,106 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
-        """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
+        """POST /api/sessions/{session_id}/fork — atomic native safe boundary."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
         source_id = request.match_info["session_id"]
-        source, err = await self._get_existing_session_or_404(source_id)
-        if err:
-            return err
         body, err = await self._read_json_body(request)
         if err:
             return err
-        db = await self._ensure_session_db_async()
-        fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
-        if not fork_id or re.search(r'[\r\n\x00]', fork_id):
-            return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
-        if await asyncio.to_thread(db.get_session, fork_id):
-            return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
-
-        # Match the CLI /branch semantics: mark the original as branched, then
-        # create a child session that carries the transcript forward. This uses
-        # SessionDB's native parent_session_id/end_reason visibility model rather
-        # than inventing a parallel fork store.
-        await asyncio.to_thread(db.end_session, source_id, "branched")
-        await asyncio.to_thread(db.create_session,
-            fork_id,
-            "api_server",
-            model=source.get("model"),
-            system_prompt=source.get("system_prompt"),
-            parent_session_id=source_id,
-        )
-        messages = await asyncio.to_thread(db.get_messages, source_id)
-        await asyncio.to_thread(db.replace_messages, fork_id, messages)
-        title = body.get("title")
-        if title is None:
-            base = source.get("title") or "fork"
-            try:
-                title = await asyncio.to_thread(db.get_next_title_in_lineage, base)
-            except Exception:
-                title = f"{base} fork"
+        if set(body) != {"external_rotation_id", "boundary_turn_id"}:
+            return web.json_response(
+                _openai_error("Invalid session fork schema", code="invalid_session_fork_schema"),
+                status=400,
+            )
+        rotation_id = body["external_rotation_id"]
+        boundary_turn_id = body["boundary_turn_id"]
         try:
-            await asyncio.to_thread(db.set_session_title, fork_id, str(title))
-        except ValueError as exc:
-            return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
-        fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
-        return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+            valid_ids = all(
+                isinstance(value, str) and str(uuid.UUID(value)) == value
+                for value in (rotation_id, boundary_turn_id)
+            )
+        except (ValueError, AttributeError):
+            valid_ids = False
+        if not valid_ids:
+            return web.json_response(
+                _openai_error("Invalid session fork schema", code="invalid_session_fork_schema"),
+                status=400,
+            )
+        _, err = await self._get_existing_session_or_404(source_id)
+        if err:
+            return err
+        db = await self._ensure_session_db_async()
+        runner = self.gateway_runner
+        if runner is None or not getattr(runner, "_running", False):
+            return web.json_response(
+                _openai_error("Native gateway unavailable", code="native_gateway_unavailable"), status=503,
+            )
+        successor_id = f"weave-{rotation_id}"
+        native_source = SessionSource(
+            platform=Platform.API_SERVER, chat_id=source_id, chat_type="dm",
+            user_id="api_server", user_name="API server",
+            profile=_api_request_profile.get() or None,
+        )
+        session_key = runner.session_store._generate_session_key(native_source)
+        await runner.async_session_store._ensure_loaded()
+
+        def unavailable():
+            return web.json_response(
+                _openai_error("Session boundary unavailable", code="session_boundary_unavailable"),
+                status=409, headers={"Retry-After": "1"},
+            )
+
+        async with self._native_lifecycle_lock(source_id):
+            queued = session_key in self._pending_messages or bool(
+                getattr(runner._peek_session_state(session_key), "conversation", None)
+                and runner._queue_depth(session_key, adapter=self)
+            )
+            entry = runner.session_store._entries.get(session_key)
+            active = (
+                session_key in self._active_sessions
+                or runner._is_session_running(session_key)
+                or bool(entry and entry.active_turn_token)
+            )
+            if queued or active:
+                return unavailable()
+            try:
+                outcome = await asyncio.to_thread(
+                    db.safe_fork_session, source_id, successor_id,
+                    before_commit=lambda: runner.revoke_session_credential(
+                        native_source, source_id
+                    ),
+                )
+            except Exception:
+                return unavailable()
+            if outcome == "boundary_unavailable":
+                return unavailable()
+            if outcome == "conflict":
+                return web.json_response(
+                    _openai_error("Session fork conflicts with native lineage", code="session_fork_conflict"),
+                    status=409,
+                )
+            try:
+                switched = await runner.async_session_store.switch_session(
+                    session_key, successor_id
+                )
+                if switched is None or switched.session_id != successor_id:
+                    return unavailable()
+                runner._evict_cached_agent(session_key)
+            except Exception:
+                return unavailable()
+
+        return web.json_response({
+            "outcome": outcome,
+            "external_rotation_id": rotation_id,
+            "boundary_turn_id": boundary_turn_id,
+            "predecessor_session_id": source_id,
+            "successor_session_id": successor_id,
+            "native_input_queue_empty": True,
+            "no_active_turn": True,
+            "no_compression_or_session_mutation_lock": True,
+        }, status=201 if outcome == "forked" else 200)
 
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
