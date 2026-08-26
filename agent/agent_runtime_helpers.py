@@ -3182,19 +3182,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 old_text=next_args.get("old_text"),
                 operations=operations,
                 store=agent._memory_store,
+                memory_manager=agent._memory_manager,
+                operation_id=tool_call_id,
             )
-            # Mirror successful built-in memory writes to external providers.
-            # All gating/op-expansion lives behind the manager interface
-            # (MemoryManager.notify_memory_tool_write).
-            if agent._memory_manager:
-                agent._memory_manager.notify_memory_tool_write(
-                    result,
-                    next_args,
-                    build_metadata=lambda: agent._build_memory_write_metadata(
-                        task_id=effective_task_id,
-                        tool_call_id=tool_call_id,
-                    ),
-                )
             return _finish_agent_tool(result, next_args)
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         def _execute(next_args: dict) -> Any:

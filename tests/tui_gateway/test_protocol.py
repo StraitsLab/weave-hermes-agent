@@ -119,6 +119,42 @@ def test_err_envelope(server):
     }
 
 
+def test_learning_edit_without_session_preserves_skill_mutation(server):
+    from hermes_constants import get_hermes_home
+
+    skill = get_hermes_home() / "skills" / "tui-skill"
+    skill.mkdir(parents=True)
+    before = "---\nname: tui-skill\ndescription: A test skill.\n---\n\n# Before\n"
+    after = before.replace("# Before", "# After")
+    (skill / "SKILL.md").write_text(before, encoding="utf-8")
+
+    response = server.handle_request({
+        "id": "skill-edit",
+        "method": "learning.edit",
+        "params": {"id": "tui-skill", "content": after, "operation_id": "op-skill"},
+    })
+
+    assert response["result"]["ok"] is True
+    assert (skill / "SKILL.md").read_text(encoding="utf-8") == after
+
+
+def test_learning_edit_without_session_rejects_native_before_write(server):
+    from hermes_constants import get_hermes_home
+
+    memory = get_hermes_home() / "memories" / "MEMORY.md"
+    memory.parent.mkdir(parents=True, exist_ok=True)
+    memory.write_text("original", encoding="utf-8")
+
+    response = server.handle_request({
+        "id": "memory-edit",
+        "method": "learning.edit",
+        "params": {"id": "memory:memory:0", "content": "changed", "operation_id": "op-memory"},
+    })
+
+    assert response["result"] == {"ok": False, "message": "native memory manager unavailable"}
+    assert memory.read_text(encoding="utf-8") == "original"
+
+
 @pytest.mark.parametrize("kind", ["legacy", "hard-only", "dynamic-getattr"])
 def test_session_interrupt_uses_explicit_stop_compatibility(server, monkeypatch, kind):
     calls = []
