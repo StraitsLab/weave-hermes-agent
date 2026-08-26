@@ -4553,7 +4553,13 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 switched = store.lookup_by_session_key(successor_key)
                 if switched is None:
-                    switched = await runner.async_session_store.switch_session(session_key, successor_id)
+                    predecessor = store.lookup_by_session_key(session_key)
+                    if predecessor is None and outcome == "identical_retry":
+                        switched = await runner.async_session_store.bind_existing_session(
+                            successor, successor_id, reopen=False,
+                        )
+                    else:
+                        switched = await runner.async_session_store.switch_session(session_key, successor_id)
                 if switched is None or switched.session_id != successor_id:
                     return unavailable()
                 with store._lock:

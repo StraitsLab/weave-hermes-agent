@@ -164,14 +164,17 @@ async def test_postcommit_repoint_failure_repairs_on_identical_replay(setup, mon
 @pytest.mark.asyncio
 async def test_db_only_predecessor_forks_and_replays(setup):
     adapter, runner, db = setup
+    store = runner.session_store
     source_id = "db-only-predecessor"
+    source_key, successor_key = store._generate_session_key(_source(source_id)), store._generate_session_key(_source(SUCCESSOR))
     db.create_session(source_id, "api_server")
-    assert runner.session_store.lookup_by_session_key(
-        runner.session_store._generate_session_key(_source(source_id))
-    ) is None
+    assert store.lookup_by_session_key(source_key) is None
     client = await _client(adapter)
     try:
         first = await client.post(f"/api/sessions/{source_id}/fork", headers=AUTH, json=_request())
+        with store._lock:
+            store._entries.clear()
+        runner._agent_cache[source_key] = object()
         replay = await client.post(f"/api/sessions/{source_id}/fork", headers=AUTH, json=_request())
         replay_body = await replay.json()
     finally:
@@ -179,6 +182,8 @@ async def test_db_only_predecessor_forks_and_replays(setup):
     assert first.status == 201
     assert replay.status == 200
     assert replay_body["outcome"] == "identical_retry"
+    assert store.lookup_by_session_key(successor_key).session_id == SUCCESSOR
+    assert source_key not in runner._agent_cache
 
 
 @pytest.mark.asyncio
