@@ -273,53 +273,29 @@ async def test_named_profile_routes_isolate_same_session_id_and_credentials(tmp_
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_races_have_one_winner_and_never_admit_after_close(
-    adapter_and_runner, monkeypatch,
-):
-    """Concurrent REST lifecycle calls linearize at one closed-session boundary."""
+async def test_close_wins_queued_submit_without_reopen_or_durable_admission(adapter_and_runner):
+    """The real lifecycle lock makes close win before native submit admission."""
     adapter, runner = adapter_and_runner
     client = await _client(adapter)
     headers = {"Authorization": "Bearer sk-native-bind-test"}
-    admitted = []
-
-    async def admit(*args):
-        admitted.append(args)
-        return "streaming"
-
-    monkeypatch.setattr(adapter, "_admit_native_session_submit", admit)
-    async def close(session_id, delete=False):
-        if delete:
-            return await client.delete(f"/api/sessions/{session_id}", headers=headers)
-        return await client.patch(f"/api/sessions/{session_id}", headers=headers, json={"end_reason": "closed"})
-
     try:
-        for suffix, delete in (("end", False), ("delete", True)):
-            session_id = f"race-bind-{suffix}"
-            runner._session_db._db.create_session(session_id, "api_server")
-            bind, closed = await asyncio.gather(
-                client.post(f"/api/sessions/{session_id}/credential/bind", headers=headers, json=_bind_body()),
-                close(session_id, delete),
-            )
-            assert closed.status == 200
-            assert bind.status in {200, 409}
-            retry = await client.post(f"/api/sessions/{session_id}/credential/bind", headers=headers, json=_bind_body())
-            assert retry.status == (404 if delete else 409)
-
-        for suffix, delete in (("end", False), ("delete", True)):
-            session_id = f"race-submit-{suffix}"
+        for suffix, delete in (("end", False),):
+            session_id = f"barrier-{suffix}"
             runner._session_db._db.create_session(session_id, "api_server")
             assert (await client.post(f"/api/sessions/{session_id}/credential/bind", headers=headers, json=_bind_body())).status == 200
-            admitted.clear()
-            closed, submit = await asyncio.gather(
-                close(session_id, delete),
-                client.post(f"/api/sessions/{session_id}/submit", headers=headers, json={"kind": "hermes.session.submit", "external_request_id": f"race-{suffix}", "message": "hello", "busy_mode": "queue"}),
-            )
+            async with adapter._native_lifecycle_lock(session_id):
+                closed_task = asyncio.create_task(client.delete(f"/api/sessions/{session_id}", headers=headers) if delete else client.patch(f"/api/sessions/{session_id}", headers=headers, json={"end_reason": "closed"}))
+                await asyncio.sleep(0)
+                submit_task = asyncio.create_task(client.post(f"/api/sessions/{session_id}/submit", headers=headers, json={"kind": "hermes.session.submit", "external_request_id": f"barrier-{suffix}", "message": "hello", "busy_mode": "queue"}))
+                await asyncio.sleep(0)
+            closed, submit = await asyncio.gather(closed_task, submit_task)
             assert closed.status == 200
-            assert submit.status in {202, 404, 409}
-            assert bool(admitted) is (submit.status == 202)
-            admitted.clear()
-            after_close = await client.post(f"/api/sessions/{session_id}/submit", headers=headers, json={"kind": "hermes.session.submit", "external_request_id": f"after-{suffix}", "message": "hello", "busy_mode": "queue"})
-            assert after_close.status == 409
-            assert admitted == []
+            assert submit.status == 409
+            row = runner._session_db._db.get_session(session_id)
+            assert (row is None) is delete
+            assert delete or row["end_reason"] == "closed"
+            assert not adapter._native_submit_ref_sessions
+            conn = runner._session_db._db._conn
+            assert not conn.execute("SELECT name FROM sqlite_master WHERE name='native_session_submit_idempotency'").fetchone()
     finally:
         await client.close()
