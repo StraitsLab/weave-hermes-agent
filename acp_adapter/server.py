@@ -672,7 +672,7 @@ class HermesACPAgent(acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
-        self._credential_transport_authenticated = False
+        self._credential_transport_initialized = False
 
     # ---- Connection lifecycle -----------------------------------------------
 
@@ -681,7 +681,7 @@ class HermesACPAgent(acp.Agent):
         if self._conn is not None and self._conn is not conn:
             self.session_manager.revoke_live_credentials()
         self._conn = conn
-        self._credential_transport_authenticated = False
+        self._credential_transport_initialized = False
         logger.info("ACP client connected")
 
 
@@ -1331,7 +1331,7 @@ class HermesACPAgent(acp.Agent):
             ),
             auth_methods=auth_methods,
         )
-        self._credential_transport_authenticated = self._conn is not None
+        self._credential_transport_initialized = self._conn is not None
         return response
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
@@ -1359,9 +1359,15 @@ class HermesACPAgent(acp.Agent):
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """Handle the private, connection-bound ACP credential extension."""
         unavailable = {"error": "credential unavailable"}
-        if method != "session/credential/bind" or not self._credential_transport_authenticated:
+        if method != "session/credential/bind" or not self._credential_transport_initialized:
             return unavailable
-        if not isinstance(params, dict):
+        if not isinstance(params, dict) or set(params) != {
+            "session_id",
+            "credential_slot",
+            "bearer",
+            "expires_at",
+            "provider_route_revision_id",
+        }:
             return unavailable
         session_id = params.get("session_id")
         credential_slot = params.get("credential_slot")
@@ -1370,12 +1376,12 @@ class HermesACPAgent(acp.Agent):
         expires_at = parse_credential_expiry(params.get("expires_at"))
         if (
             not isinstance(session_id, str)
-            or not session_id
+            or not session_id.strip()
             or credential_slot != "GATE_B_API_KEY"
             or not isinstance(bearer, str)
-            or not bearer
+            or not bearer.strip()
             or not isinstance(revision, str)
-            or not revision
+            or not revision.strip()
             or expires_at is None
         ):
             return unavailable

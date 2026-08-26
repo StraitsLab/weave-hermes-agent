@@ -112,6 +112,38 @@ async def test_bind_rejects_unknown_malformed_unauthenticated_and_foreign_transp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides, whitespace_session_id",
+        [
+            ({"unexpected": "field"}, False),
+            ({}, True),
+        ({"bearer": " \t "}, False),
+        ({"provider_route_revision_id": " \t "}, False),
+    ],
+)
+async def test_bind_requires_exact_fields_and_stripped_values(overrides, whitespace_session_id):
+    manager = SessionManager(agent_factory=_Agent)
+    agent = HermesACPAgent(session_manager=manager)
+    agent.on_connect(_PrivateTransport())
+    await agent.initialize(protocol_version=1)
+    state = manager.create_session(cwd="/tmp")
+    session_id = state.session_id
+    if whitespace_session_id:
+        with manager._lock:
+            manager._sessions.pop(session_id)
+            state.session_id = " \t "
+            manager._sessions[state.session_id] = state
+        session_id = state.session_id
+
+    response = await agent.ext_method(
+        "session/credential/bind", _bind_params(session_id, **overrides)
+    )
+
+    assert response == {"error": "credential unavailable"}
+    assert state.credential_holder is None
+
+
+@pytest.mark.asyncio
 async def test_close_and_process_cleanup_revoke_the_bound_credential():
     manager = SessionManager(agent_factory=_Agent)
     agent = HermesACPAgent(session_manager=manager)
