@@ -17,13 +17,19 @@ _MAX_CONTEXT_ITEMS = 5
 _MAX_CONTEXT_TEXT = 1200
 
 
+class HarsoWriteError(RuntimeError):
+    """Content-free failure that lets D4 record an unacknowledged mirror."""
+
+
 class HarsoMemoryProvider(MemoryProvider):
     """Use the private Weave API as the Harso admission boundary."""
 
     def __init__(self) -> None:
         self._endpoint = os.environ.get("WEAVE_HARSO_ENDPOINT", "").rstrip("/")
         self._profile_id = os.environ.get("WEAVE_HARSO_PROFILE_ID", "")
-        self._profile_revision_id = os.environ.get("WEAVE_HARSO_PROFILE_REVISION_ID", "")
+        self._profile_revision_id = os.environ.get(
+            "WEAVE_HARSO_PROFILE_REVISION_ID", ""
+        )
         self._bearer = os.environ.get("WEAVE_API_MCP_BEARER", "")
         self._route_key = os.environ.get("API_SERVER_KEY", "")
         self._session_id = ""
@@ -33,8 +39,13 @@ class HarsoMemoryProvider(MemoryProvider):
         return "harso"
 
     def is_available(self) -> bool:
-        return all((self._endpoint, self._profile_id, self._profile_revision_id,
-                    self._bearer, self._route_key))
+        return all((
+            self._endpoint,
+            self._profile_id,
+            self._profile_revision_id,
+            self._bearer,
+            self._route_key,
+        ))
 
     def unavailable_reason(self) -> str:
         return "Harso requires its endpoint, profile scope, and workload credentials."
@@ -72,9 +83,13 @@ class HarsoMemoryProvider(MemoryProvider):
         }
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        response = self._post("/internal/harso/context", {
-            **self._scope(session_id), "query": query,
-        })
+        response = self._post(
+            "/internal/harso/context",
+            {
+                **self._scope(session_id),
+                "query": query,
+            },
+        )
         if not response or response.get("degraded") is True:
             return ""
         items = response.get("items")
@@ -90,23 +105,36 @@ class HarsoMemoryProvider(MemoryProvider):
         return "\n".join(context)
 
     def on_memory_write(
-        self, action: str, target: str, content: str, metadata: Dict[str, Any] | None = None,
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Dict[str, Any] | None = None,
     ) -> bool:
         metadata = metadata or {}
         operation_id, revision = metadata.get("operation_id"), metadata.get("revision")
-        if not isinstance(operation_id, str) or not operation_id or type(revision) is not int:
-            return False
-        response = self._post("/internal/harso/mutations", {
-            **self._scope(self._session_id),
-            "action": action,
-            "target": target,
-            "content": content,
-            "operation_id": operation_id,
-            "revision": revision,
-        })
-        return bool(
+        if (
+            not isinstance(operation_id, str)
+            or not operation_id
+            or type(revision) is not int
+        ):
+            raise HarsoWriteError("harso_write_unacknowledged")
+        response = self._post(
+            "/internal/harso/mutations",
+            {
+                **self._scope(self._session_id),
+                "action": action,
+                "target": target,
+                "content": content,
+                "operation_id": operation_id,
+                "revision": revision,
+            },
+        )
+        if (
             response
             and response.get("acknowledged") is True
             and response.get("operation_id") == operation_id
             and response.get("revision") == revision
-        )
+        ):
+            return True
+        raise HarsoWriteError("harso_write_unacknowledged")
