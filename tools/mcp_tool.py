@@ -99,6 +99,7 @@ import contextvars
 import concurrent.futures
 import errno
 import fnmatch
+import hashlib
 import inspect
 import json
 import logging
@@ -4178,6 +4179,11 @@ class MCPServerTask:
 # ---------------------------------------------------------------------------
 
 _servers: Dict[str, MCPServerTask] = {}
+# ACP ownership stores descriptor digests, never a second plaintext header copy.
+_session_mcp_fingerprints: Dict[str, str] = {}
+_session_mcp_owners: Dict[str, Set[str]] = {}
+_session_mcp_managed: Set[str] = set()
+_session_mcp_releasing: Set[str] = set()
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
 # Lazy MCP startup (#56832): servers whose tools were registered from the
@@ -7168,6 +7174,113 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
+def _session_mcp_fingerprint(config: dict) -> str:
+    """Return a secret-safe identity for one transient session descriptor."""
+    raw = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def acquire_session_mcp_servers(owner_id: str, servers: Dict[str, dict]) -> List[str]:
+    """Share identical descriptors; reject same-name connection changes."""
+    if not isinstance(owner_id, str) or not owner_id.strip():
+        raise RuntimeError("MCP session owner is invalid")
+    if not isinstance(servers, dict):
+        raise RuntimeError("MCP server descriptors are invalid")
+
+    for raw_name, raw_config in servers.items():
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise RuntimeError("MCP server name is invalid")
+        if not isinstance(raw_config, dict):
+            raise RuntimeError(f"MCP server descriptor for '{raw_name}' is invalid")
+    fingerprints = {name: _session_mcp_fingerprint(config) for name, config in servers.items()}
+
+    new_names: List[str] = []
+    with _lock:
+        for name, fingerprint in fingerprints.items():
+            if name in _session_mcp_releasing:
+                raise RuntimeError(f"MCP server '{name}' is being released")
+            existing_fingerprint = _session_mcp_fingerprints.get(name)
+            if existing_fingerprint is None:
+                existing = _servers.get(name)
+                existing_config = getattr(existing, "_config", None) if existing else None
+                existing_config = existing_config or _lazy_server_configs.get(name)
+                if existing_config is not None:
+                    existing_fingerprint = _session_mcp_fingerprint(existing_config)
+            if existing_fingerprint is not None and existing_fingerprint != fingerprint:
+                raise RuntimeError(f"MCP server '{name}' already has a different descriptor")
+            if name in _session_mcp_managed and not getattr(_servers.get(name), "session", None):
+                raise RuntimeError(f"MCP server '{name}' is not ready")
+
+        for name, fingerprint in fingerprints.items():
+            preexisting = name in _servers or name in _lazy_server_configs
+            _session_mcp_fingerprints.setdefault(name, fingerprint)
+            _session_mcp_owners.setdefault(name, set()).add(owner_id)
+            if not preexisting and name not in _session_mcp_managed:
+                _session_mcp_managed.add(name)
+                new_names.append(name)
+
+    if new_names:
+        try:
+            register_mcp_servers({name: servers[name] for name in new_names})
+            with _lock:
+                failed = any(
+                    name in _server_connect_errors
+                    or not getattr(_servers.get(name), "session", None)
+                    for name in new_names
+                )
+            if failed:
+                raise RuntimeError("MCP server connection did not become ready")
+        except Exception:
+            try:
+                release_session_mcp_servers(owner_id, names=set(servers))
+            except Exception:
+                pass
+            raise RuntimeError("MCP server registration failed") from None
+    return _existing_tool_names()
+
+
+def release_session_mcp_servers(owner_id: str, *, names: Optional[Set[str]] = None) -> None:
+    """Release one session's MCP ownership without disturbing other owners."""
+    with _lock:
+        owned = [
+            name for name, owners in _session_mcp_owners.items()
+            if owner_id in owners and (names is None or name in names)
+        ]
+
+    for name in owned:
+        with _lock:
+            owners = _session_mcp_owners.get(name)
+            if owners is None or owner_id not in owners:
+                continue
+            if len(owners) > 1:
+                owners.remove(owner_id)
+                continue
+            if name not in _session_mcp_managed:
+                _session_mcp_owners.pop(name, None)
+                _session_mcp_fingerprints.pop(name, None)
+                continue
+            server = _servers.get(name)
+            _session_mcp_releasing.add(name)
+
+        try:
+            if server is not None:
+                _run_on_mcp_loop(server.shutdown, timeout=15)
+        except Exception:
+            with _lock:
+                _session_mcp_releasing.discard(name)
+            raise RuntimeError(f"MCP server '{name}' release failed") from None
+
+        with _lock:
+            if _servers.get(name) is server:
+                _servers.pop(name, None)
+            for mapping in (_session_mcp_owners, _session_mcp_fingerprints):
+                mapping.pop(name, None)
+            for group in (_session_mcp_managed, _session_mcp_releasing):
+                group.discard(name)
+            _server_connect_errors.pop(name, None)
+            _server_connecting.discard(name)
+            _parallel_safe_servers.discard(name)
+
 def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
@@ -7880,6 +7993,9 @@ def shutdown_mcp_servers():
         with _lock:
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
+            for state in (_session_mcp_fingerprints, _session_mcp_owners,
+                          _session_mcp_managed, _session_mcp_releasing):
+                state.clear()
         _stop_mcp_loop()
         return
 
@@ -7895,6 +8011,9 @@ def shutdown_mcp_servers():
                 )
         with _lock:
             _servers.clear()
+            for state in (_session_mcp_fingerprints, _session_mcp_owners,
+                          _session_mcp_managed, _session_mcp_releasing):
+                state.clear()
             # Drop connect-retry cooldowns too: a full shutdown/restart
             # should re-attempt every server immediately, not honour a
             # stale per-server backoff from before the restart (#50394).

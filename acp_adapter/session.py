@@ -185,6 +185,7 @@ class SessionState:
     interrupted_prompt_text: str = ""
     credential_holder: SessionCredential | None = None
     credential_route_revision_id: str | None = None
+    mcp_server_names: set[str] = field(default_factory=set)
 
 
 class SessionManager:
