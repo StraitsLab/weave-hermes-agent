@@ -99,11 +99,57 @@ def test_completed_turn_posts_only_user_authored_evidence(monkeypatch):
             "profile_id": "profile-1",
             "profile_revision_id": "revision-2",
             "hermes_session_ref": "weave-018f22e2-7c00-7001-8001-000000000001",
-            "source_order": 2,
             "user_content": "I prefer tea",
         },
         "timeout": 5,
     }
+
+
+def test_completed_turn_payload_ignores_message_history_length(monkeypatch):
+    provider = _provider(monkeypatch)
+    bodies = []
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda request, timeout: (
+            bodies.append(json.loads(request.data))
+            or _Response({"acknowledged": True, "disposition": "stored"})
+        ),
+    )
+    expected = {
+        "profile_id": "profile-1",
+        "profile_revision_id": "revision-2",
+        "hermes_session_ref": "weave-session",
+        "user_content": "I prefer tea",
+    }
+
+    for messages in (
+        [{"role": "user"}, {"role": "assistant"}],
+        [
+            {"role": "user"},
+            {"role": "assistant"},
+            {"role": "tool"},
+            {"role": "assistant"},
+        ],
+        None,
+    ):
+        provider.sync_turn(
+            "  I prefer tea  ",
+            "I will remember that you prefer tea",
+            session_id="weave-session",
+            messages=messages,
+        )
+
+    assert bodies == [expected, expected, expected]
+
+
+def test_completed_turn_ignores_blank_user_content(monkeypatch):
+    provider = _provider(monkeypatch)
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", calls.append)
+
+    provider.sync_turn(" \n\t ", "ack", session_id="weave-session")
+
+    assert calls == []
 
 
 def test_completed_turn_is_fail_open(monkeypatch):

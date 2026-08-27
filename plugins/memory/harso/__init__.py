@@ -112,7 +112,7 @@ class HarsoMemoryProvider(MemoryProvider):
         session_id: str = "",
         messages: List[Dict[str, Any]] | None = None,
     ) -> None:
-        del assistant_content
+        del assistant_content, messages
         content = user_content.strip()
         if not content:
             return
@@ -120,7 +120,6 @@ class HarsoMemoryProvider(MemoryProvider):
             "/internal/harso/turns",
             {
                 **self._scope(session_id or self._session_id),
-                "source_order": len(messages) if messages is not None else 0,
                 "user_content": content,
             },
         )
