@@ -81,7 +81,9 @@ def test_completed_turn_posts_only_user_authored_evidence(monkeypatch):
     monkeypatch.setattr(
         "urllib.request.urlopen",
         lambda request, timeout: (
-            seen.update(url=request.full_url, body=json.loads(request.data), timeout=timeout)
+            seen.update(
+                url=request.full_url, body=json.loads(request.data), timeout=timeout
+            )
             or _Response({"acknowledged": True, "disposition": "stored"})
         ),
     )
