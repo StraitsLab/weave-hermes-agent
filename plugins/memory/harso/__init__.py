@@ -104,6 +104,26 @@ class HarsoMemoryProvider(MemoryProvider):
                 context.append(f"{citation} {text[:_MAX_CONTEXT_TEXT]}")
         return "\n".join(context)
 
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: List[Dict[str, Any]] | None = None,
+    ) -> None:
+        del assistant_content, messages
+        content = user_content.strip()
+        if not content:
+            return
+        self._post(
+            "/internal/harso/turns",
+            {
+                **self._scope(session_id or self._session_id),
+                "user_content": content,
+            },
+        )
+
     def on_memory_write(
         self,
         action: str,
