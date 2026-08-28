@@ -24,7 +24,7 @@ class SessionCredential:
 
     def refresh(self, bearer: str, expires_at: datetime) -> bool:
         with self._lock:
-            if self._revoked or self._expires_at <= datetime.now(timezone.utc):
+            if self._revoked:
                 return False
             self._bearer = bearer
             self._expires_at = expires_at
