@@ -67,11 +67,17 @@ def test_callable_credential_is_redacted_refreshable_and_expiring():
     holder.revoke()
     with pytest.raises(RuntimeError, match="credential unavailable"):
         holder()
+    assert holder.refresh(
+        "revoked-replacement", datetime.now(timezone.utc) + timedelta(minutes=1)
+    ) is False
 
     expired = server._SessionCredential("expired-bearer", datetime.now(timezone.utc) - timedelta(seconds=1))
     with pytest.raises(RuntimeError, match="credential unavailable"):
         expired()
-    assert expired.refresh("replacement-bearer", datetime.now(timezone.utc) + timedelta(minutes=1)) is False
+    assert expired.refresh(
+        "replacement-bearer", datetime.now(timezone.utc) + timedelta(minutes=1)
+    ) is True
+    assert expired() == "replacement-bearer"
 
 
 def test_bind_requires_a_trusted_controller_and_keeps_responses_secret_free():
