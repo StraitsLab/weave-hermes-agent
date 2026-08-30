@@ -1,7 +1,9 @@
 """Behavior tests for the native authenticated passive session append."""
 
+import asyncio
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 import pytest
 from aiohttp import web
@@ -17,6 +19,8 @@ OTHER_SESSION_ID = "018f22e2-7c00-7001-8001-000000000011"
 HERMES_SESSION_ID = "weave-018f22e2-7c00-7001-8001-000000000099"
 ITEM_ONE = "018f22e2-7c00-7001-8001-000000000001"
 ITEM_TWO = "018f22e2-7c00-7001-8001-000000000002"
+ITEM_THREE = "018f22e2-7c00-7001-8001-000000000004"
+ITEM_FOUR = "018f22e2-7c00-7001-8001-000000000005"
 PARTICIPANT_ID = "018f22e2-7c00-7001-8001-000000000003"
 
 
@@ -338,7 +342,6 @@ async def test_http_exact_wrapper_constants_target_and_direct_receipt(session_db
         assert replay_receipt["outcome"] == "identical_retry"
         assert replay_receipt["native_item_ref"] == native_ref
         assert replay_receipt["same_native_ref_on_identical_retry"] is True
-
         changed_bem = await client.post(
             f"/api/sessions/{HERMES_SESSION_ID}/append", headers=headers,
             json=_request(target=OTHER_SESSION_ID),
@@ -387,6 +390,142 @@ async def test_http_exact_wrapper_constants_target_and_direct_receipt(session_db
             f"/api/sessions/{SESSION_ID}/append", headers=headers, json=extra
         )
         assert rejected.status == 400
+
+
+@pytest.mark.asyncio
+async def test_http_assistant_final_schedules_existing_memory_hook_off_path(session_db):
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "sk-passive-append-test"})
+    )
+    adapter._session_db = session_db
+    session_db.create_session(HERMES_SESSION_ID, "api_server")
+    calls = []
+
+    class Manager:
+        def sync_all(self, user, assistant, **kwargs):
+            calls.append((user, assistant, kwargs))
+
+        def shutdown_all(self):
+            calls.append("shutdown")
+
+    app = _app(adapter)
+    headers = {"Authorization": "Bearer sk-passive-append-test"}
+    with patch(
+        "agent.memory_manager.configured_memory_manager", return_value=Manager()
+    ):
+        async with TestClient(TestServer(app)) as client:
+            user = await client.post(
+                f"/api/sessions/{HERMES_SESSION_ID}/append",
+                headers=headers,
+                json=_request(target=SESSION_ID),
+            )
+            assert user.status == 201
+            assert calls == []
+
+            failed = await client.post(
+                f"/api/sessions/{HERMES_SESSION_ID}/append",
+                headers=headers,
+                json=_request(
+                    ITEM_TWO,
+                    target=SESSION_ID,
+                    role="assistant",
+                    content="final answer",
+                    predecessor=99,
+                ),
+            )
+            assert failed.status == 409
+            assert calls == []
+
+            assistant = await client.post(
+                f"/api/sessions/{HERMES_SESSION_ID}/append",
+                headers=headers,
+                json=_request(
+                    ITEM_TWO,
+                    target=SESSION_ID,
+                    role="assistant",
+                    content="final answer",
+                    predecessor=1,
+                ),
+            )
+            assert assistant.status == 201
+            await asyncio.gather(*list(adapter._background_tasks))
+
+            newer_user = await client.post(
+                f"/api/sessions/{HERMES_SESSION_ID}/append", headers=headers,
+                json=_request(ITEM_THREE, target=SESSION_ID, content="new question",
+                              predecessor=2),
+            )
+            assert newer_user.status == 201
+            newer_assistant = await client.post(
+                f"/api/sessions/{HERMES_SESSION_ID}/append", headers=headers,
+                json=_request(ITEM_FOUR, target=SESSION_ID, role="assistant",
+                              content="new answer", predecessor=3),
+            )
+            assert newer_assistant.status == 201
+            await asyncio.gather(*list(adapter._background_tasks))
+            replay = await client.post(
+                f"/api/sessions/{HERMES_SESSION_ID}/append", headers=headers,
+                json=_request(ITEM_TWO, target=SESSION_ID, role="assistant",
+                              content="final answer", predecessor=3),
+            )
+            assert replay.status == 200
+            await asyncio.gather(*list(adapter._background_tasks))
+
+    assert calls[-1] == "shutdown"
+    user_text, assistant_text, kwargs = calls[0]
+    assert (user_text, assistant_text) == ("hello", "final answer")
+    assert kwargs["session_id"] == HERMES_SESSION_ID
+    assert [item["_row_id"] for item in kwargs["messages"]] == [1, 2]
+    syncs = [call for call in calls if isinstance(call, tuple)]
+    assert [[item["_row_id"] for item in call[2]["messages"]] for call in syncs] == [
+        [1, 2], [1, 2, 3, 4], [1, 2],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_http_assistant_only_final_does_not_borrow_an_older_user(session_db):
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "sk-passive-append-test"})
+    )
+    adapter._session_db = session_db
+    session_db.create_session(HERMES_SESSION_ID, "api_server")
+    calls = []
+
+    class Manager:
+        def sync_all(self, *_args, **_kwargs):
+            calls.append("sync")
+
+        def shutdown_all(self):
+            calls.append("shutdown")
+
+    app = _app(adapter)
+    headers = {"Authorization": "Bearer sk-passive-append-test"}
+    with patch(
+        "agent.memory_manager.configured_memory_manager", return_value=Manager()
+    ):
+        async with TestClient(TestServer(app)) as client:
+            for item_id, role, content, predecessor in (
+                (ITEM_ONE, "user", "hello", None),
+                (ITEM_TWO, "assistant", "answer", 1),
+            ):
+                response = await client.post(
+                    f"/api/sessions/{HERMES_SESSION_ID}/append", headers=headers,
+                    json=_request(item_id, target=SESSION_ID, role=role,
+                                  content=content, predecessor=predecessor),
+                )
+                assert response.status == 201
+            await asyncio.gather(*list(adapter._background_tasks))
+            assert calls.count("sync") == 1
+
+            assistant_only = await client.post(
+                f"/api/sessions/{HERMES_SESSION_ID}/append", headers=headers,
+                json=_request(ITEM_THREE, target=SESSION_ID, role="assistant",
+                              content="speculation", predecessor=2),
+            )
+            assert assistant_only.status == 201
+            await asyncio.gather(*list(adapter._background_tasks))
+
+    assert calls.count("sync") == 1
 
 
 @pytest.mark.asyncio

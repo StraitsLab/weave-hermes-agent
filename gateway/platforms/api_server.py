@@ -3453,7 +3453,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if db is None:
             return []
         try:
-            return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+            return await asyncio.to_thread(
+                db.get_messages_as_conversation, session_id, include_row_ids=True
+            )
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
@@ -3856,6 +3858,12 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         outcome = result["outcome"]
+        if outcome in {"inserted", "identical_retry"} and append_request["role"] == "assistant":
+            task = asyncio.create_task(self._sync_passive_finalized_turn(
+                db, session_id, result["message_id"]
+            ))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
         external_item_id = append_request["external_item_id"]
         receipt = {
             "kind": "hermes_append_receipt",
@@ -3881,6 +3889,46 @@ class APIServerAdapter(BasePlatformAdapter):
             receipt,
             status=409,
         )
+
+    async def _sync_passive_finalized_turn(
+        self, db, session_id: str, assistant_row_id: int
+    ) -> None:
+        """Schedule an accepted passive final through the configured memory hook."""
+        manager = None
+        try:
+            messages = await asyncio.to_thread(
+                db.get_messages_as_conversation, session_id, include_row_ids=True
+            )
+            assistant_index = next((index for index, item in enumerate(messages)
+                if item.get("role") == "assistant"
+                and item.get("_row_id") == assistant_row_id
+                and item.get("content")), None)
+            if assistant_index is None:
+                return
+            assistant = messages[assistant_index]
+            predecessor = next(
+                (item for item in reversed(messages[:assistant_index])
+                 if item.get("role") in {"user", "assistant"}
+                 and item.get("content")),
+                None,
+            )
+            if predecessor is None or predecessor.get("role") != "user":
+                return
+            user = predecessor
+            from agent.memory_manager import configured_memory_manager
+
+            manager = configured_memory_manager(
+                session_id=session_id, platform="api_server"
+            )
+            manager.sync_all(
+                user["content"], assistant["content"],
+                session_id=session_id, messages=messages[:assistant_index + 1],
+            )
+        except Exception:
+            logger.warning("[%s] passive finalized-turn memory sync failed", self.name)
+        finally:
+            if manager is not None:
+                await asyncio.to_thread(manager.shutdown_all)
 
     @staticmethod
     def _native_submit_request(body: Dict[str, Any]) -> tuple[Optional[tuple[str, str]], Optional["web.Response"]]:
@@ -4949,7 +4997,11 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 db = await self._ensure_session_db_async()
                 if db is not None:
-                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+                    history = await asyncio.to_thread(
+                        db.get_messages_as_conversation,
+                        session_id,
+                        include_row_ids=True,
+                    )
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
