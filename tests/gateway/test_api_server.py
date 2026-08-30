@@ -2365,6 +2365,9 @@ class TestSessionIdHeader:
             # History must come from DB, not from the request body
             assert call_kwargs["conversation_history"] == db_history
             assert call_kwargs["user_message"] == "new question"
+            mock_db.get_messages_as_conversation.assert_called_once_with(
+                "existing-session", include_row_ids=True
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2644,6 +2647,21 @@ class TestSessionDbOffEventLoop:
         # The blocking DB call must NOT execute on the event-loop thread.
         assert captured["thread"] is not None
         assert captured["thread"] != threading.current_thread()
+
+    @pytest.mark.asyncio
+    async def test_conversation_history_preserves_native_row_ids(self, auth_adapter):
+        history = [
+            {"role": "user", "content": "stored", "_row_id": 41},
+            {"role": "assistant", "content": "reply", "_row_id": 42},
+        ]
+        database = MagicMock()
+        database.get_messages_as_conversation.return_value = history
+        auth_adapter._session_db = database
+
+        assert await auth_adapter._conversation_history_for_session("sess-x") == history
+        database.get_messages_as_conversation.assert_called_once_with(
+            "sess-x", include_row_ids=True
+        )
 
     @pytest.mark.asyncio
     async def test_create_session_without_model_does_not_persist_virtual_alias(self, auth_adapter):

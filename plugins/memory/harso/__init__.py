@@ -112,15 +112,56 @@ class HarsoMemoryProvider(MemoryProvider):
         session_id: str = "",
         messages: List[Dict[str, Any]] | None = None,
     ) -> None:
-        del assistant_content, messages
-        content = user_content.strip()
-        if not content:
+        user_content = user_content.strip()
+        assistant_content = assistant_content.strip()
+        if not user_content or not assistant_content or not messages:
             return
+        pairs: list[tuple[dict[str, str], dict[str, str]]] = []
+        user: dict[str, str] | None = None
+        assistant: dict[str, str] | None = None
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role, content, row_id = (
+                message.get("role"), message.get("content"), message.get("_row_id")
+            )
+            if (
+                role not in {"user", "assistant"}
+                or not isinstance(content, str)
+                or not content.strip()
+            ):
+                continue
+            item = {
+                "role": role,
+                "content": content.strip(),
+            }
+            if type(row_id) is int and row_id > 0:
+                item["native_item_ref"] = f"message:{row_id}"
+            if role == "user":
+                if user is not None and assistant is not None:
+                    pairs.append((user, assistant))
+                user, assistant = item, None
+            elif user is not None:
+                assistant = item
+        if user is None or assistant is None:
+            return
+        pairs.append((user, assistant))
+        if any("native_item_ref" not in item for item in pairs[-1]):
+            return
+        pairs = [
+            pair for pair in pairs
+            if all("native_item_ref" in item for item in pair)
+        ][-5:]
+        pairs[-1][0]["content"] = user_content
+        pairs[-1][1]["content"] = assistant_content
+        items = [item for pair in pairs for item in pair]
         self._post(
             "/internal/harso/turns",
             {
                 **self._scope(session_id or self._session_id),
-                "user_content": content,
+                "current_user_ref": pairs[-1][0]["native_item_ref"],
+                "current_assistant_ref": pairs[-1][1]["native_item_ref"],
+                "finalized_items": items,
             },
         )
 

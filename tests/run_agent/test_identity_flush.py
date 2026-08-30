@@ -86,6 +86,35 @@ class TestIdentityFlush:
                 agent._flush_messages_to_session_db(messages, [])
 
                 assert _contents(db) == ["q", "a"]
+                rows = db.get_messages(SESSION_ID)
+                assert [message["_row_id"] for message in messages] == [
+                    row["id"] for row in rows
+                ]
+                agent._flush_messages_to_session_db(messages, [])
+                assert [message["_row_id"] for message in messages] == [
+                    row["id"] for row in rows
+                ]
+            finally:
+                db.close()
+
+    def test_failed_atomic_flush_exposes_no_native_row_identity(self):
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            try:
+                agent = _make_agent(db)
+                messages = [
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "a"},
+                ]
+                with patch.object(
+                    db, "append_messages_batch", side_effect=RuntimeError("failed")
+                ):
+                    agent._flush_messages_to_session_db(messages, [])
+
+                assert all("_row_id" not in message for message in messages)
+                assert all("_db_persisted" not in message for message in messages)
             finally:
                 db.close()
 

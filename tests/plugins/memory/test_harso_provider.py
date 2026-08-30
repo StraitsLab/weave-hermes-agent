@@ -75,7 +75,7 @@ def test_prefetch_sends_native_session_and_exact_scope_headers(monkeypatch):
     }
 
 
-def test_completed_turn_posts_only_user_authored_evidence(monkeypatch):
+def test_completed_turn_posts_bounded_role_aware_finalized_window(monkeypatch):
     provider = _provider(monkeypatch)
     seen = {}
     monkeypatch.setattr(
@@ -88,12 +88,28 @@ def test_completed_turn_posts_only_user_authored_evidence(monkeypatch):
         ),
     )
 
+    messages = []
+    for row_id in range(1, 13):
+        role = "user" if row_id % 2 else "assistant"
+        messages.append({
+            "role": role,
+            "content": f"{role}-{row_id}",
+            "_row_id": row_id,
+        })
     provider.sync_turn(
-        "I prefer tea",
-        "I will remember that you prefer tea",
+        "user-11",
+        "assistant-12",
         session_id="weave-018f22e2-7c00-7001-8001-000000000001",
-        messages=[{"role": "user"}, {"role": "assistant"}],
+        messages=messages,
     )
+    expected_items = [
+        {
+            "role": "user" if row_id % 2 else "assistant",
+            "native_item_ref": f"message:{row_id}",
+            "content": f"{'user' if row_id % 2 else 'assistant'}-{row_id}",
+        }
+        for row_id in range(3, 13)
+    ]
 
     assert seen == {
         "url": "https://memory.example.test/internal/harso/turns",
@@ -101,13 +117,15 @@ def test_completed_turn_posts_only_user_authored_evidence(monkeypatch):
             "profile_id": "profile-1",
             "profile_revision_id": "revision-2",
             "hermes_session_ref": "weave-018f22e2-7c00-7001-8001-000000000001",
-            "user_content": "I prefer tea",
+            "current_user_ref": "message:11",
+            "current_assistant_ref": "message:12",
+            "finalized_items": expected_items,
         },
         "timeout": 5,
     }
 
 
-def test_completed_turn_payload_ignores_message_history_length(monkeypatch):
+def test_completed_turn_requires_stable_current_pair(monkeypatch):
     provider = _provider(monkeypatch)
     bodies = []
     monkeypatch.setattr(
@@ -117,13 +135,6 @@ def test_completed_turn_payload_ignores_message_history_length(monkeypatch):
             or _Response({"acknowledged": True, "disposition": "stored"})
         ),
     )
-    expected = {
-        "profile_id": "profile-1",
-        "profile_revision_id": "revision-2",
-        "hermes_session_ref": "weave-session",
-        "user_content": "I prefer tea",
-    }
-
     for messages in (
         [{"role": "user"}, {"role": "assistant"}],
         [
@@ -131,6 +142,12 @@ def test_completed_turn_payload_ignores_message_history_length(monkeypatch):
             {"role": "assistant"},
             {"role": "tool"},
             {"role": "assistant"},
+        ],
+        [
+            {"role": "user", "content": "old", "_row_id": 1},
+            {"role": "assistant", "content": "old answer", "_row_id": 2},
+            {"role": "user", "content": "I prefer tea"},
+            {"role": "assistant", "content": "ack"},
         ],
         None,
     ):
@@ -141,7 +158,7 @@ def test_completed_turn_payload_ignores_message_history_length(monkeypatch):
             messages=messages,
         )
 
-    assert bodies == [expected, expected, expected]
+    assert bodies == []
 
 
 def test_completed_turn_ignores_blank_user_content(monkeypatch):
