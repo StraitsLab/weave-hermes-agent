@@ -90,7 +90,7 @@ class HarsoMemoryProvider(MemoryProvider):
                 "query": query,
             },
         )
-        if not response or response.get("degraded") is True:
+        if not response:
             return ""
         items = response.get("items")
         if not isinstance(items, list):
