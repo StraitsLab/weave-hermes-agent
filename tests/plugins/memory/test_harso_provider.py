@@ -46,7 +46,6 @@ def test_prefetch_sends_native_session_and_exact_scope_headers(monkeypatch):
             "degraded": False,
             "items": [
                 {
-                    "evidence_id": "evidence-9",
                     "citation": "[harso: evidence-9]",
                     "text": "remembered preference",
                 }
@@ -73,6 +72,31 @@ def test_prefetch_sends_native_session_and_exact_scope_headers(monkeypatch):
         },
         "timeout": 5,
     }
+
+
+def test_prefetch_keeps_cited_degraded_fallback_but_not_empty_items(monkeypatch):
+    provider = _provider(monkeypatch)
+    responses = iter([
+        {
+            "degraded": True,
+            "items": [
+                {
+                    "evidence_id": "evidence-9",
+                    "citation": "[harso: evidence-9]",
+                    "text": "remembered preference",
+                }
+            ],
+        },
+        {"degraded": True, "items": []},
+    ])
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *_args, **_kwargs: _Response(next(responses)),
+    )
+
+    recalled = provider.prefetch("recall", session_id="native-session")
+    assert recalled == "[harso: evidence-9] remembered preference"
+    assert provider.prefetch("missing", session_id="native-session") == ""
 
 
 def test_completed_turn_posts_bounded_role_aware_finalized_window(monkeypatch):
