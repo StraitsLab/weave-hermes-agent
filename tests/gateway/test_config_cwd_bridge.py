@@ -14,6 +14,7 @@ import json
 
 from gateway.cwd_placeholder import CWD_PLACEHOLDERS, resolve_placeholder_terminal_cwd
 from hermes_cli.config import _is_ssh_remote_tilde_cwd
+from hermes_constants import normalize_terminal_home_mode
 
 
 def _simulate_config_bridge(cfg: dict, initial_env: dict | None = None):
@@ -60,6 +61,13 @@ def _simulate_config_bridge(cfg: dict, initial_env: dict | None = None):
                 if cfg_key == "cwd" and isinstance(val, str):
                     if not _is_ssh_remote_tilde_cwd(terminal_backend, val.strip()):
                         val = os.path.expanduser(val)
+                # Canonicalize home_mode and skip an unrecognized one, using the
+                # same production table as gateway/run.py, hermes_cli.config's
+                # reload bridge and get_subprocess_home.
+                if cfg_key == "home_mode":
+                    val = normalize_terminal_home_mode(val)
+                    if val is None:
+                        continue
                 if isinstance(val, list):
                     env[env_var] = json.dumps(val)
                 else:
@@ -234,3 +242,47 @@ class TestVercelTerminalBridge:
         assert result["TERMINAL_CONTAINER_CPU"] == "2"
         assert result["TERMINAL_CONTAINER_MEMORY"] == "4096"
         assert result["TERMINAL_CONTAINER_DISK"] == "51200"
+
+
+class TestTerminalHomeModeBridge:
+    """terminal.home_mode must reach TERMINAL_HOME_MODE canonicalized (WEV-1330).
+
+    The gateway map always carried the key, but it exported the raw config
+    value while the reload bridge in hermes_cli.config canonicalized it — so an
+    alias meant one thing at gateway startup and another after the first
+    per-turn reload. Both now go through normalize_terminal_home_mode.
+    """
+
+    def test_home_mode_is_bridged(self):
+        cfg = {"terminal": {"backend": "local", "home_mode": "profile"}}
+        result = _simulate_config_bridge(cfg)
+        assert result["TERMINAL_HOME_MODE"] == "profile"
+
+    def test_home_mode_alias_is_canonicalized(self):
+        cfg = {"terminal": {"backend": "local", "home_mode": " Isolated "}}
+        result = _simulate_config_bridge(cfg)
+        assert result["TERMINAL_HOME_MODE"] == "profile"
+
+    def test_unrecognized_home_mode_is_skipped(self):
+        """Skipped like a cwd placeholder, so the .env selection survives."""
+        cfg = {"terminal": {"backend": "local", "home_mode": "descriptor"}}
+        result = _simulate_config_bridge(cfg, {"TERMINAL_HOME_MODE": "profile"})
+        assert result["TERMINAL_HOME_MODE"] == "profile"
+
+    def test_unrecognized_home_mode_sets_nothing_when_env_is_empty(self):
+        cfg = {"terminal": {"backend": "local", "home_mode": "descriptor"}}
+        result = _simulate_config_bridge(cfg)
+        assert "TERMINAL_HOME_MODE" not in result
+
+
+def test_gateway_bridge_uses_the_shared_home_mode_table():
+    """The simulation above only proves the semantics if gateway/run.py really
+    routes home_mode through the shared table — the loop there is module-level
+    code that cannot be called directly, so pin it by source inspection (the
+    same technique tests/tools/test_terminal_config_env_sync.py uses)."""
+    import inspect
+
+    import gateway.run as gr
+
+    source = inspect.getsource(gr)
+    assert "normalize_terminal_home_mode(_val)" in source

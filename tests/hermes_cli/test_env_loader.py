@@ -620,3 +620,115 @@ def test_other_profile_home_does_not_bridge_process_config(tmp_path, monkeypatch
 
     # The other profile's .env value stands; the process config was not applied.
     assert os.getenv("TERMINAL_ENV") == "docker"
+
+
+# ---------------------------------------------------------------------------
+# terminal.home_mode re-apply (WEV-1330)
+#
+# TERMINAL_CONFIG_ENV_MAP carried terminal.cwd but not terminal.home_mode, even
+# though cli.py and gateway/run.py both bridged it at startup. So the reload
+# bridge re-asserted the cwd and dropped the HOME policy: a stale
+# TERMINAL_HOME_MODE in .env (or an inherited shell export) silently won back
+# on every load_hermes_dotenv() — gateway per-turn reload, cron standalone run.
+# ---------------------------------------------------------------------------
+
+
+def test_config_yaml_terminal_home_mode_overrides_stale_env(tmp_path, monkeypatch):
+    """The reload must re-bridge home_mode, not just cwd.
+
+    This is the WEV-1330 gap: both keys are explicit in config.yaml and both
+    are stale in .env, and before the fix only TERMINAL_CWD came back.
+    """
+    home = _seed_terminal_home(
+        tmp_path, monkeypatch,
+        config_yaml=(
+            "terminal:\n"
+            "  backend: local\n"
+            "  cwd: /srv/project\n"
+            "  home_mode: profile\n"
+        ),
+        env_text="TERMINAL_CWD=/stale/path\nTERMINAL_HOME_MODE=real\n",
+    )
+
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.getenv("TERMINAL_CWD") == "/srv/project"
+    assert os.getenv("TERMINAL_HOME_MODE") == "profile"
+
+
+def test_config_yaml_terminal_home_mode_overrides_stale_shell(tmp_path, monkeypatch):
+    """config.yaml must also beat a TERMINAL_HOME_MODE exported in the shell
+    (the terminal tool injects it into every subprocess env, so an agent-run
+    process inherits whatever its parent session used)."""
+    home = _seed_terminal_home(
+        tmp_path, monkeypatch,
+        config_yaml="terminal:\n  home_mode: real\n",
+    )
+
+    monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.getenv("TERMINAL_HOME_MODE") == "real"
+
+
+def test_terminal_home_mode_alias_is_canonicalized(tmp_path, monkeypatch):
+    """Accepted aliases fold to their canonical mode before hitting the env,
+    the same way terminal.cwd is expanded before it is bridged."""
+    home = _seed_terminal_home(
+        tmp_path, monkeypatch,
+        config_yaml="terminal:\n  home_mode: ' Isolated '\n",
+    )
+
+    monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.getenv("TERMINAL_HOME_MODE") == "profile"
+
+
+def test_invalid_terminal_home_mode_leaves_env_value_alone(tmp_path, monkeypatch):
+    """An unrecognized mode is rejected, not stamped into the env.
+
+    Mirrors terminal.cwd's placeholder handling: bad input is skipped so the
+    launcher/.env selection survives. Bridging it would read as "auto"
+    downstream and silently undo a deliberate TERMINAL_HOME_MODE.
+
+    The surviving .env value alone would also be the pre-fix result (the bridge
+    used to touch no home_mode at all), so this asserts a valid sibling key is
+    bridged in the SAME load — the bridge ran, and skipped only this key.
+    """
+    from hermes_constants import normalize_terminal_home_mode
+
+    home = _seed_terminal_home(
+        tmp_path, monkeypatch,
+        config_yaml=(
+            "terminal:\n"
+            "  backend: local\n"
+            "  cwd: /srv/project\n"
+            "  home_mode: descriptor\n"
+        ),
+        env_text="TERMINAL_CWD=/stale/path\nTERMINAL_HOME_MODE=profile\n",
+    )
+
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    # The bridge ran: the sibling key came back from config.yaml ...
+    assert os.getenv("TERMINAL_CWD") == "/srv/project"
+    # ... and only the unrecognized mode was skipped.
+    assert os.getenv("TERMINAL_HOME_MODE") == "profile"
+    assert normalize_terminal_home_mode("descriptor") is None
+
+
+def test_terminal_home_mode_is_bridged_by_the_shared_map():
+    """Pin the map entry itself — the reload bridge iterates it, so a removal
+    reopens the gap even if the behavioral tests above are rewritten."""
+    from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
+
+    assert TERMINAL_CONFIG_ENV_MAP["home_mode"] == "TERMINAL_HOME_MODE"

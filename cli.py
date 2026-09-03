@@ -218,7 +218,11 @@ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
-from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    display_hermes_home,
+    normalize_terminal_home_mode,
+)
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
     is_browser_debug_ready,
@@ -703,8 +707,17 @@ def load_cli_config() -> Dict[str, Any]:
                 # CLI: always export (overrides stale .env or inherited values)
                 os.environ[env_var] = str(terminal_config[config_key])
                 continue
+            val = terminal_config[config_key]
+            if env_var == "TERMINAL_HOME_MODE":
+                # Same table as hermes_cli.config's reload bridge and
+                # get_subprocess_home: canonicalize the accepted aliases, and
+                # skip an unrecognized mode rather than exporting it (it would
+                # read as "auto" downstream while hiding a deliberate
+                # TERMINAL_HOME_MODE). WEV-1330.
+                val = normalize_terminal_home_mode(val)
+                if val is None:
+                    continue
             if _file_has_terminal_config or env_var not in os.environ:
-                val = terminal_config[config_key]
                 if isinstance(val, (list, dict)):
                     os.environ[env_var] = json.dumps(val)
                 else:

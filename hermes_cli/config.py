@@ -719,7 +719,11 @@ def get_container_exec_info() -> Optional[dict]:
 # =============================================================================
 
 # Re-export from hermes_constants — canonical definition lives there.
-from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F811,E402
+from hermes_constants import (  # noqa: F811,E402
+    get_hermes_home,
+    get_process_hermes_home,
+    normalize_terminal_home_mode,
+)
 from utils import atomic_replace, fast_safe_load
 
 def get_config_path() -> Path:
@@ -3420,6 +3424,13 @@ TERMINAL_CONFIG_ENV_MAP = {
     "degraded_mode": "TERMINAL_DEGRADED_MODE",
     "cwd": "TERMINAL_CWD",
     "timeout": "TERMINAL_TIMEOUT",
+    # Subprocess HOME policy. Consumed by hermes_constants.get_subprocess_home;
+    # cli.py's env_mappings and gateway/run.py's _terminal_env_map have always
+    # carried it, so a startup bridge exported it — but this map did not, so
+    # every load_hermes_dotenv() reload re-bridged terminal.cwd and dropped
+    # terminal.home_mode, letting a stale .env TERMINAL_HOME_MODE win mid-session
+    # (WEV-1330).
+    "home_mode": "TERMINAL_HOME_MODE",
     "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
     "docker_image": "TERMINAL_DOCKER_IMAGE",
     "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
@@ -3533,6 +3544,15 @@ def apply_terminal_config_to_env(
                 terminal_backend, raw_cwd
             ):
                 value = os.path.expanduser(value)
+        elif cfg_key == "home_mode":
+            # Same shape as cwd: normalize first, and skip unusable input rather
+            # than stamping it into the env. An unrecognized mode would read as
+            # "auto" downstream anyway, so bridging it would silently erase a
+            # deliberate TERMINAL_HOME_MODE that .env or the launcher had set.
+            normalized = normalize_terminal_home_mode(value)
+            if normalized is None:
+                continue
+            value = normalized
         if (should_override and cfg_key in explicit_keys) or env_var not in target:
             target[env_var] = _terminal_env_value(value)
     return target
@@ -5405,6 +5425,28 @@ def set_config_value(key: str, value: str, force: bool = False):
                 )
 
     value = coerced_value
+    # terminal.home_mode is enum-like AND is mirrored into ~/.hermes/.env below
+    # (it is in TERMINAL_CONFIG_ENV_MAP, which terminal_config_env_var_for_key
+    # reads), so an unrecognized spelling would be persisted raw into the .env
+    # and then read as "auto" by get_subprocess_home -- a silent no-op the user
+    # cannot see. Reject it here, and store the canonical spelling in both
+    # files. Same table as every config->env bridge (WEV-1330).
+    if key.strip().lower() == "terminal.home_mode":
+        _home_mode = normalize_terminal_home_mode(value)
+        if _home_mode is None:
+            print(
+                f"✗ Cannot set '{key}' to {value!r} — not a valid home mode.",
+                file=sys.stderr,
+            )
+            print("  Valid values: auto, real, profile", file=sys.stderr)
+            print(
+                "  Accepted aliases: host, user, real_home, real-home "
+                "(→ real); isolated, profile_home, profile-home "
+                "(→ profile)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        value = _home_mode
     # Normalize a scalar ``model`` key before writing sub-keys so that
     # ``hermes config set model.provider openai`` doesn't silently
     # destroy the model id when ``model`` is a bare string shorthand
