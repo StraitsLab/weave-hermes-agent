@@ -753,3 +753,41 @@ class TestMalformedYAMLConfigPreservation:
         assert "Cannot parse" in captured.out or "Cannot parse" in captured.err
         raw = _read_config(_isolated_hermes_home)
         assert raw == self.BROKEN_CONFIG
+
+
+# ---------------------------------------------------------------------------
+# terminal.home_mode is enum-like and mirrored into .env (WEV-1330)
+# ---------------------------------------------------------------------------
+
+class TestTerminalHomeModeValidation:
+    """``hermes config set terminal.home_mode`` writes BOTH config.yaml and
+    .env (the key is in TERMINAL_CONFIG_ENV_MAP, which
+    terminal_config_env_var_for_key reads). An unrecognized spelling would be
+    persisted raw and then silently read as "auto" by get_subprocess_home, so
+    the command rejects it instead."""
+
+    def test_valid_mode_is_written_to_both_files(self, _isolated_hermes_home):
+        set_config_value("terminal.home_mode", "profile")
+
+        assert "home_mode: profile" in _read_config(_isolated_hermes_home)
+        assert "TERMINAL_HOME_MODE=profile" in _read_env(_isolated_hermes_home)
+
+    def test_alias_is_canonicalized_before_it_is_persisted(self, _isolated_hermes_home):
+        """An accepted alias must not reach .env verbatim — the .env value is
+        what a reload bridges, and every reader expects the canonical form."""
+        set_config_value("terminal.home_mode", "isolated")
+
+        assert "home_mode: profile" in _read_config(_isolated_hermes_home)
+        assert "TERMINAL_HOME_MODE=profile" in _read_env(_isolated_hermes_home)
+
+    def test_unrecognized_mode_is_refused(self, _isolated_hermes_home, capsys):
+        with pytest.raises(SystemExit) as exc:
+            set_config_value("terminal.home_mode", "descriptor")
+        assert exc.value.code == 1
+
+        captured = capsys.readouterr()
+        assert "not a valid home mode" in captured.err
+        assert "auto, real, profile" in captured.err
+        # Neither file may carry the rejected value.
+        assert "descriptor" not in _read_config(_isolated_hermes_home)
+        assert "descriptor" not in _read_env(_isolated_hermes_home)

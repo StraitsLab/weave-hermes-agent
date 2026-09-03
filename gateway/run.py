@@ -1961,7 +1961,11 @@ _ensure_ssl_certs()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
-from hermes_constants import get_hermes_home, get_hermes_home_override
+from hermes_constants import (
+    get_hermes_home,
+    get_hermes_home_override,
+    normalize_terminal_home_mode,
+)
 from utils import atomic_json_write, base_url_hostname, is_truthy_value
 _hermes_home = get_hermes_home()
 
@@ -2281,6 +2285,15 @@ if _config_path.exists():
                     if _cfg_key == "cwd" and isinstance(_val, str):
                         if not _is_ssh_remote_tilde_cwd(_terminal_backend, _val.strip()):
                             _val = os.path.expanduser(_val)
+                    # Same table as hermes_cli.config's reload bridge and
+                    # get_subprocess_home: canonicalize the accepted aliases,
+                    # and skip an unrecognized mode rather than exporting it
+                    # (it would read as "auto" downstream while hiding a
+                    # deliberate TERMINAL_HOME_MODE). WEV-1330.
+                    if _cfg_key == "home_mode":
+                        _val = normalize_terminal_home_mode(_val)
+                        if _val is None:
+                            continue
                     if isinstance(_val, (list, dict)):
                         os.environ[_env_var] = json.dumps(_val)
                     else:

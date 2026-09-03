@@ -5425,6 +5425,28 @@ def set_config_value(key: str, value: str, force: bool = False):
                 )
 
     value = coerced_value
+    # terminal.home_mode is enum-like AND is mirrored into ~/.hermes/.env below
+    # (it is in TERMINAL_CONFIG_ENV_MAP, which terminal_config_env_var_for_key
+    # reads), so an unrecognized spelling would be persisted raw into the .env
+    # and then read as "auto" by get_subprocess_home -- a silent no-op the user
+    # cannot see. Reject it here, and store the canonical spelling in both
+    # files. Same table as every config->env bridge (WEV-1330).
+    if key.strip().lower() == "terminal.home_mode":
+        _home_mode = normalize_terminal_home_mode(value)
+        if _home_mode is None:
+            print(
+                f"✗ Cannot set '{key}' to {value!r} — not a valid home mode.",
+                file=sys.stderr,
+            )
+            print("  Valid values: auto, real, profile", file=sys.stderr)
+            print(
+                "  Accepted aliases: host, user, real_home, real-home "
+                "(→ real); isolated, profile_home, profile-home "
+                "(→ profile)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        value = _home_mode
     # Normalize a scalar ``model`` key before writing sub-keys so that
     # ``hermes config set model.provider openai`` doesn't silently
     # destroy the model id when ``model`` is a bare string shorthand
