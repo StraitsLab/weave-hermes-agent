@@ -1106,6 +1106,34 @@ def get_real_home(env: dict[str, str] | None = None) -> str:
     return "/tmp"
 
 
+# Every accepted ``terminal.home_mode`` spelling → its canonical value.
+# ``get_subprocess_home`` below is the consumer; ``hermes_cli.config``'s
+# TERMINAL_HOME_MODE bridge validates against this same table so the config
+# side and the runtime side can never drift on what "a valid mode" means.
+TERMINAL_HOME_MODES = {
+    "auto": "auto",
+    "real": "real",
+    "host": "real",
+    "user": "real",
+    "real_home": "real",
+    "real-home": "real",
+    "profile": "profile",
+    "isolated": "profile",
+    "profile_home": "profile",
+    "profile-home": "profile",
+}
+
+
+def normalize_terminal_home_mode(value: object) -> str | None:
+    """Return the canonical home mode for *value*, or ``None`` if unrecognized.
+
+    Canonical values are ``auto`` / ``real`` / ``profile``; the historical
+    aliases in ``TERMINAL_HOME_MODES`` fold into them. Callers that need the
+    documented default for unrecognized input use ``or "auto"``.
+    """
+    return TERMINAL_HOME_MODES.get(str(value or "").strip().lower())
+
+
 def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
     """Return a subprocess ``HOME`` override, if one should be applied.
 
@@ -1121,11 +1149,9 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
     """
     env = env or {}
     profile_home = _profile_home_path(env)
-    mode = str(env.get("TERMINAL_HOME_MODE") or os.getenv("TERMINAL_HOME_MODE", "auto")).strip().lower() or "auto"
-    if mode in {"isolated", "profile_home", "profile-home"}:
-        mode = "profile"
-    if mode in {"host", "user", "real_home", "real-home"}:
-        mode = "real"
+    mode = normalize_terminal_home_mode(
+        env.get("TERMINAL_HOME_MODE") or os.getenv("TERMINAL_HOME_MODE", "auto")
+    ) or "auto"
 
     if mode == "profile":
         return profile_home
