@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
+from agent.session_credential import SessionCredential
+
 logger = logging.getLogger(__name__)
 
 
@@ -181,6 +183,8 @@ class SessionState:
     runtime_lock: Any = field(default_factory=Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    credential_holder: SessionCredential | None = None
+    credential_route_revision_id: str | None = None
 
 
 class SessionManager:
@@ -241,10 +245,55 @@ class SessionManager:
         # Attempt to restore from database.
         return self._restore(session_id)
 
+    def bind_credential(
+        self,
+        session_id: str,
+        bearer: str,
+        expires_at: datetime,
+        provider_route_revision_id: str,
+    ) -> bool:
+        """Bind a bearer to one live session without persistence or restoration."""
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None:
+                return False
+            with state.runtime_lock:
+                holder = state.credential_holder
+                if holder is not None:
+                    if state.credential_route_revision_id != provider_route_revision_id:
+                        return False
+                    return holder.refresh(bearer, expires_at)
+                holder = SessionCredential(bearer, expires_at)
+                try:
+                    state.agent.switch_model(
+                        new_model=state.agent.model,
+                        new_provider=state.agent.provider,
+                        api_key=holder,
+                        base_url=state.agent.base_url,
+                        api_mode=state.agent.api_mode,
+                    )
+                except Exception:
+                    holder.revoke()
+                    return False
+                state.credential_holder = holder
+                state.credential_route_revision_id = provider_route_revision_id
+                return True
+
+    def revoke_live_credentials(self) -> None:
+        """Revoke every in-memory credential without touching persisted sessions."""
+        with self._lock:
+            states = list(self._sessions.values())
+        for state in states:
+            if state.credential_holder is not None:
+                state.credential_holder.revoke()
+
     def remove_session(self, session_id: str) -> bool:
         """Remove a session from memory and database. Returns True if it existed."""
         with self._lock:
-            existed = self._sessions.pop(session_id, None) is not None
+            state = self._sessions.pop(session_id, None)
+            existed = state is not None
+            if state is not None and state.credential_holder is not None:
+                state.credential_holder.revoke()
         db_existed = self._delete_persisted(session_id)
         if existed or db_existed:
             _clear_task_cwd(session_id)
@@ -368,8 +417,12 @@ class SessionManager:
     def cleanup(self) -> None:
         """Remove all sessions (memory and database) and clear task-specific cwd overrides."""
         with self._lock:
-            session_ids = list(self._sessions.keys())
+            states = list(self._sessions.values())
+            session_ids = [state.session_id for state in states]
             self._sessions.clear()
+        for state in states:
+            if state.credential_holder is not None:
+                state.credential_holder.revoke()
         for session_id in session_ids:
             _clear_task_cwd(session_id)
             self._delete_persisted(session_id)
