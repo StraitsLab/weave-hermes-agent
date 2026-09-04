@@ -267,6 +267,23 @@ async def test_native_submit_fails_closed_while_gateway_is_draining(adapter):
 
 
 @pytest.mark.asyncio
+async def test_native_submit_fails_closed_during_startup_restore(adapter, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(GatewayConfig())
+    runner._running = True
+    runner._startup_restore_in_progress = True
+    adapter.gateway_runner = runner
+    adapter.handle_message = AsyncMock()
+    try:
+        with pytest.raises(RuntimeError, match="unavailable"):
+            await adapter._admit_native_session_submit(SESSION_ID, "hello", "native-startup")
+        adapter.handle_message.assert_not_awaited()
+        assert runner._startup_restore_queue == []
+    finally:
+        runner._session_db._db.close()
+
+
+@pytest.mark.asyncio
 async def test_real_runner_keeps_one_writer_and_uses_fifo_for_native_submit(tmp_path, monkeypatch):
     """Exercise the actual SessionStore, GatewayRunner, and adapter guard."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
