@@ -109,6 +109,9 @@ class ConversationState:
     ephemeral_pin: Optional[Tuple[Any, ...]] = None
     # Last voice-channel context delivered (None = never delivered).
     vc_last: Optional[str] = None
+    # Memory-only native REST credential and its immutable route revision.
+    credential_holder: Any = None
+    credential_route_revision_id: Optional[str] = None
 
     def clear(self) -> None:
         """Reset every conversation-scoped field to its default.
@@ -117,6 +120,8 @@ class ConversationState:
         pop-loop: adding a field here means every boundary clears it
         automatically.
         """
+        if self.credential_holder is not None:
+            self.credential_holder.revoke()
         self.model_override = None
         self.one_turn_restore = None
         self.reasoning_override = None
@@ -126,6 +131,8 @@ class ConversationState:
         self.sidecar_notes = []
         self.ephemeral_pin = None
         self.vc_last = None
+        self.credential_holder = None
+        self.credential_route_revision_id = None
 
 
 @dataclass

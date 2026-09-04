@@ -35,6 +35,7 @@ from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
+from agent.session_credential import SessionCredential, parse_credential_expiry
 from agent.compaction_display import project_compaction_message_for_display
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
@@ -164,6 +165,50 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+
+
+def _trusted_controller() -> bool:
+    return bool(getattr(current_transport(), "trusted_controller", False))
+
+
+def _activate_session_credential(session: dict, agent=None) -> None:
+    holder = session.get("credential_holder")
+    agent = agent or session.get("agent")
+    if holder is None or agent is None or session.get("credential_activated"):
+        return
+    try:
+        agent.switch_model(
+            new_model=agent.model,
+            new_provider=agent.provider,
+            api_key=holder,
+            base_url=agent.base_url,
+            api_mode=agent.api_mode,
+        )
+    except Exception as exc:
+        holder.revoke()
+        raise RuntimeError("credential unavailable") from exc
+    session["credential_activated"] = True
+
+
+def _bound_session_access_error(reference: object, rid) -> dict | None:
+    if not isinstance(reference, str) or not reference:
+        return None
+    with _sessions_lock:
+        session = _sessions.get(reference)
+        if session is None:
+            for candidate in _sessions.values():
+                if (
+                    candidate.get("session_key") == reference
+                    or _session_lookup_key(candidate) == reference
+                ):
+                    session = candidate
+                    break
+        bound = session is not None and session.get("credential_holder") is not None
+    if bound and not _trusted_controller():
+        return _err(rid, 4003, "session unavailable")
+    return None
+
+
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -1142,6 +1187,9 @@ def _pop_session_by_id(sid: str) -> dict | None:
         session = _sessions.get(sid)
         if session is not None:
             session["_closing"] = True
+            holder = session.get("credential_holder")
+            if holder is not None:
+                holder.revoke()
             _sessions.pop(sid, None)
     if session is None:
         return None
@@ -3082,6 +3130,8 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
+        if access_error := _bound_session_access_error(_params.get("session_id"), _rid):
+            return access_error
         if method not in _LONG_HANDLERS:
             return handle_request(req)
 
@@ -3365,7 +3415,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
-            current["agent"] = agent
+            with _sessions_lock:
+                if _sessions.get(sid) is not current:
+                    if hasattr(agent, "close"):
+                        agent.close()
+                    return
+                _activate_session_credential(current, agent)
+                current["agent"] = agent
             _session_todo_state(current)
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
@@ -3482,6 +3538,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
 
 def _sess_nowait(params, rid):
+    if access_error := _bound_session_access_error(params.get("session_id"), rid):
+        return (None, access_error)
     sid = params.get("session_id") or ""
     s = _sessions.get(sid)
     if s:

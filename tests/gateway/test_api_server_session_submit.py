@@ -35,6 +35,9 @@ def adapter(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     db.create_session(SESSION_ID, "api_server")
     adapter._session_db = db
+    adapter.gateway_runner = SimpleNamespace(
+        _running=True, session_credential_available=lambda *_args: True,
+    )
     try:
         yield adapter
     finally:
@@ -84,6 +87,42 @@ async def test_submit_returns_native_receipt_and_reuses_identical_request(adapte
     assert first_body["object"] == "hermes.session.admission"
     assert first_body["admission"] == "streaming"
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_requires_a_bound_session_credential_before_native_admission(
+    adapter, tmp_path, monkeypatch,
+):
+    """An ambient provider key cannot admit an unbound native REST session."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-key-must-not-admit")
+    runner = GatewayRunner(GatewayConfig())
+    runner._running = True
+    adapter._session_db = runner._session_db._db
+    adapter._session_db.create_session(SESSION_ID, "api_server")
+    adapter.gateway_runner = runner
+    admitted = []
+
+    async def admit(*args):
+        admitted.append(args)
+        return "streaming"
+
+    monkeypatch.setattr(adapter, "_admit_native_session_submit", admit)
+    client = await _client(adapter)
+    try:
+        response = await client.post(
+            f"/api/sessions/{SESSION_ID}/submit",
+            headers={"Authorization": "Bearer sk-native-submit-test"},
+            json=_request("unbound-request"),
+        )
+        body = await response.json()
+    finally:
+        await client.close()
+        runner._session_db._db.close()
+
+    assert response.status == 409
+    assert body["error"]["code"] == "credential_unavailable"
+    assert admitted == []
 
 
 @pytest.mark.asyncio

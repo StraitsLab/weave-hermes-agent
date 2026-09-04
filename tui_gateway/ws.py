@@ -41,7 +41,6 @@ _log = logging.getLogger(__name__)
 # to flush a WS frame before we mark the transport dead. Protects handler
 # threads from a wedged socket.
 _WS_WRITE_TIMEOUT_S = 10.0
-_WS_LOG_PAYLOAD_PREVIEW = 240
 
 # Per-token streaming frames are coalesced: buffered and flushed as a batch on
 # a short timer instead of waking the event loop once per token. A model reply
@@ -92,6 +91,7 @@ class WSTransport:
         *,
         peer: str = "unknown",
         auth_identity: dict | None = None,
+        trusted_controller: bool = False,
     ) -> None:
         self._ws = ws
         self._loop = loop
@@ -104,6 +104,7 @@ class WSTransport:
         #: never populate this: it is the only identity authority for
         #: browser-controller registration.
         self.auth_identity = auth_identity
+        self._trusted_controller = trusted_controller
         self._closed = False
         self._last_inbound_at = time.monotonic()
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
@@ -129,6 +130,10 @@ class WSTransport:
 
     def mark_inbound(self) -> None:
         self._last_inbound_at = time.monotonic()
+
+    @property
+    def trusted_controller(self) -> bool:
+        return self._trusted_controller
 
     @staticmethod
     def _is_streaming_frame(obj: dict) -> bool:
@@ -322,6 +327,7 @@ async def handle_ws(
     *,
     auth_identity: dict | None = None,
     subprotocol: str | None = None,
+    trusted_controller: bool = False,
 ) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
 
@@ -331,6 +337,11 @@ async def handle_ws(
     only identity authority for browser-controller registration. Existing
     callers (stdio-free harnesses, the embedded TUI child) omit it and get a
     ``None`` transport identity — unchanged behaviour.
+
+    *trusted_controller* marks the connection as the in-process controller
+    leg (the local dashboard WS route). Only a trusted controller may bind or
+    reach a credential-bound session; every other transport defaults to
+    False and is denied.
     """
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
@@ -356,6 +367,7 @@ async def handle_ws(
             asyncio.get_running_loop(),
             peer=peer,
             auth_identity=auth_identity,
+            trusted_controller=trusted_controller,
         )
 
         # resolve_skin() reads config + initializes the skin engine —
@@ -443,11 +455,10 @@ async def handle_ws(
             except json.JSONDecodeError as exc:
                 parse_errors += 1
                 _log.warning(
-                    "ws parse error peer=%s index=%d error=%s payload=%r",
+                    "ws parse error peer=%s index=%d error=%s",
                     peer,
                     messages,
                     exc,
-                    line[:_WS_LOG_PAYLOAD_PREVIEW],
                 )
                 ok = await transport.write_async(
                     {

@@ -17635,10 +17635,13 @@ async def gateway_ws(ws: WebSocket) -> None:
     # onto the WS object by _ws_auth_reason; carry it into the gateway
     # transport where it becomes the identity authority for privileged RPCs
     # (browser.controller.register). None on the legacy token path.
+    # trusted_controller marks this leg as the in-process controller, the only
+    # transport allowed to bind or reach a credential-bound session.
     await handle_ws(
         ws,
         auth_identity=getattr(ws, "_hermes_auth_identity", None),
         subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
+        trusted_controller=True,
     )
 
 

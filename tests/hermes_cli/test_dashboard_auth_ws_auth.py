@@ -13,6 +13,7 @@ pre-existing regression unrelated to dashboard-auth.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -473,3 +474,29 @@ class TestGatewayWsUrl:
         sc_cred = sc.split("internal=")[1].split("&")[0]
         assert gw_cred == sc_cred
 
+
+def test_authenticated_gateway_ws_marks_the_transport_as_trusted(monkeypatch):
+    from tui_gateway import ws as gateway_ws
+
+    seen = {}
+
+    async def fake_handle(ws, **kwargs):
+        seen["ws"] = ws
+        seen["kwargs"] = kwargs
+
+    monkeypatch.setattr(web_server, "_ws_auth_ok", lambda ws: True)
+    monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda ws: True)
+    monkeypatch.setattr(gateway_ws, "handle_ws", fake_handle)
+    ws = SimpleNamespace()
+
+    asyncio.run(web_server.gateway_ws(ws))
+
+    assert seen["ws"] is ws
+    # The dashboard route is the only in-process controller leg, so it is the
+    # only caller allowed to raise trusted_controller. Assert the whole kwarg
+    # set so a future route change cannot silently smuggle another flag in.
+    assert seen["kwargs"] == {
+        "auth_identity": None,
+        "subprotocol": None,
+        "trusted_controller": True,
+    }
