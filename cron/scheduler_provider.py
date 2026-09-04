@@ -248,13 +248,93 @@ class CronScheduler(ABC):
         """
         from cron.scheduler import run_one_job
 
-        run_one_job(
-            claimed_job,
-            adapters=adapters,
-            loop=loop,
-            cancel_event=cancel_event,
-        )
+        kwargs = {
+            "adapters": adapters,
+            "loop": loop,
+            "extra_prompt": claimed_job.get("_cron_extra_prompt"),
+        }
+        if cancel_event is not None:
+            kwargs["cancel_event"] = cancel_event
+        run_one_job(claimed_job, **kwargs)
         return True
+
+    def dispatch_claimed_fire(
+        self, claimed_job: dict, *, adapters=None, loop=None,
+        submit=None, cancel_event=None, extra_prompt=None,
+    ) -> bool:
+        """Run or hand off one already-admitted fire; callers own the rail."""
+        if extra_prompt:
+            claimed_job = dict(claimed_job, _cron_extra_prompt=extra_prompt)
+
+        def _run():
+            from cron.scheduler import release_running_job, try_register_running_job
+            if not try_register_running_job(claimed_job["id"]):
+                self.abort_claimed_fire(
+                    claimed_job,
+                    "Job is already running; execution was not started.",
+                )
+                return False
+            kwargs = {"adapters": adapters, "loop": loop}
+            if cancel_event is not None and provider_supports_fire_cancel(self):
+                kwargs["cancel_event"] = cancel_event
+            try:
+                try:
+                    result = self.fire_claimed(claimed_job, **kwargs)
+                except BaseException as exc:
+                    # The provider's fire hook is the first code that can
+                    # fail after admission. Close this exact owner-fenced
+                    # claim/attempt before returning a worker failure (or
+                    # propagating process-control signals). The abort is
+                    # deliberately idempotent: a provider that already wrote
+                    # a terminal row cannot be rewritten by this cleanup.
+                    self.abort_claimed_fire(
+                        claimed_job, str(exc) or type(exc).__name__
+                    )
+                    if not isinstance(exc, Exception):
+                        raise
+                    return False
+                if result is False:
+                    self.abort_claimed_fire(
+                        claimed_job, "Provider did not process the claimed fire."
+                    )
+                return result
+            finally:
+                release_running_job(claimed_job["id"])
+
+        if submit is None:
+            return bool(_run())
+        try:
+            handed_off = submit(_run)
+        except BaseException as exc:
+            self.abort_claimed_fire(claimed_job, str(exc) or type(exc).__name__)
+            if not isinstance(exc, Exception):
+                raise
+            return False
+        if handed_off is False:
+            self.abort_claimed_fire(
+                claimed_job, "Provider dispatch rail rejected the claimed fire."
+            )
+            return False
+        return True
+
+    @staticmethod
+    def abort_claimed_fire(claimed_job: dict, error: str) -> None:
+        """Close a claim when setup or submission fails before the worker."""
+        claim = claimed_job.get("fire_claim")
+        owner = claim.get("by") if isinstance(claim, dict) else None
+        try:
+            from cron.jobs import mark_job_run
+            kwargs = {"expected_fire_owner": owner} if owner else {}
+            mark_job_run(claimed_job["id"], False, error, **kwargs)
+        except Exception:
+            pass
+        execution_id = claimed_job.get("execution_id")
+        if execution_id:
+            try:
+                from cron.executions import finish_execution
+                finish_execution(str(execution_id), success=False, error=error)
+            except Exception:
+                pass
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):
@@ -267,7 +347,7 @@ def provider_supports_force_fire(provider: Any) -> bool:
     """Return whether a provider can safely receive ``fire_due(force=...)``."""
     try:
         parameters = inspect.signature(provider.fire_due).parameters.values()
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return False
     return any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD
@@ -278,6 +358,17 @@ def provider_supports_force_fire(provider: Any) -> bool:
         )
         for parameter in parameters
     )
+
+
+def provider_supports_claim_force(provider: Any) -> bool:
+    try:
+        parameters = inspect.signature(provider.claim_fire).parameters.values()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD or
+               (p.name == "force" and p.kind in (
+                   inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                   inspect.Parameter.KEYWORD_ONLY)) for p in parameters)
 
 
 def provider_supports_split_fire(provider: Any) -> bool:
@@ -312,7 +403,7 @@ def provider_supports_fire_cancel(provider: Any) -> bool:
     """Return whether ``fire_claimed`` accepts a ``cancel_event`` kwarg."""
     try:
         parameters = inspect.signature(provider.fire_claimed).parameters.values()
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return False
     return any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD
@@ -457,14 +548,22 @@ def fire_overdue_jobs(
             claimed = provider.claim_fire(job_id)
             if claimed is None:
                 continue
-            threading.Thread(
-                target=provider.fire_claimed,
-                args=(claimed,),
-                kwargs={"adapters": adapters, "loop": loop},
-                daemon=True,
-                name=f"cron-misfire-{job_id[:12]}",
-            ).start()
-            fired += 1
+            def _submit(worker):
+                threading.Thread(
+                    target=worker,
+                    daemon=True,
+                    name=f"cron-misfire-{job_id[:12]}",
+                ).start()
+                return True
+
+            dispatched = provider.dispatch_claimed_fire(
+                claimed,
+                adapters=adapters,
+                loop=loop,
+                submit=_submit,
+            )
+            if dispatched:
+                fired += 1
         except Exception as exc:
             logger.warning(
                 "Misfire catch-up failed for job %s: %s: %s",
@@ -473,17 +572,32 @@ def fire_overdue_jobs(
     return fired
 
 
-def resolve_cron_scheduler() -> "CronScheduler":
+def resolve_cron_scheduler(
+    *, multiplex_profiles: bool | None = None,
+) -> "CronScheduler":
     """Return the active cron scheduler provider.
 
-    Reads ``cron.provider`` from config. Empty/absent → built-in. A named
+    Reads ``cron.provider`` from the active profile config. Empty/absent →
+    built-in. A named
     provider that is missing, fails to load, or reports ``is_available() ==
     False`` falls back to the built-in with a warning — cron must never be left
-    without a trigger.
+    without a trigger. In multiplex mode, the same safe built-in fallback used
+    by gateway startup is applied to every profile-scoped caller, including
+    API routes and manual tools. ``None`` follows the process's active
+    multiplex mode; callers that already own an explicit gateway config may
+    pass it directly.
     """
     import logging
 
     logger = logging.getLogger("cron.scheduler_provider")
+
+    if multiplex_profiles is None:
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            multiplex_profiles = is_multiplex_active()
+        except Exception:
+            multiplex_profiles = False
 
     name = ""
     try:
@@ -504,6 +618,9 @@ def resolve_cron_scheduler() -> "CronScheduler":
         if not provider.is_available():
             logger.warning("cron.provider '%s' not available; using built-in ticker", name)
             return InProcessCronScheduler()
+        provider = scheduler_for_profile_mode(
+            provider, multiplex_profiles=bool(multiplex_profiles)
+        )
         logger.info("Using cron scheduler provider: %s", provider.name)
         return provider
     except Exception as e:

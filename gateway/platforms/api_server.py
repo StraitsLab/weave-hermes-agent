@@ -1285,6 +1285,73 @@ def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
         adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
 
 
+async def _run_thread_until_terminal(target, *args, abort_event: Optional[threading.Event] = None, **kwargs):
+    worker = asyncio.create_task(asyncio.to_thread(target, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        if abort_event: abort_event.set()
+        try:
+            await worker
+        except BaseException:
+            pass
+        raise
+
+
+def _detach_api_task(adapter, reservation, awaitable):
+    task = asyncio.create_task(awaitable)
+    reservation["detached"] = True
+    task.add_done_callback(lambda _task: _release_pending_api_work(adapter, reservation))
+    adapter._background_tasks.add(task); task.add_done_callback(adapter._background_tasks.discard)
+
+
+def _fire_claim_kwargs(provider, adapters, loop):
+    cancel_event = threading.Event()
+    kwargs = {"adapters": adapters, "loop": loop}
+    from cron.scheduler_provider import provider_supports_fire_cancel
+    if provider_supports_fire_cancel(provider): kwargs["cancel_event"] = cancel_event
+    return kwargs, cancel_event
+
+
+def _dispatch_claimed_api_fire(
+    provider, claimed_job, adapter, reservation, adapters, loop, *, extra_prompt=None,
+):
+    """Hand one admitted claim to the provider's dispatch rail.
+
+    ``extra_prompt`` is the transient per-run context parsed by
+    ``_handle_run_job`` (the same body ``prompt`` upstream stamps via
+    ``trigger_job(extra_prompt=...)``). It rides on the claimed snapshot for
+    this fire only and is never persisted into the job definition.
+    """
+    fire_kwargs, cancel_event = _fire_claim_kwargs(provider, adapters, loop)
+
+    def submit(worker):
+        _detach_api_task(
+            adapter,
+            reservation,
+            _run_thread_until_terminal(worker, abort_event=cancel_event),
+        )
+
+    dispatch = getattr(provider, "dispatch_claimed_fire", None)
+    if callable(dispatch):
+        if extra_prompt:
+            return dispatch(
+                claimed_job, **fire_kwargs, submit=submit, extra_prompt=extra_prompt
+            )
+        return dispatch(claimed_job, **fire_kwargs, submit=submit)
+    if extra_prompt:
+        # Base ``fire_claimed`` reads the transient context off the snapshot.
+        claimed_job = dict(claimed_job, _cron_extra_prompt=extra_prompt)
+    submit(lambda: provider.fire_claimed(claimed_job, **fire_kwargs))
+    return True
+
+
+def _abort_claimed_api_fire(provider, claimed_job, error):
+    abort = getattr(provider, "abort_claimed_fire", None)
+    if callable(abort):
+        abort(claimed_job, error)
+
+
 @contextmanager
 def _reserve_pending_api_work(adapter):
     """Keep externally-triggered background work visible across awaits.
@@ -1427,13 +1494,11 @@ try:
         list_jobs as _cron_list,
         get_job as _cron_get,
         update_job as _cron_update,
-        remove_job as _cron_remove,
-        pause_job as _cron_pause,
-        resume_job as _cron_resume,
-        trigger_job as _cron_trigger,
+        remove_job_exact as _cron_remove,
+        pause_job_exact as _cron_pause,
+        resume_job_exact as _cron_resume,
     )
     from cron.scheduler import (
-        CronSchedulerRegistrationError as _CronSchedulerRegistrationError,
         create_job_with_scheduler_registration as _cron_create,
     )
     _CRON_AVAILABLE = True
@@ -1445,11 +1510,6 @@ except ImportError:
     _cron_remove = None
     _cron_pause = None
     _cron_resume = None
-    _cron_trigger = None
-
-    class _CronSchedulerRegistrationError(RuntimeError):
-        pass
-
 
 def _notify_cron_provider_jobs_changed() -> None:
     """Tell the active cron scheduler provider the job set changed after a REST
@@ -1459,6 +1519,7 @@ def _notify_cron_provider_jobs_changed() -> None:
         _notify_provider_jobs_changed()
     except Exception:
         pass
+
 
 # Defense-in-depth: mirror the agent-facing cronjob tool, which scans the
 # user-supplied prompt for exfiltration/injection payloads at create/update
@@ -2276,6 +2337,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
+            ("GET", "/api/jobs/{job_id}/runs", self._handle_list_job_runs),
         ]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
@@ -7078,6 +7140,8 @@ class APIServerAdapter(BasePlatformAdapter):
         cron_err = self._check_jobs_available()
         if cron_err:
             return cron_err
+        from cron.jobs import CronDedupConflict, CronDedupKeyInvalid
+        from cron.scheduler import CronSchedulerRegistrationError
         try:
             body = await request.json()
             name = (body.get("name") or "").strip()
@@ -7086,6 +7150,7 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+            dedup_key = body.get("dedup_key")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -7105,7 +7170,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     return web.json_response({"error": scan_error}, status=400)
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
-
             kwargs = {
                 "prompt": prompt,
                 "schedule": schedule,
@@ -7117,10 +7181,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if dedup_key is not None:
+                kwargs["dedup_key"] = dedup_key
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})
-        except _CronSchedulerRegistrationError as e:
+        except CronDedupKeyInvalid as e: return web.json_response({"error": str(e)}, status=400)
+        except CronDedupConflict as e: return web.json_response({"error": str(e), "job_id": e.job_id}, status=409)
+        except CronSchedulerRegistrationError as e:
             return web.json_response(e.to_dict(), status=424)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
@@ -7243,7 +7311,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
     async def _handle_run_job(self, request: "web.Request") -> "web.Response":
-        """POST /api/jobs/{job_id}/run — trigger immediate execution."""
+        """POST /api/jobs/{job_id}/run — admit and dispatch one native run."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -7278,11 +7346,99 @@ class APIServerAdapter(BasePlatformAdapter):
                     if scan_error:
                         return web.json_response({"error": scan_error}, status=400)
                 extra_prompt = extra_prompt or None
+        with _reserve_pending_api_work(self) as reservation:
+            try:
+                job = _cron_get(job_id)
+                if not job:
+                    return web.json_response({"error": "Job not found"}, status=404)
+
+                from cron.executions import execution_projection, latest_execution
+                from cron.scheduler_provider import provider_supports_claim_force, provider_supports_split_fire, resolve_cron_scheduler
+                provider = resolve_cron_scheduler()
+                provider_source = str(getattr(provider, "name", "provider"))
+                if not provider_supports_split_fire(provider): return web.json_response({"error": "cron provider does not support typed run identity", "job_id": job_id}, status=409)
+                previous_execution = latest_execution(job_id)
+                claim_kwargs = {"force": True} if provider_supports_claim_force(provider) else {}
+                try:
+                    claimed_job = await asyncio.to_thread(provider.claim_fire, job_id, **claim_kwargs)
+                except Exception as admission_error:
+                    logger.error("cron API run admission failed for %s: %s", job_id, admission_error)
+                    return web.json_response({"error": "cron run admission failed", "job_id": job_id}, status=503)
+                execution_id = (claimed_job.get("execution_id") or
+                                (claimed_job.get("execution") or {}).get("id")) if isinstance(claimed_job, dict) else None
+                if claimed_job is None:
+                    job = _cron_get(job_id)
+                    if not job:
+                        return web.json_response({"error": "Job not found"}, status=404)
+                    latest = latest_execution(job_id)
+                    previous_id = previous_execution.get("id") if isinstance(previous_execution, dict) else None
+                    fresh_execution = bool(isinstance(latest, dict) and latest.get("id") and latest.get("id") != previous_id)
+                    execution = execution_projection(
+                        latest.get("id") if fresh_execution else None,
+                        job_id=job_id,
+                        source=provider_source,
+                        status=latest.get("status", "unknown") if latest else "unknown",
+                    )
+                    return web.json_response(
+                        {"job": job, "execution": execution,
+                         "status": "duplicate" if fresh_execution else "not_admitted"}, status=200,
+                    )
+
+                try:
+                    loop = asyncio.get_running_loop()
+                    runner = self.gateway_runner or request.app.get("gateway_runner")
+                    adapters = getattr(runner, "adapters", None) or None
+                    dispatched = _dispatch_claimed_api_fire(
+                        provider, claimed_job, self, reservation, adapters, loop,
+                        extra_prompt=extra_prompt,
+                    )
+                except BaseException as setup_error:
+                    _abort_claimed_api_fire(
+                        provider,
+                        claimed_job, str(setup_error) or type(setup_error).__name__
+                    )
+                    raise
+                if not dispatched:
+                    return web.json_response(
+                        {"error": "cron run dispatch failed", "job_id": job_id},
+                        status=503,
+                    )
+                execution = execution_projection(execution_id, job_id=job_id,
+                                                  source=provider_source, status="claimed")
+                return web.json_response(
+                    {"job": job, "execution": execution},
+                    status=202,
+                )
+            except Exception as e:
+                return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_list_job_runs(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        job_id, id_err = self._check_job_id(request)
+        if id_err:
+            return id_err
+        raw_limit = request.query.get("limit", "50")
         try:
-            job = _cron_trigger(job_id, extra_prompt=extra_prompt)
-            if not job:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "limit must be an integer"}, status=400)
+        if limit < 1:
+            return web.json_response({"error": "limit must be positive"}, status=400)
+        cursor = request.query.get("before_claimed_at") or None
+        try:
+            if not _cron_get(job_id):
                 return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
+            from cron.executions import list_execution_page
+            runs, next_cursor, has_more = list_execution_page(job_id, limit=limit, before_claimed_at=cursor)
+            return web.json_response({"job_id": job_id, "runs": runs,
+                                      "next_cursor": next_cursor, "has_more": has_more})
+        except ValueError:
+            return web.json_response({"error": "Malformed execution cursor"}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -7377,23 +7533,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 # ``fire_due`` hook (custom claim/re-arm/telemetry) but
                 # inherits the base ``claim_fire`` — driving it through the
                 # split claim path would silently bypass that override.
-                task = asyncio.create_task(
-                    asyncio.to_thread(
-                        provider.fire_due,
-                        job_id,
-                        adapters=adapters,
-                        loop=loop,
-                    )
-                )
-                reservation["detached"] = True
-                task.add_done_callback(
-                    lambda _task: _release_pending_api_work(self, reservation)
-                )
-                try:
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
-                except (TypeError, AttributeError):
-                    pass
+                _detach_api_task(self, reservation, _run_thread_until_terminal(
+                    provider.fire_due, job_id, adapters=adapters, loop=loop
+                ))
                 return web.json_response(
                     {"status": "accepted", "job_id": job_id}, status=202
                 )
@@ -7414,23 +7556,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=200,
                 )
 
-            task = asyncio.create_task(
-                asyncio.to_thread(
-                    provider.fire_claimed,
-                    claimed_job,
-                    adapters=adapters,
-                    loop=loop,
-                )
-            )
-            reservation["detached"] = True
-            task.add_done_callback(
-                lambda _task: _release_pending_api_work(self, reservation)
-            )
             try:
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-            except (TypeError, AttributeError):
-                pass
+                dispatched = _dispatch_claimed_api_fire(
+                    provider, claimed_job, self, reservation, adapters, loop
+                )
+            except BaseException as dispatch_error:
+                _abort_claimed_api_fire(
+                    provider,
+                    claimed_job, str(dispatch_error) or type(dispatch_error).__name__
+                )
+                if not isinstance(dispatch_error, Exception):
+                    raise
+                logger.error("cron fire dispatch failed for %s: %s", job_id, dispatch_error)
+                return web.json_response(
+                    {"error": "cron fire dispatch failed", "job_id": job_id},
+                    status=503,
+                )
+            if not dispatched:
+                return web.json_response(
+                    {"error": "cron fire dispatch failed", "job_id": job_id},
+                    status=503,
+                )
 
             return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
 

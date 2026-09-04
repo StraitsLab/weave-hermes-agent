@@ -7711,10 +7711,13 @@ class CronSchedulerRegistrationError(RuntimeError):
 
 def create_job_with_scheduler_registration(**kwargs) -> dict:
     """Persist one job and register its first trigger with the active provider."""
-    from cron.jobs import create_job
+    from cron.jobs import _create_job
     from cron.scheduler_provider import resolve_cron_scheduler
 
-    job = create_job(**kwargs)
+    # An idempotent replay must not register a second external trigger.
+    job, created = _create_job(_return_creation=True, **kwargs)
+    if not created:
+        return job
     try:
         resolve_cron_scheduler().register_job(job)
     except Exception as exc:

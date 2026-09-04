@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -160,6 +161,25 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     return record  # type: ignore[return-value]
 
 
+def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(execution_id, str) or not execution_id: return None
+    with _transaction() as conn:
+        return _record(conn.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone())
+
+def execution_identity(record: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    return None if not record else {key: str(record.get(key) or ("unknown" if key == "status" else "")) for key in ("id", "job_id", "source", "status")}
+
+
+def execution_projection(
+    execution_id: Optional[str] = None,
+    *,
+    job_id: Optional[str] = None,
+    source: str = "",
+    status: str = "unknown",
+) -> Optional[Dict[str, str]]:
+    record = get_execution(execution_id) if execution_id else None
+    return execution_identity(record) or ({"id": str(execution_id), "job_id": str(job_id or ""), "source": str(source), "status": str(status)} if execution_id else None)
+
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     """Transition one claimed attempt to running exactly once."""
     now = _hermes_now().isoformat()
@@ -250,10 +270,22 @@ def list_executions(
         clauses.append("job_id=?")
         params.append(str(job_id))
     if before_claimed_at is not None:
-        clauses.append("claimed_at < ?")
-        params.append(str(before_claimed_at))
+        cursor = str(before_claimed_at)
+        if "|" in cursor:
+            try:
+                claimed_at, execution_id = cursor.split("|")
+                if not claimed_at or not execution_id: raise ValueError
+                datetime.fromisoformat(claimed_at.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("malformed execution cursor") from exc
+            clauses.append("(claimed_at < ? OR (claimed_at = ? AND id < ?))")
+            params.extend((claimed_at, claimed_at, execution_id))
+        else:
+            datetime.fromisoformat(cursor.replace("Z", "+00:00"))
+            clauses.append("claimed_at < ?")
+            params.append(str(before_claimed_at))
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    params.append(max(1, min(int(limit), 500)))
+    params.append(max(1, min(int(limit), 501)))
     with _transaction() as conn:
         rows = conn.execute(
             "SELECT * FROM executions" + where
@@ -261,6 +293,18 @@ def list_executions(
             params,
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def list_execution_page(
+    job_id: str, *, limit: int = 50, before_claimed_at: Optional[str] = None
+) -> tuple[List[Dict[str, Any]], Optional[str], bool]:
+    page_limit = min(max(1, int(limit)), 500)
+    rows = list_executions(job_id=job_id, limit=page_limit + 1,
+                           before_claimed_at=before_claimed_at)
+    has_more = len(rows) > page_limit
+    last = rows[page_limit - 1] if has_more else None
+    return rows[:page_limit], (f"{last['claimed_at']}|{last['id']}"
+                  if last and last.get("claimed_at") and last.get("id") else None), has_more
 
 
 def latest_execution(job_id: str) -> Optional[Dict[str, Any]]:

@@ -161,3 +161,33 @@ class TestFireOverdueJobs:
         assert time.monotonic() - start < 1.0  # returned before the run
         assert provider.wait_fired(timeout=10)
         assert provider.fired == [job["id"]]
+
+    def test_worker_failure_closes_claim_and_execution(self, tmp_cron_dir):
+        """A misfire worker exception cannot strand either durable record."""
+        from cron.executions import list_executions
+
+        class FailingProvider(RecordingProvider):
+            def fire_claimed(self, claimed_job, **_kwargs):
+                self._done.set()
+                raise RuntimeError("misfire worker failed")
+
+        job = create_job(prompt="p", schedule="every 1h")
+        _park_in_past(job["id"], minutes=30)
+        provider = FailingProvider()
+
+        assert fire_overdue_jobs(provider) == 1
+        assert provider.wait_fired()
+
+        # The sweep deliberately returns as soon as the worker is submitted;
+        # wait for its owner-fenced failure cleanup after the provider hook
+        # signals that it started.
+        deadline = time.monotonic() + 5.0
+        stored = get_job(job["id"])
+        while stored.get("fire_claim") is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+            stored = get_job(job["id"])
+        assert stored.get("fire_claim") is None
+        records = list_executions(job_id=job["id"])
+        assert len(records) == 1
+        assert records[0]["status"] == "failed"
+        assert "misfire worker failed" in records[0]["error"]

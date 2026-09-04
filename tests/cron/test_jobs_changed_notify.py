@@ -71,6 +71,34 @@ def test_create_registers_first_trigger_with_active_provider(
     assert registered == [job]
 
 
+def test_dedup_replay_does_not_register_provider_again(
+    temp_home, monkeypatch, make_cron_provider
+):
+    """An idempotent create replay returns the durable job without rearming."""
+    import cron.scheduler as sched
+    import cron.scheduler_provider as sp
+
+    registered = []
+    provider = make_cron_provider(register_job=registered.append)
+    monkeypatch.setattr(sp, "resolve_cron_scheduler", lambda: provider)
+
+    first = sched.create_job_with_scheduler_registration(
+        prompt="echo hi",
+        schedule="every 5m",
+        name="w",
+        dedup_key="accept:w",
+    )
+    replay = sched.create_job_with_scheduler_registration(
+        prompt="echo hi",
+        schedule="every 5m",
+        name="w",
+        dedup_key="accept:w",
+    )
+
+    assert replay == first
+    assert registered == [first]
+
+
 def test_create_failure_preserves_job_and_hides_provider_details(
     temp_home, monkeypatch, make_cron_provider
 ):

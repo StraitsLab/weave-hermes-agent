@@ -408,3 +408,54 @@ async def test_fire_without_runner_passes_none_adapters(adapter, monkeypatch):
 
     assert seen.get("job_id") == "no-runner"
     assert seen.get("adapters") is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_fire_wrapper_keeps_reservation_until_worker_finishes(
+    adapter, monkeypatch
+):
+    started = threading.Event()
+    release = threading.Event()
+    observed = {}
+
+    class BlockingProvider:
+        def claim_fire(self, job_id):
+            return {"id": job_id, "execution_id": "exec-cancel"}
+
+        def fire_claimed(self, job, *, adapters=None, loop=None, cancel_event=None):
+            observed["cancel_event"] = cancel_event
+            started.set()
+            release.wait(timeout=2)
+            return True
+
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: BlockingProvider(),
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer good"},
+            json={"job_id": "cancel-me"},
+        )
+        assert response.status == 202
+        assert await asyncio.to_thread(started.wait, 2)
+        assert adapter._background_tasks
+        worker_wrapper = next(iter(adapter._background_tasks))
+        worker_wrapper.cancel()
+        await asyncio.sleep(0.05)
+        assert observed["cancel_event"].is_set()
+        assert adapter.active_agent_work_count() == 1
+        release.set()
+        for _ in range(100):
+            if adapter.active_agent_work_count() == 0:
+                break
+            await asyncio.sleep(0.01)
+
+    assert adapter.active_agent_work_count() == 0

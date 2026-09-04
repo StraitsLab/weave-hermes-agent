@@ -22,6 +22,9 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
 
     claimed = executions.create_execution("job-1", source="builtin")
     assert claimed["status"] == "claimed"
+    assert executions.execution_identity(claimed) == {
+        "id": claimed["id"], "job_id": "job-1", "source": "builtin", "status": "claimed"
+    }
     assert claimed["claimed_at"]
     assert claimed["started_at"] is None
     assert claimed["finished_at"] is None
@@ -81,6 +84,34 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
     records = executions.list_executions(limit=100)
     assert len([row for row in records if row["status"] == "completed"]) == 3
     assert executions.latest_execution("live")["status"] == "running"
+
+
+def test_history_cursor_keeps_same_timestamp_rows(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(
+        executions,
+        "_hermes_now",
+        lambda: datetime(2026, 8, 20, tzinfo=timezone.utc),
+    )
+    rows = [executions.create_execution("cursor-job", source="builtin") for _ in range(3)]
+    first = executions.list_executions(job_id="cursor-job", limit=2)
+    cursor = f"{first[-1]['claimed_at']}|{first[-1]['id']}"
+    second = executions.list_executions(
+        job_id="cursor-job", limit=2, before_claimed_at=cursor
+    )
+    assert {row["id"] for row in first + second} == {row["id"] for row in rows}
+    assert not ({row["id"] for row in first} & {row["id"] for row in second})
+
+
+def test_history_cursor_rejects_malformed_compound_values(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    import pytest
+
+    for cursor in ("bad|", "|execution", "not-a-time|execution", "a|b|c"):
+        with pytest.raises(ValueError):
+            executions.list_executions(before_claimed_at=cursor)
 
 
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):

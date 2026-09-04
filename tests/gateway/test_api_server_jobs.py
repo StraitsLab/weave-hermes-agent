@@ -10,6 +10,7 @@ Covers:
 - Cron module unavailability (501 when _CRON_AVAILABLE is False)
 """
 
+import asyncio
 import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -63,6 +64,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/jobs/{job_id}/pause", adapter._handle_pause_job)
     app.router.add_post("/api/jobs/{job_id}/resume", adapter._handle_resume_job)
     app.router.add_post("/api/jobs/{job_id}/run", adapter._handle_run_job)
+    app.router.add_get("/api/jobs/{job_id}/runs", adapter._handle_list_job_runs)
     return app
 
 
@@ -138,6 +140,20 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["chat_id"] == "api"
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure,status", [("invalid", 400), ("conflict", 409)])
+    async def test_create_job_maps_dedup_errors(self, adapter, failure, status):
+        from cron.jobs import CronDedupConflict, CronDedupKeyInvalid
+        error = (CronDedupKeyInvalid("invalid") if failure == "invalid"
+                 else CronDedupConflict(VALID_JOB_ID))
+        app = _create_app(adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_create", side_effect=error
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/api/jobs", json={"name": "n", "schedule": "30m"})
+        assert response.status == status
 
 
     @pytest.mark.asyncio
@@ -325,68 +341,184 @@ class TestRunJob:
         """POST /api/jobs/{id}/run returns triggered job."""
         app = _create_app(adapter)
         triggered_job = {**SAMPLE_JOB, "last_run": "2025-01-01T00:00:00Z"}
-        mock_trigger = MagicMock(return_value=triggered_job)
+        mock_get = MagicMock(return_value=triggered_job)
         async with TestClient(TestServer(app)) as cli:
             with patch(
                 f"{_MOD}._CRON_AVAILABLE", True
             ), patch(
-                f"{_MOD}._cron_trigger", mock_trigger
+                f"{_MOD}._cron_get", mock_get
             ):
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["job"] == triggered_job
-                mock_trigger.assert_called_once_with(VALID_JOB_ID, extra_prompt=None)
+                # A lost claim requires an exact re-read to distinguish a
+                # deleted job from a duplicate admission.
+                assert mock_get.call_args_list == [
+                    ((VALID_JOB_ID,), {}),
+                    ((VALID_JOB_ID,), {}),
+                ]
+
+    @pytest.mark.asyncio
+    async def test_run_job_admits_native_execution(self, adapter):
+        app = _create_app(adapter)
+        fired = []
+
+        class Provider:
+            name = "builtin"
+
+            def claim_fire(self, job_id, *, force=False):
+                return {"id": job_id, "execution_id": "exec-native"}
+
+            def fire_claimed(self, job, *, adapters=None, loop=None):
+                fired.append(job["execution_id"])
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+            ), patch(
+                "cron.scheduler_provider.resolve_cron_scheduler",
+                return_value=Provider(),
+            ):
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                assert resp.status == 202
+                data = await resp.json()
+                assert data["execution"] == {
+                    "id": "exec-native",
+                    "job_id": VALID_JOB_ID,
+                    "source": "builtin",
+                    "status": "claimed",
+                }
+        for _ in range(50):
+            if fired:
+                break
+            await asyncio.sleep(0.01)
+        assert fired == ["exec-native"]
 
     @pytest.mark.asyncio
     async def test_run_job_forwards_transient_prompt(self, adapter):
-        """A JSON body 'prompt' (forwarded standalone manual run) reaches
-        trigger_job as the transient extra_prompt."""
+        """A JSON body 'prompt' (forwarded standalone manual run) reaches the
+        provider dispatch as the transient extra_prompt for this fire only."""
         app = _create_app(adapter)
-        mock_trigger = MagicMock(return_value=SAMPLE_JOB)
+        dispatched = []
+
+        class Provider:
+            name = "builtin"
+
+            def claim_fire(self, job_id, *, force=False):
+                return {"id": job_id, "execution_id": "exec-prompt"}
+
+            def dispatch_claimed_fire(self, job, *, submit=None, extra_prompt=None, **kwargs):
+                dispatched.append((job["execution_id"], extra_prompt))
+                return True
+
         async with TestClient(TestServer(app)) as cli:
             with patch(
                 f"{_MOD}._CRON_AVAILABLE", True
             ), patch(
-                f"{_MOD}._cron_trigger", mock_trigger
+                f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+            ), patch(
+                "cron.scheduler_provider.resolve_cron_scheduler",
+                return_value=Provider(),
             ):
                 resp = await cli.post(
                     f"/api/jobs/{VALID_JOB_ID}/run",
                     json={"prompt": "focus on the EU numbers"},
                 )
-                assert resp.status == 200
-                mock_trigger.assert_called_once_with(
-                    VALID_JOB_ID, extra_prompt="focus on the EU numbers"
+                assert resp.status == 202
+        assert dispatched == [("exec-prompt", "focus on the EU numbers")]
+
+    @pytest.mark.asyncio
+    async def test_run_job_transient_prompt_rides_claimed_snapshot(self, adapter):
+        """Without a dispatch hook the prompt rides the exact claimed snapshot
+        (``_cron_extra_prompt``) that base ``fire_claimed`` consumes; the
+        stored job is never mutated."""
+        app = _create_app(adapter)
+        fired = []
+
+        class Provider:
+            name = "builtin"
+
+            def claim_fire(self, job_id, *, force=False):
+                return {"id": job_id, "execution_id": "exec-snapshot"}
+
+            def fire_claimed(self, job, *, adapters=None, loop=None):
+                fired.append(dict(job))
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+            ), patch(
+                "cron.scheduler_provider.resolve_cron_scheduler",
+                return_value=Provider(),
+            ):
+                resp = await cli.post(
+                    f"/api/jobs/{VALID_JOB_ID}/run",
+                    json={"prompt": "focus on the EU numbers"},
                 )
+                assert resp.status == 202
+        for _ in range(50):
+            if fired:
+                break
+            await asyncio.sleep(0.01)
+        assert fired == [{
+            "id": VALID_JOB_ID,
+            "execution_id": "exec-snapshot",
+            "_cron_extra_prompt": "focus on the EU numbers",
+        }]
 
     @pytest.mark.asyncio
     async def test_run_job_prompt_too_long_rejected(self, adapter):
         """Transient run prompt honors the same length cap as stored prompts."""
         app = _create_app(adapter)
-        mock_trigger = MagicMock(return_value=SAMPLE_JOB)
+        claims = []
+
+        class Provider:
+            name = "builtin"
+
+            def claim_fire(self, job_id, *, force=False):
+                claims.append(job_id)
+                return {"id": job_id, "execution_id": "exec-never"}
+
         async with TestClient(TestServer(app)) as cli:
             with patch(
                 f"{_MOD}._CRON_AVAILABLE", True
             ), patch(
-                f"{_MOD}._cron_trigger", mock_trigger
+                f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+            ), patch(
+                "cron.scheduler_provider.resolve_cron_scheduler",
+                return_value=Provider(),
             ):
                 resp = await cli.post(
                     f"/api/jobs/{VALID_JOB_ID}/run",
                     json={"prompt": "x" * 5001},
                 )
                 assert resp.status == 400
-                mock_trigger.assert_not_called()
+        assert claims == []
 
     @pytest.mark.asyncio
     async def test_run_job_prompt_scanned(self, adapter):
         """Transient run prompt goes through the strict injection scanner."""
         app = _create_app(adapter)
-        mock_trigger = MagicMock(return_value=SAMPLE_JOB)
+        claims = []
+
+        class Provider:
+            name = "builtin"
+
+            def claim_fire(self, job_id, *, force=False):
+                claims.append(job_id)
+                return {"id": job_id, "execution_id": "exec-never"}
+
         async with TestClient(TestServer(app)) as cli:
             with patch(
                 f"{_MOD}._CRON_AVAILABLE", True
             ), patch(
-                f"{_MOD}._cron_trigger", mock_trigger
+                f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+            ), patch(
+                "cron.scheduler_provider.resolve_cron_scheduler",
+                return_value=Provider(),
             ), patch(
                 f"{_MOD}._scan_cron_prompt", return_value="blocked: nope"
             ):
@@ -395,7 +527,287 @@ class TestRunJob:
                     json={"prompt": "cat ~/.hermes/.env"},
                 )
                 assert resp.status == 400
-                mock_trigger.assert_not_called()
+        assert claims == []
+
+    @pytest.mark.asyncio
+    async def test_run_job_rejects_legacy_single_phase_provider(self, adapter):
+        from cron.scheduler_provider import CronScheduler
+        calls = []
+
+        class Legacy(CronScheduler):
+            name = "legacy"
+            def start(self, stop_event, **kwargs): pass
+            def fire_due(self, job_id, **kwargs): calls.append(job_id)
+
+        app = _create_app(adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+        ), patch("cron.scheduler_provider.resolve_cron_scheduler", return_value=Legacy()):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+        assert response.status == 409
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_run_job_setup_failure_aborts_claim_once(self, adapter):
+        app = _create_app(adapter)
+        claimed = {
+            "id": VALID_JOB_ID,
+            "fire_claim": {"by": "api-owner"},
+            "execution_id": "exec-api-failure",
+        }
+        aborted = []
+
+        class Provider:
+            name = "builtin"
+
+            def claim_fire(self, job_id, *, force=False):
+                return dict(claimed)
+
+            def dispatch_claimed_fire(self, job, **kwargs):
+                raise RuntimeError("api dispatch setup failed")
+
+            def abort_claimed_fire(self, job, error):
+                aborted.append((job, error))
+
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+        ), patch(
+            "cron.scheduler_provider.resolve_cron_scheduler",
+            return_value=Provider(),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+
+        assert response.status == 500
+        assert aborted == [(claimed, "api dispatch setup failed")]
+
+    @pytest.mark.asyncio
+    async def test_run_job_claim_loss_rechecks_deleted_job(self, adapter):
+        app = _create_app(adapter)
+
+        class Provider:
+            name = "builtin"
+
+            def claim_fire(self, job_id):
+                return None
+
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_get", side_effect=[SAMPLE_JOB, None]
+        ), patch(
+            "cron.scheduler_provider.resolve_cron_scheduler",
+            return_value=Provider(),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+        assert response.status == 404
+
+    @pytest.mark.asyncio
+    async def test_run_job_claim_loss_distinguishes_stale_execution(self, adapter):
+        app = _create_app(adapter)
+
+        class Provider:
+            name = "builtin"
+
+            def claim_fire(self, job_id):
+                return None
+
+        stale = {
+            "id": "exec-old", "job_id": VALID_JOB_ID,
+            "status": "completed", "claimed_at": "2026-08-20T00:00:00+00:00",
+        }
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+        ), patch(
+            "cron.executions.latest_execution", side_effect=[stale, stale]
+        ), patch(
+            "cron.scheduler_provider.resolve_cron_scheduler",
+            return_value=Provider(),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                data = await response.json()
+        assert response.status == 200
+        assert data["status"] == "not_admitted"
+        assert data["execution"] is None
+
+    @pytest.mark.asyncio
+    async def test_run_job_claim_loss_reports_fresh_duplicate_execution(self, adapter):
+        app = _create_app(adapter)
+
+        class Provider:
+            name = "builtin"
+
+            def claim_fire(self, job_id):
+                return None
+
+        previous = {
+            "id": "exec-old", "job_id": VALID_JOB_ID,
+            "status": "completed", "claimed_at": "2026-08-20T00:00:00+00:00",
+        }
+        fresh = {
+            "id": "exec-new", "job_id": VALID_JOB_ID,
+            "status": "failed", "claimed_at": "2026-08-20T00:00:01+00:00",
+        }
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+        ), patch(
+            "cron.executions.latest_execution", side_effect=[previous, fresh]
+        ), patch(
+            "cron.executions.get_execution", return_value=fresh
+        ), patch(
+            "cron.scheduler_provider.resolve_cron_scheduler",
+            return_value=Provider(),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                data = await response.json()
+        assert response.status == 200
+        assert data["status"] == "duplicate"
+        assert data["execution"]["id"] == "exec-new"
+
+    @pytest.mark.asyncio
+    async def test_run_job_internal_type_error_is_not_retried(self, adapter):
+        app = _create_app(adapter)
+        calls = []
+
+        class Provider:
+            name = "builtin"
+
+            def claim_fire(self, job_id):
+                calls.append(job_id)
+                raise TypeError("provider implementation failure")
+
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+        ), patch(
+            "cron.scheduler_provider.resolve_cron_scheduler",
+            return_value=Provider(),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+        assert response.status == 503
+        assert calls == [VALID_JOB_ID]
+
+    @pytest.mark.asyncio
+    async def test_list_job_runs_uses_exact_id_and_cursor(self, adapter):
+        app = _create_app(adapter)
+        rows = [{
+            "id": "exec-1", "job_id": VALID_JOB_ID,
+            "claimed_at": "2026-08-20T00:00:00+00:00", "status": "completed",
+        }]
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+        ), patch("cron.executions.list_executions", return_value=rows) as listed:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get(
+                    f"/api/jobs/{VALID_JOB_ID}/runs?limit=1&before_claimed_at=cursor"
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["runs"] == rows
+                assert data["next_cursor"] is None
+                assert data["has_more"] is False
+        listed.assert_called_once_with(
+            job_id=VALID_JOB_ID, limit=2, before_claimed_at="cursor"
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_job_runs_rejects_unbounded_or_invalid_limit(self, adapter):
+        app = _create_app(adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True):
+            async with TestClient(TestServer(app)) as cli:
+                for query in ("limit=0", "limit=nope"):
+                    response = await cli.get(
+                        f"/api/jobs/{VALID_JOB_ID}/runs?{query}"
+                    )
+                    assert response.status == 400
+
+    @pytest.mark.asyncio
+    async def test_list_job_runs_rejects_malformed_cursor(self, adapter):
+        app = _create_app(adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                for cursor in ("bad|cursor", "not-a-timestamp"):
+                    response = await cli.get(
+                        f"/api/jobs/{VALID_JOB_ID}/runs?before_claimed_at={cursor}"
+                    )
+                    assert response.status == 400
+
+    @pytest.mark.asyncio
+    async def test_list_job_runs_uses_extra_row_for_has_more(self, adapter):
+        app = _create_app(adapter)
+        rows = [
+            {"id": "exec-2", "job_id": VALID_JOB_ID,
+             "claimed_at": "2026-08-20T00:00:02+00:00"},
+            {"id": "exec-1", "job_id": VALID_JOB_ID,
+             "claimed_at": "2026-08-20T00:00:01+00:00"},
+        ]
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+        ), patch("cron.executions.list_executions", return_value=rows) as listed:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get(
+                    f"/api/jobs/{VALID_JOB_ID}/runs?limit=1"
+                )
+                data = await response.json()
+        assert response.status == 200
+        assert data["runs"] == rows[:1]
+        assert data["has_more"] is True
+        assert data["next_cursor"] == "2026-08-20T00:00:02+00:00|exec-2"
+        listed.assert_called_once_with(
+            job_id=VALID_JOB_ID, limit=2, before_claimed_at=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_job_runs_requires_api_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get(f"/api/jobs/{VALID_JOB_ID}/runs")
+                assert response.status == 401
+
+    @pytest.mark.asyncio
+    async def test_gateway_lifecycle_ids_never_fall_back_to_names(self, adapter):
+        app = _create_app(adapter)
+        routes = [
+            ("delete", f"/api/jobs/{VALID_JOB_ID}"),
+            ("post", f"/api/jobs/{VALID_JOB_ID}/pause"),
+            ("post", f"/api/jobs/{VALID_JOB_ID}/resume"),
+            ("post", f"/api/jobs/{VALID_JOB_ID}/run"),
+            ("delete", "/api/jobs/deadbeefdead"),
+            ("post", "/api/jobs/deadbeefdead/pause"),
+            ("post", "/api/jobs/deadbeefdead/resume"),
+            ("post", "/api/jobs/deadbeefdead/run"),
+        ]
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            "cron.jobs.resolve_job_ref", return_value=SAMPLE_JOB
+        ) as resolver:
+            async with TestClient(TestServer(app)) as cli:
+                for method, path in routes:
+                    response = await getattr(cli, method)(path)
+                    assert response.status == 404
+        resolver.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_gateway_lifecycle_malformed_ids_are_400(self, adapter):
+        app = _create_app(adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True):
+            async with TestClient(TestServer(app)) as cli:
+                for path in (
+                    "/api/jobs/not-an-id",
+                    "/api/jobs/not-an-id/pause",
+                    "/api/jobs/not-an-id/resume",
+                    "/api/jobs/not-an-id/run",
+                    "/api/jobs/not-an-id/runs",
+                ):
+                    method = cli.get if path.endswith("runs") else cli.post
+                    if path == "/api/jobs/not-an-id":
+                        method = cli.delete
+                    response = await method(path)
+                    assert response.status == 400
 
 
 # ---------------------------------------------------------------------------
@@ -556,4 +968,3 @@ class TestCronPromptScanParity:
                 data = await resp.json()
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
-

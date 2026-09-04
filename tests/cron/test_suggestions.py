@@ -93,7 +93,7 @@ class TestStore:
             created.update(kwargs)
             return {"id": "job123", "name": kwargs.get("name"), **kwargs}
 
-        with patch("cron.jobs.create_job", fake_create_job):
+        with patch("cron.scheduler.create_job_with_scheduler_registration", fake_create_job):
             job = store.accept_suggestion("1", origin={"platform": "telegram", "chat_id": "5"})
 
         assert job is not None

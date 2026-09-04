@@ -107,6 +107,22 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     assert "RAM 92% on host" in doc
 
 
+def test_run_one_job_no_agent_persists_direct_execution_identity(hermes_env):
+    from cron.executions import list_executions
+    from cron.jobs import create_job
+    from cron.scheduler import run_one_job
+
+    (hermes_env / "scripts" / "identity.sh").write_text("echo identity\n")
+    job = create_job(
+        prompt=None, schedule="every 5m", script="identity.sh", no_agent=True, deliver="local"
+    )
+    assert run_one_job(job) is True
+    rows = list_executions(job_id=job["id"])
+    assert len(rows) == 1
+    assert rows[0]["source"] == "direct"
+    assert rows[0]["status"] == "completed"
+
+
 def test_run_job_no_agent_reloads_dotenv_before_script(hermes_env, monkeypatch):
     """Regression: a standalone cron tick process starts without home-channel
     vars in its environment, and the agent path's per-run dotenv reload never

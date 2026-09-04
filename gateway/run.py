@@ -33210,14 +33210,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     from cron.scheduler_provider import (
         InProcessCronScheduler,
         resolve_cron_scheduler,
-        scheduler_for_profile_mode,
     )
     cron_stop = threading.Event()
     multiplex_cron = bool(getattr(runner.config, "multiplex_profiles", False))
-    cron_provider = scheduler_for_profile_mode(
-        resolve_cron_scheduler(),
-        multiplex_profiles=multiplex_cron,
-    )
+    cron_provider = resolve_cron_scheduler(multiplex_profiles=multiplex_cron)
     cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
 
     # Multiplex profiles: tell the built-in ticker which profile homes to

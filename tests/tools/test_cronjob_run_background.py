@@ -67,7 +67,7 @@ class TestBackgroundDispatch:
             return True
 
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}) as m_claim, \
+            with patch("cron.jobs.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}) as m_claim, \
                  patch("cron.scheduler.run_one_job", side_effect=slow_run_one_job), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None}):
@@ -95,7 +95,7 @@ class TestBackgroundDispatch:
         # The runner executes on a daemon thread — the patches must stay
         # active until the completion event lands, so poll INSIDE the blocks.
         with _bound_session_key("agent:main:telegram:dm:777"):
-            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+            with patch("cron.jobs.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None,
@@ -128,7 +128,7 @@ class TestBackgroundDispatch:
         from tools.process_registry import process_registry
 
         with _bound_session_key("agent:main:telegram:dm:778"):
-            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+            with patch("cron.jobs.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "error",
@@ -156,14 +156,28 @@ class TestBackgroundDispatch:
         """Paused/already-firing jobs report in the tool response, not as a
         delayed completion event."""
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \
+            with patch("cron.jobs.claim_job_for_fire", return_value=False), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={**_JOB, "enabled": False}), \
                  patch("tools.async_delegation.dispatch_async_delegation") as m_disp:
                 res = _try_dispatch_background_run(_job('job-bg-04'))
         assert res["claimed"] is False
         assert "paused/disabled" in res["error"]
+        assert res["execution"]["status"] == "failed"
         m_disp.assert_not_called()
+
+    def test_claim_refusal_closes_pre_dispatch_execution(self):
+        """A refused manual claim leaves no open ledger attempt."""
+        from cron.executions import get_execution
+
+        with _bound_session_key():
+            with patch("cron.jobs.claim_job_for_fire", return_value=False), \
+                 patch("tools.cronjob_tools.get_job", return_value=_job("job-bg-04b")), \
+                 patch("tools.async_delegation.dispatch_async_delegation"):
+                res = _try_dispatch_background_run(_job("job-bg-04b"))
+        assert res["claimed"] is False
+        assert res["execution"]["status"] == "failed"
+        assert get_execution(res["execution"]["id"])["status"] == "failed"
 
 
 class TestSyncFallbacks:
@@ -183,7 +197,7 @@ class TestSyncFallbacks:
     def test_pool_at_capacity_runs_inline(self):
         """A rejected dispatch must not strand the already-taken claim."""
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+            with patch("cron.jobs.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
                  patch("tools.async_delegation.dispatch_async_delegation",
                        return_value={"status": "rejected", "error": "capacity"}), \
                  patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
@@ -193,6 +207,142 @@ class TestSyncFallbacks:
         assert res["dispatched"] is False
         assert res["success"] is True
         m_run.assert_called_once()   # ran inline on this thread
+
+    def test_dispatch_exception_closes_execution(self):
+        with _bound_session_key():
+            with patch(
+                "cron.jobs.claim_job_for_fire",
+                side_effect=lambda jid, **kw: {
+                    **_job(jid), "fire_claim": {"by": "bg-owner"}
+                },
+            ), patch(
+                "tools.async_delegation.dispatch_async_delegation",
+                side_effect=RuntimeError("submit failed"),
+            ):
+                result = _try_dispatch_background_run(_job("job-bg-07b"))
+        assert result["dispatched"] is False
+        assert result["execution"]["status"] == "failed"
+
+    def test_legacy_provider_background_uses_fire_due_without_claim(self):
+        """A legacy provider is dispatched through its single-phase hook."""
+        seen = {}
+        adapters = {"relay": object()}
+        gateway_loop = object()
+
+        class LegacyProvider:
+            name = "legacy"
+
+            def fire_due(self, job_id, *, adapters=None, loop=None):
+                seen.update(job_id=job_id, adapters=adapters, loop=loop)
+                return True
+
+        def dispatch(**kwargs):
+            seen["result"] = kwargs["runner"]()
+            return {"status": "dispatched", "delegation_id": "legacy-run-1"}
+
+        runner = type(
+            "Runner",
+            (),
+            {"adapters": adapters, "_gateway_loop": gateway_loop},
+        )()
+        with _bound_session_key():
+            with patch(
+                "cron.scheduler_provider.resolve_cron_scheduler",
+                return_value=LegacyProvider(),
+            ), patch("gateway.run._gateway_runner_ref", return_value=runner), patch(
+                "tools.async_delegation.dispatch_async_delegation",
+                side_effect=dispatch,
+            ), patch("cron.scheduler.run_one_job") as m_run:
+                result = _try_dispatch_background_run(
+                    _job("job-bg-legacy"), extra_prompt="transient context"
+                )
+
+        assert result == {
+            "claimed": True,
+            "dispatched": True,
+            "delegation_id": "legacy-run-1",
+            "execution": None,
+        }
+        assert seen["job_id"] == "job-bg-legacy"
+        assert seen["adapters"] is adapters
+        assert seen["loop"] is gateway_loop
+        assert seen["result"]["status"] == "completed"
+        assert seen["result"]["error"] is None
+        assert seen["result"]["execution"] is None
+        m_run.assert_not_called()
+
+    def test_legacy_provider_pool_rejection_runs_inline(self):
+        class LegacyProvider:
+            name = "legacy"
+
+            def __init__(self):
+                self.calls = 0
+
+            def fire_due(self, job_id, *, adapters=None, loop=None):
+                self.calls += 1
+                return True
+
+        provider = LegacyProvider()
+        with _bound_session_key():
+            with patch(
+                "cron.scheduler_provider.resolve_cron_scheduler",
+                return_value=provider,
+            ), patch(
+                "tools.async_delegation.dispatch_async_delegation",
+                return_value={"status": "rejected", "error": "capacity"},
+            ), patch("cron.scheduler.run_one_job") as m_run:
+                result = _try_dispatch_background_run(_job("job-bg-legacy-inline"))
+
+        assert result["claimed"] is True
+        assert result["success"] is True
+        assert result["dispatched"] is False
+        assert result["execution"] is None
+        assert provider.calls == 1
+        m_run.assert_not_called()
+
+    def test_legacy_provider_dispatch_exception_has_no_execution(self):
+        class LegacyProvider:
+            name = "legacy"
+
+            def fire_due(self, job_id, *, adapters=None, loop=None):
+                raise AssertionError("fire_due must not run after dispatch failure")
+
+        with _bound_session_key():
+            with patch(
+                "cron.scheduler_provider.resolve_cron_scheduler",
+                return_value=LegacyProvider(),
+            ), patch(
+                "tools.async_delegation.dispatch_async_delegation",
+                side_effect=RuntimeError("legacy submit failed"),
+            ):
+                result = _try_dispatch_background_run(_job("job-bg-legacy-error"))
+
+        assert result["claimed"] is False
+        assert result["dispatched"] is False
+        assert result["execution"] is None
+        assert result["error"] == "legacy submit failed"
+
+    def test_setup_exception_after_claim_aborts_once(self):
+        """A pre-dispatch setup failure cannot strand the provider claim."""
+        from cron.scheduler_provider import InProcessCronScheduler
+        from tools.cronjob_tools import _run_claimed_job
+
+        provider = InProcessCronScheduler()
+        claimed = {
+            **_job("job-bg-setup-failure"),
+            "fire_claim": {"by": "setup-owner"},
+            "execution_id": "setup-execution",
+        }
+        with patch(
+            "gateway.run._gateway_runner_ref",
+            side_effect=RuntimeError("gateway setup failed"),
+        ), patch.object(provider, "abort_claimed_fire") as abort:
+            result = _run_claimed_job(provider, claimed)
+
+        assert result["claimed"] is True
+        assert result["success"] is False
+        assert "gateway setup failed" in result["error"]
+        abort.assert_called_once_with(claimed, "gateway setup failed")
 
 
 class TestInFlightDedupe:
@@ -237,6 +387,24 @@ class TestInFlightDedupe:
         assert seen_during_run["registered"] is True
         assert "job-bg-09" not in sched.get_running_job_ids()   # released after
 
+    def test_manual_projection_carries_native_execution_identity(self):
+        from cron.executions import create_execution
+        from tools.cronjob_tools import _run_claimed_job
+
+        row = create_execution("job-bg-identity", source="direct")
+        job = {**_job("job-bg-identity"), "execution_id": row["id"]}
+        with patch("cron.scheduler.run_one_job", return_value=True), patch(
+            "tools.cronjob_tools.get_job",
+            return_value={"last_status": "ok", "last_error": None},
+        ):
+            result = _run_claimed_job(job)
+        assert result["execution"] == {
+            "id": row["id"],
+            "job_id": "job-bg-identity",
+            "source": "direct",
+            "status": "claimed",
+        }
+
     def test_background_dispatch_reports_running_job_immediately(self):
         """The dispatch path pre-checks the running set so a mid-run job
         reports in the tool response, not as a delayed completion event."""
@@ -245,7 +413,7 @@ class TestInFlightDedupe:
         assert sched.try_register_running_job("job-bg-10")
         try:
             with _bound_session_key():
-                with patch("tools.cronjob_tools.claim_job_for_fire") as m_claim, \
+                with patch("cron.jobs.claim_job_for_fire") as m_claim, \
                      patch("tools.async_delegation.dispatch_async_delegation") as m_disp:
                     res = _try_dispatch_background_run(_job('job-bg-10'))
             assert res["claimed"] is False
@@ -278,7 +446,7 @@ class TestCronjobRunToolIntegration:
         """cronjob(action='run') surfaces the handle + do-not-wait note."""
         with _bound_session_key():
             with patch("tools.cronjob_tools.resolve_job_ref", return_value=_job('job-bg-12')), \
-                 patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+                 patch("cron.jobs.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"id": "job-bg-12", "name": "bg run",
@@ -296,7 +464,7 @@ class TestCronjobRunToolIntegration:
         execution_success populated from the completed run)."""
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=_job('job-bg-13')), \
-             patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}) as m_claim, \
+             patch("cron.jobs.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}) as m_claim, \
              patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=ran):
             out = json.loads(cronjob(action="run", job_id="job-bg-13"))
