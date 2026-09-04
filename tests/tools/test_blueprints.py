@@ -115,7 +115,7 @@ class TestCreateBlueprintJob:
             captured.update(kwargs)
             return {"id": "abc123", **kwargs}
 
-        with patch("cron.jobs.create_job", fake_create_job):
+        with patch("cron.scheduler.create_job_with_scheduler_registration", fake_create_job):
             job = create_blueprint_job(spec, origin={"platform": "telegram"})
 
         assert captured["schedule"] == "0 8 * * *"

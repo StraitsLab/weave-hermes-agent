@@ -5,11 +5,11 @@ Mirrors the CI gate in .github/workflows/contributor-check.yml so salvage
 branches never bounce off the check-attribution job. Run it from the branch
 you are about to push:
 
-    python3 scripts/audit_pr_attribution.py            # report only
-    python3 scripts/audit_pr_attribution.py --fix      # create mapping files
+    python3 scripts/audit_pr_attribution.py --base-ref <sha>        # report only
+    python3 scripts/audit_pr_attribution.py --base-ref <sha> --fix  # create mappings
 
 Logic (kept in sync with contributor-check.yml):
-  - scans ``git log $(git merge-base origin/main HEAD)..HEAD --format=%ae``
+  - validates and scans ``git log <base-ref>..HEAD --format=%ae``
   - skips teknium/bot emails and ``<id>+<login>@users.noreply.github.com``
     (CI auto-resolves those)
   - everything else must have ``contributors/emails/<email>`` or a legacy
@@ -31,7 +31,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path.cwd()
 
 SKIP_SUBSTRINGS = (
     "teknium",
@@ -55,9 +55,16 @@ def run(*args: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-def new_emails() -> list[str]:
-    base = run("git", "merge-base", "origin/main", "HEAD")
-    log = run("git", "log", f"{base}..HEAD", "--format=%ae", "--no-merges", check=False)
+def new_emails(base_ref: str) -> list[str]:
+    exists = subprocess.run(
+        ["git", "cat-file", "-e", f"{base_ref}^{{commit}}"], cwd=REPO_ROOT
+    ).returncode == 0
+    ancestor = exists and subprocess.run(
+        ["git", "merge-base", "--is-ancestor", base_ref, "HEAD"], cwd=REPO_ROOT
+    ).returncode == 0
+    if not ancestor:
+        raise ValueError(f"base ref {base_ref!r} must identify a valid ancestor of HEAD")
+    log = run("git", "log", f"{base_ref}..HEAD", "--format=%ae", "--no-merges", check=False)
     return sorted({e for e in log.splitlines() if e.strip()})
 
 
@@ -103,9 +110,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fix", action="store_true",
                         help="auto-create contributors/emails/ mapping files")
+    parser.add_argument("--base-ref", required=True,
+                        help="explicit PR base commit SHA")
     args = parser.parse_args()
 
-    unmapped = [e for e in new_emails() if not is_mapped(e)]
+    try:
+        emails = new_emails(args.base_ref)
+    except ValueError as error:
+        parser.error(str(error))
+    unmapped = [e for e in emails if not is_mapped(e)]
     if not unmapped:
         print("✅ All contributor emails on this branch are mapped.")
         return 0
