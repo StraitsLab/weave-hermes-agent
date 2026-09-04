@@ -88,6 +88,29 @@ async def test_same_revision_refreshes_the_live_holder_without_a_second_switch()
 
 
 @pytest.mark.asyncio
+async def test_same_revision_refreshes_an_expired_holder_without_a_second_switch():
+    manager = SessionManager(agent_factory=_Agent)
+    agent = HermesACPAgent(session_manager=manager)
+    agent.on_connect(_PrivateTransport())
+    await agent.initialize(protocol_version=1)
+    state = manager.create_session(cwd="/tmp")
+
+    await agent.ext_method("session/credential/bind", _bind_params(state.session_id))
+    holder = state.credential_holder
+    holder._expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+    refreshed = await agent.ext_method(
+        "session/credential/bind",
+        _bind_params(state.session_id, bearer="replacement-bearer"),
+    )
+
+    assert refreshed == {"status": "ready", "credential_slot": "GATE_B_API_KEY"}
+    assert state.credential_holder is holder
+    assert holder() == "replacement-bearer"
+    assert len(state.agent.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_bind_rejects_unknown_malformed_unauthenticated_and_foreign_transports():
     manager = SessionManager(agent_factory=_Agent)
     agent = HermesACPAgent(session_manager=manager)
