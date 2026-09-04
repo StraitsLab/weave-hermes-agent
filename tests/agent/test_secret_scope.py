@@ -347,3 +347,49 @@ class TestRelayRoutingStampGlobals:
             ss.set_multiplex_active(False)
         for name in self.AUTH_VARS:
             assert not ss._is_global_env(name), name
+
+
+class TestWeaveConnectorBearerGlobal:
+    """WEAVE_API_MCP_BEARER is per-PROCESS (one gateway per Weave cell), not
+    per-profile: the cell supervisor injects it into the child env, and
+    ``mcp_servers`` header interpolation must resolve it under multiplexing
+    instead of shipping the literal ``${...}`` placeholder. Allowlist is EXACT."""
+
+    NAME = "WEAVE_API_MCP_BEARER"
+
+    def test_reads_environ_even_when_scoped_multiplex(self, monkeypatch):
+        monkeypatch.setenv(self.NAME, "wvc1_cell-bearer")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"ANTHROPIC_API_KEY": "sk-mine"})
+        try:
+            assert ss.get_secret(self.NAME) == "wvc1_cell-bearer"
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_unscoped_read_does_not_raise_under_multiplex(self, monkeypatch):
+        monkeypatch.setenv(self.NAME, "wvc1_cell-bearer")
+        ss.set_multiplex_active(True)
+        assert ss.get_secret(self.NAME) == "wvc1_cell-bearer"
+        assert ss._is_global_env(self.NAME)
+
+    def test_other_weave_names_stay_profile_scoped(self, monkeypatch):
+        ss.set_multiplex_active(True)
+        for name in ("WEAVE_API_MCP_BEARER_2", "WEAVE_LINEAR_TOKEN", "WEAVE_"):
+            monkeypatch.setenv(name, "cross-profile-credential")
+            assert not ss._is_global_env(name), name
+            with pytest.raises(ss.UnscopedSecretError):
+                ss.get_secret(name)
+
+    def test_mcp_header_interpolation_resolves_not_placeholder(self, monkeypatch):
+        from tools.mcp_tool import _interpolate_env_vars
+
+        monkeypatch.setenv(self.NAME, "wvc1_cell-bearer")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"ANTHROPIC_API_KEY": "sk-mine"})
+        try:
+            cfg = {"headers": {"Authorization": "Bearer ${WEAVE_API_MCP_BEARER}"}}
+            assert _interpolate_env_vars(cfg) == {
+                "headers": {"Authorization": "Bearer wvc1_cell-bearer"}
+            }
+        finally:
+            ss.reset_secret_scope(token)

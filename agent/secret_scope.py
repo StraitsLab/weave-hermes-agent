@@ -131,6 +131,16 @@ _GLOBAL_ENV_EXACT = frozenset({
     "GATEWAY_RELAY_PLATFORMS", "GATEWAY_RELAY_BOT_IDS",
     "GATEWAY_RELAY_ROUTE_KEYS", "GATEWAY_RELAY_INSTANCE_ID",
     "GATEWAY_RELAY_WAKE_URL", "GATEWAY_RELAY_DISPLAY_NAME",
+    # Weave per-cell connector bearer — the one credential in this set, and
+    # only because it is per-PROCESS, not per-profile: a Weave cell runs ONE
+    # gateway, its supervisor injects this into the child env alone (never a
+    # file, never a profile home, never argv), and every profile that process
+    # serves is the same cell — so unlike API_SERVER_KEY above there is no
+    # other profile's value in os.environ to leak to. Read by ``mcp_servers``
+    # header interpolation (``Authorization: Bearer ${WEAVE_API_MCP_BEARER}``,
+    # tools/mcp_tool.py), which resolves through get_secret and would
+    # otherwise put the literal placeholder on the wire under multiplexing.
+    "WEAVE_API_MCP_BEARER",
 })
 _GLOBAL_ENV_PREFIXES = (
     "HERMES_KANBAN_",
