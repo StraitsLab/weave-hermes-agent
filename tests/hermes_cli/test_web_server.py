@@ -14,6 +14,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from hermes_cli.config import (
     reload_env,
@@ -21,6 +22,15 @@ from hermes_cli.config import (
     OPTIONAL_ENV_VARS,
     DEFAULT_CONFIG,
 )
+
+
+def test_learning_mutation_requires_nonblank_operation_id():
+    from hermes_cli.web_models import LearningNodeEdit, LearningNodeRef
+
+    with pytest.raises(ValidationError):
+        LearningNodeRef(id="memory:memory:0")
+    with pytest.raises(ValidationError):
+        LearningNodeEdit(id="memory:memory:0", content="new", operation_id=" ")
 
 
 # ---------------------------------------------------------------------------

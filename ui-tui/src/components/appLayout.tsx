@@ -472,7 +472,7 @@ const JourneyPane = memo(function JourneyPane() {
   const { gw } = useGateway()
   const ui = useStore($uiState)
 
-  return <Journey gw={gw} onClose={() => patchOverlayState({ journey: false })} t={ui.theme} />
+  return <Journey gw={gw} onClose={() => patchOverlayState({ journey: false })} sid={ui.sid} t={ui.theme} />
 })
 
 const StatusRulePane = memo(function StatusRulePane({

@@ -66,11 +66,12 @@ export function getLearningNode(id: string, profile?: ProfileScope): Promise<Lea
 }
 
 export function deleteLearningNode(id: string, profile?: ProfileScope): Promise<{ message: string; ok: boolean }> {
+  const body = { id, operation_id: crypto.randomUUID() }
   return window.hermesDesktop.api<{ message: string; ok: boolean }>({
     ...capabilityScoped(profile),
     path: '/api/learning/node',
     method: 'DELETE',
-    body: { id }
+    body
   })
 }
 
@@ -79,11 +80,12 @@ export function editLearningNode(
   content: string,
   profile?: ProfileScope
 ): Promise<{ message: string; ok: boolean }> {
+  const body = { content, id, operation_id: crypto.randomUUID() }
   return window.hermesDesktop.api<{ message: string; ok: boolean }>({
     ...capabilityScoped(profile),
     path: '/api/learning/node',
     method: 'PUT',
-    body: { content, id }
+    body
   })
 }
 
