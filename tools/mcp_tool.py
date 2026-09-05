@@ -4646,7 +4646,13 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
     if isinstance(annotations, dict):
         hint = annotations.get("readOnlyHint")
     else:
-        hint = getattr(annotations, "readOnlyHint", None)
+        # MCP SDK >= 2.0 models ``ToolAnnotations`` with the snake_case field
+        # ``read_only_hint`` (``readOnlyHint`` is only its wire alias), so the
+        # camelCase attribute is never set on a live-discovered tool; read the
+        # field first and keep the alias for older SDKs / duck-typed objects.
+        hint = getattr(annotations, "read_only_hint", None)
+        if hint is None:
+            hint = getattr(annotations, "readOnlyHint", None)
     return hint is True
 
 

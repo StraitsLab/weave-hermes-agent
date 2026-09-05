@@ -231,6 +231,32 @@ class TestAnnotationCaptureAtDiscovery:
         assert not hints.get("delete_repo")
         assert not hints.get("no_annotations")
 
+    def test_sdk_tool_annotations_supported(self):
+        """Live discovery hands the gate real ``mcp.types.Tool`` objects.
+
+        MCP SDK 2.x models ``ToolAnnotations`` with the snake_case field
+        ``read_only_hint``; ``readOnlyHint`` is only its wire alias. The gate
+        must read the field, or every live-discovered tool is write-capable
+        no matter what the server sent (found live 2026-09-06 against
+        Linear's hosted MCP through the weave-api proxy).
+        """
+        from mcp import types as mcp_types
+
+        def tool(annotations):
+            return mcp_types.Tool.model_validate(
+                {"name": "t", "inputSchema": {"type": "object"},
+                 "annotations": annotations}
+            )
+
+        assert mcp_tool._annotation_read_only_hint(tool({"readOnlyHint": True})) is True
+        assert mcp_tool._annotation_read_only_hint(tool({"readOnlyHint": False})) is False
+        assert mcp_tool._annotation_read_only_hint(tool({"title": "x"})) is False
+        # The wire alias still round-trips through the SDK's own dump.
+        dumped = tool({"readOnlyHint": True}).annotations.model_dump(by_alias=True)
+        assert mcp_tool._annotation_read_only_hint(
+            SimpleNamespace(annotations=dumped)
+        ) is True
+
     def test_dict_annotations_supported(self):
         """Cached/JSON annotations arrive as plain dicts."""
         assert mcp_tool._annotation_read_only_hint(
