@@ -105,6 +105,11 @@ class ConversationState:
     queued_events: List[Any] = field(default_factory=list)
     # Per-turn must-deliver sidecar notes (one-shot).
     sidecar_notes: List[str] = field(default_factory=list)
+    # Weave: the caller's turn identity for the NEXT native submit (one-shot).
+    # weave-api submits a turn with the Ledger command id as external_request_id;
+    # the agent's turn id becomes exactly that id so every replay-context and
+    # audit row written by the turn's tools shares the Ledger's identity.
+    relay_turn_id: str = ""
     # Pinned session-context bytes: (change_key, text).
     ephemeral_pin: Optional[Tuple[Any, ...]] = None
     # Last voice-channel context delivered (None = never delivered).
@@ -129,6 +134,7 @@ class ConversationState:
         self.last_resolved_model = ""
         self.queued_events = []
         self.sidecar_notes = []
+        self.relay_turn_id = ""
         self.ephemeral_pin = None
         self.vc_last = None
         self.credential_holder = None
@@ -397,6 +403,9 @@ LEGACY_FIELD_SPECS: Dict[str, _FieldSpec] = {
     "_queued_events": _FieldSpec("conversation", "queued_events", list, _present_nonzero),
     "_pending_turn_sidecar_notes": _FieldSpec(
         "conversation", "sidecar_notes", list, _present_nonzero
+    ),
+    "_pending_relay_turn_ids": _FieldSpec(
+        "conversation", "relay_turn_id", str, _present_nonzero
     ),
     "_session_ephemeral_pin": _FieldSpec(
         "conversation", "ephemeral_pin", lambda: None, _present_not_none

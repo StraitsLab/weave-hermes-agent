@@ -3144,6 +3144,9 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     # and run_sync) must not leak into a future conversation's first user
     # message — session keys are source-derived and REUSED.
     "_pending_turn_sidecar_notes",
+    # Weave: a staged-but-never-consumed relay turn id (turn aborted between
+    # admission and run_sync) must not name a future conversation's first turn.
+    "_pending_relay_turn_ids",
 )
 
 # Sentinel for "caller did not pass metadata" vs "caller passed None".
@@ -6367,6 +6370,12 @@ class TurnRunner:
         agent._gateway_turn_context_notes = "\n\n".join(
             self._runner._consume_pending_turn_sidecar_notes(ctx.session_key)
         )
+        # Weave: adopt the caller's turn identity for this one turn (consumed by
+        # agent/turn_context.py at turn start; None when nothing was staged).
+        # Assigned unconditionally so a reused cached agent never replays one.
+        agent._relay_pending_turn_id = (
+            self._runner._consume_pending_relay_turn_id(ctx.session_key) or None
+        )
 
         _bg_review_release = threading.Event()
         _bg_review_pending: list[str] = []
@@ -7387,6 +7396,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _last_resolved_model = legacy_dict_property("_last_resolved_model")
     _queued_events = legacy_dict_property("_queued_events")
     _pending_turn_sidecar_notes = legacy_dict_property("_pending_turn_sidecar_notes")
+    _pending_relay_turn_ids = legacy_dict_property("_pending_relay_turn_ids")
     _pending_messages = legacy_dict_property("_pending_messages")
     _pending_native_image_paths_by_session = legacy_dict_property(
         "_pending_native_image_paths_by_session"
@@ -22259,6 +22269,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # next turn's user message.
         if turn_sidecar_notes and session_key:
             self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
+        # Weave: an authenticated native submit names its own agent turn with
+        # the caller's request id (weave-api's Ledger command id). Staged here,
+        # per event, right before the run, so it cannot outlive an aborted turn
+        # or be overwritten by a later queued submit; consumed in run_sync.
+        _native_meta = getattr(event, "metadata", None)
+        if session_key and isinstance(_native_meta, dict) and _native_meta.get("native_submit_authenticated") is True:
+            self._set_pending_relay_turn_id(session_key, str(_native_meta.get("external_request_id") or ""))
 
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
@@ -29002,6 +29019,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         staged = state.conversation.sidecar_notes
         state.conversation.sidecar_notes = []
         return list(staged) if isinstance(staged, list) else []
+
+    # Weave: the native submit's external_request_id (weave-api's Ledger command
+    # id) becomes the agent's turn id for exactly the turn it admitted, via the
+    # same one-shot staging the sidecar notes use. Only an authenticated native
+    # submit stages it (api_server._admit_native_session_submit); a plain
+    # gateway message leaves the runtime's own `<session>:<task>:<hex8>` id.
+    def _set_pending_relay_turn_id(self, session_key: str, turn_id: str) -> None:
+        if not session_key or not isinstance(turn_id, str) or not turn_id:
+            return
+        self._session_state(session_key).conversation.relay_turn_id = turn_id
+
+    def _consume_pending_relay_turn_id(self, session_key: str) -> str:
+        if not session_key:
+            return ""
+        state = self._peek_session_state(session_key)
+        if state is None:
+            return ""
+        staged = state.conversation.relay_turn_id
+        state.conversation.relay_turn_id = ""
+        return staged if isinstance(staged, str) else ""
 
     def _voice_channel_sidecar_note(self, event, source: SessionSource, session_key: str) -> Optional[str]:
         """Return a ``[Voice channel now: ...]`` note when VC state changed.

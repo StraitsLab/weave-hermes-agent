@@ -252,6 +252,20 @@ def test_preflight_timeout_stops_turn_before_provider_boundary():
     provider_call.assert_not_called()
 
 
+def test_relay_pending_turn_id_becomes_the_turn_id_exactly_once():
+    """Weave: a turn admitted by a native submit adopts the caller's request id as its turn id
+    (every replay-context and audit row the turn writes then shares the Ledger's identity); the
+    staged value is cleared so the next turn mints the runtime's own id again."""
+    agent = _FakeAgent()
+    agent._relay_pending_turn_id = "01a0702f-5b79-7f00-8000-000000000001"
+    _build(agent)
+    assert agent._current_turn_id == "01a0702f-5b79-7f00-8000-000000000001"
+    assert agent._relay_pending_turn_id is None
+    _build(agent)
+    assert agent._current_turn_id != "01a0702f-5b79-7f00-8000-000000000001"
+    assert agent._current_turn_id.startswith("sess-1:")
+
+
 def test_user_message_preserves_platform_event_timestamp():
     agent = _FakeAgent()
 

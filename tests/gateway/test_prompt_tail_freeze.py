@@ -306,6 +306,32 @@ class TestSidecarNoteStaging:
         assert runner._consume_pending_turn_sidecar_notes("sk") == []  # noqa: SLF001
 
 
+class TestRelayTurnIdStaging:
+    """Weave: the native submit's external_request_id becomes the next turn's id, one-shot."""
+
+    def test_set_then_consume_once(self):
+        runner = _make_runner(_pending_relay_turn_ids={})
+        runner._set_pending_relay_turn_id("sk", "01a0702f-5b79-7f00-8000-000000000001")  # noqa: SLF001
+        assert runner._consume_pending_relay_turn_id("sk") == "01a0702f-5b79-7f00-8000-000000000001"  # noqa: SLF001
+        assert runner._consume_pending_relay_turn_id("sk") == ""  # noqa: SLF001
+
+    def test_empty_key_or_id_stages_nothing_and_a_missing_session_reads_empty(self):
+        runner = _make_runner(_pending_relay_turn_ids={})
+        runner._set_pending_relay_turn_id("", "x")  # noqa: SLF001
+        runner._set_pending_relay_turn_id("sk", "")  # noqa: SLF001
+        runner._set_pending_relay_turn_id("sk", None)  # noqa: SLF001
+        assert runner._consume_pending_relay_turn_id("sk") == ""  # noqa: SLF001
+        assert runner._consume_pending_relay_turn_id("never-seen") == ""  # noqa: SLF001
+
+    def test_a_later_stage_replaces_an_unconsumed_one_and_a_boundary_clears_it(self):
+        runner = _make_runner(_pending_relay_turn_ids={})
+        runner._set_pending_relay_turn_id("sk", "first")  # noqa: SLF001
+        runner._set_pending_relay_turn_id("sk", "second")  # noqa: SLF001
+        assert runner._peek_session_state("sk").conversation.relay_turn_id == "second"  # noqa: SLF001
+        runner._peek_session_state("sk").conversation.clear()  # noqa: SLF001
+        assert runner._consume_pending_relay_turn_id("sk") == ""  # noqa: SLF001
+
+
 # ---------------------------------------------------------------------------
 # 6. Connected platforms: stable order
 # ---------------------------------------------------------------------------

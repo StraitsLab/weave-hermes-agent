@@ -67,7 +67,7 @@ async def _client(adapter):
 async def test_submit_returns_native_receipt_and_reuses_identical_request(adapter, monkeypatch):
     calls = []
 
-    async def admit(session_id, message, native_request_ref):
+    async def admit(session_id, message, native_request_ref, external_request_id=""):
         calls.append((session_id, message, native_request_ref))
         return "streaming"
 
@@ -127,7 +127,7 @@ async def test_submit_requires_a_bound_session_credential_before_native_admissio
 
 @pytest.mark.asyncio
 async def test_submit_rejects_changed_retry_and_non_queue_busy_modes(adapter, monkeypatch):
-    async def admit(session_id, message, native_request_ref):
+    async def admit(session_id, message, native_request_ref, external_request_id=""):
         return "queued"
 
     monkeypatch.setattr(adapter, "_admit_native_session_submit", admit)
@@ -162,7 +162,7 @@ async def test_pending_retry_reenters_native_admission_instead_of_faking_streami
     )
     admitted = []
 
-    async def admit(session_id, message, native_request_ref):
+    async def admit(session_id, message, native_request_ref, external_request_id=""):
         admitted.append((session_id, message, native_request_ref))
         return "streaming"
 
@@ -283,17 +283,23 @@ async def test_native_submit_uses_adapter_writer_or_existing_runner_fifo(adapter
 
     adapter.handle_message = AsyncMock(side_effect=start_native_event)
 
-    assert await adapter._admit_native_session_submit(SESSION_ID, "first", "native-1") == "streaming"
+    assert await adapter._admit_native_session_submit(
+        SESSION_ID, "first", "native-1", external_request_id="writer-request") == "streaming"
     event = adapter.handle_message.await_args.args[0]
     assert adapter._native_submit_ref_sessions["native-1"] == ("default", SESSION_ID)
     assert event.internal is False
     assert event.metadata["native_submit_authenticated"] is True
     assert event.metadata["gateway_session_strict"] is True
     assert event.metadata["native_request_ref"] == "native-1"
+    # Weave: the caller's request id rides the event so the turn it starts adopts it as its turn id.
+    assert event.metadata["external_request_id"] == "writer-request"
 
     adapter._active_sessions["native-key"] = asyncio.Event()
-    assert await adapter._admit_native_session_submit(SESSION_ID, "second", "native-2") == "queued"
+    assert await adapter._admit_native_session_submit(
+        SESSION_ID, "second", "native-2", external_request_id="second-request") == "queued"
     assert [(key, event.text) for key, event in queued] == [("native-key", "second")]
+    # A queued submit keeps ITS OWN request id on its event; nothing is staged on the session yet.
+    assert queued[0][1].metadata["external_request_id"] == "second-request"
     assert adapter.handle_message.await_count == 1
 
 
@@ -369,3 +375,23 @@ async def test_real_runner_keeps_one_writer_and_uses_fifo_for_native_submit(tmp_
         release.set()
         await adapter.cancel_background_tasks()
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_submit_passes_the_external_request_id_into_native_admission(adapter, monkeypatch):
+    """The route hands the caller's request id (weave-api's Ledger command id) to admission unchanged."""
+    admitted = []
+
+    async def admit(session_id, message, native_request_ref, external_request_id=""):
+        admitted.append((session_id, message, native_request_ref, external_request_id))
+        return "streaming"
+
+    monkeypatch.setattr(adapter, "_admit_native_session_submit", admit)
+    client = await _client(adapter)
+    try:
+        response = await client.post(f"/api/sessions/{SESSION_ID}/submit", json=_request("cmd-01a0-7f00"),
+                                     headers={"Authorization": "Bearer sk-native-submit-test"})
+        assert response.status == 202
+    finally:
+        await client.close()
+    assert [item[3] for item in admitted] == ["cmd-01a0-7f00"]

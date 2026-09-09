@@ -4906,7 +4906,8 @@ class APIServerAdapter(BasePlatformAdapter):
         return (request_id, message), None
 
     async def _admit_native_session_submit(
-        self, session_id: str, message: str, native_request_ref: str
+        self, session_id: str, message: str, native_request_ref: str,
+        external_request_id: str = "",
     ) -> str:
         """Submit one ordinary turn through the running gateway's writer lease."""
         runner = self.gateway_runner
@@ -4938,7 +4939,6 @@ class APIServerAdapter(BasePlatformAdapter):
         self._native_submit_ref_sessions[native_request_ref] = (
             _api_request_profile.get() or "default", session_id,
         )
-
         event = MessageEvent(
             text=message,
             message_type=MessageType.TEXT,
@@ -4953,6 +4953,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "gateway_session_strict": True,
                 "native_request_ref": native_request_ref,
                 "native_submit_authenticated": True,
+                # Weave: the caller's request id (weave-api's Ledger command id)
+                # names the agent turn this admission starts. It rides the event,
+                # so a queued submit keeps its own id; the gateway stages it
+                # one-shot right before the run (gateway/run.py).
+                "external_request_id": external_request_id,
             },
         )
         # The adapter guard is set synchronously before its background task is
@@ -5029,7 +5034,8 @@ class APIServerAdapter(BasePlatformAdapter):
             else:
                 try:
                     admission = await self._admit_native_session_submit(
-                        session_id, message, native_request_ref
+                        session_id, message, native_request_ref,
+                        external_request_id=external_request_id,
                     )
                 except Exception:
                     await asyncio.to_thread(
