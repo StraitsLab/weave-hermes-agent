@@ -8732,7 +8732,14 @@ class AIAgent:
             "task_id": effective_task_id,
             "platform": getattr(self, "platform", None) or "",
         }
-        relay_turn_id = (
+        # Weave: a turn admitted by an authenticated native submit arrives with
+        # the caller's turn identity already staged on the agent (weave-api's
+        # Ledger command id, consumed from the gateway's per-session state by
+        # TurnRunner.run_sync). Honour it here so the Relay coordinator, the
+        # turn log and every tool middleware context share that one id;
+        # otherwise mint the runtime's own ``<session>:<task>:<hex8>``.
+        staged_turn_id = str(getattr(self, "_relay_pending_turn_id", "") or "")
+        relay_turn_id = staged_turn_id or (
             f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
         )
         self._relay_pending_turn_id = relay_turn_id

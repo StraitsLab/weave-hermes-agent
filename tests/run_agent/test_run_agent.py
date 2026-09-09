@@ -3070,6 +3070,75 @@ class TestRunConversation:
         coordinator.release_conversation.assert_called_once_with(relay_lease)
         assert agent._relay_pending_turn_id is None
 
+    def test_staged_relay_turn_id_names_the_relay_turn_and_the_agent_turn(self, agent):
+        """Weave: a native submit's Ledger command id, staged on the agent by the
+        gateway before run_conversation, must survive the forwarder — it names the
+        Relay coordinator's turn AND becomes ``_current_turn_id`` (so every tool
+        middleware context and replay row shares the Ledger's identity). A turn
+        with nothing staged still mints the runtime's own ``<session>:<task>:<hex8>``."""
+        self._setup_agent(agent)
+        staged = "01a0702f-5b79-7f00-8000-000000000001"
+        agent._relay_pending_turn_id = staged
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        relay_turn = SimpleNamespace(relay_enabled=False)
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = relay_turn
+        seen: dict[str, str | None] = {}
+
+        def fake_loop(self_agent, *args, **kwargs):
+            seen["turn_id"] = getattr(self_agent, "_current_turn_id", None)
+            seen["pending_after_start"] = getattr(self_agent, "_relay_pending_turn_id", None)
+            return {"final_response": "ok", "completed": True}
+
+        from agent.turn_context import build_turn_context as real_build
+
+        def loop_via_turn_context(self_agent, *args, **kwargs):
+            # Mirror the real loop's only turn-id side effect: build_turn_context
+            # adopts the staged id exactly once.
+            self_agent._current_turn_id = (
+                str(getattr(self_agent, "_relay_pending_turn_id", "") or "")
+                or f"{self_agent.session_id}:fresh"
+            )
+            self_agent._relay_pending_turn_id = None
+            return fake_loop(self_agent, *args, **kwargs)
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch("agent.relay_runtime.current_profile_key", return_value="/profile"),
+            patch("hermes_cli.observability.relay_shared_metrics.start_task_run"),
+            patch("hermes_cli.observability.relay_shared_metrics.finish_task_run"),
+            patch("agent.conversation_loop.run_conversation", side_effect=loop_via_turn_context),
+        ):
+            result = agent.run_conversation("hello", task_id="task-1")
+
+        assert result["completed"] is True
+        assert coordinator.begin_turn.call_args.kwargs["turn_id"] == staged
+        assert seen["turn_id"] == staged
+        assert agent._relay_pending_turn_id is None
+
+        # Nothing staged: the forwarder mints the runtime's own id and the
+        # coordinator sees that same fresh id.
+        coordinator.begin_turn.reset_mock()
+        seen.clear()
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch("agent.relay_runtime.current_profile_key", return_value="/profile"),
+            patch("hermes_cli.observability.relay_shared_metrics.start_task_run"),
+            patch("hermes_cli.observability.relay_shared_metrics.finish_task_run"),
+            patch("agent.conversation_loop.run_conversation", side_effect=loop_via_turn_context),
+        ):
+            agent.run_conversation("hello again", task_id="task-2")
+        fresh = coordinator.begin_turn.call_args.kwargs["turn_id"]
+        assert fresh != staged
+        assert fresh.endswith(":task-2:" + fresh.rsplit(":", 1)[1]) and len(fresh.rsplit(":", 1)[1]) == 8
+        assert seen["turn_id"] == fresh
+        assert agent._relay_pending_turn_id is None
+
     def test_stop_finish_reason_returns_response(self, agent):
         self._setup_agent(agent)
         resp = _mock_response(content="Final answer", finish_reason="stop")
