@@ -3,3 +3,4 @@ version: 1.0.0
 description: "Scope-bound Harso memory through the private Weave API."
 hooks:
   - on_memory_write
+  - sync_turn
