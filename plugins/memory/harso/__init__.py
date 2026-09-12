@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List
 
+from agent.message_content import flatten_message_text
 from agent.memory_provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,63 @@ class HarsoMemoryProvider(MemoryProvider):
             if isinstance(citation, str) and isinstance(text, str):
                 context.append(f"{citation} {text[:_MAX_CONTEXT_TEXT]}")
         return "\n".join(context)
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: List[Dict[str, Any]] | None = None,
+    ) -> None:
+        """Submit persisted turn evidence on MemoryManager's background thread."""
+        if not self.is_available():
+            logger.debug("Harso turn skipped: provider unavailable")
+            return
+        if not messages:
+            logger.debug("Harso turn skipped: no durable messages")
+            return
+
+        # Flush stamps _row_id before dispatch; never invent refs from text.
+        user = assistant = None
+        user_index = assistant_index = -1
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if type(message.get("_row_id")) is not int:
+                continue
+            if message.get("role") == "user" and user is None:
+                user, user_index = message, index
+            elif message.get("role") == "assistant" and assistant is None:
+                assistant, assistant_index = message, index
+            if user is not None and assistant is not None:
+                break
+        if user is None or assistant is None or assistant_index <= user_index:
+            logger.debug("Harso turn skipped: no durable current-turn pair")
+            return
+
+        finalized_items = []
+        for message in (user, assistant):
+            content = flatten_message_text(message.get("content")).strip()
+            if not content:
+                logger.debug("Harso turn skipped: empty persisted content")
+                return
+            finalized_items.append({
+                "role": message["role"],
+                "native_item_ref": f"message:{message['_row_id']}",
+                "content": content[:65536],
+            })
+        response = self._post(
+            "/internal/harso/turns",
+            {
+                **self._scope(session_id),
+                "current_user_ref": finalized_items[0]["native_item_ref"],
+                "current_assistant_ref": finalized_items[1]["native_item_ref"],
+                "finalized_items": finalized_items,
+            },
+        )
+        if response is None:
+            raise HarsoWriteError("harso_turn_unacknowledged")
+        logger.debug("Harso turn disposition: %s", response.get("disposition"))
 
     def on_memory_write(
         self,
