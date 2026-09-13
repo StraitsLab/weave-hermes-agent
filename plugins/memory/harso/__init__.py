@@ -103,6 +103,21 @@ class HarsoMemoryProvider(MemoryProvider):
         }
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        # The turn-context caller omits session_id; initialization binds this
+        # provider to the agent's session. Explicit per-call scope still wins.
+        session_id = session_id or self._session_id
+        if not session_id:
+            return ""
+        try:
+            query = flatten_message_text(query).strip()
+        except Exception:
+            # Malformed content must never raise into the user's turn.
+            return ""
+        if not query:
+            return ""
+        # HarsoContextInput's wire-contract ceiling, not a recall tuning knob.
+        # Keep the head: user intent normally precedes pasted supporting text.
+        query = query[:4096]
         response = self._post(
             "/internal/harso/context",
             {
