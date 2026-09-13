@@ -8,7 +8,9 @@ import json
 import logging
 import urllib.error
 from email.message import Message
+from typing import Annotated
 
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 import pytest
 from agent.memory_manager import MemoryManager
 
@@ -35,6 +37,109 @@ class _Response:
 
     def __exit__(self, *_args):
         return False
+
+
+# Copy of weave-api app.py HarsoScopeInput/HarsoContextInput and core.py
+# UUID7_PATTERN. Validate serialized wire bodies without importing the API.
+_UUID7_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+_SESSION = "weave-01990000-0000-7000-8000-000000000003"
+
+
+class HarsoScopeInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    profile_id: Annotated[str, Field(pattern=_UUID7_PATTERN)]
+    profile_revision_id: Annotated[str, Field(pattern=_UUID7_PATTERN)]
+    hermes_session_ref: Annotated[str, Field(
+        min_length=42, max_length=42, pattern=r"^weave-[0-9a-f-]{36}$"
+    )]
+
+
+class HarsoContextInput(HarsoScopeInput):
+    query: Annotated[str, StringConstraints(
+        strip_whitespace=True, min_length=1, max_length=4096
+    )]
+
+
+def _context_provider(monkeypatch):
+    provider = _provider(monkeypatch)
+    monkeypatch.setenv("WEAVE_HARSO_PROFILE_ID", "01990000-0000-7000-8000-000000000001")
+    monkeypatch.setenv("WEAVE_HARSO_PROFILE_REVISION_ID", "01990000-0000-7000-8000-000000000002")
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    manager.initialize_all(session_id=_SESSION)
+    return provider, manager
+
+
+def test_turn_context_manager_call_sends_valid_initialized_session(monkeypatch):
+    provider, manager = _context_provider(monkeypatch)
+    seen = []
+
+    def open_request(request, timeout):
+        seen.append(json.loads(request.data))
+        return _Response({"items": [{"citation": "[harso: e1]", "text": "recalled"}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", open_request)
+    # Exactly agent/turn_context.py: prefetch_all(_query), no session_id kwarg.
+    result = manager.prefetch_all("What did we decide?")
+    assert len(seen) == 1
+    body = HarsoContextInput.model_validate(seen[0])
+    assert body.hermes_session_ref == _SESSION
+    assert body.query == "What did we decide?"
+    assert result == "[harso: e1] recalled"
+
+
+@pytest.mark.parametrize("query, expected", [
+    ("  What did we decide?  ", "What did we decide?"),
+    ("a" * 4096, "a" * 4096),
+    ("前" * 4097 + "tail", "前" * 4096),
+    ("", None),
+    (" \n\t ", None),
+], ids=["trim", "limit", "unicode-over-limit", "empty", "whitespace"])
+def test_manager_prefetch_query_contract(monkeypatch, query, expected):
+    provider, manager = _context_provider(monkeypatch)
+    seen = _capture_turn(monkeypatch)
+    manager.prefetch_all(query)
+    if expected is None:
+        assert seen == []
+    else:
+        assert len(seen) == 1
+        body = HarsoContextInput.model_validate(seen[0]["body"])
+        assert body.query == expected
+        assert seen[0]["body"]["query"] == expected
+
+
+@pytest.mark.parametrize("query, expected", [
+    ([{"type": "text", "text": "Recall this"},
+      {"type": "image_url", "image_url": {"url": "https://example.test/image"}},
+      {"type": "text", "text": "decision"}], "Recall this\ndecision"),
+    ([{"type": "image_url", "image_url": {"url": "https://example.test/image"}}], None),
+    (None, None),
+])
+def test_direct_prefetch_content_list_contract(monkeypatch, query, expected):
+    provider, manager = _context_provider(monkeypatch)
+    seen = _capture_turn(monkeypatch)
+    assert provider.prefetch(query) == ""
+    if expected is None:
+        assert seen == []
+    else:
+        assert len(seen) == 1
+        assert HarsoContextInput.model_validate(seen[0]["body"]).query == expected
+
+
+def test_prefetch_explicit_session_overrides_initialized_session(monkeypatch):
+    provider, manager = _context_provider(monkeypatch)
+    seen = _capture_turn(monkeypatch)
+    other_session = "weave-01990000-0000-7000-8000-000000000004"
+    manager.prefetch_all("Recall the decision", session_id=other_session)
+    assert len(seen) == 1
+    assert HarsoContextInput.model_validate(seen[0]["body"]).hermes_session_ref == other_session
+
+
+def test_prefetch_without_any_session_skips_request(monkeypatch):
+    provider = _provider(monkeypatch)
+    seen = _capture_turn(monkeypatch)
+    assert provider.prefetch("Recall the decision") == ""
+    assert seen == []
 
 
 def test_prefetch_sends_native_session_and_exact_scope_headers(monkeypatch):
