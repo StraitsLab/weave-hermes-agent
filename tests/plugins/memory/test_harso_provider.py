@@ -383,7 +383,81 @@ def test_sync_turn_flattens_multimodal_and_caps_text(monkeypatch):
 
 def test_sync_turn_skips_unavailable_provider(monkeypatch):
     provider = _provider(monkeypatch)
-    provider._route_key = ""
+    monkeypatch.delenv("API_SERVER_KEY")  # resolved at call time, not snapshotted
     seen = _capture_turn(monkeypatch)
     provider.sync_turn("question", "answer", messages=_turn_messages())
     assert seen == []
+
+
+def test_provider_resolves_scope_from_multiplexed_profile_secret_scope(monkeypatch):
+    """Shared-host regression: in Hermes multiplex mode the profile's .env is loaded
+    into an isolated secret scope and never into os.environ (gateway/run.py). The
+    provider must read WEAVE_HARSO_* via agent.secret_scope.get_secret at call time,
+    or it reports unavailable on every shared-host cell."""
+    from agent.secret_scope import (
+        is_multiplex_active,
+        reset_secret_scope,
+        set_multiplex_active,
+        set_secret_scope,
+    )
+
+    for name in ("WEAVE_HARSO_ENDPOINT", "WEAVE_HARSO_PROFILE_ID", "WEAVE_HARSO_PROFILE_REVISION_ID"):
+        monkeypatch.delenv(name, raising=False)
+    # These two the supervisor injects process-wide on the host (supervisor.py:466-468).
+    monkeypatch.setenv("WEAVE_API_MCP_BEARER", "cell-bearer")
+    monkeypatch.setenv("API_SERVER_KEY", "route-key")
+    module = importlib.reload(importlib.import_module("plugins.memory.harso"))
+    provider = module.HarsoMemoryProvider()  # constructed at gateway start, outside any turn scope
+
+    previous = is_multiplex_active()
+    set_multiplex_active(True)
+    token = set_secret_scope({
+        "WEAVE_HARSO_ENDPOINT": "https://memory.example.test",
+        "WEAVE_HARSO_PROFILE_ID": "profile-1",
+        "WEAVE_HARSO_PROFILE_REVISION_ID": "revision-2",
+        "WEAVE_API_MCP_BEARER": "cell-bearer",
+        "API_SERVER_KEY": "route-key",
+    })
+    try:
+        assert provider.is_available()
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode())
+            captured["route_key"] = request.get_header("X-weave-profile-route-key")
+            return _Response({"degraded": False, "items": []})
+
+        monkeypatch.setattr(module.urllib.request, "urlopen", fake_urlopen)
+        provider.prefetch("what do I like", session_id="native-session")
+    finally:
+        reset_secret_scope(token)
+        set_multiplex_active(previous)
+
+    assert captured["url"] == "https://memory.example.test/internal/harso/context"
+    assert captured["body"]["profile_id"] == "profile-1"
+    assert captured["body"]["profile_revision_id"] == "revision-2"
+    assert captured["route_key"] == "route-key"
+
+
+def test_provider_reports_unavailable_when_scope_lacks_profile_identity(monkeypatch):
+    """Multiplex is fail-closed: a scope missing the profile identity must not fall
+    through to os.environ (another profile's values)."""
+    from agent.secret_scope import is_multiplex_active, reset_secret_scope, set_multiplex_active, set_secret_scope
+
+    monkeypatch.setenv("WEAVE_HARSO_ENDPOINT", "https://other-profile.example.test")
+    monkeypatch.setenv("WEAVE_HARSO_PROFILE_ID", "other-profile")
+    monkeypatch.setenv("WEAVE_HARSO_PROFILE_REVISION_ID", "other-revision")
+    monkeypatch.setenv("WEAVE_API_MCP_BEARER", "cell-bearer")
+    monkeypatch.setenv("API_SERVER_KEY", "route-key")
+    module = importlib.reload(importlib.import_module("plugins.memory.harso"))
+    provider = module.HarsoMemoryProvider()
+
+    previous = is_multiplex_active()
+    set_multiplex_active(True)
+    token = set_secret_scope({"WEAVE_API_MCP_BEARER": "cell-bearer", "API_SERVER_KEY": "route-key"})
+    try:
+        assert not provider.is_available()
+    finally:
+        reset_secret_scope(token)
+        set_multiplex_active(previous)

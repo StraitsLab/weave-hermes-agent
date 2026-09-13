@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List
 
 from agent.message_content import flatten_message_text
 from agent.memory_provider import MemoryProvider
+from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 _TIMEOUT_SECONDS = 5
@@ -26,14 +26,33 @@ class HarsoMemoryProvider(MemoryProvider):
     """Use the private Weave API as the Harso admission boundary."""
 
     def __init__(self) -> None:
-        self._endpoint = os.environ.get("WEAVE_HARSO_ENDPOINT", "").rstrip("/")
-        self._profile_id = os.environ.get("WEAVE_HARSO_PROFILE_ID", "")
-        self._profile_revision_id = os.environ.get(
-            "WEAVE_HARSO_PROFILE_REVISION_ID", ""
-        )
-        self._bearer = os.environ.get("WEAVE_API_MCP_BEARER", "")
-        self._route_key = os.environ.get("API_SERVER_KEY", "")
         self._session_id = ""
+
+    # Resolved at call time, never snapshotted in __init__: the provider is
+    # constructed once at gateway start, but on the shared host Hermes runs in
+    # multiplex mode and each profile's .env is loaded per turn into an isolated
+    # secret scope (gateway/run.py) that never reaches os.environ. get_secret
+    # honours that scope and fails closed under multiplex, so one profile can
+    # never see another's endpoint or identity.
+    @property
+    def _endpoint(self) -> str:
+        return (get_secret("WEAVE_HARSO_ENDPOINT", "") or "").rstrip("/")
+
+    @property
+    def _profile_id(self) -> str:
+        return get_secret("WEAVE_HARSO_PROFILE_ID", "") or ""
+
+    @property
+    def _profile_revision_id(self) -> str:
+        return get_secret("WEAVE_HARSO_PROFILE_REVISION_ID", "") or ""
+
+    @property
+    def _bearer(self) -> str:
+        return get_secret("WEAVE_API_MCP_BEARER", "") or ""
+
+    @property
+    def _route_key(self) -> str:
+        return get_secret("API_SERVER_KEY", "") or ""
 
     @property
     def name(self) -> str:
