@@ -378,3 +378,58 @@ async def test_raised_native_execution_marks_terminal_failure(
     assert event.metadata["native_submit_failed"] is True
     assert queue.get_nowait()["type"] == "turn.failed"
     assert queue.get_nowait() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_failed", [True, False], ids=["provider-failure", "success"])
+async def test_returned_native_result_terminal(adapter, monkeypatch, tmp_path, provider_failed):
+    source = SessionSource(
+        platform=Platform.API_SERVER, chat_id=SESSION_ID, user_id="api_server",
+    )
+    event = MessageEvent(
+        text="hello", source=source, message_id=REQUEST_REF,
+        metadata={"native_request_ref": REQUEST_REF},
+    )
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    runner.adapters = {}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._handle_active_session_busy_message = AsyncMock(return_value=False)
+    runner._is_session_run_current = lambda *_args: True
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._get_guild_id = lambda _event: None
+    runner.hooks = MagicMock(emit=AsyncMock())
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="native-key", session_id=SESSION_ID,
+        created_at=datetime.now(), updated_at=datetime.now(),
+        platform=Platform.API_SERVER, chat_type="dm",
+    )
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_platform_message_id.return_value = False
+    result = {"final_response": "Hello", "messages": [], "api_calls": 0, "tools": []}
+    if provider_failed:
+        result.update(
+            final_response="⚠️ Provider authentication failed: no provider configured",
+            failed=True, error="provider_unavailable: no provider configured",
+        )
+    runner._run_agent = AsyncMock(return_value=result)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    queue = asyncio.Queue(maxsize=32)
+    adapter._native_submit_subscribers[REQUEST_REF] = (
+        queue, asyncio.get_running_loop(),
+    )
+
+    await runner._handle_message_with_agent(event, source, "native-key", 1)
+    await adapter._on_native_submit_finished(event, "native-key")
+
+    runner._run_agent.assert_awaited_once()
+    if provider_failed:
+        assert event.metadata["native_submit_failed"] is True
+    else:
+        assert "native_submit_failed" not in event.metadata
+    assert queue.get_nowait()["type"] == ("turn.failed" if provider_failed else "turn.completed")
+    assert queue.get_nowait() is None
+    assert queue.empty()
