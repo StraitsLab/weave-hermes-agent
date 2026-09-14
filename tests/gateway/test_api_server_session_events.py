@@ -433,3 +433,24 @@ async def test_returned_native_result_terminal(adapter, monkeypatch, tmp_path, p
     assert queue.get_nowait()["type"] == ("turn.failed" if provider_failed else "turn.completed")
     assert queue.get_nowait() is None
     assert queue.empty()
+
+
+def test_provider_resolution_failure_returns_failed_result():
+    """The real TurnRunner except-branch marks the synthetic reply as a failed turn."""
+    runner = SimpleNamespace(
+        _get_system_prompt_for_channel=lambda *_a, **_k: "",
+        _resolve_session_agent_runtime=MagicMock(
+            side_effect=RuntimeError("no provider configured for session"),
+        ),
+    )
+    source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID, user_id="api_server")
+    ctx = SimpleNamespace(
+        source=source, session_key="native-key", user_config={},
+        message="hello", context_prompt="", channel_prompt="",
+    )
+    result = gateway_run.TurnRunner(runner, ctx).run_sync()
+
+    assert result["failed"] is True
+    assert result["error"] == "provider_unavailable: no provider configured for session"
+    assert result["final_response"].startswith("⚠️ Provider authentication failed: ")
+    assert result["messages"] == [] and result["api_calls"] == 0
