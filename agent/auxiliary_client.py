@@ -3323,7 +3323,12 @@ def _read_main_provider() -> str:
     return ""
 
 
-def _read_main_api_key() -> str:
+def _normalize_aux_api_key(value: Any) -> Any:
+    """Keep refreshable credentials lazy; normalize only static strings."""
+    return value if callable(value) else value.strip() if isinstance(value, str) else ""
+
+
+def _read_main_api_key() -> Any:
     """Read the user's main model API key from the runtime override or config.
 
     Mirrors ``_read_main_model`` / ``_read_main_provider``: checks the
@@ -3336,9 +3341,9 @@ def _read_main_api_key() -> str:
     the main model's credentials instead of falling to ``no-key-required``
     (issue #9318).
     """
-    override = _runtime_main_value("api_key")
-    if isinstance(override, str) and override.strip():
-        return override.strip()
+    override = _normalize_aux_api_key(_runtime_main_value("api_key"))
+    if override:
+        return override
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
@@ -3429,7 +3434,7 @@ def _read_main_model_for_aux() -> str:
     return model
 
 
-def _read_main_api_key_if_same_host(aux_base_url: str) -> str:
+def _read_main_api_key_if_same_host(aux_base_url: str) -> Any:
     """Return the main api_key only when *aux_base_url* points at the same
     host as the main model's base_url.
 
@@ -3817,13 +3822,12 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
     # Use a placeholder key — the OpenAI SDK requires a non-empty string but
     # local servers ignore the Authorization header.  Same fix as cli.py
     # _ensure_runtime_credentials() (PR #2556).
-    if not isinstance(custom_key, str) or not custom_key.strip():
-        custom_key = "no-key-required"
+    custom_key = _normalize_aux_api_key(custom_key) or "no-key-required"
 
     if not isinstance(custom_mode, str) or not custom_mode.strip():
         custom_mode = None
 
-    return custom_base, custom_key.strip(), custom_mode
+    return custom_base, custom_key, custom_mode
 
 
 def _current_custom_base_url() -> str:
@@ -6821,7 +6825,7 @@ def resolve_provider_client(
             if api_mode == "anthropic_messages":
                 wrap_base = (explicit_base_url or "").strip().rstrip("/")
             custom_key = (
-                (explicit_api_key or "").strip()
+                _normalize_aux_api_key(explicit_api_key)
                 or _scoped_key_env("OPENAI_API_KEY")
                 or _read_main_api_key_if_same_host(custom_base)
                 or "no-key-required"  # local servers don't need auth
@@ -6840,7 +6844,7 @@ def resolve_provider_client(
             # OpenRouter or a wrong API-key provider — the main agent already
             # solved this, we just need to reuse its answer. (#45472)
             _main_base = str(main_runtime.get("base_url") or "").strip().rstrip("/")
-            _main_key = str(main_runtime.get("api_key") or "").strip()
+            _main_key = _normalize_aux_api_key(main_runtime.get("api_key"))
             if _main_base and _main_key:
                 custom_base = _main_base
                 custom_key = _main_key
@@ -6915,7 +6919,7 @@ def resolve_provider_client(
             custom_entry = _get_named_custom_provider(provider)
         if custom_entry:
             custom_base = (custom_entry.get("base_url") or "").strip()
-            custom_key = (custom_entry.get("api_key") or "").strip()
+            custom_key = _normalize_aux_api_key(custom_entry.get("api_key"))
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
                 custom_key = _scoped_key_env(custom_key_env)
@@ -6930,7 +6934,7 @@ def resolve_provider_client(
                 custom_key = build_command_token_provider(
                     custom_key_cmd, custom_entry.get("name") or provider
                 ) or custom_key
-            custom_key = custom_key or "no-key-required"
+            custom_key = custom_key or _read_main_api_key_if_same_host(custom_base) or "no-key-required"
             if custom_key == "no-key-required":
                 logger.warning(
                     "resolve_provider_client: named custom provider %r has no resolvable "
@@ -8357,7 +8361,7 @@ def _resolve_task_provider_model(
         cfg_provider = str(task_config.get("provider", "")).strip() or None
         cfg_model = str(task_config.get("model", "")).strip() or None
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
-        cfg_api_key = str(task_config.get("api_key", "")).strip() or None
+        cfg_api_key = _normalize_aux_api_key(task_config.get("api_key")) or None
         # Resolve key_env → env var when api_key is not set directly
         if not cfg_api_key:
             cfg_key_env = str(

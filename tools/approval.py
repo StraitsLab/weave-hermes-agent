@@ -3831,7 +3831,9 @@ def _run_approval_gate(
     # to answer approval prompts — an unanswered prompt just waits the full
     # timeout then fails closed. Treat them as a deterministic non-interactive
     # context governed by approvals.single_query_mode (mirrors cron below).
-    if _is_single_query_approval_context():
+    # The gateway sets EXEC_ASK process-wide; session platform outranks it
+    # and any inherited CLI interactivity, even after a smart-judge failure.
+    if _is_single_query_approval_context() or _is_unattended_platform_approval_context():
         is_cli = False
         is_gateway = False
 
@@ -4793,7 +4795,9 @@ def check_all_command_guards(command: str, env_type: str,
     # to answer approval prompts — an unanswered prompt just waits the full
     # timeout then fails closed. Treat them as a deterministic non-interactive
     # context governed by approvals.single_query_mode (mirrors cron below).
-    if _is_single_query_approval_context():
+    # The gateway sets EXEC_ASK process-wide; session platform outranks it
+    # and any inherited CLI interactivity, even after a smart-judge failure.
+    if _is_single_query_approval_context() or _is_unattended_platform_approval_context():
         is_cli = False
         is_gateway = False
         # HERMES_EXEC_ASK routes through the gateway decision loop (no human
