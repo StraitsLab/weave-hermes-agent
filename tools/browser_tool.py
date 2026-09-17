@@ -3318,7 +3318,8 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         return _cached_agent_browser
 
     if not validate:
-        _agent_browser_probe_resolved = True
+        # Cache positives only: a negative probe is cheap (which() found nothing) and
+        # must stay re-checkable so a mid-session install is seen (dep_ensure re-checks).
         raise FileNotFoundError("agent-browser CLI not found")
 
     # Nothing found — try lazy installation before giving up.

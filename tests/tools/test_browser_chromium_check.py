@@ -120,3 +120,28 @@ class TestRunBrowserCommandChromiumGuard:
     """
 
 
+
+
+def test_negative_probe_is_not_cached_across_an_install(monkeypatch):
+    """dep_ensure probes before installing, then re-checks: a cached negative
+    would report the install as failed and hide the browser tools for the
+    process lifetime. Only a positive probe may be cached."""
+    monkeypatch.setattr(bt, "_agent_browser_resolved", False)
+    monkeypatch.setattr(bt, "_cached_agent_browser", None)
+    monkeypatch.setattr(bt, "_agent_browser_probe_resolved", False, raising=False)
+    monkeypatch.setattr(bt, "_cached_agent_browser_probe", None, raising=False)
+    monkeypatch.setattr(bt, "_merge_browser_path", lambda _: "")
+    monkeypatch.setattr(bt, "node_tool_runnable", lambda path: True)
+    installed = {"npx": False}
+    monkeypatch.setattr(
+        bt.shutil, "which",
+        lambda name, path=None: "/test/bin/npx" if (name == "npx" and installed["npx"]) else None,
+    )
+    import pytest as _pytest
+    with _pytest.raises(FileNotFoundError):
+        bt._find_agent_browser(validate=False)
+    installed["npx"] = True
+    assert bt._find_agent_browser(validate=False) == bt.NPX_AGENT_BROWSER_SENTINEL
+    # and the positive result IS cached: which() is no longer consulted
+    monkeypatch.setattr(bt.shutil, "which", lambda *a, **k: (_ for _ in ()).throw(AssertionError("probe re-ran")))
+    assert bt._find_agent_browser(validate=False) == bt.NPX_AGENT_BROWSER_SENTINEL
