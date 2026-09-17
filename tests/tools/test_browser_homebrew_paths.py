@@ -22,8 +22,10 @@ import tools.browser_tool as _bt
 
 
 @pytest.fixture(autouse=True)
-def _clear_browser_caches():
+def _clear_browser_caches(monkeypatch):
     """Clear lru_cache and manual caches between tests."""
+    monkeypatch.setattr(_bt, "_cached_agent_browser_probe", None)
+    monkeypatch.setattr(_bt, "_agent_browser_probe_resolved", False)
     _discover_homebrew_node_dirs.cache_clear()
     _bt._cached_agent_browser = None
     _bt._agent_browser_resolved = False

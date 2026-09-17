@@ -77,9 +77,71 @@ class TestCheckBrowserRequirementsChromium:
         assert bt.check_browser_requirements() is True
 
 
+def test_tool_definitions_probe_npx_once(monkeypatch):
+    import model_tools
+    from tools import registry as tool_registry
+
+    # Other tests leave check_fn / tool-definition snapshots behind; this test
+    # measures a cold first build, so start from an empty cache.
+    tool_registry.invalidate_check_fn_cache()
+    model_tools._clear_tool_defs_cache()
+
+    monkeypatch.setattr(bt, "_agent_browser_resolved", False)
+    monkeypatch.setattr(bt, "_cached_agent_browser", None)
+    monkeypatch.setattr(bt, "_agent_browser_probe_resolved", False, raising=False)
+    monkeypatch.setattr(bt, "_cached_agent_browser_probe", None, raising=False)
+    monkeypatch.setattr(bt, "_is_browser_use_cli_mode", lambda: False)
+    monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(bt, "_get_cdp_override_raw", lambda: None)
+    monkeypatch.setattr(bt, "_get_cloud_provider", lambda: None)
+    monkeypatch.setattr(bt, "_chromium_installed", lambda: True)
+    monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _: False)
+    monkeypatch.setattr(bt, "_merge_browser_path", lambda _: "/test/bin")
+    monkeypatch.setattr(
+        bt.shutil, "which",
+        lambda name, path=None: "/test/bin/npx" if name == "npx" else None,
+    )
+    calls = []
+    monkeypatch.setattr(bt, "node_tool_runnable", lambda path: calls.append(path) or True)
+
+    for _ in range(2):
+        tools = model_tools.get_tool_definitions(enabled_toolsets=["hermes-acp"], quiet_mode=True)
+        assert any(t["function"]["name"] == "browser_navigate" for t in tools)
+    assert calls, "The real npx resolution path must be exercised"
+    assert len(calls) <= 1
+    # A cheap availability probe must not populate the execution-validation cache.
+    assert bt._agent_browser_resolved is False
+    assert bt._cached_agent_browser is None
+
+
 class TestRunBrowserCommandChromiumGuard:
     """Verify _run_browser_command fails fast (no timeout hang) when
     Chromium is missing in local mode.
     """
 
 
+
+
+def test_negative_probe_is_not_cached_across_an_install(monkeypatch):
+    """dep_ensure probes before installing, then re-checks: a cached negative
+    would report the install as failed and hide the browser tools for the
+    process lifetime. Only a positive probe may be cached."""
+    monkeypatch.setattr(bt, "_agent_browser_resolved", False)
+    monkeypatch.setattr(bt, "_cached_agent_browser", None)
+    monkeypatch.setattr(bt, "_agent_browser_probe_resolved", False, raising=False)
+    monkeypatch.setattr(bt, "_cached_agent_browser_probe", None, raising=False)
+    monkeypatch.setattr(bt, "_merge_browser_path", lambda _: "")
+    monkeypatch.setattr(bt, "node_tool_runnable", lambda path: True)
+    installed = {"npx": False}
+    monkeypatch.setattr(
+        bt.shutil, "which",
+        lambda name, path=None: "/test/bin/npx" if (name == "npx" and installed["npx"]) else None,
+    )
+    import pytest as _pytest
+    with _pytest.raises(FileNotFoundError):
+        bt._find_agent_browser(validate=False)
+    installed["npx"] = True
+    assert bt._find_agent_browser(validate=False) == bt.NPX_AGENT_BROWSER_SENTINEL
+    # and the positive result IS cached: which() is no longer consulted
+    monkeypatch.setattr(bt.shutil, "which", lambda *a, **k: (_ for _ in ()).throw(AssertionError("probe re-ran")))
+    assert bt._find_agent_browser(validate=False) == bt.NPX_AGENT_BROWSER_SENTINEL
