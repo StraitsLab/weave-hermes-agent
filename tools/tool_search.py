@@ -110,6 +110,8 @@ class ToolSearchConfig:
     # Absolute cap on the embedded listing, regardless of context size.
     # Effective budget = min(listing_max_tokens, threshold_pct% of context).
     listing_max_tokens: int = 4000
+    # Exact model-facing tool names that remain inline when deferral is active.
+    always_eager: Tuple[str, ...] = ()
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -166,6 +168,7 @@ class ToolSearchConfig:
             max_search_limit=max_search_limit,
             listing=listing,
             listing_max_tokens=listing_max_tokens,
+            always_eager=_parse_always_eager(raw.get("always_eager")),
         )
 
 
@@ -181,6 +184,14 @@ def _safe_float(value: Any, fallback: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _parse_always_eager(value: Any) -> Tuple[str, ...]:
+    if (not isinstance(value, list) or len(value) > 64
+            or any(not isinstance(v, str) for v in value)
+            or len(set(value)) != len(value)):
+        return ()
+    return tuple(value)
 
 
 def load_config() -> ToolSearchConfig:
@@ -283,7 +294,7 @@ def _describe_classification(
     return "available"
 
 
-def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def classify_tools(tool_defs: List[Dict[str, Any]], *, always_eager: Iterable[str] = ()) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
@@ -299,7 +310,7 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
             continue
-        if is_deferrable_tool_name(name):
+        if name not in always_eager and is_deferrable_tool_name(name):
             deferrable.append(td)
         else:
             visible.append(td)
@@ -927,7 +938,11 @@ def assemble_tool_defs(
     incoming = [td for td in tool_defs
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
 
-    visible, deferrable = classify_tools(incoming)
+    eager_names = set(config.always_eager)
+    known_names = {(td.get("function") or {}).get("name", "") for td in incoming}
+    for name in sorted(eager_names - known_names):
+        logger.debug("always_eager tool %r is not present in the current catalog; ignoring", name)
+    visible, deferrable = classify_tools(incoming, always_eager=eager_names)
     if not deferrable:
         return AssemblyResult(tool_defs=incoming, activated=False)
 
@@ -1078,7 +1093,7 @@ def dispatch_tool_search(args: Dict[str, Any],
     else:
         limit = max(1, min(config.max_search_limit, _safe_int(raw_limit, config.search_default_limit)))
 
-    _, deferrable = classify_tools(current_tool_defs)
+    _, deferrable = classify_tools(current_tool_defs, always_eager=config.always_eager)
     catalog = build_catalog(deferrable)
 
     results: List[Dict[str, Any]] = []
@@ -1151,7 +1166,7 @@ def dispatch_tool_describe(args: Dict[str, Any],
             "Retry with fewer names per call."
         )
 
-    _, deferrable = classify_tools(current_tool_defs)
+    _, deferrable = classify_tools(current_tool_defs, always_eager=config.always_eager)
     by_name: Dict[str, Dict[str, Any]] = {}
     for td in deferrable:
         fn = td.get("function") or {}

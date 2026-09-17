@@ -61,6 +61,17 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_always_eager_defaults_empty(self):
+        from tools.tool_search import ToolSearchConfig
+        assert ToolSearchConfig.from_raw(None).always_eager == ()
+
+    def test_always_eager_rejects_invalid_shape_and_duplicates(self):
+        from tools.tool_search import ToolSearchConfig
+        assert ToolSearchConfig.from_raw({"always_eager": "terminal"}).always_eager == ()
+        assert ToolSearchConfig.from_raw({"always_eager": ["a", 1]}).always_eager == ()
+        assert ToolSearchConfig.from_raw({"always_eager": ["a", "a"]}).always_eager == ()
+        assert ToolSearchConfig.from_raw({"always_eager": [str(i) for i in range(65)]}).always_eager == ()
+
 
 # ---------------------------------------------------------------------------
 # Classification — the hard invariant: core tools NEVER defer.
@@ -251,6 +262,49 @@ class TestAssembly:
         )
         assert not result.activated
         assert {t["function"]["name"] for t in result.tool_defs} == {"terminal", "read_file"}
+
+    def test_always_eager_tool_stays_inline_and_is_absent_from_listing(self):
+        from tools.registry import registry
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs
+        name = "mcp_always_eager_probe"
+        tool_def = _td(name, "Always eager probe capability")
+        registry.register(name=name, handler=lambda args, **kwargs: "{}",
+                          schema=tool_def, toolset="mcp-always-eager")
+        deferred_name = "mcp_deferred_probe"
+        deferred_def = _td(deferred_name, "Deferred capability")
+        registry.register(name=deferred_name, handler=lambda args, **kwargs: "{}",
+                          schema=deferred_def, toolset="mcp-always-eager")
+        result = assemble_tool_defs(
+            [tool_def, deferred_def, _td("terminal", "Run shell")], context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on", "always_eager": [name]}),
+        )
+        names = {td["function"]["name"] for td in result.tool_defs}
+        assert name in names
+        search = next(td for td in result.tool_defs if td["function"]["name"] == "tool_search")
+        assert name not in search["function"]["description"]
+        from tools.tool_search import dispatch_tool_search
+        found = json.loads(dispatch_tool_search(
+            {"queries": ["probe"]}, current_tool_defs=[tool_def, deferred_def],
+            config=ToolSearchConfig.from_raw({"enabled": "on", "always_eager": [name]}),
+        ))
+        assert found["total_available"] == 1
+        assert name not in found["tools"]
+        assert found["results"][0]["matches"] == [deferred_name]
+
+    def test_unknown_always_eager_name_is_ignored(self, caplog):
+        from tools.registry import registry
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs
+        name = "mcp_unknown_eager_probe"
+        tool_def = _td(name, "Deferred capability")
+        registry.register(name=name, handler=lambda args, **kwargs: "{}",
+                          schema=tool_def, toolset="mcp-unknown-eager")
+        with caplog.at_level("DEBUG", logger="tools.tool_search"):
+            result = assemble_tool_defs(
+                [tool_def],
+                config=ToolSearchConfig.from_raw({"always_eager": ["xx_unknown_tool_xx"]}),
+            )
+        assert result.activated and name not in {td["function"]["name"] for td in result.tool_defs if "function" in td}
+        assert "not present" in caplog.text
 
     @staticmethod
     def _register_mcp(name):
