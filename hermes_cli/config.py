@@ -2292,6 +2292,20 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
 
     issues: List[ConfigIssue] = []
 
+    # ── tools.tool_search.always_eager ───────────────────────────────────
+    tools_cfg = config.get("tools")
+    tool_search_cfg = tools_cfg.get("tool_search") if isinstance(tools_cfg, dict) else None
+    if isinstance(tool_search_cfg, dict) and "always_eager" in tool_search_cfg:
+        eager = tool_search_cfg["always_eager"]
+        if (not isinstance(eager, list) or len(eager) > 64
+                or any(not isinstance(name, str) for name in eager)
+                or len(set(eager)) != len(eager)):
+            issues.append(ConfigIssue(
+                "error",
+                "tools.tool_search.always_eager must be a list of at most 64 unique strings",
+                "Use distinct tool names, for example: always_eager: [web_search_exa]",
+            ))
+
     # ── voice.submit_mode: direct | draft ────────────────────────────────
     voice_cfg = config.get("voice")
     if isinstance(voice_cfg, dict) and "submit_mode" in voice_cfg:
