@@ -668,6 +668,7 @@ class SessionManager:
             return self._agent_factory()
 
         from run_agent import AIAgent
+        from agent.skill_utils import parse_config_string_list
         from hermes_cli.config import load_config
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -687,10 +688,14 @@ class SessionManager:
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
 
+        enabled_toolsets = (config.get("platform_toolsets") or {}).get("acp")
+        if not isinstance(enabled_toolsets, list) or not enabled_toolsets:
+            enabled_toolsets = ["hermes-acp"]
+
         kwargs = {
             "platform": "acp",
             "enabled_toolsets": _expand_acp_enabled_toolsets(
-                ["hermes-acp"],
+                enabled_toolsets,
                 mcp_server_names=configured_mcp_servers,
             ),
             "quiet_mode": True,
@@ -698,6 +703,9 @@ class SessionManager:
             "session_db": self._get_db(),
             "model": model or default_model,
         }
+        agent_config = config.get("agent") or {}
+        if "disabled_toolsets" in agent_config:
+            kwargs["disabled_toolsets"] = parse_config_string_list(agent_config["disabled_toolsets"])
 
         try:
             runtime = resolve_runtime_provider(requested=requested_provider or config_provider)

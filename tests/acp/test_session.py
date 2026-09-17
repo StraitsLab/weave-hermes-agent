@@ -66,6 +66,38 @@ class TestCreateSession:
         assert fetched is state
 
 
+    @pytest.mark.parametrize(
+        "tool_config, expected, disabled",
+        [
+            ({"platform_toolsets": {"acp": ["terminal", "file"]},
+              "agent": {"disabled_toolsets": ["browser"]}},
+             ["terminal", "file", "mcp-test"], ["browser"]),
+            ({"agent": {"disabled_toolsets": '["browser"]'}},
+             ["hermes-acp", "mcp-test"], ["browser"]),
+            ({}, ["hermes-acp", "mcp-test"], None),
+            ({"platform_toolsets": {"acp": []}}, ["hermes-acp", "mcp-test"], None),
+        ],
+    )
+    def test_make_agent_config_toolsets(self, monkeypatch, tool_config, expected, disabled):
+        config = {"model": "fake-model", "mcp_servers": {"test": {}, "off": {"enabled": False}},
+                  **tool_config}
+        agent_cls = MagicMock()
+        monkeypatch.setattr("run_agent.AIAgent", agent_cls)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw: {})
+        monkeypatch.setattr("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build", lambda **kw: None)
+        monkeypatch.setattr(acp_session, "_register_task_cwd", lambda *args: None)
+        monkeypatch.setattr(SessionManager, "_get_db", lambda self: None)
+
+        SessionManager().create_session(cwd="/tmp/project")
+
+        kwargs = agent_cls.call_args.kwargs
+        assert kwargs["enabled_toolsets"] == expected
+        if disabled is None:
+            assert "disabled_toolsets" not in kwargs
+        else:
+            assert kwargs["disabled_toolsets"] == disabled
+
     def test_make_agent_stamps_session_cwd_for_codex_runtime(self, monkeypatch):
         class FakeAgent:
             model = "fake-model"
