@@ -2340,14 +2340,19 @@ class HermesACPAgent(acp.Agent):
         final_response = result.get("final_response") or ""
         cancelled = bool(state.cancel_event and state.cancel_event.is_set())
         interrupted = bool(result.get("interrupted")) or cancelled
-        # run_conversation reports a turn it could not finish (provider error,
-        # content policy, exhausted continuation, truncated output) as
-        # ``error`` / ``partial`` with completed=False, not as an exception.
-        # Surface that on the wire instead of an empty end_turn, or a client
+        # run_conversation reports a turn it could not finish as a normal
+        # return, not an exception: the finalizer computes ``completed``
+        # (final_response present, not failed, under budget or ended in text)
+        # and the early-return sites stamp ``error``/``partial``. Some failed
+        # shapes carry only ``completed: False`` (repeated outer errors,
+        # budget exhaustion) — read the verdict, not just the annotations.
+        # Surface it on the wire instead of an empty end_turn, or a client
         # that settles on the stop reason records a success that never was.
-        failed = (
-            not interrupted
-            and (bool(result.get("error")) or bool(result.get("partial")))
+        failed = not interrupted and (
+            result.get("completed") is False
+            or bool(result.get("failed"))
+            or bool(result.get("error"))
+            or bool(result.get("partial"))
         )
         # Hermes' local "waiting for model response" interrupt status is metadata,
         # not assistant prose — clients get cancellation from stop_reason instead.

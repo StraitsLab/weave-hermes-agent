@@ -461,9 +461,22 @@ class TestPrompt:
              "refusal"),
             ({"final_response": "Hit an API error", "messages": [],
               "completed": False, "error": "API error after retries"}, "refusal"),
+            # The finalizer's own verdict: a failed turn may carry neither
+            # error nor partial (repeated outer errors, budget exhaustion).
+            ({"final_response": "I apologize, but I encountered repeated errors: x",
+              "messages": [], "completed": False, "failed": True,
+              "partial": False}, "refusal"),
+            ({"final_response": "Partial summary before the budget ran out",
+              "messages": [], "completed": False, "failed": False,
+              "partial": False}, "refusal"),
+            # A completed turn is never failed, whatever else is set.
+            ({"final_response": "done", "messages": [], "completed": True,
+              "failed": False, "partial": False}, "end_turn"),
             # Interrupted turns keep their own signal and never read as failed.
             ({"final_response": None, "messages": [], "interrupted": True,
               "error": "interrupted"}, "end_turn"),
+            ({"final_response": None, "messages": [], "completed": False,
+              "interrupted": True}, "end_turn"),
         ],
     )
     async def test_prompt_stop_reason_reflects_unfinished_turn(
