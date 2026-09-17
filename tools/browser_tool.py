@@ -749,6 +749,9 @@ _allow_private_urls_resolved = False
 _cached_allow_private_urls: Optional[bool] = None
 _cached_agent_browser: Optional[str] = None
 _agent_browser_resolved = False
+# Availability probes must never bypass execution-time validation.
+_cached_agent_browser_probe: Optional[str] = None
+_agent_browser_probe_resolved = False
 
 # Lightpanda engine support — cached like _get_cloud_provider().
 # agent-browser v0.25.3+ supports ``--engine lightpanda`` natively.
@@ -3224,6 +3227,11 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         FileNotFoundError: If agent-browser is not installed
     """
     global _cached_agent_browser, _agent_browser_resolved
+    global _cached_agent_browser_probe, _agent_browser_probe_resolved
+    if not validate and _agent_browser_probe_resolved:
+        if _cached_agent_browser_probe is None:
+            raise FileNotFoundError("agent-browser CLI not found (cached probe)")
+        return _cached_agent_browser_probe
     if _agent_browser_resolved:
         if _cached_agent_browser is None:
             raise FileNotFoundError(
@@ -3252,6 +3260,8 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         agent_browser_runnable(which_result) if validate else _agent_browser_candidate_present(which_result)
     ):
         if not validate:
+            _cached_agent_browser_probe = which_result
+            _agent_browser_probe_resolved = True
             return which_result
         _cached_agent_browser = which_result
         _agent_browser_resolved = True
@@ -3266,6 +3276,8 @@ def _find_agent_browser(*, validate: bool = True) -> str:
             agent_browser_runnable(which_result) if validate else _agent_browser_candidate_present(which_result)
         ):
             if not validate:
+                _cached_agent_browser_probe = which_result
+                _agent_browser_probe_resolved = True
                 return which_result
             _cached_agent_browser = which_result
             _agent_browser_resolved = True
@@ -3287,6 +3299,8 @@ def _find_agent_browser(*, validate: bool = True) -> str:
             agent_browser_runnable(local_which) if validate else _agent_browser_candidate_present(local_which)
         ):
             if not validate:
+                _cached_agent_browser_probe = local_which
+                _agent_browser_probe_resolved = True
                 return local_which
             _cached_agent_browser = local_which
             _agent_browser_resolved = True
@@ -3296,12 +3310,15 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     npx_path = _resolve_npx_bin()
     if npx_path:
         if not validate:
+            _cached_agent_browser_probe = NPX_AGENT_BROWSER_SENTINEL
+            _agent_browser_probe_resolved = True
             return NPX_AGENT_BROWSER_SENTINEL
         _cached_agent_browser = NPX_AGENT_BROWSER_SENTINEL
         _agent_browser_resolved = True
         return _cached_agent_browser
 
     if not validate:
+        _agent_browser_probe_resolved = True
         raise FileNotFoundError("agent-browser CLI not found")
 
     # Nothing found — try lazy installation before giving up.
@@ -5968,6 +5985,9 @@ def cleanup_all_browsers() -> None:
         pass
 
     # Reset cached lookups so they are re-evaluated on next use.
+    global _cached_agent_browser_probe, _agent_browser_probe_resolved
+    _agent_browser_probe_resolved = False
+    _cached_agent_browser_probe = None
     global _cached_agent_browser, _agent_browser_resolved
     global _cached_command_timeout, _command_timeout_resolved
     global _cached_snapshot_threshold, _snapshot_threshold_resolved
