@@ -2202,6 +2202,11 @@ class HermesACPAgent(acp.Agent):
                 session_tokens = set_session_vars(
                     session_key=session_id, session_id=session_id, cwd=state.cwd,
                     cron_session="",
+                    # ACP has no detached-result consumer. Keep delegated
+                    # results in this prompt via the native synchronous batch
+                    # fallback; children still run in parallel and the parent
+                    # receives their results before session/prompt ends.
+                    async_delivery=False,
                 )
             except Exception:
                 session_tokens = None
@@ -2331,9 +2336,24 @@ class HermesACPAgent(acp.Agent):
                     exc_info=True,
                 )
 
-        final_response = result.get("final_response", "")
+        # A hard interrupt during a joined tool call can finish without prose.
+        final_response = result.get("final_response") or ""
         cancelled = bool(state.cancel_event and state.cancel_event.is_set())
         interrupted = bool(result.get("interrupted")) or cancelled
+        # run_conversation reports a turn it could not finish as a normal
+        # return, not an exception: the finalizer computes ``completed``
+        # (final_response present, not failed, under budget or ended in text)
+        # and the early-return sites stamp ``error``/``partial``. Some failed
+        # shapes carry only ``completed: False`` (repeated outer errors,
+        # budget exhaustion) — read the verdict, not just the annotations.
+        # Surface it on the wire instead of an empty end_turn, or a client
+        # that settles on the stop reason records a success that never was.
+        failed = not interrupted and (
+            result.get("completed") is False
+            or bool(result.get("failed"))
+            or bool(result.get("error"))
+            or bool(result.get("partial"))
+        )
         # Hermes' local "waiting for model response" interrupt status is metadata,
         # not assistant prose — clients get cancellation from stop_reason instead.
         from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
@@ -2388,7 +2408,7 @@ class HermesACPAgent(acp.Agent):
 
         await self._send_usage_update(state)
 
-        stop_reason = "cancelled" if cancelled else "end_turn"
+        stop_reason = "cancelled" if cancelled else ("refusal" if failed else "end_turn")
         return PromptResponse(stop_reason=stop_reason, usage=usage)
 
     # ---- Slash commands (headless) -------------------------------------------

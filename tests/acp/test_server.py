@@ -446,6 +446,59 @@ class TestPrompt:
 
         assert captured.get("child") == resp.session_id
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "result, expected",
+        [
+            ({"final_response": "done", "messages": []}, "end_turn"),
+            # A turn run_conversation could not finish is reported as
+            # error/partial with completed=False, not as an exception. It
+            # must not come back as an empty end_turn (a client that settles
+            # on the stop reason would record a success that never was).
+            ({"final_response": None, "messages": [], "completed": False,
+              "partial": True,
+              "error": "Response remained truncated after 4 continuation attempts"},
+             "refusal"),
+            ({"final_response": "Hit an API error", "messages": [],
+              "completed": False, "error": "API error after retries"}, "refusal"),
+            # The finalizer's own verdict: a failed turn may carry neither
+            # error nor partial (repeated outer errors, budget exhaustion).
+            ({"final_response": "I apologize, but I encountered repeated errors: x",
+              "messages": [], "completed": False, "failed": True,
+              "partial": False}, "refusal"),
+            ({"final_response": "Partial summary before the budget ran out",
+              "messages": [], "completed": False, "failed": False,
+              "partial": False}, "refusal"),
+            # A completed turn is never failed, whatever else is set.
+            ({"final_response": "done", "messages": [], "completed": True,
+              "failed": False, "partial": False}, "end_turn"),
+            # Interrupted turns keep their own signal and never read as failed.
+            ({"final_response": None, "messages": [], "interrupted": True,
+              "error": "interrupted"}, "end_turn"),
+            ({"final_response": None, "messages": [], "completed": False,
+              "interrupted": True}, "end_turn"),
+        ],
+    )
+    async def test_prompt_stop_reason_reflects_unfinished_turn(
+        self, agent, mock_manager, result, expected
+    ):
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        state.agent.run_conversation = lambda *a, **k: dict(result)
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        out = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="hi")],
+            session_id=resp.session_id,
+        )
+
+        assert out.stop_reason == expected
+        assert not state.is_running
+
 
 
 
