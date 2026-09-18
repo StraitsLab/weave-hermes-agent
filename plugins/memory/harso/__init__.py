@@ -125,7 +125,13 @@ class HarsoMemoryProvider(MemoryProvider):
                 "query": query,
             },
         )
-        if not response or response.get("degraded") is True:
+        if not response:
+            return ""
+        # Explicit recall status supersedes the legacy degraded boolean.
+        if "recall_status" in response:
+            if response["recall_status"] not in ("ok", "degraded"):
+                return ""
+        elif response.get("degraded") is True:
             return ""
         items = response.get("items")
         if not isinstance(items, list):
@@ -135,8 +141,23 @@ class HarsoMemoryProvider(MemoryProvider):
             if not isinstance(item, dict):
                 continue
             citation, text = item.get("citation"), item.get("text")
-            if isinstance(citation, str) and isinstance(text, str):
+            citations = item.get("citations")
+            # Wire-contract ceiling per entry, not a recall-breadth tuning knob.
+            if (isinstance(citations, list) and citations
+                    and all(isinstance(ref, str) and ref.strip() for ref in citations)):
+                citation = " ".join(citations[:64])
+            if (isinstance(citation, str) and citation.strip()
+                    and isinstance(text, str) and text[:_MAX_CONTEXT_TEXT].strip()):
                 context.append(f"{citation} {text[:_MAX_CONTEXT_TEXT]}")
+        # Gaps may annotate admitted evidence, never create context by themselves.
+        gaps = response.get("gaps")
+        if context and isinstance(gaps, list):
+            reasons = [gap["reason"] for gap in gaps
+                       if isinstance(gap, dict) and gap.get("reason") in (
+                           "missing", "stale", "contradictory", "privacy-excluded", "budget-excluded"
+                       )][:5]
+            if reasons:
+                context.append("Memory gaps: " + ", ".join(reasons))
         return "\n".join(context)
 
     def sync_turn(

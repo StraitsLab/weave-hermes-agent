@@ -13,6 +13,177 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 import pytest
 from agent.memory_manager import MemoryManager
+from agent.turn_context import compose_user_api_content
+
+
+# Fixed MemoryService.context DTO from weave-cloud c3d41e9f9e258102e4d9422efcaff39f417dbc23.
+def _recall_body():
+    return {
+        "degraded": True, "recall_status": "degraded", "degradation": "lexical_only",
+        "items": [{"evidence_id": "evidence-9", "citation": "[harso: evidence-9]",
+                   "citations": ["[harso: evidence-9]", "[harso: evidence-12]"],
+                   "text": "The offline orchid project uses PostgreSQL."}],
+        "gaps": [{"reason": "stale"}],
+    }
+
+
+def _recall_context(monkeypatch, body):
+    provider, manager = _context_provider(monkeypatch)
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: _Response(body))
+    query = "What database does the orchid project use?"
+    direct = provider.prefetch(query)  # A swallowed provider exception is not a fail-closed pass.
+    recalled = manager.prefetch_all(query)
+    assert recalled == direct
+    return recalled, compose_user_api_content(query, recalled, "")
+
+
+def test_degraded_lexical_recall_survives_to_the_final_model_context(monkeypatch):
+    recalled, final = _recall_context(monkeypatch, _recall_body())
+    assert final is not None
+    assert "<memory-context>" in final
+    assert "The offline orchid project uses PostgreSQL." in final
+    assert "[harso: evidence-9] [harso: evidence-12]" in final
+    assert "stale" in final
+    assert recalled in final
+    assert final.startswith("What database does the orchid project use?\n\n")
+
+
+@pytest.mark.parametrize("items", [[], _recall_body()["items"]])
+def test_unavailable_recall_fails_closed(monkeypatch, items):
+    body = {**_recall_body(), "recall_status": "unavailable", "items": items}
+    assert _recall_context(monkeypatch, body) == ("", None)
+
+
+@pytest.mark.parametrize("status", ["partial", "", None, True, 1, [], {}])
+def test_unknown_recall_status_fails_closed(monkeypatch, status):
+    body = {**_recall_body(), "degraded": False, "recall_status": status}
+    assert _recall_context(monkeypatch, body) == ("", None)
+
+
+def test_legacy_degraded_response_keeps_existing_suppression(monkeypatch):
+    body = {"degraded": True, "items": _recall_body()["items"]}
+    assert _recall_context(monkeypatch, body) == ("", None)
+
+
+@pytest.mark.parametrize("degraded", [False, None, 1, "true"])
+def test_legacy_healthy_response_still_renders(monkeypatch, degraded):
+    body = {"degraded": degraded, "items": [{"citation": "[harso: e1]", "text": "legacy"}]}
+    recalled, final = _recall_context(monkeypatch, body)
+    assert final is not None
+    assert recalled == "[harso: e1] legacy"
+    assert final == compose_user_api_content(
+        "What database does the orchid project use?", "[harso: e1] legacy", "")
+
+
+@pytest.mark.parametrize("status,degraded,degradation", [
+    ("ok", False, "none"), ("ok", True, "none"),
+    ("degraded", True, "base_ranker"), ("degraded", False, "lexical_only"),
+])
+def test_explicit_usable_status_controls_admission(monkeypatch, status, degraded, degradation):
+    body = {**_recall_body(), "recall_status": status,
+            "degraded": degraded, "degradation": degradation}
+    recalled, final = _recall_context(monkeypatch, body)
+    assert final is not None
+    assert recalled and recalled in final
+    assert "[harso: evidence-9] [harso: evidence-12]" in final
+
+
+@pytest.mark.parametrize("items", [[], [None, {}, {"citation": 1, "text": "bad"},
+                                       {"citation": "[harso: e1]", "text": []}],
+                                   [{"citation": "", "text": ""}],
+                                   [{"citation": "[harso: e1]", "text": "  "}],
+                                   [{"citation": "  ", "text": "orphan text"}]])
+def test_gaps_alone_never_create_a_memory_block(monkeypatch, items):
+    body = {**_recall_body(), "items": items, "gaps": [{"reason": "missing"}]}
+    assert _recall_context(monkeypatch, body) == ("", None)
+
+
+@pytest.mark.parametrize("body", [None, {}, [], {"recall_status": "ok"},
+                                 {"recall_status": "ok", "items": {}},
+                                 {"recall_status": "ok", "items": "items"}])
+def test_malformed_recall_body_never_creates_context(monkeypatch, body):
+    assert _recall_context(monkeypatch, body) == ("", None)
+
+
+def test_only_allowlisted_gap_reasons_cross_the_boundary(monkeypatch):
+    reasons = ["missing", "stale", "contradictory", "privacy-excluded", "budget-excluded"]
+    body = _recall_body()
+    body["gaps"] = [None, "missing", {"reason": []}, {"reason": "candidate_ref_leak"}]
+    body["gaps"] += [{"reason": r, "candidate_ref": "secret"} for r in reasons * 2]
+    recalled, final = _recall_context(monkeypatch, body)
+    assert final is not None
+    assert recalled.splitlines()[-1] == "Memory gaps: " + ", ".join(reasons)
+    assert recalled in final
+    assert "candidate_ref" not in final and "secret" not in final
+
+
+@pytest.mark.parametrize("gaps", [None, "stale", {}, [{"reason": "unknown"}]])
+def test_malformed_gaps_do_not_hide_admitted_items(monkeypatch, gaps):
+    body = {**_recall_body(), "gaps": gaps}
+    recalled, final = _recall_context(monkeypatch, body)
+    assert final is not None
+    assert recalled in final and "PostgreSQL" in final
+    assert "Memory gaps:" not in final
+
+
+def test_citations_are_ordered_and_bounded(monkeypatch):
+    body = _recall_body()
+    refs = [f"[harso: ref-{i}]" for i in range(70)]
+    body["items"] = [{"citation": "singular-not-used", "citations": refs, "text": "one"},
+                     {"citations": refs, "text": "two"}]
+    recalled, final = _recall_context(monkeypatch, body)
+    assert final is not None
+    assert recalled.splitlines()[:2] == [" ".join(refs[:64]) + " " + t for t in ("one", "two")]
+    assert recalled in final
+    assert "singular-not-used" not in final
+    assert all(ref not in final for ref in refs[64:])
+
+
+@pytest.mark.parametrize("extra", [{}, {"citations": None}, {"citations": "bad"},
+                                   {"citations": []}, {"citations": ["valid", 1]},
+                                   {"citations": [""]}, {"citations": ["  "]},
+                                   {"citations": {"ref": "bad"}}])
+def test_missing_citations_falls_back_to_legacy_singular(monkeypatch, extra):
+    body = {"recall_status": "ok", "items": [{"citation": "[harso: old]", "text": "text", **extra}]}
+    recalled, final = _recall_context(monkeypatch, body)
+    assert final is not None
+    assert recalled == "[harso: old] text" and recalled in final
+
+
+def test_private_receipt_and_lane_two_fields_are_not_rendered(monkeypatch):
+    body = _recall_body()
+    private = {key: "private-value-" + key for key in (
+        "receipt", "scores", "excluded_refs", "selected_entries", "policy_revision_ref",
+        "total_tokens", "session_id", "occurred_at", "role", "kind")}
+    body.update(private)
+    body["items"][0].update(private, evidence_id="private-evidence-id")
+    body["gaps"][0].update(private)
+    recalled, final = _recall_context(monkeypatch, body)
+    assert final is not None
+    assert "PostgreSQL" in final and recalled in final
+    assert "private-" not in final
+    assert all(key not in final for key in private)
+
+
+def test_context_item_and_text_limits_are_unchanged(monkeypatch):
+    body = _recall_body()
+    body["items"] = [{"citations": [f"[harso: e{i}]"], "text": "x" * 1200 + "trimmed"}
+                     for i in range(6)]
+    recalled, final = _recall_context(monkeypatch, body)
+    assert final is not None
+    assert recalled.splitlines()[:5] == [f"[harso: e{i}] " + "x" * 1200 for i in range(5)]
+    assert recalled in final and "trimmed" not in final and "[harso: e5]" not in final
+
+
+def test_no_recalled_content_is_logged(monkeypatch, caplog):
+    body = _recall_body()
+    with caplog.at_level(logging.DEBUG):
+        recalled, final = _recall_context(monkeypatch, body)
+    assert final is not None
+    assert recalled and recalled in final
+    forbidden = [body["items"][0]["text"], *body["items"][0]["citations"], "stale",
+                 "What database does the orchid project use?", "cell-bearer", "route-key"]
+    assert all(value not in record.getMessage() for record in caplog.records for value in forbidden)
 
 
 def _provider(monkeypatch):
