@@ -9779,10 +9779,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _begin_native_followup(self, pending_event: Any, session_key: str) -> Optional["MessageEvent"]:
         """Weave (WEV-1726): announce a queued native submit as the active turn.
 
-        Returns the event when it carries a native ref and the adapter exposes
-        the hook, so ``_end_native_followup`` can close the same ref. Non-native
-        follow-ups (and adapters without the hooks) return None: no behaviour
-        change for them.
+        Returns the event when the hook succeeded, so ``_end_native_followup``
+        closes the same ref. Non-native follow-ups (and adapters without the
+        hooks) return None: no behaviour change for them.
+
+        A start failure is the FOLLOW-UP's failure, never the outer turn's: the
+        outer request already produced and delivered its answer. So this never
+        raises an ordinary exception to the caller. It closes whatever the hook
+        may have activated (api_server installs the ref BEFORE its db await) as
+        failed and returns None; the caller then skips the follow-up run.
+        Cancellation is cleaned up the same way and then propagated.
         """
         meta = getattr(pending_event, "metadata", None) or {}
         if not (isinstance(meta, dict) and isinstance(meta.get("native_request_ref"), str) and meta["native_request_ref"]):
@@ -9795,15 +9801,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result = started(pending_event, session_key)
             if inspect.isawaitable(result):
                 await result
-        except Exception:
-            # The hook installs the ref as the session's active ref BEFORE its database
-            # await (api_server._on_native_submit_started), so a failure here can leave the
-            # follow-up active and untracked. Keep cleanup ownership: return the event so
-            # _end_native_followup closes it as failed, and do not run the follow-up at all.
-            logger.debug("Native follow-up start notification failed", exc_info=True)
+        except asyncio.CancelledError:
             await self._end_native_followup(pending_event, session_key, failed=True)
             raise
+        except Exception:
+            logger.debug("Native follow-up start notification failed", exc_info=True)
+            await self._end_native_followup(pending_event, session_key, failed=True)
+            return None
         return pending_event
+
+    @staticmethod
+    def _native_followup_skipped(pending_event: Any) -> bool:
+        """True when a native follow-up's start hook failed: it was closed as failed and must not run."""
+        meta = getattr(pending_event, "metadata", None)
+        return isinstance(meta, dict) and bool(meta.get("native_submit_failed"))
 
     async def _end_native_followup(self, pending_event: Optional["MessageEvent"], session_key: str, *, failed: bool) -> None:
         if pending_event is None:
@@ -31909,6 +31920,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # 2026-09-20 12:22Z: the sibling handoff hung until reconciliation).
                 # Bracket the follow-up with the same hooks the outer event got.
                 _followup_native = await self._begin_native_followup(pending_event, next_session_key)
+                if _followup_native is None and self._native_followup_skipped(pending_event):
+                    # The follow-up could not be announced; it is already closed as failed.
+                    # The outer turn's result stands untouched.
+                    return result
                 _followup_failed = True  # only a completed run clears this; cancellation never does
                 try:
                     followup_result = await self._run_agent(

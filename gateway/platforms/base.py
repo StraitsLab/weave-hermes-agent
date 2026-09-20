@@ -2924,11 +2924,14 @@ def _record_merged_native_ref(survivor: MessageEvent, folded: MessageEvent) -> N
     merged = survivor_meta.setdefault("merged_native_request_refs", [])
     if not isinstance(merged, list):
         return
-    # The folded event may itself carry refs it absorbed earlier: keep them.
+    # The folded event may itself carry refs it absorbed earlier: keep them. Every admitted
+    # ref is closed by the survivor's start hook; none may be dropped, so there is no cap on
+    # the list itself. Growth is bounded upstream by the admission path (one pending slot per
+    # session, overflow in queued_events), and each ref is a 32-char id.
     inherited = folded_meta.get("merged_native_request_refs")
     for candidate in ([ref] + (inherited if isinstance(inherited, list) else [])):
         if (isinstance(candidate, str) and candidate and candidate not in merged
-                and candidate != survivor_meta.get("native_request_ref") and len(merged) < 64):
+                and candidate != survivor_meta.get("native_request_ref")):
             merged.append(candidate)
 
 

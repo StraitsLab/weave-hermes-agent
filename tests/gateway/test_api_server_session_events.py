@@ -567,9 +567,10 @@ async def test_run_followup_brackets_a_native_event_and_ignores_others(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_run_followup_start_failure_still_closes_the_ref(monkeypatch):
-    """The start hook installs the ref as active BEFORE its db await; if that await fails the
-    follow-up must be closed as failed and not run, never left active and untracked."""
+async def test_run_followup_start_failure_closes_the_ref_and_spares_the_outer_turn(monkeypatch):
+    """The start hook installs the ref as active BEFORE its db await. If that await fails, the
+    follow-up is closed as failed and NOT run — and the failure must not escape into the outer
+    turn, whose answer was already produced and delivered (second review: re-raising marked A failed)."""
     runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
     calls = []
     class Adapter:
@@ -577,9 +578,43 @@ async def test_run_followup_start_failure_still_closes_the_ref(monkeypatch):
         async def _on_native_submit_finished(self, event, key): calls.append(("finish", event.metadata.get("native_submit_failed")))
     monkeypatch.setattr(runner, "_adapter_for_source", lambda source: Adapter(), raising=False)
     native = SimpleNamespace(metadata={"native_request_ref": "r1"}, source=object())
-    with pytest.raises(RuntimeError):
+    token = await runner._begin_native_followup(native, "k")          # does not raise
+    assert token is None and runner._native_followup_skipped(native)
+    assert calls == ["start", ("finish", True)]
+
+
+@pytest.mark.asyncio
+async def test_run_followup_cancelled_during_start_still_closes_the_ref(monkeypatch):
+    """Cancellation while the start hook awaits its db update: the ref was already installed as
+    active; it must be closed as failed, and the cancellation must keep propagating."""
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    calls = []
+    class Adapter:
+        async def _on_native_submit_started(self, event, key): calls.append("start"); raise asyncio.CancelledError()
+        async def _on_native_submit_finished(self, event, key): calls.append(("finish", event.metadata.get("native_submit_failed")))
+    monkeypatch.setattr(runner, "_adapter_for_source", lambda source: Adapter(), raising=False)
+    native = SimpleNamespace(metadata={"native_request_ref": "r1"}, source=object())
+    with pytest.raises(asyncio.CancelledError):
         await runner._begin_native_followup(native, "k")
     assert calls == ["start", ("finish", True)]
+
+
+@pytest.mark.asyncio
+async def test_api_start_failure_after_activation_is_closed_by_end(adapter):
+    """End-to-end on the real adapter: the start hook activates the ref then its db update fails;
+    _end_native_followup(failed=True) must emit turn.failed and release the active ref."""
+    queue = _subscribe(adapter, REQUEST_REF, "handoff-A")
+    event = SimpleNamespace(metadata={"native_request_ref": REQUEST_REF}, source=SimpleNamespace(chat_id=SESSION_ID, profile=None))
+    def _boom(**kwargs): raise RuntimeError("db down")
+    adapter._session_db.set_native_session_submit_admission = _boom  # the await after activation fails
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    runner._adapter_for_source = lambda source: adapter
+    token = await runner._begin_native_followup(event, "k")
+    await asyncio.sleep(0)
+    assert token is None
+    assert adapter._native_submit_active_refs.get("k") is None, "activated ref must be released"
+    assert REQUEST_REF in adapter._native_submit_terminals
+    assert [e["type"] for e in _drain(queue)][-1] == "turn.failed"
 
 
 @pytest.mark.asyncio
@@ -607,8 +642,10 @@ def test_media_fold_also_records_the_folded_native_ref():
     pending = {"k": survivor}
     merge_pending_message_event(pending, "k", folded)
     assert survivor.metadata["merged_native_request_refs"] == ["ref-f", "ref-older"]
-    # Bounded.
+    # Never orphaned: every admitted ref is kept, however many fold in (second review: a cap
+    # silently dropped later refs). Growth is bounded by the admission path, not here.
     for i in range(100):
         merge_pending_message_event(pending, "k", MessageEvent(text="", message_type=MessageType.PHOTO, user_id="u", user_name="u", source=src,
             message_id=str(i), media_urls=["c.jpg"], media_types=["image/jpeg"], metadata={"native_request_ref": f"ref-{i}"}))
-    assert len(survivor.metadata["merged_native_request_refs"]) == 64
+    refs = survivor.metadata["merged_native_request_refs"]
+    assert len(refs) == 102 and refs[-1] == "ref-99" and len(set(refs)) == 102
