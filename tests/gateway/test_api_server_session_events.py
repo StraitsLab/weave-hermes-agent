@@ -687,3 +687,34 @@ async def test_survivor_start_abort_still_settles_its_folded_siblings(adapter, a
     # Idempotent: finishing the survivor again emits nothing for the sibling.
     await adapter._on_native_submit_finished(survivor, "k")
     assert _drain(qf) == []
+
+
+@pytest.mark.asyncio
+async def test_settled_siblings_stay_settled_across_terminal_cache_eviction(adapter):
+    """Fourth review: idempotency relied on _native_submit_terminals, which evicts after 1,024
+    closes. A long survivor turn let finish re-emit an already-completed sibling's start and
+    terminal (and flip it to failed). Settlement is recorded on the survivor event instead."""
+    from gateway.platforms.base import merge_pending_message_event, MessageType
+    survivor_ref, folded_ref = "native-survivor", "native-folded"
+    qs, qf = _subscribe(adapter, survivor_ref, "handoff-S"), _subscribe(adapter, folded_ref, "handoff-F")
+    src = SimpleNamespace(chat_id=SESSION_ID, profile=None)
+    survivor = MessageEvent(text="first", message_type=MessageType.TEXT, user_id="u", user_name="u", source=src,
+                            message_id=survivor_ref, metadata={"native_request_ref": survivor_ref})
+    folded = MessageEvent(text="second", message_type=MessageType.TEXT, user_id="u", user_name="u", source=src,
+                          message_id=folded_ref, metadata={"native_request_ref": folded_ref})
+    merge_pending_message_event({"k": survivor}, "k", folded, merge_text=True)
+    await adapter._on_native_submit_started(survivor, "k")
+    assert [(e["type"], e.get("merged_into")) for e in _drain(qf)] == [("turn.started", survivor_ref), ("turn.completed", survivor_ref)]
+    # The survivor's turn is long: 1,100 unrelated closes evict the sibling from the terminal cache.
+    for i in range(1_100):
+        adapter._native_submit_close(f"unrelated-{i}", "turn.completed")
+    assert folded_ref not in adapter._native_submit_terminals
+    # The survivor then FAILS. The sibling's merge already happened; it must not be re-emitted or flipped.
+    # (Its subscriber was torn down at close, so the observable is the event machinery itself: a
+    # re-emit would recreate the sibling's sequence counter and re-enter it in the terminal cache.)
+    assert folded_ref not in adapter._native_submit_sequences
+    survivor.metadata["native_submit_failed"] = True
+    await adapter._on_native_submit_finished(survivor, "k")
+    assert folded_ref not in adapter._native_submit_sequences, "sibling was re-emitted after eviction"
+    assert folded_ref not in adapter._native_submit_terminals, "sibling was re-terminalized"
+    assert [e["type"] for e in _drain(qs)][-1] == "turn.failed"

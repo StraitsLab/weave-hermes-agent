@@ -5369,13 +5369,21 @@ class APIServerAdapter(BasePlatformAdapter):
         start aborted closed itself but stranded its folded siblings). Idempotent
         via the terminal cache; a retry of either path emits nothing new.
         """
-        merged = (getattr(event, "metadata", None) or {}).get("merged_native_request_refs")
+        meta = getattr(event, "metadata", None)
+        merged = (meta or {}).get("merged_native_request_refs") if isinstance(meta, dict) else None
         if not isinstance(merged, list):
+            return
+        # Idempotency lives on the EVENT, not in the bounded terminal cache (fourth review:
+        # that cache evicts after 1,024 closes, so a long survivor turn let finish re-emit a
+        # sibling's start and terminal). Once settled, the survivor's own metadata says so.
+        settled = meta.setdefault("settled_native_request_refs", [])
+        if not isinstance(settled, list):
             return
         queued_refs = self.__dict__.setdefault("_native_queued_submit_refs", set())
         for sibling in merged:
-            if not isinstance(sibling, str) or not sibling or sibling in self._native_submit_terminals:
+            if not isinstance(sibling, str) or not sibling or sibling in settled or sibling in self._native_submit_terminals:
                 continue
+            settled.append(sibling)
             queued_refs.discard(sibling)
             self._native_submit_event(sibling, "turn.started", merged_into=survivor_ref)
             self._native_submit_close(sibling, "turn.failed" if failed else "turn.completed", merged_into=survivor_ref)
