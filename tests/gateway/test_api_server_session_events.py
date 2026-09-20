@@ -649,3 +649,41 @@ def test_media_fold_also_records_the_folded_native_ref():
             message_id=str(i), media_urls=["c.jpg"], media_types=["image/jpeg"], metadata={"native_request_ref": f"ref-{i}"}))
     refs = survivor.metadata["merged_native_request_refs"]
     assert len(refs) == 102 and refs[-1] == "ref-99" and len(set(refs)) == 102
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abort", ["exception", "cancel"])
+async def test_survivor_start_abort_still_settles_its_folded_siblings(adapter, abort):
+    """Third review: a survivor whose start hook aborted (db error, or cancellation at the db
+    await) closed itself but stranded the refs folded into it. Both paths must settle C."""
+    from gateway.platforms.base import merge_pending_message_event, MessageType
+    survivor_ref, folded_ref = "native-survivor", "native-folded"
+    qs, qf = _subscribe(adapter, survivor_ref, "handoff-S"), _subscribe(adapter, folded_ref, "handoff-F")
+    adapter.__dict__.setdefault("_native_queued_submit_refs", set()).update({survivor_ref, folded_ref})
+    src = SimpleNamespace(chat_id=SESSION_ID, profile=None)
+    survivor = MessageEvent(text="first", message_type=MessageType.TEXT, user_id="u", user_name="u", source=src,
+                            message_id=survivor_ref, metadata={"native_request_ref": survivor_ref})
+    folded = MessageEvent(text="second", message_type=MessageType.TEXT, user_id="u", user_name="u", source=src,
+                          message_id=folded_ref, metadata={"native_request_ref": folded_ref})
+    merge_pending_message_event({"k": survivor}, "k", folded, merge_text=True)
+
+    def _boom(**kwargs):
+        raise (asyncio.CancelledError() if abort == "cancel" else RuntimeError("db down"))
+    adapter._session_db.set_native_session_submit_admission = _boom
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    runner._adapter_for_source = lambda source: adapter
+    if abort == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await runner._begin_native_followup(survivor, "k")
+    else:
+        assert await runner._begin_native_followup(survivor, "k") is None
+    await asyncio.sleep(0)
+
+    assert adapter._native_submit_active_refs.get("k") is None
+    assert survivor_ref in adapter._native_submit_terminals and folded_ref in adapter._native_submit_terminals
+    assert [e["type"] for e in _drain(qs)][-1] == "turn.failed"
+    assert [(e["type"], e.get("merged_into")) for e in _drain(qf)] == [("turn.started", survivor_ref), ("turn.failed", survivor_ref)]
+    assert folded_ref not in adapter._native_queued_submit_refs
+    # Idempotent: finishing the survivor again emits nothing for the sibling.
+    await adapter._on_native_submit_finished(survivor, "k")
+    assert _drain(qf) == []

@@ -5359,14 +5359,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 # Weave (WEV-1726): submits folded into this turn while it queued get an honest
                 # terminal now, attributed to the turn that absorbed them, so their consumers
                 # settle instead of hanging until stale reconciliation.
-                merged = (getattr(event, "metadata", None) or {}).get("merged_native_request_refs")
-                if isinstance(merged, list):
-                    for sibling in merged:
-                        if not isinstance(sibling, str) or not sibling or sibling in self._native_submit_terminals:
-                            continue
-                        queued_refs.discard(sibling)
-                        self._native_submit_event(sibling, "turn.started", merged_into=native_request_ref)
-                        self._native_submit_close(sibling, "turn.completed", merged_into=native_request_ref)
+                self._native_submit_close_merged(event, native_request_ref, failed=False)
+
+    def _native_submit_close_merged(self, event: Any, survivor_ref: str, *, failed: bool) -> None:
+        """Weave (WEV-1726): settle every ref folded into ``event`` exactly once.
+
+        Called from the survivor's successful start (merged into a running turn)
+        AND from its failure/cancellation finish (third review: a survivor whose
+        start aborted closed itself but stranded its folded siblings). Idempotent
+        via the terminal cache; a retry of either path emits nothing new.
+        """
+        merged = (getattr(event, "metadata", None) or {}).get("merged_native_request_refs")
+        if not isinstance(merged, list):
+            return
+        queued_refs = self.__dict__.setdefault("_native_queued_submit_refs", set())
+        for sibling in merged:
+            if not isinstance(sibling, str) or not sibling or sibling in self._native_submit_terminals:
+                continue
+            queued_refs.discard(sibling)
+            self._native_submit_event(sibling, "turn.started", merged_into=survivor_ref)
+            self._native_submit_close(sibling, "turn.failed" if failed else "turn.completed", merged_into=survivor_ref)
 
     async def _on_native_submit_finished(self, event: MessageEvent, session_key: str) -> None:
         native_request_ref = (getattr(event, "metadata", None) or {}).get("native_request_ref")
@@ -5378,6 +5390,9 @@ class APIServerAdapter(BasePlatformAdapter):
             if key[0] == native_request_ref and state == "pending":
                 self._native_submit_clarifies[key] = "terminal"
         failed = bool((getattr(event, "metadata", None) or {}).get("native_submit_failed"))
+        # A survivor that never reached its successful start still owns its folded siblings:
+        # settle them with the survivor's outcome. Already-closed siblings are skipped.
+        self._native_submit_close_merged(event, native_request_ref, failed=failed)
         self._native_submit_close(
             native_request_ref, "turn.failed" if failed else "turn.completed",
         )
