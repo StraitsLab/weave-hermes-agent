@@ -2867,6 +2867,7 @@ def merge_pending_message_event(
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             _invalidate_pending_stt_cache(existing)
+            _record_merged_native_ref(existing, event)
             return
 
         if existing_has_media or incoming_has_media:
@@ -2887,6 +2888,7 @@ def merge_pending_message_event(
             ):
                 existing.message_type = event.message_type
             _invalidate_pending_stt_cache(existing)
+            _record_merged_native_ref(existing, event)
             return
 
         if (
@@ -2896,9 +2898,41 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            _record_merged_native_ref(existing, event)
             return
 
     pending_messages[session_key] = event
+
+
+def _record_merged_native_ref(survivor: MessageEvent, folded: MessageEvent) -> None:
+    """Weave: a native submit folded into another pending turn must not vanish.
+
+    Each native submit carries its own ``native_request_ref`` and a consumer
+    waiting on that ref for a terminal event. When its text is merged into the
+    survivor, remember the ref on the survivor so the gateway can emit
+    ``turn.completed`` with ``merged_into`` for it when the survivor's turn
+    starts (api_server._on_native_submit_started). Without this the folded
+    consumer waits forever (founder call 2026-09-20 12:22Z).
+    """
+    folded_meta = getattr(folded, "metadata", None) or {}
+    ref = folded_meta.get("native_request_ref")
+    if not isinstance(ref, str) or not ref:
+        return
+    survivor_meta = getattr(survivor, "metadata", None)
+    if not isinstance(survivor_meta, dict):
+        return
+    merged = survivor_meta.setdefault("merged_native_request_refs", [])
+    if not isinstance(merged, list):
+        return
+    # The folded event may itself carry refs it absorbed earlier: keep them. Every admitted
+    # ref is closed by the survivor's start hook; none may be dropped, so there is no cap on
+    # the list itself. Growth is bounded upstream by the admission path (one pending slot per
+    # session, overflow in queued_events), and each ref is a 32-char id.
+    inherited = folded_meta.get("merged_native_request_refs")
+    for candidate in ([ref] + (inherited if isinstance(inherited, list) else [])):
+        if (isinstance(candidate, str) and candidate and candidate not in merged
+                and candidate != survivor_meta.get("native_request_ref")):
+            merged.append(candidate)
 
 
 # Error substrings that indicate a transient *connection* failure worth retrying.

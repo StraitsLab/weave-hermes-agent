@@ -1679,6 +1679,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._native_submit_locks: Dict[tuple[str, str], asyncio.Lock] = {}
         self._native_submit_lock_refs: Dict[tuple[str, str], int] = {}
         self._native_submit_active_refs: Dict[str, str] = {}
+        # Weave (WEV-1726): native_request_ref -> the caller's external_request_id, for final attribution.
+        self._native_submit_external_ids: Dict[str, str] = {}
         self._native_submit_ref_sessions: Dict[str, tuple[str, str]] = {}
         self._native_submit_events: Dict[str, List[Dict[str, Any]]] = {}
         self._native_submit_clarifies: Dict[tuple[str, str], str] = {}
@@ -4963,6 +4965,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # The adapter guard is set synchronously before its background task is
         # spawned.  Queue directly through the runner's existing FIFO helper,
         # never through its ambient steer/interrupt policy.
+        self._native_submit_external_ids[native_request_ref] = external_request_id
+        if len(self._native_submit_external_ids) > 1_024:
+            self._native_submit_external_ids.pop(next(iter(self._native_submit_external_ids)), None)
         busy = entry.session_key in self._active_sessions
         is_session_running = getattr(runner, "_is_session_running", None)
         if not busy and callable(is_session_running):
@@ -5113,8 +5118,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 loop.call_soon_threadsafe(_enqueue)
         return event
 
-    def _native_submit_close(self, native_request_ref: str, event_type: str) -> None:
-        self._native_submit_event(native_request_ref, event_type)
+    def _native_submit_close(self, native_request_ref: str, event_type: str, **fields: Any) -> None:
+        self._native_submit_event(native_request_ref, event_type, **fields)
         self._native_submit_terminals[native_request_ref] = None
         if len(self._native_submit_terminals) > 1_024:
             evicted = next(iter(self._native_submit_terminals))
@@ -5173,8 +5178,14 @@ class APIServerAdapter(BasePlatformAdapter):
     def _native_submit_final(self, session_key: str, content: Any) -> None:
         native_request_ref = self._native_submit_active_ref(session_key)
         if native_request_ref and isinstance(content, str) and content:
+            # Weave (WEV-1726): the final names the admission it answers, so a consumer
+            # attributes by id rather than by arrival order.
+            external_request_id = self._native_submit_external_ids.get(native_request_ref)
             self._native_submit_event(
                 native_request_ref, "assistant.final", content=content[:16_384],
+                # Omit rather than send null: a consumer without the id falls back to its
+                # order rule; an explicit null would be a third, undefined state.
+                **({"external_request_id": external_request_id} if isinstance(external_request_id, str) and external_request_id else {}),
             )
 
     async def _handle_native_submit_events(self, request: "web.Request") -> "web.StreamResponse":
@@ -5345,6 +5356,39 @@ class APIServerAdapter(BasePlatformAdapter):
                 if native_request_ref in queued_refs:
                     queued_refs.discard(native_request_ref)
                     self._native_submit_event(native_request_ref, "turn.started")
+                # Weave (WEV-1726): submits folded into this turn while it queued get an honest
+                # terminal now, attributed to the turn that absorbed them, so their consumers
+                # settle instead of hanging until stale reconciliation.
+                self._native_submit_close_merged(event, native_request_ref, failed=False)
+
+    def _native_submit_close_merged(self, event: Any, survivor_ref: str, *, failed: bool) -> None:
+        """Weave (WEV-1726): settle every ref folded into ``event`` exactly once.
+
+        Called from the survivor's successful start (merged into a running turn)
+        AND from its failure/cancellation finish (third review: a survivor whose
+        start aborted closed itself but stranded its folded siblings). Idempotent
+        via ``settled_native_request_refs`` on the survivor's own metadata (the
+        bounded terminal cache is only a secondary guard); a retry of either
+        path emits nothing new.
+        """
+        meta = getattr(event, "metadata", None)
+        merged = (meta or {}).get("merged_native_request_refs") if isinstance(meta, dict) else None
+        if not isinstance(merged, list):
+            return
+        # Idempotency lives on the EVENT, not in the bounded terminal cache (fourth review:
+        # that cache evicts after 1,024 closes, so a long survivor turn let finish re-emit a
+        # sibling's start and terminal). Once settled, the survivor's own metadata says so.
+        settled = meta.setdefault("settled_native_request_refs", [])
+        if not isinstance(settled, list):
+            return
+        queued_refs = self.__dict__.setdefault("_native_queued_submit_refs", set())
+        for sibling in merged:
+            if not isinstance(sibling, str) or not sibling or sibling in settled or sibling in self._native_submit_terminals:
+                continue
+            settled.append(sibling)
+            queued_refs.discard(sibling)
+            self._native_submit_event(sibling, "turn.started", merged_into=survivor_ref)
+            self._native_submit_close(sibling, "turn.failed" if failed else "turn.completed", merged_into=survivor_ref)
 
     async def _on_native_submit_finished(self, event: MessageEvent, session_key: str) -> None:
         native_request_ref = (getattr(event, "metadata", None) or {}).get("native_request_ref")
@@ -5356,6 +5400,9 @@ class APIServerAdapter(BasePlatformAdapter):
             if key[0] == native_request_ref and state == "pending":
                 self._native_submit_clarifies[key] = "terminal"
         failed = bool((getattr(event, "metadata", None) or {}).get("native_submit_failed"))
+        # A survivor that never reached its successful start still owns its folded siblings:
+        # settle them with the survivor's outcome. Already-closed siblings are skipped.
+        self._native_submit_close_merged(event, native_request_ref, failed=failed)
         self._native_submit_close(
             native_request_ref, "turn.failed" if failed else "turn.completed",
         )
