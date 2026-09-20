@@ -2896,9 +2896,32 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            _record_merged_native_ref(existing, event)
             return
 
     pending_messages[session_key] = event
+
+
+def _record_merged_native_ref(survivor: MessageEvent, folded: MessageEvent) -> None:
+    """Weave: a native submit folded into another pending turn must not vanish.
+
+    Each native submit carries its own ``native_request_ref`` and a consumer
+    waiting on that ref for a terminal event. When its text is merged into the
+    survivor, remember the ref on the survivor so the gateway can emit
+    ``turn.completed`` with ``merged_into`` for it when the survivor's turn
+    starts (api_server._on_native_submit_started). Without this the folded
+    consumer waits forever (founder call 2026-09-20 12:22Z).
+    """
+    folded_meta = getattr(folded, "metadata", None) or {}
+    ref = folded_meta.get("native_request_ref")
+    if not isinstance(ref, str) or not ref:
+        return
+    survivor_meta = getattr(survivor, "metadata", None)
+    if not isinstance(survivor_meta, dict):
+        return
+    merged = survivor_meta.setdefault("merged_native_request_refs", [])
+    if isinstance(merged, list) and ref not in merged and ref != survivor_meta.get("native_request_ref"):
+        merged.append(ref)
 
 
 # Error substrings that indicate a transient *connection* failure worth retrying.

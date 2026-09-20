@@ -454,3 +454,111 @@ def test_provider_resolution_failure_returns_failed_result():
     assert result["error"] == "provider_unavailable: no provider configured for session"
     assert result["final_response"].startswith("⚠️ Provider authentication failed: ")
     assert result["messages"] == [] and result["api_calls"] == 0
+
+
+# WEV-1726 — a queued native submit is its own turn: attributed by its own ref, closed honestly.
+
+
+def _subscribe(adapter, ref, external_request_id):
+    adapter._session_db.register_native_session_submit(
+        SESSION_ID, external_request_id=external_request_id, message_sha256="0" * 64, native_request_ref=ref)
+    adapter._native_submit_external_ids[ref] = external_request_id
+    queue = asyncio.Queue(maxsize=32)
+    adapter._native_submit_subscribers[ref] = (queue, asyncio.get_running_loop())
+    adapter._native_submit_ref_sessions[ref] = ("default", SESSION_ID)
+    return queue
+
+
+def _drain(queue):
+    events = []
+    while not queue.empty():
+        item = queue.get_nowait()
+        if item is not None:
+            events.append(item)
+    return events
+
+
+@pytest.mark.asyncio
+async def test_final_names_the_admission_it_answers(adapter):
+    """The final carries external_request_id so a consumer attributes by id, never by arrival order."""
+    queue = _subscribe(adapter, REQUEST_REF, "handoff-A")
+    event = SimpleNamespace(metadata={"native_request_ref": REQUEST_REF}, source=SimpleNamespace(chat_id=SESSION_ID, profile=None))
+    await adapter._on_native_submit_started(event, "k")
+    adapter._native_submit_final("k", "answer")
+    await adapter._on_native_submit_finished(event, "k")
+    final = next(e for e in _drain(queue) if e["type"] == "assistant.final")
+    assert final["external_request_id"] == "handoff-A" and final["content"] == "answer"
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_switches_attribution_and_terminates_its_own_ref(adapter):
+    """Founder call 2026-09-20 12:22Z: a second submit queued behind a running turn ran as its own
+    turn but every event was stamped with the FIRST ref and the second never terminated. The in-band
+    follow-up must bracket itself with the same start/finish hooks the outer event got."""
+    first, second = REQUEST_REF, "native-request-ref-2"
+    q1, q2 = _subscribe(adapter, first, "handoff-A"), _subscribe(adapter, second, "handoff-B")
+    e1 = SimpleNamespace(metadata={"native_request_ref": first}, source=SimpleNamespace(chat_id=SESSION_ID, profile=None))
+    e2 = SimpleNamespace(metadata={"native_request_ref": second}, source=SimpleNamespace(chat_id=SESSION_ID, profile=None))
+    adapter.__dict__.setdefault("_native_queued_submit_refs", set()).add(second)
+
+    await adapter._on_native_submit_started(e1, "k")
+    adapter._native_submit_final("k", "Here are the headlines.")
+    await adapter._on_native_submit_finished(e1, "k")
+    # What run.py now does for the queued follow-up (gateway_run._begin/_end_native_followup):
+    await adapter._on_native_submit_started(e2, "k")
+    adapter._native_submit_final("k", "Hi Molly, good to meet you!")
+    await adapter._on_native_submit_finished(e2, "k")
+
+    ev1, ev2 = _drain(q1), _drain(q2)
+    assert [e["type"] for e in ev1] == ["assistant.final", "turn.completed"]
+    assert ev1[0]["content"] == "Here are the headlines." and ev1[0]["external_request_id"] == "handoff-A"
+    assert [e["type"] for e in ev2] == ["turn.started", "assistant.final", "turn.completed"]
+    assert ev2[1]["content"] == "Hi Molly, good to meet you!" and ev2[1]["external_request_id"] == "handoff-B"
+    assert second in adapter._native_submit_terminals
+
+
+@pytest.mark.asyncio
+async def test_text_merged_sibling_is_closed_as_merged_into_the_survivor(adapter):
+    """When a third submit's text is folded into an already-queued one, the folded ref would vanish.
+    merge_pending_message_event records it on the survivor; the survivor's start closes it."""
+    from gateway.platforms.base import merge_pending_message_event, MessageType
+    survivor_ref, folded_ref = "native-survivor", "native-folded"
+    qs, qf = _subscribe(adapter, survivor_ref, "handoff-S"), _subscribe(adapter, folded_ref, "handoff-F")
+    adapter.__dict__.setdefault("_native_queued_submit_refs", set()).update({survivor_ref, folded_ref})
+    src = SimpleNamespace(chat_id=SESSION_ID, profile=None)
+    survivor = MessageEvent(text="first", message_type=MessageType.TEXT, user_id="u", user_name="u", source=src,
+                            message_id=survivor_ref, metadata={"native_request_ref": survivor_ref})
+    folded = MessageEvent(text="second", message_type=MessageType.TEXT, user_id="u", user_name="u", source=src,
+                          message_id=folded_ref, metadata={"native_request_ref": folded_ref})
+    pending = {"k": survivor}
+    merge_pending_message_event(pending, "k", folded, merge_text=True)
+    assert pending["k"] is survivor and survivor.text == "first\nsecond"
+    assert survivor.metadata["merged_native_request_refs"] == [folded_ref]
+
+    await adapter._on_native_submit_started(survivor, "k")
+    ef = _drain(qf)
+    assert [(e["type"], e.get("merged_into")) for e in ef] == [("turn.started", survivor_ref), ("turn.completed", survivor_ref)]
+    assert folded_ref in adapter._native_submit_terminals
+    assert [e["type"] for e in _drain(qs)] == ["turn.started"]
+    # Idempotent: a second start (retry) does not re-close the folded ref.
+    await adapter._on_native_submit_started(survivor, "k")
+    assert _drain(qf) == []
+
+
+@pytest.mark.asyncio
+async def test_run_followup_brackets_a_native_event_and_ignores_others(monkeypatch):
+    """gateway_run._begin/_end_native_followup call the adapter hooks only for native events."""
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    calls = []
+    class Adapter:
+        async def _on_native_submit_started(self, event, key): calls.append(("start", event.metadata["native_request_ref"], key))
+        async def _on_native_submit_finished(self, event, key): calls.append(("finish", event.metadata["native_request_ref"], key, event.metadata.get("native_submit_failed")))
+    monkeypatch.setattr(runner, "_adapter_for_source", lambda source: Adapter(), raising=False)
+    native = SimpleNamespace(metadata={"native_request_ref": "r1"}, source=object())
+    plain = SimpleNamespace(metadata={}, source=object())
+    assert await runner._begin_native_followup(plain, "k") is None
+    await runner._end_native_followup(None, "k", failed=False)
+    assert calls == []
+    token = await runner._begin_native_followup(native, "k")
+    await runner._end_native_followup(token, "k", failed=True)
+    assert calls == [("start", "r1", "k"), ("finish", "r1", "k", True)]

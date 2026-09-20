@@ -9776,6 +9776,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # it up.  Clearing happens on /new and /reset via
     # _handle_reset_command.
 
+    async def _begin_native_followup(self, pending_event: Any, session_key: str) -> Optional["MessageEvent"]:
+        """Weave (WEV-1726): announce a queued native submit as the active turn.
+
+        Returns the event when it carries a native ref and the adapter exposes
+        the hook, so ``_end_native_followup`` can close the same ref. Non-native
+        follow-ups (and adapters without the hooks) return None: no behaviour
+        change for them.
+        """
+        meta = getattr(pending_event, "metadata", None) or {}
+        if not (isinstance(meta, dict) and isinstance(meta.get("native_request_ref"), str) and meta["native_request_ref"]):
+            return None
+        adapter = self._adapter_for_source(getattr(pending_event, "source", None))
+        started = getattr(adapter, "_on_native_submit_started", None)
+        if not callable(started):
+            return None
+        try:
+            result = started(pending_event, session_key)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("Native follow-up start notification failed", exc_info=True)
+            return None
+        return pending_event
+
+    async def _end_native_followup(self, pending_event: Optional["MessageEvent"], session_key: str, *, failed: bool) -> None:
+        if pending_event is None:
+            return
+        meta = getattr(pending_event, "metadata", None)
+        if isinstance(meta, dict) and failed:
+            meta["native_submit_failed"] = True
+        adapter = self._adapter_for_source(getattr(pending_event, "source", None))
+        finished = getattr(adapter, "_on_native_submit_finished", None)
+        if not callable(finished):
+            return
+        try:
+            result = finished(pending_event, session_key)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("Native follow-up finish notification failed", exc_info=True)
+
     def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
         """Append a /queue event to the FIFO chain for a session."""
         if adapter is None:
@@ -31856,18 +31897,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                    message_type=next_message_type,
+                # Weave (WEV-1726): a queued native submit runs here as its own agent
+                # turn, in-band, without passing through the adapter's start/finish
+                # hooks — so its deltas and final were stamped with the PREVIOUS
+                # submit's ref and it never received a terminal event (founder call
+                # 2026-09-20 12:22Z: the sibling handoff hung until reconciliation).
+                # Bracket the follow-up with the same hooks the outer event got.
+                _followup_native = await self._begin_native_followup(pending_event, next_session_key)
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                        message_type=next_message_type,
+                    )
+                except Exception:
+                    await self._end_native_followup(_followup_native, next_session_key, failed=True)
+                    raise
+                await self._end_native_followup(
+                    _followup_native, next_session_key,
+                    failed=bool(isinstance(followup_result, dict) and followup_result.get("failed")),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
