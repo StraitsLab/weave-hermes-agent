@@ -5367,7 +5367,9 @@ class APIServerAdapter(BasePlatformAdapter):
         Called from the survivor's successful start (merged into a running turn)
         AND from its failure/cancellation finish (third review: a survivor whose
         start aborted closed itself but stranded its folded siblings). Idempotent
-        via the terminal cache; a retry of either path emits nothing new.
+        via ``settled_native_request_refs`` on the survivor's own metadata (the
+        bounded terminal cache is only a secondary guard); a retry of either
+        path emits nothing new.
         """
         meta = getattr(event, "metadata", None)
         merged = (meta or {}).get("merged_native_request_refs") if isinstance(meta, dict) else None
