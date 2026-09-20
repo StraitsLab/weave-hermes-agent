@@ -9796,8 +9796,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if inspect.isawaitable(result):
                 await result
         except Exception:
+            # The hook installs the ref as the session's active ref BEFORE its database
+            # await (api_server._on_native_submit_started), so a failure here can leave the
+            # follow-up active and untracked. Keep cleanup ownership: return the event so
+            # _end_native_followup closes it as failed, and do not run the follow-up at all.
             logger.debug("Native follow-up start notification failed", exc_info=True)
-            return None
+            await self._end_native_followup(pending_event, session_key, failed=True)
+            raise
         return pending_event
 
     async def _end_native_followup(self, pending_event: Optional["MessageEvent"], session_key: str, *, failed: bool) -> None:
@@ -31904,6 +31909,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # 2026-09-20 12:22Z: the sibling handoff hung until reconciliation).
                 # Bracket the follow-up with the same hooks the outer event got.
                 _followup_native = await self._begin_native_followup(pending_event, next_session_key)
+                _followup_failed = True  # only a completed run clears this; cancellation never does
                 try:
                     followup_result = await self._run_agent(
                         message=next_message,
@@ -31918,13 +31924,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         channel_prompt=next_channel_prompt,
                         message_type=next_message_type,
                     )
-                except Exception:
-                    await self._end_native_followup(_followup_native, next_session_key, failed=True)
-                    raise
-                await self._end_native_followup(
-                    _followup_native, next_session_key,
-                    failed=bool(isinstance(followup_result, dict) and followup_result.get("failed")),
-                )
+                    _followup_failed = bool(isinstance(followup_result, dict) and followup_result.get("failed"))
+                finally:
+                    # Runs on return, Exception AND CancelledError: the follow-up ref always
+                    # gets a terminal and never stays the session's active ref.
+                    await self._end_native_followup(_followup_native, next_session_key, failed=_followup_failed)
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task

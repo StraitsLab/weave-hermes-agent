@@ -5180,9 +5180,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if native_request_ref and isinstance(content, str) and content:
             # Weave (WEV-1726): the final names the admission it answers, so a consumer
             # attributes by id rather than by arrival order.
+            external_request_id = self._native_submit_external_ids.get(native_request_ref)
             self._native_submit_event(
                 native_request_ref, "assistant.final", content=content[:16_384],
-                external_request_id=self._native_submit_external_ids.get(native_request_ref),
+                # Omit rather than send null: a consumer without the id falls back to its
+                # order rule; an explicit null would be a third, undefined state.
+                **({"external_request_id": external_request_id} if isinstance(external_request_id, str) and external_request_id else {}),
             )
 
     async def _handle_native_submit_events(self, request: "web.Request") -> "web.StreamResponse":

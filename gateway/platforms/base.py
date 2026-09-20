@@ -2867,6 +2867,7 @@ def merge_pending_message_event(
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             _invalidate_pending_stt_cache(existing)
+            _record_merged_native_ref(existing, event)
             return
 
         if existing_has_media or incoming_has_media:
@@ -2887,6 +2888,7 @@ def merge_pending_message_event(
             ):
                 existing.message_type = event.message_type
             _invalidate_pending_stt_cache(existing)
+            _record_merged_native_ref(existing, event)
             return
 
         if (
@@ -2920,8 +2922,14 @@ def _record_merged_native_ref(survivor: MessageEvent, folded: MessageEvent) -> N
     if not isinstance(survivor_meta, dict):
         return
     merged = survivor_meta.setdefault("merged_native_request_refs", [])
-    if isinstance(merged, list) and ref not in merged and ref != survivor_meta.get("native_request_ref"):
-        merged.append(ref)
+    if not isinstance(merged, list):
+        return
+    # The folded event may itself carry refs it absorbed earlier: keep them.
+    inherited = folded_meta.get("merged_native_request_refs")
+    for candidate in ([ref] + (inherited if isinstance(inherited, list) else [])):
+        if (isinstance(candidate, str) and candidate and candidate not in merged
+                and candidate != survivor_meta.get("native_request_ref") and len(merged) < 64):
+            merged.append(candidate)
 
 
 # Error substrings that indicate a transient *connection* failure worth retrying.

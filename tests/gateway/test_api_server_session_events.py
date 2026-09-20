@@ -501,20 +501,22 @@ async def test_queued_followup_switches_attribution_and_terminates_its_own_ref(a
     e2 = SimpleNamespace(metadata={"native_request_ref": second}, source=SimpleNamespace(chat_id=SESSION_ID, profile=None))
     adapter.__dict__.setdefault("_native_queued_submit_refs", set()).add(second)
 
+    # REAL nesting (reviewer correction): the follow-up runs INSIDE the outer _run_agent, so the
+    # outer finish hook fires AFTER the follow-up has started and finished.
     await adapter._on_native_submit_started(e1, "k")
     adapter._native_submit_final("k", "Here are the headlines.")
-    await adapter._on_native_submit_finished(e1, "k")
-    # What run.py now does for the queued follow-up (gateway_run._begin/_end_native_followup):
-    await adapter._on_native_submit_started(e2, "k")
+    await adapter._on_native_submit_started(e2, "k")          # run.py _begin_native_followup
     adapter._native_submit_final("k", "Hi Molly, good to meet you!")
-    await adapter._on_native_submit_finished(e2, "k")
+    await adapter._on_native_submit_finished(e2, "k")         # run.py _end_native_followup
+    await adapter._on_native_submit_finished(e1, "k")         # base.py outer finish, last
 
     ev1, ev2 = _drain(q1), _drain(q2)
     assert [e["type"] for e in ev1] == ["assistant.final", "turn.completed"]
     assert ev1[0]["content"] == "Here are the headlines." and ev1[0]["external_request_id"] == "handoff-A"
     assert [e["type"] for e in ev2] == ["turn.started", "assistant.final", "turn.completed"]
     assert ev2[1]["content"] == "Hi Molly, good to meet you!" and ev2[1]["external_request_id"] == "handoff-B"
-    assert second in adapter._native_submit_terminals
+    assert first in adapter._native_submit_terminals and second in adapter._native_submit_terminals
+    assert adapter._native_submit_active_refs.get("k") is None, "no leaked active ref"
 
 
 @pytest.mark.asyncio
@@ -562,3 +564,51 @@ async def test_run_followup_brackets_a_native_event_and_ignores_others(monkeypat
     token = await runner._begin_native_followup(native, "k")
     await runner._end_native_followup(token, "k", failed=True)
     assert calls == [("start", "r1", "k"), ("finish", "r1", "k", True)]
+
+
+@pytest.mark.asyncio
+async def test_run_followup_start_failure_still_closes_the_ref(monkeypatch):
+    """The start hook installs the ref as active BEFORE its db await; if that await fails the
+    follow-up must be closed as failed and not run, never left active and untracked."""
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    calls = []
+    class Adapter:
+        async def _on_native_submit_started(self, event, key): calls.append("start"); raise RuntimeError("db down")
+        async def _on_native_submit_finished(self, event, key): calls.append(("finish", event.metadata.get("native_submit_failed")))
+    monkeypatch.setattr(runner, "_adapter_for_source", lambda source: Adapter(), raising=False)
+    native = SimpleNamespace(metadata={"native_request_ref": "r1"}, source=object())
+    with pytest.raises(RuntimeError):
+        await runner._begin_native_followup(native, "k")
+    assert calls == ["start", ("finish", True)]
+
+
+@pytest.mark.asyncio
+async def test_final_omits_external_request_id_when_unknown(adapter):
+    """No null on the wire: an unknown id is simply absent, so a consumer uses its fallback rule."""
+    queue = asyncio.Queue(maxsize=32)
+    adapter._native_submit_subscribers[REQUEST_REF] = (queue, asyncio.get_running_loop())
+    adapter._native_submit_active_refs["k"] = REQUEST_REF
+    adapter._native_submit_external_ids.pop(REQUEST_REF, None)
+    adapter._native_submit_final("k", "x")
+    await asyncio.sleep(0)
+    event = queue.get_nowait()
+    assert event["type"] == "assistant.final" and "external_request_id" not in event
+
+
+def test_media_fold_also_records_the_folded_native_ref():
+    """Photo/media folds absorb an event too; the folded ref must survive on the survivor."""
+    from gateway.platforms.base import merge_pending_message_event, MessageType
+    src = SimpleNamespace(chat_id=SESSION_ID, profile=None)
+    survivor = MessageEvent(text="", message_type=MessageType.PHOTO, user_id="u", user_name="u", source=src,
+                            message_id="s", media_urls=["a.jpg"], media_types=["image/jpeg"], metadata={"native_request_ref": "ref-s"})
+    folded = MessageEvent(text="", message_type=MessageType.PHOTO, user_id="u", user_name="u", source=src,
+                          message_id="f", media_urls=["b.jpg"], media_types=["image/jpeg"],
+                          metadata={"native_request_ref": "ref-f", "merged_native_request_refs": ["ref-older"]})
+    pending = {"k": survivor}
+    merge_pending_message_event(pending, "k", folded)
+    assert survivor.metadata["merged_native_request_refs"] == ["ref-f", "ref-older"]
+    # Bounded.
+    for i in range(100):
+        merge_pending_message_event(pending, "k", MessageEvent(text="", message_type=MessageType.PHOTO, user_id="u", user_name="u", source=src,
+            message_id=str(i), media_urls=["c.jpg"], media_types=["image/jpeg"], metadata={"native_request_ref": f"ref-{i}"}))
+    assert len(survivor.metadata["merged_native_request_refs"]) == 64
