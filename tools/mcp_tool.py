@@ -4485,7 +4485,11 @@ _session_mcp_fingerprints: Dict[str, str] = {}
 _session_mcp_owners: Dict[str, Set[str]] = {}
 _session_mcp_managed: Set[str] = set()
 _session_mcp_releasing: Set[str] = set()
+# Reservation fences session acquisition and new RPC admission during reconcile.
+_mcp_reconciling: Set[str] = set()
 _server_connecting: set[str] = set()
+_server_connecting_since: Dict[str, float] = {}
+_server_connect_tasks: Dict[str, asyncio.Task] = {}
 _server_connect_errors: Dict[str, str] = {}
 # Lazy MCP startup (#56832): servers whose tools were registered from the
 # on-disk schema cache without spawning/connecting. Keyed by server name;
@@ -5573,7 +5577,7 @@ def _wrap_with_dashboard_oauth_flow(coro):
     return _scoped()
 
 
-def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
+def _run_on_mcp_loop(coro_or_factory, timeout: Optional[float] = 30):
     """Schedule a coroutine on the MCP event loop and block until done.
 
     Accepts either a coroutine object or a zero-arg callable that returns one.
@@ -5630,6 +5634,7 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
             if remaining <= 0:
                 future.cancel()
                 elapsed = time.monotonic() - start_time
+                assert timeout is not None
                 raise TimeoutError(
                     f"MCP call timed out after {elapsed:.1f}s "
                     f"(configured timeout: {float(timeout):.1f}s)"
@@ -5938,9 +5943,10 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
             return False
         if _connect_cooldown_active(server_name):
             return False
-        if server_name in _server_connecting:
+        if server_name in _server_connecting or server_name in _mcp_reconciling:
             return False
         _server_connecting.add(server_name)
+        _server_connecting_since[server_name] = time.monotonic()
         _server_connect_errors.pop(server_name, None)
 
     logger.info("MCP server '%s': lazy start on first use", server_name)
@@ -6032,6 +6038,14 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str):
     CancelledError; external cancels (caller timeout, user interrupt)
     propagate unchanged.
     """
+    # The admission check and inflight insertion run without an await on the
+    # MCP loop: a reconcile cannot observe idle and then admit a late RPC.
+    with _lock:
+        if server_name in _mcp_reconciling:
+            raise RuntimeError(f"MCP server '{server_name}' is being reconciled")
+    shutdown = getattr(server, "_shutdown_event", None)
+    if shutdown is not None and shutdown.is_set() is True:
+        raise RuntimeError(f"MCP server '{server_name}' has been shut down")
     inflight = getattr(server, "_inflight_tasks", None)
     task = asyncio.current_task()
     if task is not None and inflight is not None:
@@ -6439,7 +6453,7 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            async with server._rpc_lock, _track_inflight_rpc(server, server_name, "resources/list"):
                 all_resources = await _paginate_full_list(
                     server.session.list_resources, "resources", server_name
                 )
@@ -6502,7 +6516,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            async with server._rpc_lock, _track_inflight_rpc(server, server_name, "resources/read"):
                 result = await server.session.read_resource(uri)
             # read_resource returns ReadResourceResult with .contents list
             parts: List[str] = []
@@ -6559,7 +6573,7 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            async with server._rpc_lock, _track_inflight_rpc(server, server_name, "prompts/list"):
                 all_prompts = await _paginate_full_list(
                     server.session.list_prompts, "prompts", server_name
                 )
@@ -6625,7 +6639,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            async with server._rpc_lock, _track_inflight_rpc(server, server_name, "prompts/get"):
                 result = await server.session.get_prompt(name, arguments=arguments)
             # GetPromptResult has .messages list
             messages = []
@@ -7583,6 +7597,24 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     return registered_names
 
 async def _discover_and_register_server(name: str, config: dict) -> List[str]:
+    """Track the actual connector task, including pre-publication handshakes."""
+    task = asyncio.current_task()
+    assert task is not None
+    with _lock:
+        _server_connecting.add(name)
+        _server_connecting_since.setdefault(name, time.monotonic())
+        _server_connect_tasks[name] = task
+    try:
+        return await _connect_and_register_server(name, config)
+    finally:
+        with _lock:
+            if _server_connect_tasks.get(name) is task:
+                _server_connect_tasks.pop(name, None)
+                _server_connecting_since.pop(name, None)
+                _server_connecting.discard(name)
+
+
+async def _connect_and_register_server(name: str, config: dict) -> List[str]:
     """Connect to a single MCP server, discover tools, and register them.
 
     Returns list of registered tool names.
@@ -7630,9 +7662,6 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     with _lock:
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
-        # Keep the published task's descriptor authoritative even when a
-        # connector supplies an already-started task.
-        server._config = config
         _servers[name] = server
 
     registered_names = _register_server_tools(name, server, config)
@@ -7685,7 +7714,7 @@ def acquire_session_mcp_servers(owner_id: str, servers: Dict[str, dict]) -> List
     new_names: List[str] = []
     with _lock:
         for name, fingerprint in fingerprints.items():
-            if name in _session_mcp_releasing:
+            if name in _session_mcp_releasing or name in _mcp_reconciling:
                 raise RuntimeError(f"MCP server '{name}' is being released")
             existing_fingerprint = _session_mcp_fingerprints.get(name)
             if existing_fingerprint is None:
@@ -7727,16 +7756,170 @@ def acquire_session_mcp_servers(owner_id: str, servers: Dict[str, dict]) -> List
     return _existing_tool_names()
 
 
-def _teardown_server(name: str, server: Optional[MCPServerTask]) -> None:
-    """Shut down one task (including tool deregistration), then forget it."""
+async def _teardown_mcp_server(name: str, server: Optional[MCPServerTask]) -> None:
+    """Single-server shutdown/deregister/forget, on the MCP loop."""
     if server is not None:
-        _run_on_mcp_loop(server.shutdown, timeout=15)
+        await server.shutdown()
     with _lock:
+        cached_names = _lazy_server_tool_names.pop(name, [])
+        _lazy_server_configs.pop(name, None)
+        _lazy_server_fingerprints.pop(name, None)
         if _servers.get(name) is server:
             _servers.pop(name, None)
         _server_connect_errors.pop(name, None)
         _server_connecting.discard(name)
         _parallel_safe_servers.discard(name)
+        _server_connecting_since.pop(name, None)
+        _clear_connect_failure(name)
+    if cached_names:
+        from tools.registry import registry
+        for tool_name in cached_names:
+            registry.deregister(tool_name)
+            _forget_mcp_tool_server(tool_name)
+
+
+def reconcile_mcp_servers(
+    servers: dict[str, dict], *, drain_seconds: float | None = None,
+) -> dict[str, str]:
+    """Reconcile an explicit authoritative full ROOT descriptor set.
+
+    Discovery is intentionally additive; a profile-scoped config load must
+    never supply this authority. The host calls this after publishing root
+    config. Successful first connections also use the outcome ``replaced``.
+
+    Policy is read once per invocation: mcp.reconcile_drain_seconds (10),
+    mcp.reconcile_shutdown_seconds (15), mcp.reconcile_budget_seconds (60).
+    Serial drain/shutdown costs at most N * (drain + shutdown) absent the
+    aggregate budget; connection time also counts against that budget.
+    Unstarted remainder is refused_busy rather than partially shut down.
+    A timed-out transition is connect_failed and stays fenced until its
+    asynchronous cleanup ends. No rollback to the old descriptor is attempted.
+    """
+    from hermes_cli.config import load_config
+
+    started = time.monotonic()
+    if not isinstance(servers, dict) or any(
+        not isinstance(name, str) or not name.strip() or not isinstance(cfg, dict)
+        for name, cfg in servers.items()
+    ):
+        raise ValueError("MCP servers must be a dict of named descriptors")
+    # Snapshot caller-owned data before yielding; never obtain descriptors
+    # from the scoped loader. That loader supplies policy settings ONLY.
+    servers = json.loads(json.dumps(servers))
+    settings = load_config().get("mcp", {})
+
+    def seconds(value):
+        result = float(value)
+        if not math.isfinite(result) or result < 0:
+            raise ValueError("MCP reconcile timeouts must be finite and nonnegative")
+        return result
+
+    shutdown_seconds = seconds(settings.get("reconcile_shutdown_seconds", 15))
+    drain = seconds(settings.get("reconcile_drain_seconds", 10) if drain_seconds is None else drain_seconds)
+    budget = seconds(settings.get("reconcile_budget_seconds", 60))
+    deadline = started + budget
+    _ensure_mcp_loop()
+    with _lock:
+        names = sorted(set(servers) | set(_servers) | set(_lazy_server_configs) | set(_server_connecting))
+
+    async def _reconcile():
+        outcomes = {}
+        for index, name in enumerate(names):
+            if time.monotonic() >= deadline:
+                outcomes.update({n: "refused_busy" for n in names[index:]})
+                break
+            config = servers.get(name)
+            enabled = config is not None and _parse_boolish(config.get("enabled", True), default=True)
+            with _lock:
+                server = _servers.get(name)
+                if _session_mcp_owners.get(name):
+                    outcomes[name] = "refused_owned"
+                    continue
+                if name in _server_connecting:
+                    since = _server_connecting_since.setdefault(name, time.monotonic())
+                    connector = _server_connect_tasks.get(name)
+                    live = (connector is not None and not connector.done()) or (
+                        server is not None and server._task is not None and not server._task.done()
+                    )
+                    if live or time.monotonic() - since <= drain:
+                        outcomes[name] = "refused_connecting"
+                        continue
+                    _server_connecting.discard(name)
+                    _server_connecting_since.pop(name, None)
+                    _server_connect_tasks.pop(name, None)
+                if name in _mcp_reconciling or name in _session_mcp_releasing:
+                    outcomes[name] = "refused_busy"
+                    continue
+                current_config = server._config if server is not None else _lazy_server_configs.get(name)
+                if enabled and config is not None and current_config is not None and _session_mcp_fingerprint(config) == _session_mcp_fingerprint(current_config):
+                    outcomes[name] = "unchanged"
+                    continue
+                # Do not begin a destructive transition without enough time
+                # for its full shutdown allowance. Remainder stays untouched.
+                if shutdown_seconds >= deadline - time.monotonic():
+                    outcomes.update({n: "refused_busy" for n in names[index:]})
+                    break
+                _mcp_reconciling.add(name)
+            pending = None
+            try:
+                if server is not None:
+                    active = {task for task in server._inflight_tasks if not task.done()}
+                    if active:
+                        _, active = await asyncio.wait(active, timeout=min(drain, max(0, deadline - time.monotonic() - shutdown_seconds)))
+                    if active:
+                        outcomes[name] = "refused_busy"
+                        continue
+                pending = asyncio.create_task(_teardown_mcp_server(name, server))
+                done, _ = await asyncio.wait({pending}, timeout=min(shutdown_seconds, max(0, deadline - time.monotonic())))
+                if not done:
+                    # Shutdown may already have signalled the transport. Keep
+                    # its reservation until cleanup completes; never publish a
+                    # replacement over a still-live old task.
+                    outcomes[name] = "connect_failed"
+                    with _lock:
+                        _server_connect_errors[name] = "MCP reconcile shutdown timed out"
+                    continue
+                await pending
+                if not enabled:
+                    outcomes[name] = "removed"
+                    continue
+                assert config is not None
+                try:
+                    pending = asyncio.create_task(_discover_and_register_server(name, config))
+                    done, _ = await asyncio.wait({pending}, timeout=max(0, deadline - time.monotonic()))
+                    if not done:
+                        pending.cancel()
+                        raise TimeoutError("MCP reconcile connection budget exhausted")
+                    await pending
+                    with _lock:
+                        _clear_connect_failure(name)
+                        if _parse_boolish(config.get("supports_parallel_tool_calls", False), default=False):
+                            _parallel_safe_servers.add(name)
+                    outcomes[name] = "replaced"
+                except Exception as exc:
+                    with _lock:
+                        _server_connect_errors[name] = _format_connect_error(exc)
+                        _record_connect_failure(name)
+                    outcomes[name] = "connect_failed"
+            except Exception as exc:
+                with _lock:
+                    _server_connect_errors[name] = _format_connect_error(exc)
+                outcomes[name] = "connect_failed"
+            finally:
+                def release_reservation(task=None, reserved_name=name):
+                    if task is not None and not task.cancelled():
+                        task.exception()  # consume background cleanup failures
+                    with _lock:
+                        _mcp_reconciling.discard(reserved_name)
+                if pending is not None and not pending.done():
+                    pending.add_done_callback(release_reservation)
+                else:
+                    release_reservation()
+        return outcomes
+
+    # The coroutine owns deadlines and cleanup reservations; cancelling the
+    # outer future would strand a half-finished transition.
+    return _run_on_mcp_loop(_reconcile, timeout=None)
 
 
 def release_session_mcp_servers(owner_id: str, *, names: Optional[Set[str]] = None) -> None:
@@ -7763,7 +7946,7 @@ def release_session_mcp_servers(owner_id: str, *, names: Optional[Set[str]] = No
             _session_mcp_releasing.add(name)
 
         try:
-            _teardown_server(name, server)
+            _run_on_mcp_loop(lambda: _teardown_mcp_server(name, server), timeout=15)
         except Exception:
             with _lock:
                 _session_mcp_releasing.discard(name)
@@ -7807,6 +7990,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             for k, v in servers.items()
             if k not in _servers
             and k not in connecting
+            and k not in _mcp_reconciling
             # Servers already lazily registered from the schema cache are
             # not re-registered; they connect on first tool use (#56832).
             and k not in _lazy_server_configs
@@ -7830,6 +8014,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             if k in _servers and getattr(_servers[k], "session", None) is None
         ]
         _server_connecting.update(new_servers)
+        for name in new_servers:
+            _server_connecting_since[name] = time.monotonic()
         for srv_name in new_servers:
             _server_connect_errors.pop(srv_name, None)
         # Track which servers opt-in to parallel tool calls (idempotent).
@@ -7995,16 +8181,14 @@ def discover_mcp_tools() -> List[str]:
     Called from ``model_tools`` after ``discover_builtin_tools()``. Safe to call even when
     the ``mcp`` package is not installed (returns empty list).
 
-    Idempotent for unchanged servers. Changed descriptors replace only that
-    server; removed or disabled servers are shut down and unregistered.
-    Session-managed and currently connecting servers are left alone.
-    Failed connections retain the normal per-server retry/backoff behavior.
+    Idempotent for already-connected servers. If some servers failed on a
+    previous call, only the missing ones are retried.
 
     Returns:
         List of all registered MCP tool names.
     """
     servers = _load_mcp_config()
-    if not servers and not _servers:
+    if not servers:
         logger.debug("No MCP servers configured")
         return []
 
@@ -8039,24 +8223,6 @@ def discover_mcp_tools() -> List[str]:
             logger.debug("Retry succeeded -- acquired MCP discovery lock")
 
     try:
-        # Compare descriptors, not just names: an edited endpoint or filter
-        # must replace only its own connection on this discovery pass.
-        with _lock:
-            changed_servers = [
-                (name, server)
-                for name, server in _servers.items()
-                if name not in _session_mcp_managed
-                and name not in _server_connecting
-                and (
-                    name not in servers
-                    or not _parse_boolish(servers[name].get("enabled", True), default=True)
-                    or _session_mcp_fingerprint(servers[name])
-                    != _session_mcp_fingerprint(server._config)
-                )
-            ]
-        for name, server in changed_servers:
-            _teardown_server(name, server)
-
         with _lock:
             connecting = set(_server_connecting)
             new_server_names = [

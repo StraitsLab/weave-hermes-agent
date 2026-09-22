@@ -2314,6 +2314,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
+            ("POST", "/v1/mcp/reconcile", self._handle_mcp_reconcile),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
@@ -4196,6 +4197,38 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "data": skills,
         })
+
+    async def _handle_mcp_reconcile(self, request: "web.Request") -> "web.Response":
+        """POST /v1/mcp/reconcile — host-supplied full root descriptor set."""
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
+        # The route table is also mirrored under /p/<profile>. A profile's
+        # own valid API key does not confer authority over process-global MCP.
+        if _api_request_profile.get() not in (None, "", "default"):
+            return web.json_response(_openai_error("Root MCP authority required"), status=403)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return web.json_response(_openai_error("Invalid JSON body"), status=400)
+        servers = body.get("servers") if isinstance(body, dict) else None
+        if not isinstance(servers, dict) or any(
+            not isinstance(name, str) or not name.strip() or not isinstance(cfg, dict)
+            for name, cfg in servers.items()
+        ):
+            return web.json_response(
+                _openai_error("servers must be a dict of named descriptors"), status=400,
+            )
+        try:
+            from tools.mcp_tool import reconcile_mcp_servers
+            outcomes = await asyncio.to_thread(reconcile_mcp_servers, servers)
+        except Exception:
+            logger.exception("POST /v1/mcp/reconcile failed")
+            return web.json_response(
+                _openai_error("Failed to reconcile MCP servers", err_type="server_error"),
+                status=500,
+            )
+        return web.json_response({"outcomes": outcomes})
 
     async def _handle_toolsets(self, request: "web.Request") -> "web.Response":
         """GET /v1/toolsets — list toolsets and their resolved tools.
