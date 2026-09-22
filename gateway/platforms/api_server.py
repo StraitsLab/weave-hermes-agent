@@ -23,6 +23,7 @@ Exposes an HTTP server with endpoints:
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
+- POST /v1/mcp/reload              — reload the root config.yaml mcp_servers set (root authority only)
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
 AnythingLLM, NextChat, ChatBox, etc.) can connect to hermes-agent
@@ -1689,6 +1690,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._native_submit_sequences: Dict[str, int] = {}
         self._native_submit_event_lock = threading.Lock()
         self._native_submit_terminals: Dict[str, None] = {}
+        # POST /v1/mcp/reload — one reload at a time (set/cleared with no await
+        # between, so the "already in progress" verdict can never queue another).
+        self._mcp_reload_in_progress: bool = False
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -2314,6 +2318,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
+            ("POST", "/v1/mcp/reload", self._handle_mcp_reload),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
@@ -3267,6 +3272,52 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(
             {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
         )
+
+    async def _handle_mcp_reload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/mcp/reload — root-authority whole-set MCP reload (WEV-1795).
+
+        Auth first (401), then 403 for named-profile mirrors (non-default
+        ``_api_request_profile``), 409 while a reload is in flight.  The shared
+        ``GatewayRunner._reload_mcp_toolset`` keeps blocking work off the event
+        loop and returns ``{added, removed, reconnected, tools, servers}``.
+        """
+        auth_error = self._check_auth(request)
+        if auth_error is not None:
+            return auth_error
+        profile = _api_request_profile.get()
+        if profile and profile != "default":
+            logger.warning(
+                "MCP reload refused for named-profile mirror %r: %s",
+                profile, self._request_audit_log_suffix(request),
+            )
+            return web.json_response(
+                _openai_error("MCP reload is root-authority only", code="mcp_reload_forbidden"),
+                status=403,
+            )
+        if self._mcp_reload_in_progress:
+            return web.json_response(
+                _openai_error("An MCP reload is already in progress", code="mcp_reload_in_progress"),
+                status=409,
+            )
+        runner = self.gateway_runner or request.app.get("gateway_runner")
+        reload_mcp_toolset = getattr(runner, "_reload_mcp_toolset", None)
+        if reload_mcp_toolset is None:
+            return web.json_response(
+                _openai_error("MCP reload unavailable: no gateway runner", err_type="server_error", code="mcp_reload_unavailable"),
+                status=500,
+            )
+        self._mcp_reload_in_progress = True
+        try:
+            changes = await reload_mcp_toolset()
+        except Exception as exc:
+            logger.warning("MCP reload failed: %s", exc)
+            return web.json_response(
+                _openai_error("MCP reload failed; see gateway log", err_type="server_error", code="mcp_reload_failed"),
+                status=500,
+            )
+        finally:
+            self._mcp_reload_in_progress = False
+        return web.json_response(changes)
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
         """GET /health/detailed — rich status for cross-container dashboard probing.
