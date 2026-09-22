@@ -7630,6 +7630,9 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     with _lock:
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
+        # Keep the published task's descriptor authoritative even when a
+        # connector supplies an already-started task.
+        server._config = config
         _servers[name] = server
 
     registered_names = _register_server_tools(name, server, config)
@@ -7724,6 +7727,18 @@ def acquire_session_mcp_servers(owner_id: str, servers: Dict[str, dict]) -> List
     return _existing_tool_names()
 
 
+def _teardown_server(name: str, server: Optional[MCPServerTask]) -> None:
+    """Shut down one task (including tool deregistration), then forget it."""
+    if server is not None:
+        _run_on_mcp_loop(server.shutdown, timeout=15)
+    with _lock:
+        if _servers.get(name) is server:
+            _servers.pop(name, None)
+        _server_connect_errors.pop(name, None)
+        _server_connecting.discard(name)
+        _parallel_safe_servers.discard(name)
+
+
 def release_session_mcp_servers(owner_id: str, *, names: Optional[Set[str]] = None) -> None:
     """Release one session's MCP ownership without disturbing other owners."""
     with _lock:
@@ -7748,23 +7763,17 @@ def release_session_mcp_servers(owner_id: str, *, names: Optional[Set[str]] = No
             _session_mcp_releasing.add(name)
 
         try:
-            if server is not None:
-                _run_on_mcp_loop(server.shutdown, timeout=15)
+            _teardown_server(name, server)
         except Exception:
             with _lock:
                 _session_mcp_releasing.discard(name)
             raise RuntimeError(f"MCP server '{name}' release failed") from None
 
         with _lock:
-            if _servers.get(name) is server:
-                _servers.pop(name, None)
             for mapping in (_session_mcp_owners, _session_mcp_fingerprints):
                 mapping.pop(name, None)
             for group in (_session_mcp_managed, _session_mcp_releasing):
                 group.discard(name)
-            _server_connect_errors.pop(name, None)
-            _server_connecting.discard(name)
-            _parallel_safe_servers.discard(name)
 
 def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
@@ -7986,14 +7995,16 @@ def discover_mcp_tools() -> List[str]:
     Called from ``model_tools`` after ``discover_builtin_tools()``. Safe to call even when
     the ``mcp`` package is not installed (returns empty list).
 
-    Idempotent for already-connected servers. If some servers failed on a
-    previous call, only the missing ones are retried.
+    Idempotent for unchanged servers. Changed descriptors replace only that
+    server; removed or disabled servers are shut down and unregistered.
+    Session-managed and currently connecting servers are left alone.
+    Failed connections retain the normal per-server retry/backoff behavior.
 
     Returns:
         List of all registered MCP tool names.
     """
     servers = _load_mcp_config()
-    if not servers:
+    if not servers and not _servers:
         logger.debug("No MCP servers configured")
         return []
 
@@ -8028,6 +8039,24 @@ def discover_mcp_tools() -> List[str]:
             logger.debug("Retry succeeded -- acquired MCP discovery lock")
 
     try:
+        # Compare descriptors, not just names: an edited endpoint or filter
+        # must replace only its own connection on this discovery pass.
+        with _lock:
+            changed_servers = [
+                (name, server)
+                for name, server in _servers.items()
+                if name not in _session_mcp_managed
+                and name not in _server_connecting
+                and (
+                    name not in servers
+                    or not _parse_boolish(servers[name].get("enabled", True), default=True)
+                    or _session_mcp_fingerprint(servers[name])
+                    != _session_mcp_fingerprint(server._config)
+                )
+            ]
+        for name, server in changed_servers:
+            _teardown_server(name, server)
+
         with _lock:
             connecting = set(_server_connecting)
             new_server_names = [
