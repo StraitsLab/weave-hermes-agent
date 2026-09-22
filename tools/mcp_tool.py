@@ -4487,6 +4487,29 @@ _session_mcp_managed: Set[str] = set()
 _session_mcp_releasing: Set[str] = set()
 # Reservation fences session acquisition and new RPC admission during reconcile.
 _mcp_reconciling: Set[str] = set()
+# WEV-1795 v4: per-name descriptor publication generation (never decremented).
+# ``reconcile_mcp_servers`` increments a name's generation BEFORE any teardown
+# of a transition (removed/replaced/connect_failed); every publisher captures
+# the generation at SELECTION time and the single publication point (registry
+# write + ``_servers``/lazy-map assignment, one ``_lock`` section) compares the
+# capture against the current value. A mismatched (late) publisher publishes
+# nothing, tears down any transport its attempt started, and returns ``[]``.
+_mcp_descriptor_generation: Dict[str, int] = {}
+# Selection-time capture carried to the synchronous lazy-cache publication on
+# the calling thread. The lazy attempt has no task/parameter seam the fixed
+# instrumentation signatures allow (``_register_from_cache_sync(name, config,
+# entry)`` is wrapped 3-arg by retained gate instruments), so the capture set
+# by register_mcp_servers at selection rides a contextvar into the publication
+# point. The eager connector threads its capture via parameter instead.
+_mcp_selected_generation: "contextvars.ContextVar[Optional[int]]" = (
+    contextvars.ContextVar("mcp_selected_generation", default=None)
+)
+# discover_mcp_tools' own capture at ITS selection, handed to
+# register_mcp_servers in-thread (ContextVar keeps the external
+# ``register_mcp_servers(servers)`` call form and the v2/v3 seams intact).
+_mcp_discover_selection: "contextvars.ContextVar[Optional[Dict[str, int]]]" = (
+    contextvars.ContextVar("mcp_discover_selection", default=None)
+)
 _server_connecting: set[str] = set()
 _server_connecting_since: Dict[str, float] = {}
 _server_connect_tasks: Dict[str, asyncio.Task] = {}
@@ -5267,7 +5290,12 @@ _mcp_thread: Optional[threading.Thread] = None
 
 # Protects _mcp_loop, _mcp_thread, _servers, MCP connection status maps,
 # _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
-_lock = threading.Lock()
+# RLock (WEV-1795 v4): the single publication point holds this lock across
+# the registry writes and the map assignment, and the registry write helpers
+# (_record_tool_trust_metadata / _track_mcp_tool_server) re-enter it in the
+# same thread. Cross-thread semantics are unchanged; tools/registry.py never
+# acquires this lock, so the mcp-lock -> registry-lock order is safe.
+_lock = threading.RLock()
 
 # ---------------------------------------------------------------------------
 # Cross-process MCP discovery guard
@@ -7472,12 +7500,11 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         utility_tools_from_cache_entry,
     )
 
-    # WEV-1795 publication fence: while an authoritative reconcile
-    # transition owns this name, a resumed cache publisher must not
-    # republish the old descriptor/tools. Refuse as a no-op before any
-    # registry/trust/lazy-map publication; the caller's ``finally`` still
-    # releases the lazy-path reservation. Reconcile's fence is authoritative
-    # for the duration of a transition.
+    # WEV-1795 v3 publication fence (early-out, kept): while an authoritative
+    # reconcile transition owns this name, a resumed cache publisher must not
+    # even start recording trust metadata. This is NOT correctness-bearing in
+    # v4 — the generation compare at the single publication point below is.
+    # The caller's ``finally`` still releases the lazy-path reservation.
     with _lock:
         if name in _mcp_reconciling:
             logger.debug(
@@ -7525,100 +7552,131 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         if isinstance(raw, dict) and raw.get("name")
     ]
     _record_tool_trust_metadata(name, config, cached_tool_objs)
-    for raw in tools_from_cache_entry(entry):
-        if not isinstance(raw, dict):
-            continue
-        raw_name = raw.get("name")
-        if not raw_name or not _should_register(raw_name):
-            continue
-        raw_schema = raw.get("inputSchema")
-        mcp_tool = _CachedMCPTool(
-            raw_name,
-            raw.get("description") or "",
-            raw_schema if isinstance(raw_schema, dict) else {},
-        )
-        # Defense-in-depth: the cache file is user-writable JSON, so run the
-        # same injection scan the eager discovery path applies.
-        _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
-        schema = _convert_mcp_schema(name, mcp_tool)
-        registry_name = schema["name"]
-        existing_toolset = registry.get_toolset_for_tool(registry_name)
-        if existing_toolset and existing_toolset != toolset_name:
-            logger.warning(
-                "MCP server '%s' (lazy): cached tool '%s' collides with "
-                "toolset '%s' — skipping",
-                name, registry_name, existing_toolset,
+
+    with _lock:
+        # WEV-1795 v4 single lazy publication point: the selection-time
+        # descriptor-generation compare, the registry writes, and the lazy-map
+        # assignment commit in ONE ``_lock`` section (mutant E drops exactly
+        # the compare below). The capture was taken by register_mcp_servers at
+        # SELECTION and rides the per-thread contextvar because the retained
+        # gate instruments wrap this function 3-arg. Mismatch -> publish
+        # nothing and return ``[]`` (the lazy attempt started no transport, so
+        # there is nothing to tear down).
+        selected_generation = _mcp_selected_generation.get()
+        if selected_generation is not None and selected_generation != _mcp_descriptor_generation.get(name, 0):
+            logger.debug(
+                "MCP server '%s' (lazy): stale cache publication refused "
+                "(selected generation %s, current %s)",
+                name,
+                selected_generation,
+                _mcp_descriptor_generation.get(name, 0),
             )
-            continue
-        registry.register(
-            name=registry_name,
-            toolset=toolset_name,
-            schema=schema,
-            handler=_make_tool_handler(name, raw_name, tool_timeout),
-            check_fn=check_fn,
-            is_async=False,
-            description=schema["description"],
-        )
-        if registry.get_toolset_for_tool(registry_name) != toolset_name:
-            continue
-        _track_mcp_tool_server(registry_name, name)
-        registered_names.append(registry_name)
+            return []
+        for raw in tools_from_cache_entry(entry):
+            if not isinstance(raw, dict):
+                continue
+            raw_name = raw.get("name")
+            if not raw_name or not _should_register(raw_name):
+                continue
+            raw_schema = raw.get("inputSchema")
+            mcp_tool = _CachedMCPTool(
+                raw_name,
+                raw.get("description") or "",
+                raw_schema if isinstance(raw_schema, dict) else {},
+            )
+            # Defense-in-depth: the cache file is user-writable JSON, so run the
+            # same injection scan the eager discovery path applies.
+            _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
+            schema = _convert_mcp_schema(name, mcp_tool)
+            registry_name = schema["name"]
+            existing_toolset = registry.get_toolset_for_tool(registry_name)
+            if existing_toolset and existing_toolset != toolset_name:
+                logger.warning(
+                    "MCP server '%s' (lazy): cached tool '%s' collides with "
+                    "toolset '%s' — skipping",
+                    name, registry_name, existing_toolset,
+                )
+                continue
+            registry.register(
+                name=registry_name,
+                toolset=toolset_name,
+                schema=schema,
+                handler=_make_tool_handler(name, raw_name, tool_timeout),
+                check_fn=check_fn,
+                is_async=False,
+                description=schema["description"],
+            )
+            if registry.get_toolset_for_tool(registry_name) != toolset_name:
+                continue
+            _track_mcp_tool_server(registry_name, name)
+            registered_names.append(registry_name)
 
-    handler_factories = {
-        "list_resources": _make_list_resources_handler,
-        "read_resource": _make_read_resource_handler,
-        "list_prompts": _make_list_prompts_handler,
-        "get_prompt": _make_get_prompt_handler,
-    }
-    for raw in utility_tools_from_cache_entry(entry):
-        if not isinstance(raw, dict):
-            continue
-        schema = raw.get("schema")
-        handler_key = raw.get("handler_key")
-        if not isinstance(schema, dict) or handler_key not in handler_factories:
-            continue
-        util_name = schema.get("name") or ""
-        if not util_name:
-            continue
-        existing_toolset = registry.get_toolset_for_tool(util_name)
-        if existing_toolset and existing_toolset != toolset_name:
-            continue
-        registry.register(
-            name=util_name,
-            toolset=toolset_name,
-            schema=schema,
-            handler=handler_factories[handler_key](name, tool_timeout),
-            check_fn=check_fn,
-            is_async=False,
-            description=schema.get("description") or "",
-        )
-        if registry.get_toolset_for_tool(util_name) != toolset_name:
-            continue
-        _track_mcp_tool_server(util_name, name)
-        registered_names.append(util_name)
+        handler_factories = {
+            "list_resources": _make_list_resources_handler,
+            "read_resource": _make_read_resource_handler,
+            "list_prompts": _make_list_prompts_handler,
+            "get_prompt": _make_get_prompt_handler,
+        }
+        for raw in utility_tools_from_cache_entry(entry):
+            if not isinstance(raw, dict):
+                continue
+            schema = raw.get("schema")
+            handler_key = raw.get("handler_key")
+            if not isinstance(schema, dict) or handler_key not in handler_factories:
+                continue
+            util_name = schema.get("name") or ""
+            if not util_name:
+                continue
+            existing_toolset = registry.get_toolset_for_tool(util_name)
+            if existing_toolset and existing_toolset != toolset_name:
+                continue
+            registry.register(
+                name=util_name,
+                toolset=toolset_name,
+                schema=schema,
+                handler=handler_factories[handler_key](name, tool_timeout),
+                check_fn=check_fn,
+                is_async=False,
+                description=schema.get("description") or "",
+            )
+            if registry.get_toolset_for_tool(util_name) != toolset_name:
+                continue
+            _track_mcp_tool_server(util_name, name)
+            registered_names.append(util_name)
 
-    if registered_names:
-        registry.register_toolset_alias(name, toolset_name)
-        with _lock:
+        if registered_names:
+            registry.register_toolset_alias(name, toolset_name)
             _lazy_server_configs[name] = dict(config)
             _lazy_server_fingerprints[name] = fingerprint
             _lazy_server_tool_names[name] = list(registered_names)
-        logger.info(
-            "MCP server '%s' (lazy): registered %d tool(s) from schema cache",
-            name, len(registered_names),
-        )
+            logger.info(
+                "MCP server '%s' (lazy): registered %d tool(s) from schema cache",
+                name, len(registered_names),
+            )
     return registered_names
 
-async def _discover_and_register_server(name: str, config: dict) -> List[str]:
-    """Track the actual connector task, including pre-publication handshakes."""
+async def _discover_and_register_server(
+    name: str, config: dict, generation: Optional[int] = None,
+) -> List[str]:
+    """Track the actual connector task, including pre-publication handshakes.
+
+    ``generation`` is the descriptor generation captured at SELECTION time
+    (WEV-1795 v4) and is threaded unchanged to the single publication point
+    in ``_connect_and_register_server``. ``None`` captures at entry — this
+    caller's own selection (a lazy first-use connect, or reconcile's own
+    transition connector, which starts after its increment and is therefore
+    current by construction).
+    """
     task = asyncio.current_task()
     assert task is not None
     with _lock:
+        if generation is None:
+            generation = _mcp_descriptor_generation.get(name, 0)
         _server_connecting.add(name)
         _server_connecting_since.setdefault(name, time.monotonic())
         _server_connect_tasks[name] = task
     try:
-        return await _connect_and_register_server(name, config)
+        return await _connect_and_register_server(name, config, generation)
     finally:
         with _lock:
             if _server_connect_tasks.get(name) is task:
@@ -7627,7 +7685,9 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
                 _server_connecting.discard(name)
 
 
-async def _connect_and_register_server(name: str, config: dict) -> List[str]:
+async def _connect_and_register_server(
+    name: str, config: dict, generation: int,
+) -> List[str]:
     """Connect to a single MCP server, discover tools, and register them.
 
     Returns list of registered tool names.
@@ -7680,10 +7740,30 @@ async def _connect_and_register_server(name: str, config: dict) -> List[str]:
         # sees the marker plus the tracked live connector task and answers
         # ``refused_connecting`` instead of transitioning a half-published
         # server.
-        _server_connect_errors.pop(name, None)
-        _servers[name] = server
+        #
+        # WEV-1795 v4 single eager publication point: the registry write (via
+        # ``_register_server_tools``) and the ``_servers`` assignment commit in
+        # ONE ``_lock`` section, gated by the selection-time descriptor
+        # generation compare (mutant E drops exactly the compare below). A
+        # mismatched (late) publisher publishes nothing, tears down the
+        # transport its attempt started, and returns ``[]``.
+        if generation != _mcp_descriptor_generation.get(name, 0):
+            stale_generation = True
+            registered_names = []
+        else:
+            stale_generation = False
+            _server_connect_errors.pop(name, None)
+            _servers[name] = server
+            registered_names = _register_server_tools(name, server, config)
+    if stale_generation:
+        logger.debug(
+            "MCP server '%s': stale publication refused (selected generation "
+            "%s, current %s); tearing down this attempt's transport",
+            name, generation, _mcp_descriptor_generation.get(name, 0),
+        )
+        await server.shutdown()
+        return []
 
-    registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
 
     transport_type = "HTTP" if "url" in config else "stdio"
@@ -7879,6 +7959,16 @@ def reconcile_mcp_servers(
                     outcomes.update({n: "refused_busy" for n in names[index:]})
                     break
                 _mcp_reconciling.add(name)
+                # WEV-1795 v4: bind publication to a per-name generation.
+                # Every name that reaches this line ends as removed/replaced/
+                # connect_failed (all refusal paths continue above), so the
+                # increment fires exactly once per transition, BEFORE any
+                # teardown begins, and is never decremented. Publishers that
+                # captured this name's generation at selection are now stale
+                # and will refuse at the single publication point.
+                _mcp_descriptor_generation[name] = (
+                    _mcp_descriptor_generation.get(name, 0) + 1
+                )
             pending = None
             try:
                 if server is not None:
@@ -7977,7 +8067,9 @@ def release_session_mcp_servers(owner_id: str, *, names: Optional[Set[str]] = No
             for group in (_session_mcp_managed, _session_mcp_releasing):
                 group.discard(name)
 
-def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+def register_mcp_servers(
+    servers: Dict[str, dict],
+) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
     Idempotent for already-connected server names. Servers with
@@ -8035,6 +8127,16 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         _server_connecting.update(new_servers)
         for name in new_servers:
             _server_connecting_since[name] = time.monotonic()
+        # WEV-1795 v4: capture every selected name's descriptor generation at
+        # SELECTION time (now) and thread it to the single publication point.
+        # A capture supplied by discover_mcp_tools (via
+        # ``_mcp_discover_selection``) is even earlier and only ever more
+        # conservative, so it wins when present.
+        _inflight = _mcp_discover_selection.get() or {}
+        captured_generation = {
+            k: _inflight.get(k, _mcp_descriptor_generation.get(k, 0))
+            for k in new_servers
+        }
         for srv_name in new_servers:
             _server_connect_errors.pop(srv_name, None)
         # Track which servers opt-in to parallel tool calls (idempotent).
@@ -8078,7 +8180,12 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             # falsely acknowledged removal/replacement, after which the
             # resumed publisher republished the old descriptor/tools. Only a
             # completed publication clears the reservation, in this finally.
+            # WEV-1795 v4: the selection-time generation capture rides a
+            # contextvar into ``_register_from_cache_sync``'s single
+            # publication point (see the module state note on
+            # ``_mcp_selected_generation``).
             published = False
+            selected_token = _mcp_selected_generation.set(captured_generation[name])
             try:
                 names = _register_from_cache_sync(name, cfg, entry)
                 published = True
@@ -8091,6 +8198,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 # tracked connector task.
                 continue
             finally:
+                _mcp_selected_generation.reset(selected_token)
                 if published:
                     with _lock:
                         _server_connecting.discard(name)
@@ -8113,7 +8221,9 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     async def _discover_one(name: str, cfg: dict) -> List[str]:
         """Connect to a single server and return its registered tool names."""
-        return await _discover_and_register_server(name, cfg)
+        return await _discover_and_register_server(
+            name, cfg, captured_generation[name],
+        )
 
     async def _discover_all():
         server_names = list(new_servers.keys())
@@ -8264,8 +8374,21 @@ def discover_mcp_tools() -> List[str]:
                 and name not in connecting
                 and _parse_boolish(cfg.get("enabled", True), default=True)
             ]
+            # WEV-1795 v4: capture the descriptor generation of every selected
+            # name at selection time and hand the captures to the publisher.
+            selection_generation = {
+                name: _mcp_descriptor_generation.get(name, 0)
+                for name in new_server_names
+            }
 
-        tool_names = register_mcp_servers(servers)
+        # WEV-1795 v4: deliver this call's selection captures to
+        # register_mcp_servers via contextvar (keeps the external call form
+        # and its v2/v3 test seams byte-identical).
+        _sel_token = _mcp_discover_selection.set(selection_generation)
+        try:
+            tool_names = register_mcp_servers(servers)
+        finally:
+            _mcp_discover_selection.reset(_sel_token)
         if not new_server_names:
             return tool_names
 

@@ -68,6 +68,7 @@ def runtime(tmp_path, monkeypatch):
         "_stdio_pgids", "_orphan_stdio_pid_servers", "_server_trust_levels",
         "_tool_read_only_hints", "_server_error_counts", "_server_breaker_opened_at",
         "_server_connecting_since", "_server_connect_tasks",
+        "_mcp_descriptor_generation",
     ):
         monkeypatch.setattr(mcp, name, {})
     for name in (
@@ -804,3 +805,309 @@ def test_eager_publication_is_one_transition_with_reservation(runtime, monkeypat
     assert 'mcp__fixture__alpha' not in names
     assert names == _names(tools=('beta',))
     assert mcp._servers['fixture']._config == changed['fixture']
+
+
+# ---------------------------------------------------------------------------
+# WEV-1795 v4 — gate-2 expiry hunts, INVERTED (lead ruling LEAD-RULING-2.md).
+#
+# Driver-for-driver ports of .lane/review-gate-2/test_expiry_hunts.py: the 8
+# lazy cases + the default-policy control + the two eager "selected but
+# unscheduled" cases (the ruling's named 11) + the file's eager-inside-fence
+# disproof (12 items total). The gate-2 file asserted the DEFECT (the old
+# publisher resumed and republished A after an authoritative ACK). Every case
+# here INVERTS to the ruling's acceptance: old publisher resumes ->
+# publication REFUSED at the single generation-compared publication point ->
+# registry and lazy maps unchanged -> real RPC on the old name fails or hits
+# the NEW server, never ``A:alpha``. Mutant E (drop the generation compare at
+# the publication point) turns all of these RED.
+# ---------------------------------------------------------------------------
+
+def _record_cache_return(monkeypatch):
+    """Record every cache-publisher return; a refused publication returns [].
+
+    Wrap-around for seams that pause INSIDE ``_register_from_cache_sync``.
+    """
+    published = []
+    real = mcp._register_from_cache_sync
+
+    def record(name, config, *args):
+        result = real(name, config, *args)
+        published.append(list(result))
+        return result
+
+    monkeypatch.setattr(mcp, "_register_from_cache_sync", record)
+    return published
+
+
+def _spy_connect(monkeypatch, target_config):
+    """Record the transports spawned for *target_config* (teardown proof)."""
+    spawned = []
+    real_connect = mcp._connect_server
+
+    async def spy(name, config):
+        server = await real_connect(name, config)
+        if config == target_config:
+            spawned.append(server)
+        return server
+
+    monkeypatch.setattr(mcp, "_connect_server", spy)
+    return spawned
+
+
+def _record_registry_writes(monkeypatch):
+    """Record every (server-level) registry publication attempt's config."""
+    registered = []
+    real_tools = mcp._register_server_tools
+
+    def record(name, server, config):
+        registered.append(config)
+        return real_tools(name, server, config)
+
+    monkeypatch.setattr(mcp, "_register_server_tools", record)
+    return registered
+
+
+@pytest.mark.parametrize("entry", ["register", "discovery"])
+@pytest.mark.parametrize("replace", [False, True])
+@pytest.mark.parametrize("seam", ["entry", "after-check"])
+def test_v4_expired_lazy_reservation_publication_refused(runtime, monkeypatch, entry, replace, seam):
+    """Inverted gate-2 ``test_expired_lazy_reservation_allows_stale_publication``.
+
+    Same driver: pause the cache publisher at ``_register_from_cache_sync``
+    entry (seam='entry') or at ``_record_tool_trust_metadata`` (seam='after-
+    check', downstream of the v3 fence), let a REAL reconcile fully complete a
+    zero-drain removed/replaced transition and release its fence, then resume
+    the old publisher. Inverted: the resumed publication is REFUSED (the
+    return is ``[]``) and nothing stale is published.
+    """
+    from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
+    a = runtime.descriptor("A", lazy=True)
+    write_cache_entry("fixture", config_fingerprint(a), tools=[{"name": "alpha", "description": "A alpha", "inputSchema": {"type": "object", "properties": {}}}])
+    target = {"fixture": runtime.descriptor("B", tools={"include": ["beta"]})} if replace else {}
+    entered = threading.Event()
+    release = threading.Event()
+    published = []
+    if seam == "entry":
+        attr = "_register_from_cache_sync"
+    else:
+        published = _record_cache_return(monkeypatch)
+        attr = "_record_tool_trust_metadata"
+    real_attr = getattr(mcp, attr)
+
+    def held(name, config, *args):
+        if config == a:
+            entered.set()
+            assert release.wait(25)
+        result = real_attr(name, config, *args)
+        if attr == "_register_from_cache_sync":
+            published.append(list(result))
+        return result
+
+    monkeypatch.setattr(mcp, attr, held)
+    runtime.publish({"fixture": a})
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        publishing = pool.submit(mcp.discover_mcp_tools) if entry == "discovery" else pool.submit(mcp.register_mcp_servers, {"fixture": a})
+        try:
+            assert entered.wait(5)
+            assert "fixture" in mcp._server_connecting
+            assert "fixture" not in mcp._server_connect_tasks
+            runtime.publish(target)
+            outcome = mcp.reconcile_mcp_servers(target, drain_seconds=0)
+            assert outcome == {"fixture": "replaced" if replace else "removed"}
+            assert not mcp._mcp_reconciling
+            assert "mcp__fixture__alpha" not in runtime.registry.get_all_tool_names()
+        finally:
+            release.set()
+        publishing.result(timeout=10)
+    # INVERTED: gate-2 asserted stale alpha / A:alpha here.
+    assert published and published[-1] == [], ("publication was not refused", published)
+    names = set(runtime.registry.get_all_tool_names())
+    assert "mcp__fixture__alpha" not in names, ("stale alpha after authoritative ACK", seam, entry, replace, outcome, sorted(names))
+    assert mcp._lazy_server_configs.get("fixture") is None
+    if replace:
+        assert mcp._servers["fixture"]._config == target["fixture"]
+        assert mcp.reconcile_mcp_servers(target) == {"fixture": "unchanged"}
+        answer = mcp._make_tool_handler("fixture", "alpha", 5)({})
+        assert "B:alpha" in answer and "A:alpha" not in answer
+    else:
+        assert "fixture" not in mcp._servers and "fixture" not in mcp._lazy_server_configs
+        answer = mcp._make_tool_handler("fixture", "alpha", 5)({})
+        assert "A:alpha" not in answer
+    print("ACCEPT stale lazy publication refused", seam, entry, replace, outcome)
+
+
+def test_v4_default_drain_expired_live_lazy_publisher_publication_refused(runtime, monkeypatch):
+    """Inverted gate-2 ``test_default_drain_naturally_expires_live_lazy_publisher``.
+
+    No timestamp or fence injection: DEFAULT policy, the first reconcile
+    truthfully refuses, the stranded-marker expiry (default 10s) lets the
+    second reconcile transition, and the resumed publisher is REFUSED.
+    """
+    from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
+    a = runtime.descriptor("A", lazy=True)
+    write_cache_entry("fixture", config_fingerprint(a), tools=[{"name": "alpha", "description": "A alpha", "inputSchema": {}}])
+    entered = threading.Event()
+    release = threading.Event()
+    published = []
+    real = mcp._register_from_cache_sync
+
+    def held(*args):
+        entered.set()
+        assert release.wait(25)
+        result = real(*args)
+        published.append(list(result))
+        return result
+
+    monkeypatch.setattr(mcp, "_register_from_cache_sync", held)
+    runtime.publish({"fixture": a})
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        publishing = pool.submit(mcp.register_mcp_servers, {"fixture": a})
+        try:
+            assert entered.wait(5)
+            runtime.publish({})
+            assert mcp.reconcile_mcp_servers({}) == {"fixture": "refused_connecting"}
+            time.sleep(10.1)
+            assert time.monotonic() - mcp._server_connecting_since["fixture"] > 10
+            assert mcp.reconcile_mcp_servers({}) == {"fixture": "removed"}
+        finally:
+            release.set()
+        publishing.result(timeout=10)
+    # INVERTED: gate-2 asserted alpha reappearing and A:alpha here.
+    assert published and published[-1] == [], ("publication was not refused", published)
+    assert "mcp__fixture__alpha" not in runtime.registry.get_all_tool_names()
+    assert "fixture" not in mcp._servers and "fixture" not in mcp._lazy_server_configs
+    answer = mcp._make_tool_handler("fixture", "alpha", 5)({})
+    assert "A:alpha" not in answer
+    print("ACCEPT default 10s expiry; live lazy publisher resumed and was refused")
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_v4_selected_but_unscheduled_eager_publication_refused(runtime, monkeypatch, replace):
+    """Inverted gate-2 ``test_selected_but_unscheduled_eager_connector_outlives_reconcile``.
+
+    The eager selection-to-task gap: an old caller selected before a zero-drain
+    reconcile (which expires the taskless marker and fully completes
+    removed/replaced) resumes, really connects A, and must then be REFUSED at
+    the single publication point — no registry write, its own transport torn
+    down, and the authoritative result left in place.
+    """
+    a = runtime.descriptor("A")
+    entered = threading.Event()
+    release = threading.Event()
+    real = mcp._resolve_server_lazy
+
+    def held(name, cfg):
+        if cfg == a:
+            entered.set()
+            assert release.wait(15)
+        return real(name, cfg)
+
+    monkeypatch.setattr(mcp, "_resolve_server_lazy", held)
+    target = {"fixture": runtime.descriptor("B", tools={"include": ["beta"]})} if replace else {}
+    runtime.publish({"fixture": a})
+    spawned = _spy_connect(monkeypatch, a)
+    registered = _record_registry_writes(monkeypatch)
+    replacement = None
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            publishing = pool.submit(mcp.register_mcp_servers, {"fixture": a})
+            try:
+                assert entered.wait(5)
+                assert "fixture" in mcp._server_connecting
+                assert not mcp._server_connect_tasks
+                runtime.publish(target)
+                assert mcp.reconcile_mcp_servers(target, drain_seconds=0) == {"fixture": "replaced" if replace else "removed"}
+                replacement = mcp._servers.get("fixture")
+            finally:
+                release.set()
+            publishing.result(timeout=10)
+        # INVERTED: gate-2 asserted _servers['fixture']._config == a and A:alpha.
+        assert a not in registered, ("stale eager attempt reached the registry", registered)
+        assert spawned and spawned[-1].session is None, "stale attempt's transport was not torn down"
+        names = set(runtime.registry.get_all_tool_names())
+        assert "mcp__fixture__alpha" not in names, ("stale alpha after authoritative ACK", replace, sorted(names))
+        if replace:
+            assert mcp._servers.get("fixture") is replacement
+            assert mcp._servers["fixture"]._config == target["fixture"]
+            assert mcp.reconcile_mcp_servers(target) == {"fixture": "unchanged"}
+            answer = mcp._make_tool_handler("fixture", "alpha", 5)({})
+            assert "B:alpha" in answer and "A:alpha" not in answer
+        else:
+            assert "fixture" not in mcp._servers and "fixture" not in mcp._lazy_server_configs
+            answer = mcp._make_tool_handler("fixture", "alpha", 5)({})
+            assert "A:alpha" not in answer
+        print("ACCEPT delayed eager connector refused", replace, sorted(names))
+    finally:
+        if replacement is not None and mcp._servers.get("fixture") is not replacement:
+            mcp._run_on_mcp_loop(replacement.shutdown, timeout=5)
+        for server in spawned:
+            if getattr(server, "session", None) is not None:
+                mcp._run_on_mcp_loop(server.shutdown, timeout=5)
+
+
+def test_v4_eager_predecessor_publication_refused_inside_active_reconcile(runtime, monkeypatch):
+    """Inverted gate-2 ``test_eager_predecessor_can_publish_inside_active_reconcile``.
+
+    The resumed selected-but-unscheduled eager predecessor runs WHILE the
+    reconcile transition is still open (post-teardown seam). Inverted: the
+    predecessor is REFUSED even inside the fence (the generation increment
+    precedes the fence), never registers A, never touches ``_servers``, and
+    tears down its own transport; B then completes the transition cleanly.
+    """
+    a = runtime.descriptor("A")
+    b = runtime.descriptor("B", tools={"include": ["beta"]})
+    selected = threading.Event()
+    go = threading.Event()
+    torn = threading.Event()
+    finish = threading.Event()
+    real_lazy = mcp._resolve_server_lazy
+    real_teardown = mcp._teardown_mcp_server
+    registered = _record_registry_writes(monkeypatch)
+    spawned = _spy_connect(monkeypatch, a)
+
+    def parked(name, cfg):
+        if cfg == a:
+            selected.set()
+            assert go.wait(15)
+        return real_lazy(name, cfg)
+
+    async def teardown(name, server):
+        await real_teardown(name, server)
+        torn.set()
+        while not finish.is_set():
+            await asyncio.sleep(.005)
+
+    monkeypatch.setattr(mcp, "_resolve_server_lazy", parked)
+    monkeypatch.setattr(mcp, "_teardown_mcp_server", teardown)
+    runtime.publish({"fixture": a})
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            registering = pool.submit(mcp.register_mcp_servers, {"fixture": a})
+            try:
+                assert selected.wait(5)
+                runtime.publish({"fixture": b})
+                reconciling = pool.submit(mcp.reconcile_mcp_servers, {"fixture": b}, drain_seconds=0)
+                assert torn.wait(5)
+                go.set()
+                registering.result(timeout=10)
+                # INVERTED: gate-2 asserted stale._config == a here (the stale
+                # eager publisher had run INSIDE _mcp_reconciling).
+                assert a not in registered, ("stale predecessor reached the registry", registered)
+                assert "fixture" not in mcp._servers
+                assert "mcp__fixture__alpha" not in runtime.registry.get_all_tool_names()
+            finally:
+                go.set()
+                finish.set()
+            assert reconciling.result(timeout=10) == {"fixture": "replaced"}
+        assert mcp._servers["fixture"]._config == b
+        assert "mcp__fixture__alpha" not in runtime.registry.get_all_tool_names()
+        assert set(mcp._servers["fixture"]._registered_tool_names) == _names(tools=("beta",))
+        assert mcp.reconcile_mcp_servers({"fixture": b}) == {"fixture": "unchanged"}
+        answer = mcp._make_tool_handler("fixture", "alpha", 5)({})
+        assert "B:alpha" in answer and "A:alpha" not in answer
+        assert spawned and spawned[-1].session is None, "stale predecessor's transport was not torn down"
+        print("ACCEPT stale EAGER predecessor refused inside the open transition")
+    finally:
+        for server in spawned:
+            if getattr(server, "session", None) is not None:
+                mcp._run_on_mcp_loop(server.shutdown, timeout=5)

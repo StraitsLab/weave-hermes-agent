@@ -2340,7 +2340,7 @@ class TestDiscoveryFailedCount:
             "bad_server": {"command": "npx", "args": ["bad"]},
         }
 
-        async def fake_register(name, cfg):
+        async def fake_register(name, cfg, generation=None):
             if name == "bad_server":
                 raise ConnectionError("Connection refused")
             # Simulate successful registration
@@ -2385,7 +2385,7 @@ class TestDiscoveryFailedCount:
             "fail1": {"command": "npx", "args": ["fail"]},
         }
 
-        async def selective_register(name, cfg):
+        async def selective_register(name, cfg, generation=None):
             if name == "fail1":
                 raise ConnectionError("Refused")
             from tools.mcp_tool import MCPServerTask
@@ -2682,7 +2682,7 @@ class TestRegisterMcpServers:
 
         fake_config = {"my_server": {"command": "npx", "args": ["test"]}}
 
-        async def fake_register(name, cfg):
+        async def fake_register(name, cfg, generation=None):
             server = _make_mock_server(name)
             server._registered_tool_names = ["mcp__my_server__tool1"]
             _servers[name] = server
@@ -2709,7 +2709,7 @@ class TestRegisterMcpServers:
         _server_connecting.add("my_srv")
         connect_calls = []
 
-        async def fake_register(name, cfg):
+        async def fake_register(name, cfg, generation=None):
             connect_calls.append(name)
             server = _make_mock_server(name)
             server._registered_tool_names = [f"mcp_{name}_tool"]
