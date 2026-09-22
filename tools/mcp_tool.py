@@ -7472,6 +7472,19 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         utility_tools_from_cache_entry,
     )
 
+    # WEV-1795 publication fence: while an authoritative reconcile
+    # transition owns this name, a resumed cache publisher must not
+    # republish the old descriptor/tools. Refuse as a no-op before any
+    # registry/trust/lazy-map publication; the caller's ``finally`` still
+    # releases the lazy-path reservation. Reconcile's fence is authoritative
+    # for the duration of a transition.
+    with _lock:
+        if name in _mcp_reconciling:
+            logger.debug(
+                "MCP server '%s' (lazy): cache publication refused during reconcile",
+                name,
+            )
+            return []
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
     fingerprint = config_fingerprint(config)
@@ -7660,7 +7673,13 @@ async def _connect_and_register_server(name: str, config: dict) -> List[str]:
         _connect_server_claim.reset(claim_token)
 
     with _lock:
-        _server_connecting.discard(name)
+        # WEV-1795 eager mirror: do NOT drop the ``_server_connecting``
+        # reservation before publication. ``_discover_and_register_server``'s
+        # ``finally`` is the single clear point, so a reconcile snapshot taken
+        # at any instant of this call (including the publish instant below)
+        # sees the marker plus the tracked live connector task and answers
+        # ``refused_connecting`` instead of transitioning a half-published
+        # server.
         _server_connect_errors.pop(name, None)
         _servers[name] = server
 
@@ -8051,17 +8070,30 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             entry = get_cached_entry(name, config_fingerprint(cfg))
             if not entry:
                 continue
-            with _lock:
-                _server_connecting.discard(name)
+            # WEV-1795 lazy-path fence: keep ``name`` reserved in
+            # ``_server_connecting`` for the WHOLE cache publication below
+            # (since-timestamp semantics; no connector task exists here).
+            # Clearing the reservation before the call let a paused publisher
+            # outlive an authoritative reconcile that saw no reservation and
+            # falsely acknowledged removal/replacement, after which the
+            # resumed publisher republished the old descriptor/tools. Only a
+            # completed publication clears the reservation, in this finally.
+            published = False
             try:
                 names = _register_from_cache_sync(name, cfg, entry)
+                published = True
             except Exception as exc:
                 logger.warning(
                     "Failed lazy MCP registration for '%s': %s", name, exc,
                 )
-                with _lock:
-                    _server_connecting.add(name)
+                # Failure keeps the reservation (as the pre-fence re-add
+                # did); the eager fallback below adopts it with its own
+                # tracked connector task.
                 continue
+            finally:
+                if published:
+                    with _lock:
+                        _server_connecting.discard(name)
             eager_servers.pop(name, None)
             lazy_registered += len(names)
             lazy_server_count += 1

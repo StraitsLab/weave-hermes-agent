@@ -3,6 +3,7 @@
 import sys
 import asyncio
 import concurrent.futures
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -76,6 +77,15 @@ def runtime(tmp_path, monkeypatch):
         monkeypatch.setattr(mcp, name, set())
     monkeypatch.setattr(mcp, "_mcp_loop", None)
     monkeypatch.setattr(mcp, "_mcp_thread", None)
+    # Bundled plugin discovery (a2a, spotify, ...) registers unrelated plugin
+    # tools into whichever ``tools.registry.registry`` is current whenever
+    # ``discover_mcp_tools`` loads config through ``_load_mcp_config``. The
+    # gate reviewer's acceptance assertions compare the WHOLE registry
+    # (``names == _names(...)``), so this fixture isolates the registry from
+    # plugin registration. MCP discovery, lazy cache publication, and
+    # reconcile are exercised unchanged.
+    import hermes_cli.plugins as plugins_module
+    monkeypatch.setattr(plugins_module, "discover_plugins", lambda *args, **kwargs: None)
     script = tmp_path / "fake_mcp.py"
     script.write_text(_STDIO_SERVER)
 
@@ -509,3 +519,288 @@ def test_bad_authority_is_rejected_without_teardown(runtime, servers):
         mcp.reconcile_mcp_servers(servers)
     assert mcp._servers["fixture"] is old
     assert old.session is not None
+
+
+# ---------------------------------------------------------------------------
+# WEV-1795 v3 — gate-review P1: lazy-cache publication vs the reconcile fence.
+#
+# Ported from .lane/review-gate/test_lazy_safety.py (assertions verbatim) and
+# .lane/review-gate/test_gate_hunts.py (the two defect probes, inverted). The
+# gate reviewer's callback barrier paused the native cache publisher at its
+# entry; the drivers below keep that seam and additionally hold reconcile's
+# transition open (post-teardown) so the resumed publisher deterministically
+# runs inside the fenced window the publisher-side check must reject.
+# ---------------------------------------------------------------------------
+
+def _hold_cache_publisher(monkeypatch):
+    """Pause at the entry of the native cache publisher (gate barrier)."""
+    entered = threading.Event()
+    release = threading.Event()
+    real = mcp._register_from_cache_sync
+
+    def held(name, config, entry):
+        entered.set()
+        assert release.wait(10)
+        return real(name, config, entry)
+
+    monkeypatch.setattr(mcp, "_register_from_cache_sync", held)
+    return entered, release
+
+
+def _gated_reconcile_teardown(monkeypatch):
+    """Hold reconcile's fence after its teardown cleanup (transition seam)."""
+    done = threading.Event()
+    go = threading.Event()
+    real_teardown = mcp._teardown_mcp_server
+
+    async def gated(name, server):
+        await real_teardown(name, server)
+        done.set()
+        while not go.is_set():
+            await asyncio.sleep(0.005)
+
+    monkeypatch.setattr(mcp, "_teardown_mcp_server", gated)
+    return done, go
+
+
+@pytest.mark.parametrize("entry", ["register", "discovery"])
+@pytest.mark.parametrize("replace", [False, True])
+def test_reconcile_does_not_ack_then_accept_stale_lazy_publication(runtime, monkeypatch, replace, entry):
+    """Port of .lane/review-gate/test_lazy_safety.py; assertions verbatim.
+
+    Driver adaptation (assertions unchanged): the paused cache publisher is
+    resumed WHILE the authoritative reconcile transition holds its
+    ``_mcp_reconciling`` fence, which is exactly the window the gate reviewer
+    found the publisher could exploit. The marker is aged past the drain
+    window first so the transition proceeds instead of answering a truthful
+    ``refused_connecting`` forever.
+    """
+    from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
+    a = runtime.descriptor("A", lazy=True)
+    write_cache_entry("fixture", config_fingerprint(a), tools=[{"name": "alpha", "description": "A alpha", "inputSchema": {"type": "object", "properties": {}}}])
+    entered, release = _hold_cache_publisher(monkeypatch)
+    teardown_done, teardown_go = _gated_reconcile_teardown(monkeypatch)
+    target = {"fixture": runtime.descriptor("B", tools={"include": ["beta"]})} if replace else {}
+    runtime.publish({"fixture": a})
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        registering = pool.submit(mcp.discover_mcp_tools) if entry == "discovery" else pool.submit(mcp.register_mcp_servers, {"fixture": a})
+        try:
+            assert entered.wait(5)
+            mcp._server_connecting_since["fixture"] = time.monotonic() - 999.0
+            runtime.publish(target)
+            reconciling = pool.submit(mcp.reconcile_mcp_servers, target)
+            assert teardown_done.wait(5)
+            release.set()
+            registering.result(timeout=10)
+        finally:
+            release.set()
+            teardown_go.set()
+        outcome = reconciling.result(timeout=10)
+    if outcome.get('fixture') in ('refused_connecting','refused_busy'):
+        outcome=mcp.reconcile_mcp_servers(target)
+    names=set(runtime.registry.get_all_tool_names())
+    assert 'mcp__fixture__alpha' not in names, ('stale alpha after successful reconcile',outcome,sorted(names))
+    if replace:
+        assert outcome=={'fixture':'replaced'}
+        assert names==_names(tools=('beta',))
+        assert 'B:beta' in mcp._make_tool_handler('fixture','beta',5)({})
+    else:
+        assert 'fixture' not in mcp._servers and 'fixture' not in mcp._lazy_server_configs
+
+
+def test_lazy_registration_cannot_publish_after_authoritative_removal(runtime, monkeypatch):
+    """Inverted gate probe 1 (.lane/review-gate/test_gate_hunts.py).
+
+    The reviewer's probe asserted the defect: ``reconcile_mcp_servers({})``
+    returned ``{}`` (the name had vanished from every snapshotted set) and the
+    resumed publisher then resurrected A. Inverted: the name stays reserved
+    across the whole publication, the window refusal is truthful
+    (``refused_connecting``, asserted as the acceptable outcome), and the
+    resumed publisher must NOT reintroduce A.
+    """
+    from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
+    cfg = runtime.descriptor("A", lazy=True)
+    write_cache_entry("fixture", config_fingerprint(cfg), tools=[{"name": "beta", "description": "A cached beta", "inputSchema": {"type": "object", "properties": {}}}])
+    entered, release = _hold_cache_publisher(monkeypatch)
+    teardown_done, teardown_go = _gated_reconcile_teardown(monkeypatch)
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        discovery = pool.submit(mcp.register_mcp_servers, {"fixture": cfg})
+        try:
+            assert entered.wait(5)
+            assert 'fixture' in mcp._server_connecting
+            assert not mcp._lazy_server_configs and not mcp._servers
+            runtime.publish({})
+            assert mcp.reconcile_mcp_servers({}) == {"fixture": "refused_connecting"}
+            mcp._server_connecting_since["fixture"] = time.monotonic() - 999.0
+            reconciling = pool.submit(mcp.reconcile_mcp_servers, {})
+            assert teardown_done.wait(5)
+            release.set()
+            discovery.result(timeout=10)
+            assert 'fixture' not in mcp._lazy_server_configs
+        finally:
+            release.set()
+            teardown_go.set()
+        result = reconciling.result(timeout=10)
+    assert result == {"fixture": "removed"}
+    assert 'fixture' not in mcp._servers and 'fixture' not in mcp._lazy_server_configs
+    assert 'mcp__fixture__beta' not in runtime.registry.get_all_tool_names()
+    answer = mcp._make_tool_handler('fixture', 'beta', 5)({})
+    assert 'A:beta' not in answer
+
+
+def test_lazy_registration_cannot_overwrite_replaced_server_schema(runtime, monkeypatch):
+    """Inverted gate probe 2 (.lane/review-gate/test_gate_hunts.py).
+
+    The reviewer's probe asserted the defect: the window reconcile falsely
+    returned ``replaced``, then the resumed publisher restored stale alpha
+    beside beta and a second reconcile stayed ``unchanged`` leaving the
+    excluded tool registered and callable. Inverted: the window refusal is
+    truthful, resumed publication must NOT reintroduce alpha, and the retry
+    reconcile is authoritative with beta only.
+
+    Note: the reviewer's final defect assertion drove a raw
+    ``_make_tool_handler('fixture','alpha',...)`` call, which constructs a
+    handler outside the registry and therefore bypasses the registration-time
+    include filter by design. The inverted property is registry absence (the
+    model can never see the excluded tool), asserted below and re-asserted
+    after the second reconcile.
+    """
+    from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
+    cfg = runtime.descriptor("A", lazy=True)
+    write_cache_entry("fixture", config_fingerprint(cfg), tools=[{"name": "alpha", "description": "A stale alpha", "inputSchema": {"type": "object", "properties": {}}}])
+    entered, release = _hold_cache_publisher(monkeypatch)
+    teardown_done, teardown_go = _gated_reconcile_teardown(monkeypatch)
+    b = runtime.descriptor("B", tools={"include": ["beta"]})
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        discovery = pool.submit(mcp.register_mcp_servers, {"fixture": cfg})
+        try:
+            assert entered.wait(5)
+            assert 'fixture' in mcp._server_connecting
+            runtime.publish({"fixture": b})
+            assert mcp.reconcile_mcp_servers({"fixture": b}) == {"fixture": "refused_connecting"}
+            mcp._server_connecting_since["fixture"] = time.monotonic() - 999.0
+            reconciling = pool.submit(mcp.reconcile_mcp_servers, {"fixture": b})
+            assert teardown_done.wait(5)
+            release.set()
+            discovery.result(timeout=10)
+            assert 'mcp__fixture__alpha' not in runtime.registry.get_all_tool_names()
+        finally:
+            release.set()
+            teardown_go.set()
+        result = reconciling.result(timeout=10)
+    assert result == {"fixture": "replaced"}
+    names = set(runtime.registry.get_all_tool_names())
+    assert 'mcp__fixture__alpha' not in names and 'mcp__fixture__beta' in names
+    assert set(mcp._servers['fixture']._registered_tool_names) == _names(tools=('beta',))
+    assert mcp._servers['fixture']._config == b
+    assert mcp.reconcile_mcp_servers({"fixture": b}) == {"fixture": "unchanged"}
+    assert 'mcp__fixture__alpha' not in runtime.registry.get_all_tool_names()
+
+
+def test_eager_connector_reservation_excludes_reconcile(runtime, monkeypatch):
+    """Eager mirror, connect phase: the tracked connector task makes a
+    concurrent reconcile answer ``refused_connecting`` (brief v3 prediction),
+    and the completion publishes exactly once with a truthful follow-up."""
+    cfg = runtime.descriptor("A", connect_timeout=20)
+    runtime.publish({"fixture": cfg})
+    parked = threading.Event()
+    go = threading.Event()
+    real_connect = mcp._connect_server
+
+    async def gated_connect(name, config):
+        server = await real_connect(name, config)
+        parked.set()
+        while not go.is_set():
+            await asyncio.sleep(0.005)
+        return server
+
+    monkeypatch.setattr(mcp, "_connect_server", gated_connect)
+    changed = {"fixture": runtime.descriptor("B", tools={"include": ["beta"]})}
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        registering = pool.submit(mcp.discover_mcp_tools)
+        try:
+            assert parked.wait(5)
+            assert 'fixture' in mcp._server_connecting
+            assert 'fixture' in mcp._server_connect_tasks
+            assert mcp.reconcile_mcp_servers(changed) == {"fixture": "refused_connecting"}
+            assert 'fixture' not in mcp._servers
+        finally:
+            go.set()
+        registering.result(timeout=15)
+    assert 'fixture' not in mcp._server_connecting
+    assert set(mcp._servers['fixture']._registered_tool_names) == _names()
+    assert mcp.reconcile_mcp_servers(changed) == {"fixture": "replaced"}
+    assert 'mcp__fixture__alpha' not in runtime.registry.get_all_tool_names()
+    assert mcp._servers['fixture']._config == changed['fixture']
+
+
+def test_eager_publish_instant_stays_reserved_against_reconcile(runtime):
+    """Eager mirror at the publish instant: ``_servers`` is already published
+    and tools are still registering, but the reservation plus the tracked
+    live connector task still force ``refused_connecting`` — even with a
+    marker aged beyond every drain window (the live task, not the age, is the
+    fence). This is the state `_connect_and_register_server` occupies between
+    its ``_servers[name] = server`` publication and the wrapper's finally."""
+    a = runtime.descriptor("A")
+    mcp._ensure_mcp_loop()
+
+    async def hold():
+        await asyncio.Event().wait()
+
+    async def create():
+        return asyncio.create_task(hold())
+
+    connector = mcp._run_on_mcp_loop(create)
+    server = mcp.MCPServerTask("fixture")
+    server._config = a
+    with mcp._lock:
+        mcp._server_connecting.add("fixture")
+        mcp._server_connecting_since["fixture"] = time.monotonic() - 999.0
+        mcp._server_connect_tasks["fixture"] = connector
+        mcp._servers["fixture"] = server
+    try:
+        assert mcp.reconcile_mcp_servers({"fixture": runtime.descriptor("B", tools={"include": ["beta"]})}) == {"fixture": "refused_connecting"}
+        assert mcp._servers["fixture"] is server
+        assert 'fixture' in mcp._server_connecting
+    finally:
+        mcp._mcp_loop.call_soon_threadsafe(connector.cancel)
+
+
+def test_eager_publication_is_one_transition_with_reservation(runtime, monkeypatch):
+    """Eager mirror, real publish instant: a parked native tool registration
+    proves (a) the reservation is still held at the publish instant, and (b)
+    publication is one transition on the MCP loop — a concurrent reconcile
+    cannot interleave with it (it stays queued behind the parked publisher),
+    so no false acknowledgement can precede or accept a stale eager
+    publication. The post-publication reconcile outcome is truthful."""
+    cfg = runtime.descriptor("A", connect_timeout=20)
+    runtime.publish({"fixture": cfg})
+    parked = threading.Event()
+    go = threading.Event()
+    real_register = mcp._register_server_tools
+
+    def gated_register(name, server, config):
+        parked.set()
+        assert go.wait(10)
+        return real_register(name, server, config)
+
+    monkeypatch.setattr(mcp, "_register_server_tools", gated_register)
+    changed = {"fixture": runtime.descriptor("B", tools={"include": ["beta"]})}
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        registering = pool.submit(mcp.discover_mcp_tools)
+        try:
+            assert parked.wait(5)
+            assert 'fixture' in mcp._server_connecting
+            assert 'fixture' in mcp._server_connect_tasks
+            reconciling = pool.submit(mcp.reconcile_mcp_servers, changed)
+            time.sleep(0.3)
+            assert not reconciling.done()
+        finally:
+            go.set()
+        registering.result(timeout=15)
+        assert reconciling.result(timeout=15) == {"fixture": "replaced"}
+    assert 'fixture' not in mcp._server_connecting
+    names = set(runtime.registry.get_all_tool_names())
+    assert 'mcp__fixture__alpha' not in names
+    assert names == _names(tools=('beta',))
+    assert mcp._servers['fixture']._config == changed['fixture']
