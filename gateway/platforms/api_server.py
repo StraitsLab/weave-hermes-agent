@@ -272,6 +272,9 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+# WEV-1817: per-connection bound on undelivered commit notes; overflow
+# degrades to a ``reset`` frame instead of ever blocking a writer thread.
+SESSION_EVENTS_STREAM_QUEUE_MAX = 64
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
@@ -2325,6 +2328,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            ("GET", "/api/sessions/{session_id}/events", self._handle_session_events),
+            ("GET", "/api/sessions/{session_id}/events/stream", self._handle_session_events_stream),
             ("POST", "/api/sessions/{session_id}/append", self._handle_session_append),
             ("POST", "/api/sessions/{session_id}/credential/bind", self._handle_session_credential_bind),
             ("POST", "/api/sessions/{session_id}/submit", self._handle_session_submit),
@@ -3573,6 +3578,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
+                "session_events": {"method": "GET", "path": "/api/sessions/{session_id}/events"},
+                "session_events_stream": {"method": "GET", "path": "/api/sessions/{session_id}/events/stream"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
@@ -4729,6 +4736,211 @@ class APIServerAdapter(BasePlatformAdapter):
                 "returned": len(messages),
             },
         })
+
+    # ------------------------------------------------------------------
+    # Committed-transcript event log (WEV-1817)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _session_events_page_sync(db, session_id: str, after: int, limit: int) -> Dict[str, Any]:
+        """One consistent catch-up read (runs on a worker thread).
+
+        ``reset_required`` whenever ``after`` is not an active row of the
+        resolved session: the rows were rewound or compacted away, or a
+        compression fork moved the conversation to a descendant (whose rows
+        all carry new ids). Conservative by construction — an unknown cursor
+        always resets, and the page then starts from 0.
+        """
+        resolved = db.resolve_resume_session_id(session_id) or session_id
+        reset_required = after > 0 and not db.has_active_message(resolved, after)
+        rows = db.get_messages(
+            resolved, limit=limit, after_id=0 if reset_required else after,
+        )
+        head = db.get_active_message_watermark(resolved)
+        return {
+            "session_id": resolved,
+            "head": head,
+            "reset_required": reset_required,
+            "rows": rows,
+        }
+
+    def _session_event_item(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        return {"cursor": int(row["id"]), "message": self._message_response(row)}
+
+    @staticmethod
+    def _parse_event_cursor(raw: Optional[str]) -> Optional[int]:
+        if raw is None or raw == "":
+            return 0
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
+
+    async def _handle_session_events(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/events?after=N&limit=M — committed items after a cursor."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        after = self._parse_event_cursor(request.query.get("after"))
+        raw_limit = request.query.get("limit")
+        try:
+            limit = 200 if raw_limit is None else int(raw_limit)
+        except (TypeError, ValueError):
+            limit = -1
+        if after is None or not 1 <= limit <= 500:
+            return web.json_response(
+                _openai_error(
+                    "after must be an integer >= 0 and limit an integer in 1..500",
+                    code="invalid_pagination",
+                ),
+                status=400,
+            )
+        db = await self._ensure_session_db_async()
+        page = await asyncio.to_thread(
+            self._session_events_page_sync, db, session_id, after, limit,
+        )
+        return web.json_response({
+            "object": "conversation_events",
+            "session_id": page["session_id"],
+            "head": page["head"],
+            "reset_required": page["reset_required"],
+            "items": [self._session_event_item(row) for row in page["rows"]],
+        })
+
+    async def _handle_session_events_stream(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /api/sessions/{session_id}/events/stream — resumable SSE of committed items.
+
+        Replays from ``Last-Event-ID`` (or ``?after=``) exactly like the
+        catch-up endpoint, then goes live. Live frames are driven only by
+        SessionDB post-commit notes; each note merely wakes this handler,
+        which re-reads the database after its last sent cursor. Idle
+        connections perform no reads — only ``: keepalive`` comments.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        raw_cursor = request.headers.get("Last-Event-ID")
+        if raw_cursor is None:
+            raw_cursor = request.query.get("after")
+        after = self._parse_event_cursor(raw_cursor)
+        if after is None:
+            return web.json_response(
+                _openai_error(
+                    "Last-Event-ID / after must be an integer >= 0",
+                    code="invalid_pagination",
+                ),
+                status=400,
+            )
+        db = await self._ensure_session_db_async()
+        loop = asyncio.get_running_loop()
+        notes: asyncio.Queue = asyncio.Queue(maxsize=SESSION_EVENTS_STREAM_QUEUE_MAX)
+        state: Dict[str, Any] = {
+            "watch": frozenset({session_id}),
+            "overflow": False,
+        }
+
+        def _deliver(note: tuple) -> None:  # event-loop thread
+            try:
+                notes.put_nowait(note)
+            except asyncio.QueueFull:
+                state["overflow"] = True
+
+        def _listener(note: tuple) -> None:  # committing writer thread
+            if len(note) < 2 or note[1] not in state["watch"]:
+                return
+            try:
+                loop.call_soon_threadsafe(_deliver, note)
+            except RuntimeError:
+                pass  # loop closed; the finally below unsubscribes
+
+        # Subscribe BEFORE the replay read so nothing committed in between
+        # is missed (a duplicate wake just re-reads an empty tail).
+        db.add_commit_listener(_listener)
+        response = web.StreamResponse(status=200, headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        })
+        page_size = 200
+
+        async def _send_page(page: Dict[str, Any]) -> int:
+            last = 0
+            for row in page["rows"]:
+                item = self._session_event_item(row)
+                last = item["cursor"]
+                await response.write(
+                    f"id: {last}\n".encode() + _sse_frame(item, event="item")
+                )
+            return last
+
+        async def _sync(cursor: int, force_reset: bool) -> int:
+            """Send reset (if due) plus every committed item after *cursor*."""
+            page = await asyncio.to_thread(
+                self._session_events_page_sync, db, session_id,
+                0 if force_reset else cursor, page_size,
+            )
+            if page["session_id"] not in state["watch"]:
+                # The resolved head moved. Widen the note filter FIRST, then
+                # read again, so a commit landing between the two reads can
+                # never fall through the filter unseen.
+                state["watch"] = frozenset({session_id, page["session_id"]})
+                page = await asyncio.to_thread(
+                    self._session_events_page_sync, db, session_id,
+                    0 if force_reset else cursor, page_size,
+                )
+                state["watch"] = frozenset({session_id, page["session_id"]})
+            if force_reset or page["reset_required"]:
+                await response.write(
+                    _sse_frame({"head": page["head"]}, event="reset")
+                )
+                cursor = 0
+            while True:
+                sent = await _send_page(page)
+                if sent:
+                    cursor = sent
+                if len(page["rows"]) < page_size:
+                    return cursor
+                page = await asyncio.to_thread(
+                    self._session_events_page_sync, db, session_id, cursor, page_size,
+                )
+                if page["reset_required"]:
+                    # Our own cursor vanished mid-drain; a reset note is
+                    # already queued and restarts the replay.
+                    return cursor
+
+        try:
+            await response.prepare(request)
+            cursor = await _sync(after, force_reset=False)
+            while True:
+                try:
+                    note = await asyncio.wait_for(
+                        notes.get(), timeout=CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    await response.write(b": keepalive\n\n")
+                    continue
+                # Coalesce everything already queued into one DB read.
+                reset = note[0] == "reset"
+                while not notes.empty():
+                    reset = reset or notes.get_nowait()[0] == "reset"
+                if state["overflow"]:
+                    state["overflow"] = False
+                    reset = True
+                cursor = await _sync(cursor, force_reset=reset)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+            pass
+        finally:
+            db.remove_commit_listener(_listener)
+        return response
 
     async def _handle_session_append(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/append — passive native append."""
