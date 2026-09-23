@@ -77,6 +77,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _sql_session_last_active_by_id,
     escape_like as _escape_like,
     DEFERRED_INDEX_SQL,
+    TRANSCRIPT_EPOCH_SQL,
     FTS_CJK_STALE_KEY,
     FTS_REBUILD_DEFERRAL_KEY,
     FTS_SQL,
@@ -664,30 +665,28 @@ def _read_budget_for(db_path) -> _PathReadBudget:
         return budget
 
 
-class _CommitNoteHub:
-    """Post-commit transcript-note subscribers for ONE state.db path (WEV-1817).
+class _CommitWakeHub:
+    """Post-commit wake-ups for ONE state.db path (WEV-1817).
 
-    Shared by every :class:`SessionDB` instance on the same file in this
-    process — the gateway runner and the API-server adapter each hold their
-    own instance on one ``state.db`` (#98573), so an instance-local registry
-    would miss the other instance's writes.  Notes are wake-ups only:
-    ``("appended", session_id, max_new_id)`` or ``("reset", session_id)``.
-    They never carry row content; the database stays the source of truth.
+    Shared by every :class:`SessionDB` on the same file in this process (the
+    gateway runner and the API adapter each hold their own instance). A wake
+    carries no data: the database is the source of truth, and readers decide
+    what changed from ``sessions.transcript_epoch`` and message ids.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._listeners: tuple = ()
 
-    def add(self, listener: Callable[[tuple], None]) -> None:
+    def add(self, listener: Callable[[], None]) -> None:
         with self._lock:
             self._listeners = self._listeners + (listener,)
 
-    def remove(self, listener: Callable[[tuple], None]) -> None:
+    def remove(self, listener: Callable[[], None]) -> None:
         with self._lock:
             listeners = list(self._listeners)
             for index, existing in enumerate(listeners):
-                if existing == listener:  # bound methods compare by (self, func)
+                if existing == listener:
                     del listeners[index]
                     self._listeners = tuple(listeners)
                     return
@@ -695,28 +694,24 @@ class _CommitNoteHub:
     def count(self) -> int:
         return len(self._listeners)
 
-    def publish(self, notes: List[tuple]) -> None:
-        listeners = self._listeners  # immutable snapshot; no lock held
-        for note in notes:
-            for listener in listeners:
-                try:
-                    listener(note)
-                except Exception:
-                    logger.debug("commit-note listener failed", exc_info=True)
+    def publish(self) -> None:
+        for listener in self._listeners:  # immutable snapshot; no lock held
+            try:
+                listener()
+            except Exception:
+                logger.debug("commit wake listener failed", exc_info=True)
 
 
-_commit_hubs: "weakref.WeakValueDictionary[str, _CommitNoteHub]" = (
-    weakref.WeakValueDictionary()
-)
+_commit_hubs: "weakref.WeakValueDictionary[str, _CommitWakeHub]" = weakref.WeakValueDictionary()
 _commit_hubs_lock = threading.Lock()
 
 
-def _commit_hub_for(db_path) -> _CommitNoteHub:
+def _commit_hub_for(db_path) -> _CommitWakeHub:
     key = _read_budget_key(db_path)
     with _commit_hubs_lock:
         hub = _commit_hubs.get(key)
         if hub is None:
-            hub = _CommitNoteHub()
+            hub = _CommitWakeHub()
             _commit_hubs[key] = hub
         return hub
 
@@ -5785,32 +5780,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         while True:
             try:
-                committed_notes: Optional[List[tuple]] = None
                 with self._lock:
                     if self._conn is None:
                         # close() ran while this writer was still unwinding
                         # (#94736) — reopen instead of dying on None.execute.
                         self._reopen_after_close_locked(context="write")
                     self._conn.execute("BEGIN IMMEDIATE")
-                    # WEV-1817: transcript writers note what they changed
-                    # during fn(conn). Collected per ATTEMPT, so a rollback
-                    # or a locked-retry discards them; published only after
-                    # commit() returns, outside self._lock.
-                    self._txn_notes = []
+                    changes_before = self._conn.total_changes
                     try:
                         result = fn(self._conn)
                         self._conn.commit()
-                        committed_notes = self._txn_notes
                     except BaseException:
                         try:
                             self._conn.rollback()
                         except Exception:
                             pass
                         raise
-                    finally:
-                        self._txn_notes = None
-                if committed_notes:
-                    self._commit_note_hub().publish(list(dict.fromkeys(committed_notes)))
+                    changed = self._conn.total_changes != changes_before
+                # WEV-1817: wake event-log readers only after the commit, and
+                # outside the write lock. Rolled-back or retried attempts never
+                # reach here.
+                if changed:
+                    self._commit_hub().publish()
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -5880,100 +5871,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
-
-    # ── Post-commit transcript notes (WEV-1817) ──────────────────────────
-    #
-    # Kinds: ("appended", session_id, max_new_id) for fresh display rows and
-    # ("reset", session_id) for any write that deactivates/rewrites rows or
-    # may change which session a resume of *session_id* resolves to. A note
-    # is a wake-up only; subscribers re-read the database.
-
-    def _commit_note_hub(self) -> "_CommitNoteHub":
-        hub = self.__dict__.get("_commit_hub")
-        if hub is None:
-            hub = _commit_hub_for(self.db_path)
-            self._commit_hub = hub
-        return hub
-
-    def add_commit_listener(self, listener: Callable[[tuple], None]) -> None:
-        """Subscribe *listener* to post-commit transcript notes.
-
-        Called on the committing writer thread, outside the write lock, once
-        per note. It must not block or raise; hand off (for example with
-        ``loop.call_soon_threadsafe``) and return. Shared by every SessionDB
-        on the same database file in this process.
-        """
-        self._commit_note_hub().add(listener)
-
-    def remove_commit_listener(self, listener: Callable[[tuple], None]) -> None:
-        self._commit_note_hub().remove(listener)
-
-    def commit_listener_count(self) -> int:
-        return self._commit_note_hub().count()
-
-    def _note_commit(self, note: tuple) -> None:
-        notes = self.__dict__.get("_txn_notes")
-        if notes is not None:
-            notes.append(note)
-
-    def _note_reset(self, session_id: Optional[str]) -> None:
-        if session_id:
-            self._note_commit(("reset", session_id))
-
-    # Same child exclusions as resolve_resume_session_id's forward walk: only
-    # a qualifying child can become the resolved head of its parent.
-    # Deliberately looser than that walk (reset children still qualify) so an
-    # uncertain case over-reports a reset rather than missing one.
-    _RESUME_CHILD_FILTER_SQL = (
-        "json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
-        "AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL "
-        "AND COALESCE(child.source, '') != 'tool'"
-    )
-
-    def _note_resolution_change(self, conn, session_id: Optional[str]) -> None:
-        """Reset every ancestor whose resume may now resolve through *session_id*."""
-        current = session_id
-        seen = {current}
-        for _ in range(32):
-            if not current:
-                return
-            row = conn.execute(
-                "SELECT child.parent_session_id FROM sessions AS child "
-                "WHERE child.id = ? AND child.parent_session_id IS NOT NULL "
-                f"AND {self._RESUME_CHILD_FILTER_SQL}",
-                (current,),
-            ).fetchone()
-            if row is None:
-                return
-            parent = row[0]
-            if not parent or parent in seen:
-                return
-            seen.add(parent)
-            self._note_reset(parent)
-            current = parent
-
-    def _note_appended(self, conn, session_id: str, first_id: Optional[int], max_id: Optional[int]) -> None:
-        """Note fresh rows ``first_id..max_id`` in *session_id* (inside the txn)."""
-        if self.__dict__.get("_txn_notes") is None or not session_id or max_id is None:
-            return
-        self._note_commit(("appended", session_id, int(max_id)))
-        # A session's FIRST rows can make it the resolved head of an ancestor
-        # (resolve_resume_session_id prefers the deepest node with messages).
-        prior = conn.execute(
-            "SELECT 1 FROM messages WHERE session_id = ? AND id < ? LIMIT 1",
-            (session_id, int(first_id if first_id is not None else max_id)),
-        ).fetchone()
-        if prior is None:
-            self._note_resolution_change(conn, session_id)
-
-    def _note_sessions_removed(self, conn, session_ids) -> None:
-        """Reset sessions whose rows are about to be deleted, plus ancestors
-        whose resume may have resolved through them. Call BEFORE the delete."""
-        if self.__dict__.get("_txn_notes") is None:
-            return
-        for sid in session_ids:
-            self._note_reset(sid)
-            self._note_resolution_change(conn, sid)
 
     def _sleep_before_write_retry(
         self, deadline: float, patience_s: float
@@ -6550,14 +6447,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             profile_name = self._own_profile_name()
 
         def _do(conn):
-            prior_parent_row = (
-                conn.execute(
-                    "SELECT parent_session_id FROM sessions WHERE id = ?",
-                    (session_id,),
-                ).fetchone()
-                if parent_session_id
-                else None
-            )
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
                 """INSERT INTO sessions (
@@ -6690,10 +6579,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        )""",
                     (session_id,),
                 )
-                # WEV-1817: a new compression continuation is followed by
-                # get_compression_tip even before it holds rows.
-                if prior_parent_row is None or prior_parent_row[0] is None:
-                    self._note_resolution_change(conn, session_id)
         # Session-row creation is transcript-critical: if it fails, the
         # first flush of a new session fails and the turn is aborted as
         # session_persistence_failed. Ride out long sibling holds.
@@ -7619,9 +7504,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "AND end_reason = 'compression'",
                 (session_id,),
             )
-            if updated.rowcount == 1:
-                self._note_reset(session_id)
-                self._note_resolution_change(conn, session_id)
             # rowcount==1 is guaranteed by the parent SELECT at the top of
             # this same BEGIN IMMEDIATE transaction. If this is ever edited
             # to return False past this point, note that the lease DELETE
@@ -7804,14 +7686,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         if c not in ("id", "session_id", "active", "compacted")
                     ]
                     col_list = ", ".join(clone_cols)
-                    clone_cursor = conn.execute(
+                    conn.execute(
                         f"INSERT INTO messages ({col_list}, session_id, active, compacted) "
                         f"SELECT {col_list}, ?, 1, 0 FROM messages "
                         f"WHERE id IN ({placeholders}) ORDER BY id",
                         [child_session_id, *tail_ids],
-                    )
-                    self._note_appended(
-                        conn, child_session_id, None, clone_cursor.lastrowid
                     )
                     total_messages += len(tail_ids)
                     for r in tail_rows:
@@ -7835,9 +7714,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise RuntimeError(
                     f"Compression parent changed during publication: {parent_session_id}"
                 )
-            # WEV-1817: no explicit note needed here — the child's first rows
-            # (_insert_message_rows → _note_appended) reset the parent and
-            # every ancestor whose resume now resolves to the child.
 
         self._execute_write(_do)
 
@@ -7904,15 +7780,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             columns = [name for name in self._message_column_names(conn) if name not in {"id", "session_id"}]
             names = ", ".join(columns)
-            fork_cursor = conn.execute(
+            conn.execute(
                 f"INSERT INTO messages (session_id, {names}) SELECT ?, {names} FROM messages "
                 "WHERE session_id = ? AND active = 1 ORDER BY id",
                 (child_session_id, parent_session_id),
             )
-            if fork_cursor.rowcount:
-                # Branch child (``_branched_from``): never a resume target of
-                # the parent, so only the child's own log gains rows.
-                self._note_appended(conn, child_session_id, None, fork_cursor.lastrowid)
             updated = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = 'branched' WHERE id = ? AND ended_at IS NULL",
                 (now, parent_session_id),
@@ -7934,15 +7806,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         intentionally need to re-end a closed session with a new reason.
         """
         def _do(conn):
-            cursor = conn.execute(
+            conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND ended_at IS NULL",
                 (time.time(), end_reason, session_id),
             )
-            if cursor.rowcount and end_reason == "compression":
-                # WEV-1817: compression tips are followed from here on.
-                self._note_reset(session_id)
-                self._note_resolution_change(conn, session_id)
         self._execute_write(_do)
 
     def reopen_session(self, session_id: str) -> None:
@@ -7966,12 +7834,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"AND {_legacy_reset_child_sql('child', placeholders)}",
                 (session_id, *_RESET_END_REASONS),
             )
-            prior = conn.execute(
-                "SELECT end_reason FROM sessions WHERE id = ?", (session_id,)
-            ).fetchone()
-            if prior is not None and prior[0] == "compression":
-                self._note_reset(session_id)
-                self._note_resolution_change(conn, session_id)
             conn.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                 (session_id,),
@@ -11928,7 +11790,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ),
             )
             msg_id = cursor.lastrowid
-            self._note_appended(conn, session_id, msg_id, msg_id)
 
             # Update counters
             if num_tool_calls > 0:
@@ -12105,7 +11966,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ),
             )
             message_id = cursor.lastrowid
-            self._note_appended(conn, session_id, message_id, message_id)
             conn.execute(
                 """INSERT INTO passive_append_idempotency (
                    external_item_id, session_id, target_bem_session_id, native_message_id,
@@ -12274,7 +12134,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             from agent.transcript_repair import resolve_and_repair_transcript_batch
 
-            repair_changes_before = conn.total_changes
             inserted_rows = resolve_and_repair_transcript_batch(
                 conn,
                 session_id,
@@ -12282,9 +12141,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 encode_content_fn=self._encode_content,
                 decode_content_fn=self._decode_content,
             )
-            if conn.total_changes != repair_changes_before:
-                # WEV-1817: a blank assistant row was filled in place.
-                self._note_reset(session_id)
             inserted = 0
             tool_calls_total = 0
             if inserted_rows:
@@ -12341,9 +12197,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     row[0],
                 ),
             )
-            # WEV-1817: display_kind is a served field of an already-announced
-            # row; an in-place edit is not an append.
-            self._note_reset(session_id)
             return True
 
         return bool(self._execute_write(_do))
@@ -12568,8 +12421,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now_ts = time.time()
         inserted = 0
         tool_calls_total = 0
-        first_row_id: Optional[int] = None
-        last_row_id: Optional[int] = None
         for msg in messages:
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
@@ -12644,19 +12495,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             if isinstance(msg, dict) and cur.lastrowid is not None:
                 msg["_row_id"] = cur.lastrowid
-            if cur.lastrowid is not None:
-                if first_row_id is None:
-                    first_row_id = cur.lastrowid
-                last_row_id = cur.lastrowid
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1
                 )
             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
-        # WEV-1817: every caller (batch append, replace, compaction,
-        # compression child, rewind handoff, import) inserts display rows.
-        self._note_appended(conn, session_id, first_row_id, last_row_id)
         return inserted, tool_calls_total
 
     def replace_messages(
@@ -12729,9 +12573,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     and session["end_reason"] == "compression"
                 ):
                     raise CompressionSessionClosedError(session_id)
-            # WEV-1817: live rows are archived or deleted and re-inserted with
-            # new ids — consumers must drop their cached transcript.
-            self._note_reset(session_id)
             if archive_dropped:
                 # Content-preserving UPDATE: the rows keep their FTS entries
                 # (the messages_fts triggers fire on INSERT / DELETE / UPDATE
@@ -12777,6 +12618,75 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
+    # ── Committed-transcript event log (WEV-1817) ────────────────────────
+
+    def _commit_hub(self) -> "_CommitWakeHub":
+        hub = self.__dict__.get("_commit_wake_hub")
+        if hub is None:
+            hub = _commit_hub_for(self.db_path)
+            self._commit_wake_hub = hub
+        return hub
+
+    def add_commit_listener(self, listener: Callable[[], None]) -> None:
+        """Call *listener()* after every committed write to this state.db.
+
+        Runs on the committing thread, outside the write lock. It must not
+        block or raise: hand off (``loop.call_soon_threadsafe``) and return.
+        Writes from another process on the same file do not wake it.
+        """
+        self._commit_hub().add(listener)
+
+    def remove_commit_listener(self, listener: Callable[[], None]) -> None:
+        self._commit_hub().remove(listener)
+
+    def commit_listener_count(self) -> int:
+        return self._commit_hub().count()
+
+    def get_transcript_epoch(self, session_id: str) -> int:
+        """Current transcript epoch of *session_id* (see TRANSCRIPT_TRIGGER_SQL)."""
+        with self._read_ctx() as conn:
+            row = conn.execute(TRANSCRIPT_EPOCH_SQL, (session_id,)).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def _message_session_id(self, message_id: int) -> Optional[str]:
+        with self._read_ctx() as conn:
+            row = conn.execute("SELECT session_id FROM messages WHERE id = ?", (message_id,)).fetchone()
+        return row[0] if row else None
+
+    _TRANSCRIPT_READ_ATTEMPTS = 8
+
+    def read_transcript_events(self, session_id: str, cursor: Optional[Tuple[int, int]],
+                               limit: int) -> Dict[str, Any]:
+        """One consistent page of the committed transcript after *cursor*.
+
+        *cursor* is ``(epoch, id)`` or None (from the start). The page is
+        consistent without a long read transaction: every non-append change
+        bumps the epoch in its own commit, so the epoch is read before and
+        after the resolution + row reads and the page is retried if it moved.
+        Appends that land mid-read are safe (rows are keyed by id, and the
+        head is read after the rows, so it never trails them).
+
+        Returns ``{"session_id", "epoch", "head", "reset_required", "rows"}``
+        where ``head`` is the max active id of the resolved session.
+        """
+        for _ in range(self._TRANSCRIPT_READ_ATTEMPTS):
+            epoch = self.get_transcript_epoch(session_id)
+            resolved = self.resolve_resume_session_id(session_id) or session_id
+            reset = cursor is None or cursor[0] != epoch
+            if not reset and cursor[1] > 0:
+                # Resolution can move to another session through an append or
+                # a heartbeat without an epoch bump (sibling ordering). The
+                # client's rows then belong to a session it no longer shows.
+                reset = self._message_session_id(cursor[1]) != resolved
+            after_id = 0 if reset else cursor[1]
+            rows = self.get_messages(resolved, limit=limit, after_id=after_id)
+            head = self.get_active_message_watermark(resolved)
+            if self.get_transcript_epoch(session_id) == epoch:
+                return {"session_id": resolved, "epoch": epoch, "head": max(head, after_id),
+                        "reset_required": reset, "rows": rows}
+        raise sqlite3.OperationalError("transcript changed during every read attempt")
+
+
     def get_active_message_watermark(self, session_id: str) -> int:
         """MAX(id) of the session's active rows — the compression watermark.
 
@@ -12794,22 +12704,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             ).fetchone()
         return int(row[0]) if row else 0
-
-    def has_active_message(self, session_id: str, message_id: int) -> bool:
-        """True when *message_id* is a currently active row of *session_id*.
-
-        The conversation-event cursor check (WEV-1817): a cursor that is no
-        longer an active row of the resolved session means the client's
-        cached transcript was rewound, compacted, or forked away.
-        """
-        if not session_id:
-            return False
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? AND active = 1",
-                (int(message_id), session_id),
-            ).fetchone()
-        return row is not None
 
     def archive_and_compact(
         self,
@@ -12963,9 +12857,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # class as the carried-forward tail (#86366), so they take the
             # rewind flags too instead of double-matching the recall filter.
             rewind_ids = [*(rewind_tail_ids or []), *tail_ids]
-            # WEV-1817: every active row is archived; the compacted set and the
-            # concurrent tail come back under NEW ids.
-            self._note_reset(session_id)
 
             if rewind_ids:
                 placeholders = ",".join("?" for _ in rewind_ids)
@@ -13000,13 +12891,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     if c not in ("id", "active", "compacted")
                 ]
                 col_list = ", ".join(clone_cols)
-                tail_cursor = conn.execute(
+                conn.execute(
                     f"INSERT INTO messages ({col_list}, active, compacted) "
                     f"SELECT {col_list}, 1, 0 FROM messages "
                     f"WHERE id IN ({placeholders}) ORDER BY id",
                     tail_ids,
                 )
-                self._note_appended(conn, session_id, None, tail_cursor.lastrowid)
                 inserted += len(tail_ids)
                 tool_calls_total += tail_tool_calls
 
@@ -14196,7 +14086,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"UPDATE messages SET active = 0 WHERE id IN ({placeholders})",
                     ids,
                 )
-                self._note_reset(session_id)
             if replacement is not None:
                 self._insert_message_rows(conn, session_id, [replacement])
                 inserted = conn.execute("SELECT last_insert_rowid()").fetchone()
@@ -14260,8 +14149,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"UPDATE messages SET active = 1 WHERE id IN ({placeholders})",
                     ids,
                 )
-                # Old ids reappear below the head: not an append.
-                self._note_reset(session_id)
             return len(ids)
 
         return self._execute_write(_do)
@@ -14559,7 +14446,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
         def _do(conn):
-            self._note_sessions_removed(conn, [session_id])
             conn.execute(
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
             )
@@ -14656,9 +14542,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 }
                 if actual_ids != expected_ids:
                     return False
-            self._note_sessions_removed(
-                conn, [session_id, *_collect_delegate_child_ids(conn, [session_id])]
-            )
             removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(
@@ -14776,9 +14659,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return 0
 
             existing_placeholders = ",".join("?" * len(existing))
-            self._note_sessions_removed(
-                conn, [*existing, *_collect_delegate_child_ids(conn, existing)]
-            )
             removed_delegate_ids.extend(_delete_delegate_children(conn, existing))
             # Orphan remaining children whose parent is in the kill list so the
             # FK constraint stays satisfied. Pin children whose parent
@@ -14901,7 +14781,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 list(session_ids),
             )
 
-            self._note_sessions_removed(conn, session_ids)
             for sid in session_ids:
                 # DELETE FROM messages is paranoia — the selector's
                 # ``NOT EXISTS`` probe already proved these sessions own no
@@ -15290,7 +15169,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not session_ids:
                 return 0
 
-            self._note_sessions_removed(conn, session_ids)
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(
@@ -15399,11 +15277,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"UPDATE messages SET content = '' WHERE id IN ({placeholders})",
                     ids,
                 )
-                for (sid,) in conn.execute(
-                    f"SELECT DISTINCT session_id FROM messages WHERE id IN ({placeholders})",
-                    ids,
-                ).fetchall():
-                    self._note_reset(sid)
             return ids
 
         affected_ids = self._execute_write(_do)

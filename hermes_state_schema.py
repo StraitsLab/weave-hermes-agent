@@ -30,6 +30,7 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    TRANSCRIPT_TRIGGER_SQL,
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _ephemeral_child_sql,
@@ -1009,6 +1010,14 @@ class SessionSchemaMixin:
         # Deferred indexes that reference the reconciler-added ``active``
         # column (idx_messages_session_active) — same ordering constraint.
         cursor.executescript(DEFERRED_INDEX_SQL)
+
+        # WEV-1817: transcript change counter (see TRANSCRIPT_TRIGGER_SQL).
+        # Idempotent; runs on every writable open so an older database gains
+        # the triggers without a version bump. Existing rows start at epoch 0.
+        try:
+            cursor.executescript(TRANSCRIPT_TRIGGER_SQL)
+        except sqlite3.OperationalError as exc:
+            logger.warning("transcript change triggers unavailable: %s", exc)
 
         # Heal NULL ``active`` rows unconditionally on every startup.
         # On real-world DBs the reconciler-added ``active`` column can lack

@@ -1,8 +1,8 @@
-"""Post-commit transcript notes on SessionDB (WEV-1817).
+"""Durable transcript epoch + post-commit wake-ups on SessionDB (WEV-1817).
 
-A note is published only after ``_execute_write`` commits, never on rollback,
-and exactly once across a ``database is locked`` retry. Notes carry no row
-content — subscribers re-read the database.
+``sessions.transcript_epoch`` is bumped by SQLite triggers, inside the writing
+transaction, on every non-append change a reader could miss. Wake-ups are
+published only after a commit, never on rollback, and carry no data.
 """
 
 from __future__ import annotations
@@ -29,127 +29,225 @@ def db(tmp_path: Path):
         d.close()
 
 
-def _collect(db: SessionDB):
-    notes: list = []
-    db.add_commit_listener(notes.append)
-    return notes
+def _wakes(db: SessionDB):
+    calls: list = []
+    db.add_commit_listener(lambda: calls.append(db._lock.locked()))
+    return calls
 
 
-def test_note_is_published_after_commit_and_row_is_readable_in_callback(db, tmp_path):
+# ── wake-ups ─────────────────────────────────────────────────────────────
+
+
+def test_wake_is_published_after_commit_outside_the_lock(db, tmp_path):
     seen: list = []
 
-    def listener(note):
-        # An independent connection only sees COMMITTED data.
-        conn = sqlite3.connect(str(tmp_path / "state.db"))
+    def listener():
+        conn = sqlite3.connect(str(tmp_path / "state.db"))  # sees COMMITTED data only
         try:
-            row = conn.execute(
-                "SELECT content FROM messages WHERE id = ?", (note[2],)
-            ).fetchone()
+            seen.append((conn.execute("SELECT content FROM messages").fetchall(), db._lock.locked()))
         finally:
             conn.close()
-        seen.append((note, row, db._lock.locked()))
 
     db.add_commit_listener(listener)
-    msg_id = db.append_message(SID, role="user", content="durable")
-
-    assert len(seen) == 1
-    note, row, lock_held = seen[0]
-    assert note == ("appended", SID, msg_id)
-    assert row == ("durable",)
-    assert lock_held is False, "listeners run outside the SessionDB write lock"
+    db.append_message(SID, role="user", content="durable")
+    assert seen == [([("durable",)], False)]
 
 
-def test_rolled_back_write_publishes_nothing(db, monkeypatch):
-    notes = _collect(db)
+def test_rolled_back_write_wakes_nobody(db, monkeypatch):
+    calls = _wakes(db)
 
     def exploding_insert(conn, session_id, messages):
-        # Real insert (which records a note), then fail inside fn.
         SessionDB._insert_message_rows(db, conn, session_id, messages)
         raise RuntimeError("boom inside fn")
 
     monkeypatch.setattr(db, "_insert_message_rows", exploding_insert)
     with pytest.raises(RuntimeError, match="boom inside fn"):
         db.append_messages_batch(SID, [{"role": "user", "content": "lost"}])
-
-    assert notes == []
+    assert calls == []
     assert db.get_messages(SID) == []
 
 
-def test_locked_retry_publishes_once(db, monkeypatch):
-    notes = _collect(db)
+def test_locked_retry_wakes_once(db, monkeypatch):
+    calls = _wakes(db)
     attempts = {"n": 0}
 
     def flaky_insert(conn, session_id, messages):
         attempts["n"] += 1
         if attempts["n"] == 1:
-            # The doomed attempt notes a DIFFERENT max id, so a note leaked
-            # from it could not be hidden by value de-duplication.
-            SessionDB._insert_message_rows(
-                db, conn, session_id, [*messages, {"role": "user", "content": "doomed"}]
-            )
+            SessionDB._insert_message_rows(db, conn, session_id, messages)
             raise sqlite3.OperationalError("database is locked")
         return SessionDB._insert_message_rows(db, conn, session_id, messages)
 
     monkeypatch.setattr(db, "_insert_message_rows", flaky_insert)
     db.append_messages_batch(SID, [{"role": "user", "content": "retried"}])
-
     assert attempts["n"] == 2
-    rows = db.get_messages(SID)
-    assert [r["content"] for r in rows] == ["retried"]
-    assert notes == [("appended", SID, rows[0]["id"])]
+    assert calls == [False]
 
 
-def test_append_from_other_thread_notifies_listener(db):
-    notes = _collect(db)
-    t = threading.Thread(
-        target=db.append_message, args=(SID,), kwargs={"role": "user", "content": "x"}
-    )
+def test_append_from_other_thread_wakes_listener(db):
+    calls = _wakes(db)
+    t = threading.Thread(target=db.append_message, args=(SID,), kwargs={"role": "user", "content": "x"})
     t.start()
     t.join(5)
-    assert len(notes) == 1 and notes[0][0] == "appended" and notes[0][1] == SID
+    assert calls == [False]
 
 
-def test_rewind_and_compaction_note_reset(db):
-    first = db.append_message(SID, role="user", content="one")
+def test_listeners_are_shared_per_path_and_removable(db, tmp_path):
+    other = SessionDB(tmp_path / "state.db")
+    try:
+        calls: list = []
+        listener = lambda: calls.append(1)  # noqa: E731
+        db.add_commit_listener(listener)
+        assert other.commit_listener_count() == 1
+        other.append_message(SID, role="user", content="via second handle")
+        assert calls == [1]
+        db.remove_commit_listener(listener)
+        assert db.commit_listener_count() == 0
+        other.append_message(SID, role="user", content="unheard")
+        assert calls == [1]
+    finally:
+        other.close()
+
+
+# ── epoch: pure appends never bump ───────────────────────────────────────
+
+
+def test_plain_appends_titles_and_counters_do_not_bump(db):
+    before = db.get_transcript_epoch(SID)
+    db.append_message(SID, role="user", content="one")
     db.append_message(SID, role="assistant", content="two")
-    notes = _collect(db)
-
-    db.rewind_to_message(SID, first)
-    assert ("reset", SID) in notes
-
-    notes.clear()
-    db.append_message(SID, role="user", content="three")
-    db.archive_and_compact(SID, [{"role": "user", "content": "summary"}])
-    assert ("reset", SID) in notes
-    assert notes[-1][0] == "appended", "compacted rows are announced after the reset"
+    db.append_messages_batch(SID, [{"role": "user", "content": "three"}])
+    db.set_session_title(SID, "a title")
+    db.touch_session_activity(SID)
+    assert db.get_transcript_epoch(SID) == before
 
 
-def test_compression_fork_notes_reset_on_parent(db):
+def test_reaction_metadata_does_not_bump(db):
+    row = db.append_message(SID, role="assistant", content="hi")
+    before = db.get_transcript_epoch(SID)
+    with db._lock:
+        db._conn.execute("UPDATE messages SET display_metadata = '{\"r\":1}' WHERE id = ?", (row,))
+        db._conn.commit()
+    assert db.get_transcript_epoch(SID) == before
+
+
+# ── epoch: every non-append change bumps, durably ────────────────────────
+
+
+def _bumps(db, sid, change):
+    before = db.get_transcript_epoch(sid)
+    change()
+    return db.get_transcript_epoch(sid) > before
+
+
+def test_rewind_restore_compaction_and_clear_bump(db):
+    one = db.append_message(SID, role="user", content="one")
+    db.append_message(SID, role="assistant", content="two")
+    assert _bumps(db, SID, lambda: db.rewind_to_message(SID, one))
+    assert _bumps(db, SID, lambda: db.restore_rewound(SID, one))
+    assert _bumps(db, SID, lambda: db.archive_and_compact(SID, [{"role": "user", "content": "summary"}]))
+    assert _bumps(db, SID, lambda: db.clear_messages(SID))
+
+
+def test_in_place_repair_and_display_kind_stamp_bump(db):
+    row = db.append_message(SID, role="assistant", content="")
+    assert _bumps(db, SID, lambda: db.append_messages_batch(
+        SID, [{"role": "assistant", "content": "final answer", "_row_id": row}]))
+    db.append_message(SID, role="user", content="synthetic prompt")
+    assert _bumps(db, SID, lambda: db.set_latest_matching_message_display_kind(
+        SID, role="user", content="synthetic prompt", display_kind="internal"))
+
+
+def test_compression_fork_bumps_parent(db):
     db.append_message(SID, role="user", content="before fork")
-    notes = _collect(db)
-    db.publish_compression_child(
-        parent_session_id=SID,
-        child_session_id="notes-child",
-        source="test",
-        messages=[{"role": "user", "content": "handoff"}],
-        require_compression_lease=False,
-    )
-    assert ("reset", SID) in notes
-    assert any(n[0] == "appended" and n[1] == "notes-child" for n in notes)
+    assert _bumps(db, SID, lambda: db.publish_compression_child(
+        parent_session_id=SID, child_session_id="notes-child", source="test",
+        messages=[{"role": "user", "content": "handoff"}], require_compression_lease=False))
     assert db.resolve_resume_session_id(SID) == "notes-child"
 
 
-def test_remove_listener_stops_delivery_and_is_shared_per_path(db, tmp_path):
-    other = SessionDB(tmp_path / "state.db")
+def test_ending_or_deleting_an_eligible_child_bumps_the_root(db):
+    db.append_message(SID, role="user", content="root")
+    db.create_session("a", "test", parent_session_id=SID)
+    db.append_message("a", role="user", content="a")
+    assert _bumps(db, SID, lambda: db.end_session("a", "agent_close"))
+    db.create_session("empty", "test", parent_session_id=SID)
+    assert _bumps(db, SID, lambda: db.delete_session_if_empty("empty"))
+
+
+def test_import_of_a_child_bumps_the_parent(db):
+    db.append_message(SID, role="user", content="root")
+    assert _bumps(db, SID, lambda: db.import_sessions([{
+        "id": "imported", "source": "test", "parent_session_id": SID,
+        "messages": [{"role": "user", "content": "imported continuation"}]}]))
+
+
+def test_branch_and_delegate_children_do_not_bump(db):
+    db.append_message(SID, role="user", content="root")
+    before = db.get_transcript_epoch(SID)
+    db.create_session("br", "test", parent_session_id=SID, model_config={"_branched_from": SID})
+    db.create_session("tool-child", "tool", parent_session_id=SID)
+    assert db.get_transcript_epoch(SID) == before
+
+
+def test_epoch_survives_reopen(tmp_path):
+    first = SessionDB(tmp_path / "state.db")
+    first.create_session(SID, "test")
+    row = first.append_message(SID, role="user", content="one")
+    first.rewind_to_message(SID, row)
+    epoch = first.get_transcript_epoch(SID)
+    first.close()
+    second = SessionDB(tmp_path / "state.db")
     try:
-        notes: list = []
-        db.add_commit_listener(notes.append)
-        assert other.commit_listener_count() == 1
-        other.append_message(SID, role="user", content="via second handle")
-        assert len(notes) == 1
-        db.remove_commit_listener(notes.append)
-        assert db.commit_listener_count() == 0
-        other.append_message(SID, role="user", content="unheard")
-        assert len(notes) == 1
+        assert epoch > 0 and second.get_transcript_epoch(SID) == epoch
     finally:
-        other.close()
+        second.close()
+
+
+def test_raw_write_from_another_connection_still_bumps(db, tmp_path):
+    row = db.append_message(SID, role="user", content="one")
+    before = db.get_transcript_epoch(SID)
+    raw = sqlite3.connect(str(tmp_path / "state.db"))
+    try:
+        raw.execute("UPDATE messages SET content = 'edited elsewhere' WHERE id = ?", (row,))
+        raw.commit()
+    finally:
+        raw.close()
+    assert db.get_transcript_epoch(SID) > before
+
+
+def test_raw_child_insert_from_another_connection_bumps_the_parent(db, tmp_path):
+    """The session INSERT trigger alone (a plain INSERT fires no UPDATE trigger)."""
+    db.append_message(SID, role="user", content="root")
+    before = db.get_transcript_epoch(SID)
+    raw = sqlite3.connect(str(tmp_path / "state.db"))
+    try:
+        raw.execute("INSERT INTO sessions (id, source, parent_session_id, started_at) VALUES ('raw-child', 'test', ?, 1)", (SID,))
+        raw.commit()
+    finally:
+        raw.close()
+    assert db.get_transcript_epoch(SID) > before
+
+
+def test_existing_database_gains_triggers_and_starts_at_epoch_zero(tmp_path):
+    path = tmp_path / "state.db"
+    first = SessionDB(path)
+    first.create_session(SID, "test")
+    first.append_message(SID, role="user", content="legacy")
+    first.close()
+    raw = sqlite3.connect(str(path))
+    try:
+        for (name,) in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'transcript_epoch_%'").fetchall():
+            raw.execute(f"DROP TRIGGER {name}")
+        raw.execute("UPDATE sessions SET transcript_epoch = 0")
+        raw.commit()
+    finally:
+        raw.close()
+    reopened = SessionDB(path)
+    try:
+        assert reopened.get_transcript_epoch(SID) == 0
+        row = reopened.get_messages(SID)[0]["id"]
+        assert _bumps(reopened, SID, lambda: reopened.rewind_to_message(SID, row))
+    finally:
+        reopened.close()
