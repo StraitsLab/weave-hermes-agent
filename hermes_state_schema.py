@@ -1014,10 +1014,10 @@ class SessionSchemaMixin:
         # WEV-1817: transcript change counter (see TRANSCRIPT_TRIGGER_SQL).
         # Idempotent; runs on every writable open so an older database gains
         # the triggers without a version bump. Existing rows start at epoch 0.
-        try:
-            cursor.executescript(TRANSCRIPT_TRIGGER_SQL)
-        except sqlite3.OperationalError as exc:
-            logger.warning("transcript change triggers unavailable: %s", exc)
+        # A lock error here propagates into the open's lock-patience retry (a
+        # database opened WITHOUT these triggers would serve catch-up reads that
+        # silently miss edits).
+        cursor.executescript(TRANSCRIPT_TRIGGER_SQL)
 
         # Heal NULL ``active`` rows unconditionally on every startup.
         # On real-world DBs the reconciler-added ``active`` column can lack

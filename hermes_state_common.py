@@ -664,7 +664,7 @@ def _transcript_bump_sql(targets: str) -> str:
 # membership. api_content, display_metadata (reactions), platform_message_id
 # and observed are deliberately absent.
 _TRANSCRIPT_MESSAGE_COLUMNS = (
-    "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
+    "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
     "timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
     "display_kind", "active", "compacted", "_compressed_summary",
 )
@@ -678,6 +678,8 @@ def _changed_sql(columns) -> str:
 
 
 TRANSCRIPT_TRIGGERS = (
+    "transcript_epoch_message_replace",
+    "transcript_epoch_message_insert_below_head",
     "transcript_epoch_message_update",
     "transcript_epoch_message_delete",
     "transcript_epoch_session_insert",
@@ -685,6 +687,12 @@ TRANSCRIPT_TRIGGERS = (
     "transcript_epoch_session_update",
 )
 TRANSCRIPT_TRIGGER_SQL = f"""
+CREATE TRIGGER IF NOT EXISTS transcript_epoch_message_replace BEFORE INSERT ON messages
+WHEN NEW.id IS NOT NULL AND EXISTS (SELECT 1 FROM messages _m WHERE _m.id = NEW.id)
+BEGIN {_transcript_bump_sql("(SELECT _m.session_id FROM messages _m WHERE _m.id = NEW.id), NEW.session_id")} END;
+CREATE TRIGGER IF NOT EXISTS transcript_epoch_message_insert_below_head AFTER INSERT ON messages
+WHEN EXISTS (SELECT 1 FROM messages _m WHERE _m.id > NEW.id)
+BEGIN {_transcript_bump_sql("NEW.session_id")} END;
 CREATE TRIGGER IF NOT EXISTS transcript_epoch_message_update
 AFTER UPDATE OF {", ".join(_TRANSCRIPT_MESSAGE_COLUMNS)} ON messages
 WHEN {_changed_sql(_TRANSCRIPT_MESSAGE_COLUMNS)}

@@ -251,3 +251,88 @@ def test_existing_database_gains_triggers_and_starts_at_epoch_zero(tmp_path):
         assert _bumps(reopened, SID, lambda: reopened.rewind_to_message(SID, row))
     finally:
         reopened.close()
+
+
+# ── round-2 review: raw-SQL paths the triggers must still catch ──────────
+
+
+def _raw(tmp_path, *statements):
+    conn = sqlite3.connect(str(tmp_path / "state.db"))
+    try:
+        for sql, args in statements:
+            conn.execute(sql, args)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_insert_or_replace_over_a_row_bumps(db, tmp_path):
+    row = db.append_message(SID, role="user", content="original")
+    before = db.get_transcript_epoch(SID)
+    _raw(tmp_path, ("INSERT OR REPLACE INTO messages(id, session_id, role, content, timestamp) "
+                    "VALUES (?, ?, 'user', 'replacement', 1)", (row, SID)))
+    assert db.get_messages(SID)[0]["content"] == "replacement"
+    assert db.get_transcript_epoch(SID) > before
+
+
+def test_backfill_insert_below_the_head_bumps(db, tmp_path):
+    one = db.append_message(SID, role="user", content="one")
+    two = db.append_message(SID, role="user", content="two")
+    three = db.append_message(SID, role="user", content="three")
+    _raw(tmp_path, ("DELETE FROM messages WHERE id = ?", (two,)))
+    before = db.get_transcript_epoch(SID)
+    _raw(tmp_path, ("INSERT INTO messages(id, session_id, role, content, timestamp, active) "
+                    "VALUES (?, ?, 'user', 'two', 1, 1)", (two, SID)))
+    assert [r["id"] for r in db.get_messages(SID)] == [one, two, three]
+    assert db.get_transcript_epoch(SID) > before
+
+
+def test_changing_a_message_id_bumps(db, tmp_path):
+    first = db.append_message(SID, role="user", content="one")
+    db.append_message(SID, role="user", content="two")
+    before = db.get_transcript_epoch(SID)
+    _raw(tmp_path, ("UPDATE messages SET id = 100 WHERE id = ?", (first,)))
+    assert db.get_transcript_epoch(SID) > before
+
+
+def test_a_tail_append_with_an_explicit_id_does_not_bump(db, tmp_path):
+    last = db.append_message(SID, role="user", content="one")
+    before = db.get_transcript_epoch(SID)
+    _raw(tmp_path, ("INSERT INTO messages(id, session_id, role, content, timestamp, active) "
+                    "VALUES (?, ?, 'user', 'tail', 1, 1)", (last + 5, SID)))
+    assert db.get_transcript_epoch(SID) == before
+
+
+def test_trigger_install_waits_out_a_held_write_lock(tmp_path):
+    """Round-2 finding 1: a lock during the trigger install used to be logged and
+    swallowed, opening the database with NO triggers. It must retry instead."""
+    path = tmp_path / "state.db"
+    first = SessionDB(path)
+    first.create_session(SID, "test")
+    row = first.append_message(SID, role="user", content="x")
+    first.close()
+    holder = sqlite3.connect(str(path), check_same_thread=False)
+    for (name,) in holder.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'transcript_epoch_%'").fetchall():
+        holder.execute(f"DROP TRIGGER {name}")
+    holder.commit()
+    holder.execute("BEGIN IMMEDIATE")
+    release = threading.Timer(2.5, holder.rollback)  # past the open's 1 s busy timeout
+    release.start()
+    try:
+        reopened = SessionDB(path)
+    finally:
+        release.join()
+        holder.close()
+    try:
+        with reopened._lock:
+            installed = reopened._conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'transcript_epoch_%'"
+            ).fetchone()[0]
+        from hermes_state_common import TRANSCRIPT_TRIGGERS
+        assert installed == len(TRANSCRIPT_TRIGGERS)
+        before = reopened.get_transcript_epoch(SID)
+        reopened._execute_write(lambda c: c.execute("UPDATE messages SET content = 'edited' WHERE id = ?", (row,)))
+        assert reopened.get_transcript_epoch(SID) > before
+    finally:
+        reopened.close()
