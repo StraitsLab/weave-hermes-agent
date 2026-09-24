@@ -496,3 +496,18 @@ def test_a_rewound_sequence_never_reissues_an_epoch(db):
     row = db.get_messages(SID)[0]["id"]
     db._execute_write(lambda c: c.execute("UPDATE messages SET content = 'edited' WHERE id = ?", (row,)))
     assert db.get_transcript_epoch(SID) > high
+
+
+def test_a_rewound_sequence_never_reissues_a_lineage_epoch(db):
+    """h6: the public epoch is a MAX over a lineage; a child edit after a
+    rewound sequence must still move it (recovery rewinds transcript_seq)."""
+    db.append_message(SID, role="user", content="root")
+    db.create_session("child", "test", parent_session_id=SID)
+    db.append_message("child", role="user", content="child")
+    db._execute_write(lambda c: c.execute("UPDATE sessions SET transcript_epoch = 7 WHERE id = ?", (SID,)))
+    db._execute_write(lambda c: c.execute("UPDATE state_meta SET value = '4' WHERE key = 'transcript_seq'"))
+    public = db.get_transcript_epoch(SID)
+    assert public == 7
+    row = db.get_messages("child")[0]["id"]
+    db._execute_write(lambda c: c.execute("UPDATE messages SET content = 'edited' WHERE id = ?", (row,)))
+    assert db.get_transcript_epoch(SID) > public

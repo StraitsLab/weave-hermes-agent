@@ -1042,6 +1042,9 @@ class SessionSchemaMixin:
         # Triggers are recreated whenever their stored body differs from the
         # current definition (CREATE TRIGGER IF NOT EXISTS would otherwise keep
         # an older body forever on an upgraded database).
+        # The bump reads MAX(sessions.transcript_epoch): keep that one seek.
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_transcript_epoch "
+                       "ON sessions(transcript_epoch)")
         self._install_transcript_triggers(cursor)
 
         # Heal NULL ``active`` rows unconditionally on every startup.

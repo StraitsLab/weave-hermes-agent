@@ -651,13 +651,16 @@ def _transcript_eligible_sql(alias: str) -> str:
 
 
 def _transcript_bump_sql(targets: str) -> str:
-    # The sequence never issues a value at or below an epoch a target already
-    # holds, so a copied or rewound state_meta (session recovery copies
-    # sessions first, then state_meta) cannot reissue an old epoch.
-    floor = f"(SELECT COALESCE(MAX(transcript_epoch), 0) FROM sessions WHERE id IN ({targets}))"
+    # One database-wide high-water mark: the next epoch is above both the
+    # stored sequence and EVERY epoch any session holds (one index seek on
+    # idx_sessions_transcript_epoch). A copied or rewound state_meta (session
+    # recovery copies sessions first, then state_meta) can therefore never
+    # reissue an epoch — not for the target, nor for any lineage whose public
+    # epoch is a MAX over several sessions.
+    high = "(SELECT COALESCE(MAX(transcript_epoch), 0) FROM sessions)"
     return (
-        f"INSERT INTO state_meta(key, value) VALUES ('transcript_seq', CAST({floor} + 1 AS TEXT)) "
-        f"ON CONFLICT(key) DO UPDATE SET value = CAST(MAX(CAST(value AS INTEGER), {floor}) + 1 AS TEXT); "
+        f"INSERT INTO state_meta(key, value) VALUES ('transcript_seq', CAST({high} + 1 AS TEXT)) "
+        f"ON CONFLICT(key) DO UPDATE SET value = CAST(MAX(CAST(value AS INTEGER), {high}) + 1 AS TEXT); "
         "UPDATE sessions SET transcript_epoch = "
         "(SELECT CAST(value AS INTEGER) FROM state_meta WHERE key = 'transcript_seq') "
         f"WHERE id IN ({targets});"
