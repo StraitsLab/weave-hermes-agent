@@ -292,3 +292,27 @@ symptom set of the wall-cap/CPU-starvation cause above, not an independent flake
 - tests/run_agent/test_moa_loop_mode.py::test_references_parallel_interrupt_aborts_wait
 - tests/test_pty_session.py::test_eof_marks_dead_and_closes_socket_4410
 - tests/tools/test_read_special_file_guard.py::TestReadFileToolFifoGuard::test_fifo_read_returns_note_instantly
+
+### Round-2 receipt — TWO CONSECUTIVE GREEN RUNS (goal met)
+
+Both runs are workflow `CI` on `codex/fork-ci-green`, PR #39 (draft, base `codex/wev-repin-v0.21.0`),
+with `Python tests / Run tests` and every other job green (incl. the `All required checks pass` gate).
+
+| run id | head | `Run tests` window (UTC) | wall time | conclusion |
+|---|---|---|---|---|
+| `35999001186` | `4d9e0e1dad` | 13:04:50 -> 13:28:00 | **1390s (~23m10s)** | success |
+| `36008814259` | `f2316a1c25` | 13:53:49 -> 14:26:00 | **1931s (~32m11s)** | success |
+
+- `f2316a1c25` is the merge of `origin/codex/wev-repin-v0.21.0` tip `ecc39eae` (fork #40, harso native
+  seams; 12 files, +1258/-104; ort merge, no conflicts) into `codex/fork-ci-green`, per the lead's
+  retry instruction. Fork #40's new test files (tests/cron/test_cron_run_credential.py,
+  tests/gateway/test_api_server_native_approval.py, tests/gateway/test_live_session_append.py,
+  tests/tools/test_api_server_approval.py additions, tests/acp/test_server.py additions) all run green
+  as merged - no new failure ids, so no new xfail marks (ruling 3: xfail ONLY what still fails).
+- Wall time grew 1390s -> 1931s with fork #40's added tests; still well under the ~60 min
+  single-job condition in LEAD RULING 1, so no `HERMES_TEST_SLICE` matrix is needed.
+- Wall-time knob: `HERMES_TEST_FILE_TIMEOUT` unchanged (300s x 2 attempts) - no file hit the wall cap
+  in either green run, so per LEAD RULING 1 no raise is justified.
+- This receipt commit is docs-only (`.lane/ci-triage.md`) and carries `[skip ci]` so it cannot
+  disturb the measured green streak; the two runs above are the two consecutive greens on
+  code-bearing heads.
