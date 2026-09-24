@@ -27,6 +27,16 @@ classify_jobs = _mod.classify_jobs
 
 DOCKER = "Docker Build, Test, and Publish"
 
+# The caller workflow that passes WATCH_WORKFLOWS exists upstream but was
+# trimmed from this fork — where it is absent there is nothing to verify.
+_CI_REVIEW_COMMENT = (
+    Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci-review-comment.yml"
+)
+_requires_caller = pytest.mark.skipif(
+    not _CI_REVIEW_COMMENT.exists(),
+    reason="ci-review-comment.yml is not in this fork's workflows; nothing to verify",
+)
+
 
 def _run(run_id: int, name: str, created_at: str) -> dict:
     return {"id": run_id, "name": name, "created_at": created_at}
@@ -88,6 +98,7 @@ def test_parse_watch_workflows_keeps_commas_inside_a_name():
     assert _mod.parse_watch_workflows("") == []
 
 
+@_requires_caller
 def test_workflow_watch_list_names_a_workflow_that_exists():
     """The names the workflow passes must match real workflow ``name:`` values.
 
@@ -115,6 +126,7 @@ def test_workflow_watch_list_names_a_workflow_that_exists():
     assert set(watched) <= known, f"unknown workflow names: {set(watched) - known}"
 
 
+@_requires_caller
 def test_poller_never_watches_its_own_workflow():
     """The poller's own run must never gate completion.
 

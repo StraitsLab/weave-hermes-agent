@@ -394,9 +394,17 @@ class TestAgentBrowserPostSetup:
             yield stub
 
     def test_warns_when_neither_npx_nor_agent_browser_on_path(self):
+        # The resolution seam is _find_agent_browser (PATH -> Homebrew/
+        # Hermes-managed node -> local .bin -> npx), not a bare shutil.which;
+        # stubbing only which() lets the later cascade rungs resolve for real
+        # (or fall through the mocked subprocess probes), so pin the seam
+        # itself to the real "nothing resolves" outcome: FileNotFoundError.
         with patch("shutil.which", return_value=None), patch(
-            "subprocess.run"
-        ) as run, patch("hermes_cli.tools_config._print_warning") as warn:
+            "tools.browser_tool._find_agent_browser",
+            side_effect=FileNotFoundError("no npx / agent-browser"),
+        ), patch("subprocess.run") as run, patch(
+            "hermes_cli.tools_config._print_warning"
+        ) as warn:
             _run_post_setup("agent_browser")
 
         run.assert_not_called()

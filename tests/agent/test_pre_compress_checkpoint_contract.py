@@ -342,7 +342,13 @@ def test_compressed_summary_column_is_added_to_legacy_databases(tmp_path):
     SessionDB(db_path)
 
     # Simulate a pre-upgrade database: the marker column does not exist.
+    # A real pre-upgrade database also predates the transcript-epoch update
+    # trigger that lists the column (_TRANSCRIPT_MESSAGE_COLUMNS), and modern
+    # SQLite refuses ALTER TABLE ... DROP COLUMN while a trigger references
+    # the column ("error in trigger ... no such column: OLD._compressed_summary"),
+    # so the dependent trigger goes first — exactly the legacy shape.
     conn = sqlite3.connect(db_path)
+    conn.execute("DROP TRIGGER IF EXISTS transcript_epoch_message_update")
     conn.execute("ALTER TABLE messages DROP COLUMN _compressed_summary")
     conn.commit()
     legacy_cols = {

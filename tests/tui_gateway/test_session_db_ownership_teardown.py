@@ -407,11 +407,15 @@ def test_deferred_build_closes_the_handle_when_the_session_is_reaped_midbuild(
     handle has to be closed right here instead of handed over.
     """
 
+    captured: dict = {}
+
     def _fake_make_agent(sid, key, session_db=None, **_kwargs):
         # Simulate a concurrent reap landing while the agent was being built.
         with server._sessions_lock:
             server._sessions[sid] = {"session_key": "someone-else"}
-        return types.SimpleNamespace(_session_db=session_db, _owns_session_db=False)
+        agent = types.SimpleNamespace(_session_db=session_db, _owns_session_db=False)
+        captured["agent"] = agent
+        return agent
 
     monkeypatch.setattr(server, "_make_agent", _fake_make_agent)
     sid, session = "sid-reaped", _session(build_env.profile_home)
@@ -421,7 +425,10 @@ def test_deferred_build_closes_the_handle_when_the_session_is_reaped_midbuild(
 
     db = build_env.opened[0]
     assert db.closed == 1
-    assert session["agent"]._owns_session_db is False
+    # The discarded agent kept no ownership and was never handed into the
+    # swapped-out session (which legitimately keeps no "agent" key at all).
+    assert captured["agent"]._owns_session_db is False
+    assert "agent" not in session
 
 
 def test_deferred_build_never_opens_or_closes_for_the_launch_profile(
