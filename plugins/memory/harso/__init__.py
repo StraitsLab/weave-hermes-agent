@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List
@@ -16,6 +17,12 @@ logger = logging.getLogger(__name__)
 _TIMEOUT_SECONDS = 5
 _MAX_CONTEXT_ITEMS = 5
 _MAX_CONTEXT_TEXT = 1200
+_P = r"(?:0\.[0-9]{2}|1\.00)"
+_ACTION = rf"external action: (?:likely|unlikely|unsure) \({_P}\)"
+# WEV-1850: the fixed vocabulary weave-api's RoutingHint.line() generates. No
+# free text can match, so nothing instruction-shaped reaches the chat model.
+_ROUTING_HINT = re.compile(
+    rf"Routing hint: (?:(?:inline|work) \({_P}\)(?:; {_ACTION})?|none; {_ACTION})")
 
 
 class HarsoWriteError(RuntimeError):
@@ -127,15 +134,20 @@ class HarsoMemoryProvider(MemoryProvider):
         )
         if not response:
             return ""
+        # Jev's advisory hint is independent of recall: it renders with or
+        # without admitted memory, after items and gaps. Anything else drops.
+        hint = response.get("routing_hint")
+        hint = hint.strip() if isinstance(hint, str) and len(hint.strip()) <= 200 else ""
+        hint = hint if _ROUTING_HINT.fullmatch(hint) else ""
         # Explicit recall status supersedes the legacy degraded boolean.
         if "recall_status" in response:
             if response["recall_status"] not in ("ok", "degraded"):
-                return ""
+                return hint
         elif response.get("degraded") is True:
-            return ""
+            return hint
         items = response.get("items")
         if not isinstance(items, list):
-            return ""
+            return hint
         context = []
         for item in items[:_MAX_CONTEXT_ITEMS]:
             if not isinstance(item, dict):
@@ -158,6 +170,8 @@ class HarsoMemoryProvider(MemoryProvider):
                        )][:5]
             if reasons:
                 context.append("Memory gaps: " + ", ".join(reasons))
+        if hint:
+            context.append(hint)
         return "\n".join(context)
 
     def sync_turn(
