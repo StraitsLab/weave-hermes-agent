@@ -183,6 +183,13 @@ def _classify_write_denial(path: str) -> Optional[str]:
                 return "credential"
         except Exception:
             pass
+        # vault/: key + ciphertext side by side (agent/vault_store.py) — credential material.
+        try:
+            vault_real = os.path.realpath(os.path.join(base_real, "vault"))
+            if resolved == vault_real or resolved.startswith(vault_real + os.sep):
+                return "credential"
+        except Exception:
+            pass
 
     safe_roots = get_safe_write_roots()
     if safe_roots:
@@ -400,6 +407,31 @@ def get_read_block_error(path: str) -> Optional[str]:
             "snapshot (copied cookies/logins) and cannot be read directly. "
             "(Defense-in-depth — not a security boundary; the terminal tool "
             "can still bypass.)"
+        )
+
+    # vault/: vault.key + vault.json.enc sit side by side; key + ciphertext = plaintext, so the
+    # whole directory is one credential (upstream vault port @49b4286a22).
+    for hd in hermes_dirs:
+        try:
+            vault_dir = (hd / "vault").resolve()
+        except Exception:
+            continue
+        if resolved == vault_dir:
+            return (
+                f"Access denied: {path} is the Hermes credential vault directory "
+                "and cannot be read directly (secrets are filled server-side by "
+                "browser_vault_fill). (Defense-in-depth — not a security boundary; "
+                "the terminal tool can still bypass.)"
+            )
+        try:
+            resolved.relative_to(vault_dir)
+        except ValueError:
+            continue
+        return (
+            f"Access denied: {path} is inside the Hermes credential vault "
+            "(encrypted secrets + local key) and cannot be read directly "
+            "(browser_vault_fill resolves them server-side). (Defense-in-depth — "
+            "not a security boundary; the terminal tool can still bypass.)"
         )
 
     # Block common secret-bearing project-local .env files anywhere on disk.

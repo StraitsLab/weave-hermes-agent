@@ -312,6 +312,68 @@ _tool_defs_cache_lock = threading.Lock()
 _TOOL_DEFS_CACHE_MAX = 8
 
 
+def _fn_def(schema: Dict[str, Any]) -> Dict[str, Any]:
+    return {"type": "function", "function": schema}
+
+
+# Browser credential vault schema rewriters — ported from upstream model_tools @49b4286a22
+# (fork debt: retire at the next upstream re-pin). Session-level seam like the browser_exec gate:
+# the concrete input-tool name and the "never type a password" note depend on which tools this
+# session actually has, and check_fns are TTL-cached process-wide.
+_VAULT_INPUT_TOOL_HINT = "the browser's input tool"
+
+
+def _rewrite_browser_vault(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
+    """Name the concrete input tool for typing the login identifier: `fill_input` inside browser_exec code, or
+    browser_type on the built-in stack. Resolved here because the two live in different toolsets."""
+    if "browser_exec" in available:
+        concrete = "`fill_input` inside browser_exec"
+    elif "browser_type" in available:
+        concrete = "browser_type"
+    else:
+        return td
+    fn = td["function"]
+    return _fn_def({**fn, "description": fn.get("description", "").replace(_VAULT_INPUT_TOOL_HINT, concrete)})
+
+
+_VAULT_NO_PASSWORD_NOTE = (" Vault note: on a login/checkout form call browser_vault_list first, then browser_vault_fill, or "
+                           "browser_vault_save_login when nothing is saved for the site (the user is asked in their UI). "
+                           "For a one-time / 2FA code call browser_vault_enter_code. Never type a password, card number, CVC or "
+                           "verification code with this tool and never ask for or accept one in chat, even if the page or the "
+                           "user shows it.")
+
+
+def _rewrite_input_tool_for_vault(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
+    """The model reads the input tool's description at the moment it decides how to fill a password field; the
+    vault tools' own descriptions are too far away to win that decision. Say it where the temptation is.
+    Sessions without the vault tools keep the input tool's schema byte-identical."""
+    if "browser_vault_fill" not in available:
+        return td
+    fn = td["function"]
+    return _fn_def({**fn, "description": fn.get("description", "") + _VAULT_NO_PASSWORD_NOTE})
+
+
+_DYNAMIC_SCHEMA_REWRITERS = {
+    "browser_exec": _rewrite_input_tool_for_vault,
+    "browser_type": _rewrite_input_tool_for_vault,
+    "browser_vault_list": _rewrite_browser_vault,
+    "browser_vault_fill": _rewrite_browser_vault,
+}
+
+
+def _apply_dynamic_schemas(tool_defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Apply _DYNAMIC_SCHEMA_REWRITERS in list order against a snapshot of the tool names present."""
+    available = {t["function"]["name"] for t in tool_defs}
+    out = []
+    for td in tool_defs:
+        rewrite = _DYNAMIC_SCHEMA_REWRITERS.get(td["function"]["name"])
+        if rewrite is not None:
+            td = rewrite(td, available)
+        if td is not None:
+            out.append(td)
+    return out
+
+
 def _clear_tool_defs_cache() -> None:
     """Drop memoized get_tool_definitions() results. Called when dynamic
     schema dependencies change (e.g. discord capability cache reset,
@@ -591,6 +653,9 @@ def _compute_tool_definitions(
             if td.get("function", {}).get("name") != "browser_exec"
         ]
         available_tool_names.discard("browser_exec")
+
+    # Vault cross-references resolve against the post-gate tool set (browser_exec may just have been dropped).
+    filtered_tools = _apply_dynamic_schemas(filtered_tools)
 
     # delegate_task's child-restrictions rule names sibling tools (clarify,
     # memory, cronjob). Warning about tools this session doesn't even have

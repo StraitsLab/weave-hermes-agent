@@ -2849,6 +2849,12 @@ def register_gateway_notify(session_key: str, cb) -> None:
         _gateway_notify_cbs[session_key] = cb
 
 
+def _gateway_notify_cb(session_key: str):
+    """The session's registered gateway approval notifier, or None (upstream accessor @49b4286a22)."""
+    with _lock:
+        return _gateway_notify_cbs.get(session_key)
+
+
 def unregister_gateway_notify(session_key: str) -> None:
     """Unregister the per-session gateway approval callback.
 
@@ -3214,7 +3220,8 @@ def prompt_dangerous_approval(command: str, description: str,
                               allow_permanent: bool = True,
                               approval_callback=None,
                               *, allow_session: bool = True,
-                              smart_denied: bool = False) -> str:
+                              smart_denied: bool = False,
+                              title: str | None = None) -> str:
     """Prompt the user to approve a dangerous command (CLI only).
 
     Args:
@@ -3256,7 +3263,19 @@ def prompt_dangerous_approval(command: str, description: str,
             approval_callback,
             allow_session=allow_session,
             smart_denied=smart_denied,
+            title=title,
         )
+
+
+def _callback_accepts(callback, keyword: str) -> bool:
+    """True when *callback* takes ``keyword`` (or ``**kwargs``): approval callbacks predate ``title``
+    and a TypeError inside the callback would read as a deny (upstream ``callback_accepts``)."""
+    import inspect
+    try:
+        params = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _prompt_dangerous_approval_inner(command: str, description: str,
@@ -3264,7 +3283,8 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                                      allow_permanent: bool = True,
                                      approval_callback=None,
                                      *, allow_session: bool = True,
-                                     smart_denied: bool = False) -> str:
+                                     smart_denied: bool = False,
+                                     title: str | None = None) -> str:
     # Redact secrets before any user-visible rendering. The original
     # `command` is still what executes after approval; only the displayed
     # copy is scrubbed. Reuses the same redaction module used for memory
@@ -3284,6 +3304,8 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                 callback_kwargs["allow_session"] = False
             if smart_denied:
                 callback_kwargs["smart_denied"] = True
+            if title and _callback_accepts(approval_callback, "title"):
+                callback_kwargs["title"] = title
             return approval_callback(
                 display_command, display_description, **callback_kwargs
             )
@@ -5890,6 +5912,7 @@ def request_elicitation_consent(
     *,
     timeout_seconds: int | None = None,
     surface: str = "mcp-elicitation",
+    title: str = "Confirm this action?",
 ) -> str:
     """Route an MCP elicitation request to whichever approval surface owns
     the active session and return a normalized result.
@@ -5912,8 +5935,7 @@ def request_elicitation_consent(
         return "decline"
 
     if _is_gateway_approval_context():
-        with _lock:
-            notify_cb = _gateway_notify_cbs.get(session_key)
+        notify_cb = _gateway_notify_cb(session_key)
         if notify_cb is None:
             logger.warning(
                 "Elicitation requested in gateway session %s but no "
@@ -5955,6 +5977,7 @@ def request_elicitation_consent(
             description,
             timeout_seconds=timeout_seconds,
             allow_permanent=False,
+            title=title,
         )
     except Exception as exc:
         logger.error(
