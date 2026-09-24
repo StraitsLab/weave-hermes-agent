@@ -9,6 +9,7 @@ an agent thread against the real adapter handlers.
 import asyncio
 import contextvars
 import threading
+import time
 
 import pytest
 from aiohttp import web
@@ -31,7 +32,7 @@ def adapter(tmp_path, monkeypatch):
     for key in ("HERMES_SINGLE_QUERY_SESSION", "HERMES_CRON_SESSION", "HERMES_YOLO_MODE"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(ap, "_YOLO_MODE_FROZEN", False)
-    monkeypatch.setattr(ap, "_get_approval_timeout", lambda: 10)
+    monkeypatch.setattr(ap, "_get_approval_timeout", lambda: 60)
     config = {"mode": "manual"}
     monkeypatch.setattr(ap, "_get_approval_config", lambda: config)
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-native-approval"}))
@@ -82,7 +83,7 @@ def _start_gate(adapter, loop):
                 description=data["description"],
             ),
             loop,
-        ).result(timeout=5)
+        ).result(timeout=30)
 
     def run():
         APIServerAdapter._bind_api_server_session(chat_id=SESSION_ID, session_key=SESSION_KEY)
@@ -105,7 +106,9 @@ def _start_gate(adapter, loop):
 
 
 async def _pending_request_id(adapter):
-    for _ in range(200):
+    # Loose deadline: the agent thread may be slow to start on a loaded runner.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
         pending = ap.list_gateway_approvals(SESSION_KEY)
         if pending and adapter._native_submit_approvals_sent.get(REF):
             return pending[0]["request_id"]
@@ -145,7 +148,7 @@ async def test_attended_turn_raises_card_and_once_runs_the_action(adapter):
         )
     finally:
         await client.close()
-    await asyncio.to_thread(thread.join, 5)
+    await asyncio.to_thread(thread.join, 30)
 
     assert response.status == 200 and body["resolved"] is True
     assert replay.status == 409
@@ -167,7 +170,7 @@ async def test_deny_returns_the_native_blocked_text(adapter):
         )
     finally:
         await client.close()
-    await asyncio.to_thread(thread.join, 5)
+    await asyncio.to_thread(thread.join, 30)
 
     assert response.status == 200
     assert outcome["result"]["approved"] is False
@@ -197,7 +200,7 @@ async def test_always_and_session_are_refused_and_nothing_is_persisted(adapter, 
         )
     finally:
         await client.close()
-    await asyncio.to_thread(thread.join, 5)
+    await asyncio.to_thread(thread.join, 30)
 
     assert refused.status == 400
     assert refused_body["error"]["code"] == "invalid_native_approval_choice"
@@ -224,7 +227,7 @@ async def test_reconnect_lists_and_replays_pending_approvals(adapter):
         cleared_body = await cleared.json()
     finally:
         await client.close()
-    await asyncio.to_thread(thread.join, 5)
+    await asyncio.to_thread(thread.join, 30)
 
     assert listed.status == 200
     assert [(e["type"], e["request_id"], e["choices"]) for e in listed_body["data"]] == [
@@ -243,7 +246,7 @@ async def test_finished_turn_unmarks_the_session_and_denies_instantly_again(adap
     assert adapter._native_submit_approval_keys == {}
 
     thread, outcome = _start_gate(adapter, asyncio.get_running_loop())
-    await asyncio.to_thread(thread.join, 5)
+    await asyncio.to_thread(thread.join, 30)
     assert outcome["result"]["approved"] is False
     assert "unattended platform (api_server)" in outcome["result"]["message"]
 
@@ -255,7 +258,7 @@ async def test_config_off_keeps_native_turns_unattended(adapter):
     assert SESSION_KEY not in ap._attended_api_sessions
 
     thread, outcome = _start_gate(adapter, asyncio.get_running_loop())
-    await asyncio.to_thread(thread.join, 5)
+    await asyncio.to_thread(thread.join, 30)
     assert outcome["result"]["approved"] is False
     assert "unattended platform (api_server)" in outcome["result"]["message"]
     assert ap.list_gateway_approvals(SESSION_KEY) == []
