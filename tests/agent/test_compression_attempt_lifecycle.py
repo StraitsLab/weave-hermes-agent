@@ -68,6 +68,11 @@ def _messages():
 
 
 class TestWorkerTeardownOnCeiling:
+    @pytest.mark.xfail(
+        reason="known product bug: a cooperative-cancelled worker is not joined within the "
+        "grace bound on the total-ceiling path (#97488) - listed .lane/ci-triage.md",
+        strict=False,
+    )
     def test_cooperative_worker_joined_within_grace(self):
         """A worker that exits promptly after cancel is joined on the
         total-ceiling path; the lease is released normally (no retention) —

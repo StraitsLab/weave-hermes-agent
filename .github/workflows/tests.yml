@@ -14,13 +14,29 @@ concurrency:
 jobs:
   test:
     name: Run tests
-    # One 96-core runner for the whole suite. There is no slicing. Slicing
-    # existed to spread the suite over 4-core runners. It cost a matrix job, a
-    # duration cache, a per-slice artifact and a merge job to do it.
+    # Standard GitHub-hosted ubuntu-latest (4 vCPU / 16 GB). The org's larger
+    # runner pools queue indefinitely, so this is the only runner available
+    # (0c59ab69cf, afa97358e6). The 96-core EPYC 7763 this job used to run on
+    # is gone.
     #
-    # 96 cores clear the floor that the slowest single test file sets (about
-    # 82s). A second slice divides work that is already at that floor, and
-    # adds a second setup.
+    # One job, workers = the runner's REAL core count. The runner this job gets
+    # is standard GitHub-hosted ubuntu-latest, 4 vCPU / 16 GB — the step below
+    # echoes it live (`▸ runner: 4 cores, MemTotal: 16373452 kB`).
+    #
+    # Fix: the former `HERMES_TEST_WORKERS=96` claimed 96 workers on 4 cores, so
+    # each of the 96 test subprocesses got ~4% of one core and every wall-clock
+    # bound and every 30-300s subprocess timeout in the suite blew out. That is
+    # what produced the rotating failure sets, not flaky tests.
+    #
+    # No slice matrix, deliberately. Measured at workers=$(nproc): one half of
+    # the suite (1756 files, 21122 tests) runs in 778.8s at 4 workers, so a whole
+    # job is on the order of 30 min of tests — well under the ~60 min at which a
+    # slice matrix would start to pay for itself. A 2-slice matrix was tried first
+    # and reverted here: it renamed this check away from `Run tests`, and setting
+    # HERMES_TEST_SLICE exported it into the runner's own self-tests, so
+    # tests/test_run_tests_parallel.py sliced its two probe dirs down to one.
+    # If the suite ever grows past ~60 min per job, HERMES_TEST_SLICE / --slice in
+    # scripts/run_tests_parallel.py is the existing, sanctioned knob to reach for.
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -96,30 +112,32 @@ jobs:
         # No --files: the runner discovers the suite itself. The discovered
         # set is identical to the list the removed matrix job used to pass in.
         run: |
+          set -euo pipefail
           source .venv/bin/activate
-          scripts/run_tests.sh
+          CORES="$(nproc)"
+          echo "▸ runner: $CORES cores, $(grep -m1 MemTotal /proc/meminfo | tr -s ' ')"
+          echo "▸ HERMES_TEST_WORKERS=$CORES (one per core)"
+          START=$(date +%s)
+          trap 'echo "▸ Run tests wall time: $(( $(date +%s) - START ))s"' EXIT
+          HERMES_TEST_WORKERS="$CORES" scripts/run_tests.sh
         env:
           # This is the maximum number of test FILES that run together.
           # run_tests_parallel.py starts one pytest subprocess for each file
           # from a single ThreadPoolExecutor, so this value IS the limit. The
-          # default is cpu_count*2, which is 192 here.
+          # default is cpu_count*2.
           #
-          # Measured on this runner (96-core EPYC 7763, 377GB). Whole suite,
-          # two repetitions for each value. See run 32549672063:
+          # One worker per core. Measured on the 96-core runner this suite
+          # used to run on (run 32549672063, two reps per value): 48 workers
+          # 138s, 96w 126s, 144w 132s, 192w 132s, 240w 140s, 288w 142s. The
+          # curve is shallow and one worker per core wins; workers above the
+          # core count only add contention.
           #
-          #     workers   x cores   mean
-          #        48       0.5x    138s
-          #        96       1.0x    126s   <- fastest
-          #       144       1.5x    132s
-          #       192       2.0x    132s
-          #       240       2.5x    140s
-          #       288       3.0x    142s
-          #
-          # One worker for each core wins. The curve is shallow: 126s to 142s
-          # across a 6x range. The suite has sufficient concurrency at this
-          # size. The remaining time is the slowest files plus the setup.
-          # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
+          # It is set from `$(nproc)` in the step above rather than hard-coded
+          # here: `env:` values are not shell-expanded, and a hard-coded count
+          # is exactly what went stale. 96 belonged to the 96-core runner and
+          # was left behind when the job moved to ubuntu-latest — 96 pytest
+          # processes then competed for 4 cores, every file blew its 300s
+          # per-file wall cap, and "Run tests" failed differently each run.
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
