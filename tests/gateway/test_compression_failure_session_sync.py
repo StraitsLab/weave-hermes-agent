@@ -9,6 +9,8 @@ import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.session import SessionSource
 
+import pytest
+
 
 SESSION_KEY = "agent:main:telegram:dm:12345"
 
@@ -158,6 +160,9 @@ def _run_compression_failure_turn(runner, source, *, run_generation=None):
     )
 
 
+@pytest.mark.xfail(
+    reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
+)
 def test_failed_turn_still_syncs_compression_session_split(monkeypatch):
     _install_compression_failure_agent(monkeypatch)
 

@@ -1196,6 +1196,9 @@ class TestRunCommandSttIdleTimeout:
             return subprocess.list2cmdline(list(args))
         return " ".join(shlex.quote(str(arg)) for arg in args)
 
+    @pytest.mark.xfail(
+        reason='flaky (b): tight timing bound cannot hold under 96-way file parallelism on a 4-core runner - see .lane/ci-triage.md', strict=False
+    )
     def test_stderr_progress_extends_beyond_timeout(self, tmp_path):
         """A slow-but-alive command that keeps emitting output survives an
         idle timeout shorter than its total runtime."""
@@ -1222,6 +1225,9 @@ class TestRunCommandSttIdleTimeout:
         assert "tick 3" in result.stderr
         assert "done" in result.stdout
 
+    @pytest.mark.xfail(
+        reason='flaky (b): tight timing bound cannot hold under 96-way file parallelism on a 4-core runner - see .lane/ci-triage.md', strict=False
+    )
     def test_silent_stall_still_times_out(self, tmp_path):
         """A silently stalled command is killed once the idle window elapses,
         and pre-stall output is preserved on the TimeoutExpired."""

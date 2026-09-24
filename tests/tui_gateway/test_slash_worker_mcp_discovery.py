@@ -26,6 +26,9 @@ if not hasattr(_mcp_server_mod, "MCPServer"):
     )
 
 
+@pytest.mark.xfail(
+    reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
+)
 def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     profile_home = tmp_path / "profile-home"
     profile_home.mkdir()

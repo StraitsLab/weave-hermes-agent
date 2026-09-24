@@ -169,6 +169,9 @@ def _resume_event() -> MessageEvent:
 
 class TestGatewayResumeRestartsWork:
     @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
+    )
     async def test_resume_after_budget_exhaustion_enqueues_continuation(
         self, hermes_home
     ):

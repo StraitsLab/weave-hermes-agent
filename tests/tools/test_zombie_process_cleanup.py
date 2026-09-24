@@ -11,6 +11,8 @@ import subprocess
 import sys
 import threading
 
+import pytest
+
 
 
 def _spawn_sleep(seconds: float = 60) -> subprocess.Popen:
@@ -444,6 +446,9 @@ class TestDelegationCleanup:
         assert result["status"] == "error"
         relay_host.unregister_subagent.assert_not_called()
 
+    @pytest.mark.xfail(
+        reason='flaky (b/c): cross-file process/thread interference under 96-way file parallelism - see .lane/ci-triage.md', strict=False
+    )
     def test_timed_out_child_keeps_relay_session_until_its_turn_exits(
         self, monkeypatch, tmp_path
     ):

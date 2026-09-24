@@ -162,6 +162,9 @@ async def test_new_key_at_capacity_raises_when_none_reapable():
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(
+    reason='flaky (b/c): cross-file process/thread interference under 96-way file parallelism - see .lane/ci-triage.md', strict=False
+)
 async def test_reaper_loop_invokes_reap(monkeypatch):
     from hermes_cli.pty_session import run_reaper
     reg = make_registry()

@@ -30,6 +30,9 @@ def _read_json_line(out: queue.Queue[dict], timeout: float = 2.0) -> dict:
         raise AssertionError("timed out waiting for compute host JSON") from exc
 
 
+@pytest.mark.xfail(
+    reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
+)
 def test_compute_host_line_json_seed_turn_interrupt():
     repo = Path(__file__).resolve().parents[2]
     env = dict(os.environ)

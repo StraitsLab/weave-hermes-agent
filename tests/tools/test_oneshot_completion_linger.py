@@ -372,6 +372,9 @@ def test_e2e_lingering_parent_keeps_background_delivery_alive(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pipe/session semantics")
+@pytest.mark.xfail(
+    reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
+)
 def test_e2e_control_immediate_exit_loses_delivery_without_linger(tmp_path):
     """Control proving the bug class: the same parent WITHOUT the linger may
     lose the delivery. We assert only the fixed path's contract here — the

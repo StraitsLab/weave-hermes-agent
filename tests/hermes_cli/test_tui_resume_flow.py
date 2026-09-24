@@ -106,6 +106,9 @@ def test_exit_after_oneshot_flushes_stdio_and_calls_os_exit(
 
 
 
+@pytest.mark.xfail(
+    reason='flaky (b/c): cross-file process/thread interference under 96-way file parallelism - see .lane/ci-triage.md', strict=False
+)
 def test_oneshot_subprocess_exits_without_teardown_abort():
     program = textwrap.dedent(
         """

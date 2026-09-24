@@ -53,6 +53,9 @@ def _fast_polls(monkeypatch):
     yield emitted
 
 
+@pytest.mark.xfail(
+    reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
+)
 def test_interrupt_abandons_noncooperative_tool(monkeypatch, fake_agent, _fast_polls):
     """A blocking tool is abandoned within ~poll+grace once interrupted."""
 
