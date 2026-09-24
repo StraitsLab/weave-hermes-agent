@@ -678,6 +678,7 @@ def _changed_sql(columns) -> str:
 
 
 TRANSCRIPT_TRIGGERS = (
+    "transcript_epoch_message_id_immutable",
     "transcript_epoch_message_replace",
     "transcript_epoch_message_insert_below_head",
     "transcript_epoch_message_update",
@@ -687,8 +688,11 @@ TRANSCRIPT_TRIGGERS = (
     "transcript_epoch_session_update",
 )
 TRANSCRIPT_TRIGGER_SQL = f"""
+CREATE TRIGGER IF NOT EXISTS transcript_epoch_message_id_immutable BEFORE UPDATE ON messages
+WHEN OLD.id IS NOT NEW.id
+BEGIN SELECT RAISE(ABORT, 'messages.id is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS transcript_epoch_message_replace BEFORE INSERT ON messages
-WHEN NEW.id IS NOT NULL AND EXISTS (SELECT 1 FROM messages _m WHERE _m.id = NEW.id)
+WHEN NEW.id > 0 AND EXISTS (SELECT 1 FROM messages _m WHERE _m.id = NEW.id)
 BEGIN {_transcript_bump_sql("(SELECT _m.session_id FROM messages _m WHERE _m.id = NEW.id), NEW.session_id")} END;
 CREATE TRIGGER IF NOT EXISTS transcript_epoch_message_insert_below_head AFTER INSERT ON messages
 WHEN EXISTS (SELECT 1 FROM messages _m WHERE _m.id > NEW.id)

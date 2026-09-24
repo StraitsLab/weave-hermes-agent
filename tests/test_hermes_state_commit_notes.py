@@ -287,12 +287,35 @@ def test_backfill_insert_below_the_head_bumps(db, tmp_path):
     assert db.get_transcript_epoch(SID) > before
 
 
-def test_changing_a_message_id_bumps(db, tmp_path):
+@pytest.mark.parametrize("sql", [
+    "UPDATE messages SET id = 100 WHERE id = ?",
+    "UPDATE messages SET rowid = 100 WHERE id = ?",
+    "UPDATE messages SET oid = 100 WHERE id = ?",
+    "UPDATE messages SET _rowid_ = 100 WHERE id = ?",
+])
+def test_message_ids_are_immutable(db, tmp_path, sql):
     first = db.append_message(SID, role="user", content="one")
     db.append_message(SID, role="user", content="two")
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        _raw(tmp_path, (sql, (first,)))
+    assert [r["content"] for r in db.get_messages(SID)] == ["one", "two"]
+
+
+def test_update_or_replace_onto_another_id_is_refused(db, tmp_path):
+    kept = db.append_message(SID, role="user", content="will not vanish")
+    db.create_session("other", "test")
+    moved = db.append_message("other", role="user", content="moved")
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        _raw(tmp_path, ("UPDATE OR REPLACE messages SET id = ? WHERE id = ?", (kept, moved)))
+    assert [r["id"] for r in db.get_messages(SID)] == [kept]
+
+
+def test_appends_after_a_negative_id_row_do_not_bump(db, tmp_path):
+    _raw(tmp_path, ("INSERT INTO messages(id, session_id, role, content, timestamp, active) "
+                    "VALUES (-1, ?, 'user', 'imported', 1, 1)", (SID,)))
     before = db.get_transcript_epoch(SID)
-    _raw(tmp_path, ("UPDATE messages SET id = 100 WHERE id = ?", (first,)))
-    assert db.get_transcript_epoch(SID) > before
+    db.append_message(SID, role="user", content="ordinary append")
+    assert db.get_transcript_epoch(SID) == before
 
 
 def test_a_tail_append_with_an_explicit_id_does_not_bump(db, tmp_path):
