@@ -925,6 +925,36 @@ class TestTwoFactor:
         assert out["success"] and out["origin"] == "https://trusted.example"
         assert json.dumps("https://trusted.example") in seen["expr"]  # in-page TOCTOU assert binds the item origin
 
+    @pytest.mark.parametrize("mode", ["returned", "raised"])
+    def test_code_echoed_by_a_failed_injection_is_scrubbed(self, store, mode):
+        """Fork fix: a page exception can echo the injected code. Returned and raised injection errors go through
+        the forced vault redactor before truncation, matching the password path."""
+        from agent import redact
+        from tools import browser_vault_tool
+
+        meta = store.add_item("login", "gh", {"identifier_type": "username", "identifier": "tek", "password": "pw",
+                                              "otp_secret": "JBSWY3DPEHPK3PXP"}, origin="https://trusted.example")
+        controls = [{"index": 0, "type": "text", "name": "otp", "autocomplete": "one-time-code"}]
+        code = "481516"
+
+        def failing_secret(t, e):
+            if mode == "raised":
+                raise RuntimeError(f"Uncaught Error: {code}")
+            return {"success": False, "error": f"Uncaught Error: {code}"}
+
+        try:
+            with patch("agent.vault_store.get_vault_store", return_value=store), \
+                 patch("agent.vault_backends.local.LocalLoginBackend.resolve_otp", return_value=code), \
+                 patch.object(browser_vault_tool, "_focus_bound_origin", lambda t, o, k: o or None), \
+                 patch.object(browser_vault_tool, "_eval_js", return_value={"success": True, "result": json.dumps(controls)}), \
+                 patch.object(browser_vault_tool, "_eval_js_secret", side_effect=failing_secret):
+                raw = browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t")
+        finally:
+            redact.clear_vault_redaction_values()
+        out = json.loads(raw)
+        assert out["success"] is False and code not in raw
+        assert "«redacted-vault-secret»" in out["error"]
+
     def test_unknown_handle_resolves_and_prompts_nothing(self, store):
         from agent.vault_backends import unlock as unlock_mod
         from tools import browser_vault_tool

@@ -342,7 +342,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     authenticator seed, the code is minted server-side and nobody is asked; otherwise the user is prompted on
     their surface for the code their phone/email/app shows. The code goes into the page over the supervisor
     socket and never enters the conversation."""
-    from agent.redact import register_vault_redaction_value
+    from agent.redact import redact_sensitive_text, register_vault_redaction_value
     from agent.vault_backends import UnlockRequired, backend_for_handle
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
@@ -406,10 +406,19 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
     register_vault_redaction_value(code)
     fills = build_otp_fills(otp_controls, code)
-    result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
-    del code
+    # Fork fix (not upstream @49b4286a22): a page exception can echo the injected code, so every error that leaves
+    # this function goes through the forced vault redactor (the code is registered above) BEFORE truncation.
+    try:
+        result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    except Exception as exc:
+        return json.dumps({"success": False, "error": redact_sensitive_text(str(exc), force=True)[:200]})
+    finally:
+        del code
     if not result.get("success"):
-        return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
+        out = {"success": False, "error": redact_sensitive_text(str(result.get("error") or "fill failed"), force=True)[:200]}
+        if result.get("error_type"):
+            out["error_type"] = result["error_type"]
+        return json.dumps(out)
     parsed = _parse_json_result(result.get("result"))
     if isinstance(parsed, str):
         parsed = _parse_json_result(parsed)

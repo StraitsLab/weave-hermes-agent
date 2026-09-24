@@ -790,6 +790,36 @@ class TestVaultEgressRedaction:
         assert secret not in json.dumps(result, ensure_ascii=False)
         assert "«redacted-vault-secret»" in result["text_summary"]
 
+    @pytest.mark.parametrize("native", [False, True])
+    def test_vault_secret_in_the_screenshot_filename_never_leaves(self, tmp_path, monkeypatch, native):
+        """Fork fix: screenshot_path is read from RAW stdout. A registered value inside the filename must be
+        scrubbed from every emitted copy (JSON, multimodal text/meta), while the real file is still attached."""
+        from agent import redact
+
+        secret = "vaultcanaryinfilename803"
+        shot = tmp_path / f"{secret}.png"
+        loaded = []
+        # The child writes the image itself, so the freshness check never races a loaded host.
+        cli = _fake_cli(tmp_path, f'cat > /dev/null\nprintf "PNG" > "{shot}"\necho "{shot}"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr("tools.vision_tools._should_use_native_vision_fast_path", lambda: native)
+        monkeypatch.setattr("tools.vision_tools._resize_image_for_vision",
+                            lambda p, **kw: loaded.append(str(p)) or "data:image/png;base64,QUJD")
+        redact.register_vault_redaction_value(secret)
+        try:
+            raw = bu_cli.browser_exec("print(capture_screenshot())")
+        finally:
+            redact.clear_vault_redaction_values()
+
+        result = raw if native else json.loads(raw)
+        assert secret not in json.dumps(result, ensure_ascii=False)
+        if native:
+            assert result["_multimodal"] is True and loaded == [str(shot)]  # the real image is still attached
+            assert "«redacted-vault-secret»" in result["meta"]["screenshot_path"]
+            assert "«redacted-vault-secret»" in result["text_summary"]
+        else:
+            assert result["screenshot_path"] == str(tmp_path / "«redacted-vault-secret».png")
+
 
 class TestStepLabels:
     """browser_exec code leads with a `# …` comment (per the tool

@@ -454,7 +454,11 @@ def _find_screenshot(stdout: str, since: float) -> Optional[str]:
 
 
 def _native_screenshot_result(result: Dict[str, Any], path: str) -> Optional[Dict[str, Any]]:
-    """Build a multimodal tool result attaching path for vision models"""
+    """Build a multimodal tool result attaching path for vision models.
+
+    ``path`` is the real file (loaded, never emitted); emitted metadata uses ``result["screenshot_path"]``,
+    which the caller has already passed through model-egress redaction.
+    """
     try:
         from pathlib import Path
 
@@ -493,7 +497,7 @@ def _native_screenshot_result(result: Dict[str, Any], path: str) -> Optional[Dic
                 {"type": "image_url", "image_url": {"url": data_url}},
             ],
             "text_summary": text,
-            "meta": {"screenshot_path": path, "native_vision": True},
+            "meta": {"screenshot_path": result.get("screenshot_path", path), "native_vision": True},
         }
     except Exception as e:
         logger.debug("Native screenshot attach failed (falling back to text): %s", e)
@@ -869,7 +873,10 @@ def browser_exec(
 
     screenshot = _find_screenshot(proc.stdout, started)
     if screenshot:
-        result["screenshot_path"] = screenshot
+        # Fork fix (not upstream a48debd368): the path comes from RAW stdout, so a registered vault value in the
+        # filename would bypass the scrub above. The real path stays private (image loading only); every emitted
+        # copy (JSON, multimodal text/meta) is the redacted form.
+        result["screenshot_path"] = redact_sensitive_text(screenshot, force=True)
         native = _native_screenshot_result(result, screenshot)
         if native is not None:
             return native
