@@ -1454,6 +1454,8 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "models_dev": "agent",
     "checkpoints": "agent",
     "approvals": "security",
+    # Fork (vault V0a): `vault.enabled` is the only schema-surfaced vault field; it is a security opt-in.
+    "vault": "security",
     "human_delay": "display",
     "dashboard": "display",
     "code_execution": "agent",
