@@ -343,6 +343,50 @@ def atomic_write_text(
         raise
 
 
+def atomic_write_bytes(path: Union[str, Path], content: bytes, *, tmp_prefix: str = ".tmp_",
+                       mode: "int | None" = None, fsync_dir: bool = False) -> None:
+    """Bytes variant of :func:`atomic_write_text` (encrypted blobs, key material).
+
+    Signature of upstream ``utils.atomic_write_bytes`` @49b4286a22 (vault port; fork debt, retire at
+    the next upstream re-pin). *mode* is fchmod'd onto the mkstemp (0600) temp fd before the replace
+    so the target never transits a wider mode; with no *mode* an existing target keeps its bits.
+    *fsync_dir* also fsyncs the resolved target's parent so the rename itself is durable (upstream
+    01a7efaed5: a symlinked destination is replaced in the real file's directory).
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    effective_mode = mode if mode is not None else _preserve_file_mode(path)
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=tmp_prefix, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            if effective_mode is not None and hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), effective_mode)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        real_path = Path(atomic_replace(tmp_path, path))  # symlink-preserving actual destination
+        if effective_mode is not None and not hasattr(os, "fchmod"):
+            _restore_file_mode(real_path, effective_mode)
+        if fsync_dir and os.name != "nt":
+            try:
+                dir_fd = os.open(str(real_path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            except OSError:
+                dir_fd = None
+            if dir_fd is not None:
+                try:
+                    os.fsync(dir_fd)
+                except OSError:
+                    pass
+                finally:
+                    os.close(dir_fd)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def atomic_json_write(
     path: Union[str, Path],
     data: Any,
