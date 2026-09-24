@@ -30,11 +30,16 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    transcript_trigger_statements,
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _ephemeral_child_sql,
     fts_rebuild_admission,
 )
+
+def _normalize_sql(sql):
+    return None if sql is None else " ".join(sql.replace("IF NOT EXISTS ", "").split())
+
 
 # Moved methods logged under the "hermes_state" logger before the split;
 # keep that logger identity so log filtering/capture behavior is unchanged.
@@ -158,6 +163,24 @@ class SessionSchemaMixin:
                 raise
             self._warn_fts5_unavailable(exc)
             return False
+
+    @staticmethod
+    def _install_transcript_triggers(cursor: sqlite3.Cursor) -> None:
+        """Install the WEV-1817 transcript-epoch triggers, replacing any whose
+        stored body is stale. Drops and creates run in one transaction."""
+        wanted = transcript_trigger_statements()
+        stored = dict(cursor.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'transcript\\_epoch\\_%' ESCAPE '\\'"
+        ).fetchall())
+        stale = [name for name in stored if name not in wanted]
+        changed = [name for name, sql in wanted.items()
+                   if _normalize_sql(stored.get(name)) != _normalize_sql(sql)]
+        if not stale and not changed:
+            return
+        script = "".join(f"DROP TRIGGER IF EXISTS {name};" for name in stale + changed)
+        script += "".join(wanted[name] + ";" for name in changed)
+        cursor.executescript(f"BEGIN IMMEDIATE;{script}COMMIT;")
 
     def _drop_all_fts_triggers(self, cursor: sqlite3.Cursor) -> None:
         self._drop_fts_triggers(cursor)
@@ -1009,6 +1032,20 @@ class SessionSchemaMixin:
         # Deferred indexes that reference the reconciler-added ``active``
         # column (idx_messages_session_active) — same ordering constraint.
         cursor.executescript(DEFERRED_INDEX_SQL)
+
+        # WEV-1817: transcript change counter (see TRANSCRIPT_TRIGGER_SQL).
+        # Idempotent; runs on every writable open so an older database gains
+        # the triggers without a version bump. Existing rows start at epoch 0.
+        # A lock error here propagates into the open's lock-patience retry (a
+        # database opened WITHOUT these triggers would serve catch-up reads that
+        # silently miss edits).
+        # Triggers are recreated whenever their stored body differs from the
+        # current definition (CREATE TRIGGER IF NOT EXISTS would otherwise keep
+        # an older body forever on an upgraded database).
+        # The bump reads MAX(sessions.transcript_epoch): keep that one seek.
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_transcript_epoch "
+                       "ON sessions(transcript_epoch)")
+        self._install_transcript_triggers(cursor)
 
         # Heal NULL ``active`` rows unconditionally on every startup.
         # On real-world DBs the reconciler-added ``active`` column can lack

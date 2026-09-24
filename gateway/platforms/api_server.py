@@ -2325,6 +2325,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            ("GET", "/api/sessions/{session_id}/events", self._handle_session_events),
+            ("GET", "/api/sessions/{session_id}/events/stream", self._handle_session_events_stream),
             ("POST", "/api/sessions/{session_id}/append", self._handle_session_append),
             ("POST", "/api/sessions/{session_id}/credential/bind", self._handle_session_credential_bind),
             ("POST", "/api/sessions/{session_id}/submit", self._handle_session_submit),
@@ -3573,6 +3575,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
+                "session_events": {"method": "GET", "path": "/api/sessions/{session_id}/events"},
+                "session_events_stream": {"method": "GET", "path": "/api/sessions/{session_id}/events/stream"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
@@ -4729,6 +4733,154 @@ class APIServerAdapter(BasePlatformAdapter):
                 "returned": len(messages),
             },
         })
+
+    # ------------------------------------------------------------------
+    # Committed-transcript event log (WEV-1817)
+    # ------------------------------------------------------------------
+    #
+    # Cursor: the opaque string "<epoch>.<id>". ``epoch`` is the session's
+    # durable transcript epoch (SessionDB.get_transcript_epoch: bumped by
+    # SQLite triggers on every non-append change); ``id`` is messages.id.
+
+    _EVENT_CURSOR_RE = re.compile(r"^(\d{1,15})\.(\d{1,15})$")
+
+    @classmethod
+    def _parse_event_cursor(cls, raw: Optional[str]):
+        """``(epoch, id)``, ``None`` for from-the-start, or ``False`` if malformed."""
+        if raw is None or raw == "" or raw == "0":
+            return None
+        match = cls._EVENT_CURSOR_RE.fullmatch(raw)
+        if match is None:
+            return False
+        return int(match.group(1)), int(match.group(2))
+
+    @staticmethod
+    def _event_cursor(epoch: int, message_id: int) -> str:
+        return f"{int(epoch)}.{int(message_id)}"
+
+    def _session_event_item(self, epoch: int, row: Dict[str, Any]) -> Dict[str, Any]:
+        return {"cursor": self._event_cursor(epoch, row["id"]), "message": self._message_response(row)}
+
+    async def _handle_session_events(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/events?after=<cursor>&limit=M — committed items after a cursor."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        cursor = self._parse_event_cursor(request.query.get("after"))
+        raw_limit = request.query.get("limit")
+        try:
+            limit = 200 if raw_limit is None else int(raw_limit)
+        except (TypeError, ValueError):
+            limit = -1
+        if cursor is False or not 1 <= limit <= 500:
+            return web.json_response(
+                _openai_error(
+                    'after must be "<epoch>.<id>" or 0, and limit an integer in 1..500',
+                    code="invalid_pagination",
+                ),
+                status=400,
+            )
+        db = await self._ensure_session_db_async()
+        page = await asyncio.to_thread(db.read_transcript_events, session_id, cursor, limit)
+        epoch = page["epoch"]
+        return web.json_response({
+            "object": "conversation_events",
+            "session_id": page["session_id"],
+            "epoch": epoch,
+            "head": self._event_cursor(epoch, page["head"]),
+            "reset_required": page["reset_required"],
+            "items": [self._session_event_item(epoch, row) for row in page["rows"]],
+        })
+
+    async def _handle_session_events_stream(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /api/sessions/{session_id}/events/stream — resumable SSE of committed items.
+
+        Replays after ``Last-Event-ID`` (or ``?after=``), then goes live. Each
+        committed write in this process wakes the handler, which re-reads from
+        its last cursor. When the epoch moved it sends ``event: reset`` with
+        ``{"cursor": "<epoch>.0"}`` and ends the response; the client
+        reconnects with that cursor and gets the new epoch from the start, so
+        item cursors on one connection only ever increase. Idle connections do
+        no reads, only ``: keepalive`` comments.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        raw_cursor = request.headers.get("Last-Event-ID")
+        if raw_cursor is None:
+            raw_cursor = request.query.get("after")
+        cursor = self._parse_event_cursor(raw_cursor)
+        if cursor is False:
+            return web.json_response(
+                _openai_error('Last-Event-ID / after must be "<epoch>.<id>" or 0', code="invalid_pagination"),
+                status=400,
+            )
+        db = await self._ensure_session_db_async()
+        loop = asyncio.get_running_loop()
+        wake = asyncio.Event()
+
+        def _listener() -> None:  # committing writer thread
+            try:
+                loop.call_soon_threadsafe(wake.set)
+            except RuntimeError:
+                pass  # loop closed; the finally below unsubscribes
+
+        # Subscribe BEFORE the first read so nothing committed in between is
+        # missed (a spurious wake just re-reads an empty tail).
+        db.add_commit_listener(_listener)
+        response = web.StreamResponse(status=200, headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        })
+        page_size = 200
+
+        async def _drain(position):
+            """Send every committed item after *position*; return the new
+            position, or None after sending a reset (the caller then closes)."""
+            first = True
+            while True:
+                page = await asyncio.to_thread(db.read_transcript_events, session_id, position, page_size)
+                epoch = page["epoch"]
+                if page["reset_required"] and not (first and position is None):
+                    await response.write(_sse_frame({"cursor": self._event_cursor(epoch, 0)}, event="reset"))
+                    return None
+                first = False
+                for row in page["rows"]:
+                    item = self._session_event_item(epoch, row)
+                    await response.write(f"id: {item['cursor']}\n".encode() + _sse_frame(item, event="item"))
+                    position = (epoch, int(row["id"]))
+                if position is None:
+                    position = (epoch, 0)
+                if len(page["rows"]) < page_size:
+                    return position
+
+        try:
+            await response.prepare(request)
+            position = cursor
+            while True:
+                wake.clear()  # before the read: a commit during it re-wakes us
+                position = await _drain(position)
+                if position is None:
+                    break  # reset sent: end the response
+                while not wake.is_set():
+                    try:
+                        await asyncio.wait_for(wake.wait(), timeout=CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
+                    except asyncio.TimeoutError:
+                        await response.write(b": keepalive\n\n")
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+            pass
+        finally:
+            db.remove_commit_listener(_listener)
+        return response
 
     async def _handle_session_append(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/append — passive native append."""

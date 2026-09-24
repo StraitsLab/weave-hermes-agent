@@ -77,6 +77,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _sql_session_last_active_by_id,
     escape_like as _escape_like,
     DEFERRED_INDEX_SQL,
+    TRANSCRIPT_EPOCH_SQL,
     FTS_CJK_STALE_KEY,
     FTS_REBUILD_DEFERRAL_KEY,
     FTS_SQL,
@@ -662,6 +663,57 @@ def _read_budget_for(db_path) -> _PathReadBudget:
             budget = _PathReadBudget()
             _read_budgets[key] = budget
         return budget
+
+
+class _CommitWakeHub:
+    """Post-commit wake-ups for ONE state.db path (WEV-1817).
+
+    Shared by every :class:`SessionDB` on the same file in this process (the
+    gateway runner and the API adapter each hold their own instance). A wake
+    carries no data: the database is the source of truth, and readers decide
+    what changed from ``sessions.transcript_epoch`` and message ids.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._listeners: tuple = ()
+
+    def add(self, listener: Callable[[], None]) -> None:
+        with self._lock:
+            self._listeners = self._listeners + (listener,)
+
+    def remove(self, listener: Callable[[], None]) -> None:
+        with self._lock:
+            listeners = list(self._listeners)
+            for index, existing in enumerate(listeners):
+                if existing == listener:
+                    del listeners[index]
+                    self._listeners = tuple(listeners)
+                    return
+
+    def count(self) -> int:
+        return len(self._listeners)
+
+    def publish(self) -> None:
+        for listener in self._listeners:  # immutable snapshot; no lock held
+            try:
+                listener()
+            except Exception:
+                logger.debug("commit wake listener failed", exc_info=True)
+
+
+_commit_hubs: "weakref.WeakValueDictionary[str, _CommitWakeHub]" = weakref.WeakValueDictionary()
+_commit_hubs_lock = threading.Lock()
+
+
+def _commit_hub_for(db_path) -> _CommitWakeHub:
+    key = _read_budget_key(db_path)
+    with _commit_hubs_lock:
+        hub = _commit_hubs.get(key)
+        if hub is None:
+            hub = _CommitWakeHub()
+            _commit_hubs[key] = hub
+        return hub
 
 
 # Import-time snapshot used by _default_db_path() to detect a deliberately
@@ -5734,6 +5786,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         # (#94736) — reopen instead of dying on None.execute.
                         self._reopen_after_close_locked(context="write")
                     self._conn.execute("BEGIN IMMEDIATE")
+                    changes_before = self._conn.total_changes
                     try:
                         result = fn(self._conn)
                         self._conn.commit()
@@ -5743,6 +5796,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         except Exception:
                             pass
                         raise
+                    changed = self._conn.total_changes != changes_before
+                # WEV-1817: wake event-log readers only after the commit, and
+                # outside the write lock. Rolled-back or retried attempts never
+                # reach here.
+                if changed:
+                    self._commit_hub().publish()
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -12558,6 +12617,75 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
             return cursor.fetchone() is not None
+
+    # ── Committed-transcript event log (WEV-1817) ────────────────────────
+
+    def _commit_hub(self) -> "_CommitWakeHub":
+        hub = self.__dict__.get("_commit_wake_hub")
+        if hub is None:
+            hub = _commit_hub_for(self.db_path)
+            self._commit_wake_hub = hub
+        return hub
+
+    def add_commit_listener(self, listener: Callable[[], None]) -> None:
+        """Call *listener()* after every committed write to this state.db.
+
+        Runs on the committing thread, outside the write lock. It must not
+        block or raise: hand off (``loop.call_soon_threadsafe``) and return.
+        Writes from another process on the same file do not wake it.
+        """
+        self._commit_hub().add(listener)
+
+    def remove_commit_listener(self, listener: Callable[[], None]) -> None:
+        self._commit_hub().remove(listener)
+
+    def commit_listener_count(self) -> int:
+        return self._commit_hub().count()
+
+    def get_transcript_epoch(self, session_id: str) -> int:
+        """Current transcript epoch of *session_id* (see TRANSCRIPT_TRIGGER_SQL)."""
+        with self._read_ctx() as conn:
+            row = conn.execute(TRANSCRIPT_EPOCH_SQL, (session_id,)).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def _message_session_id(self, message_id: int) -> Optional[str]:
+        with self._read_ctx() as conn:
+            row = conn.execute("SELECT session_id FROM messages WHERE id = ?", (message_id,)).fetchone()
+        return row[0] if row else None
+
+    _TRANSCRIPT_READ_ATTEMPTS = 8
+
+    def read_transcript_events(self, session_id: str, cursor: Optional[Tuple[int, int]],
+                               limit: int) -> Dict[str, Any]:
+        """One consistent page of the committed transcript after *cursor*.
+
+        *cursor* is ``(epoch, id)`` or None (from the start). The page is
+        consistent without a long read transaction: every non-append change
+        bumps the epoch in its own commit, so the epoch is read before and
+        after the resolution + row reads and the page is retried if it moved.
+        Appends that land mid-read are safe (rows are keyed by id, and the
+        head is read after the rows, so it never trails them).
+
+        Returns ``{"session_id", "epoch", "head", "reset_required", "rows"}``
+        where ``head`` is the max active id of the resolved session.
+        """
+        for _ in range(self._TRANSCRIPT_READ_ATTEMPTS):
+            epoch = self.get_transcript_epoch(session_id)
+            resolved = self.resolve_resume_session_id(session_id) or session_id
+            reset = cursor is None or cursor[0] != epoch
+            if not reset and cursor[1] > 0:
+                # Resolution can move to another session through an append or
+                # a heartbeat without an epoch bump (sibling ordering). The
+                # client's rows then belong to a session it no longer shows.
+                reset = self._message_session_id(cursor[1]) != resolved
+            after_id = 0 if reset else cursor[1]
+            rows = self.get_messages(resolved, limit=limit, after_id=after_id)
+            head = self.get_active_message_watermark(resolved)
+            if self.get_transcript_epoch(session_id) == epoch:
+                return {"session_id": resolved, "epoch": epoch, "head": max(head, after_id),
+                        "reset_required": reset, "rows": rows}
+        raise sqlite3.OperationalError("transcript changed during every read attempt")
+
 
     def get_active_message_watermark(self, session_id: str) -> int:
         """MAX(id) of the session's active rows — the compression watermark.
