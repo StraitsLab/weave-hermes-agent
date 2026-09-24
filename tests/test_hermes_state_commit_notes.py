@@ -310,9 +310,13 @@ def test_update_or_replace_onto_another_id_is_refused(db, tmp_path):
     assert [r["id"] for r in db.get_messages(SID)] == [kept]
 
 
-def test_appends_after_a_negative_id_row_do_not_bump(db, tmp_path):
-    _raw(tmp_path, ("INSERT INTO messages(id, session_id, role, content, timestamp, active) "
-                    "VALUES (-1, ?, 'user', 'imported', 1, 1)", (SID,)))
+def test_appends_after_a_legacy_negative_id_row_do_not_bump(db, tmp_path):
+    # A legacy row written before the positive-id rule (the rule rejects new ones).
+    _raw(tmp_path, ("DROP TRIGGER transcript_epoch_message_positive_id", ()),
+         ("INSERT INTO messages(id, session_id, role, content, timestamp, active) "
+          "VALUES (-1, ?, 'user', 'imported', 1, 1)", (SID,)))
+    reopened = SessionDB(tmp_path / "state.db")  # reinstalls the rule; the legacy row stays
+    reopened.close()
     before = db.get_transcript_epoch(SID)
     db.append_message(SID, role="user", content="ordinary append")
     assert db.get_transcript_epoch(SID) == before
@@ -359,3 +363,70 @@ def test_trigger_install_waits_out_a_held_write_lock(tmp_path):
         assert reopened.get_transcript_epoch(SID) > before
     finally:
         reopened.close()
+
+
+# ── round-3 review: upgrades and replaced identities ─────────────────────
+
+
+def test_stale_trigger_bodies_are_rebuilt_on_open(tmp_path):
+    """An upgraded database keeps whatever trigger body CREATE TRIGGER IF NOT
+    EXISTS found; the open must replace a body that differs from the current one."""
+    path = tmp_path / "state.db"
+    first = SessionDB(path)
+    first.create_session(SID, "test")
+    first.close()
+    raw = sqlite3.connect(str(path))
+    try:
+        raw.execute("DROP TRIGGER transcript_epoch_message_replace")
+        raw.execute("CREATE TRIGGER transcript_epoch_message_replace BEFORE INSERT ON messages "
+                    "WHEN NEW.id IS NOT NULL BEGIN UPDATE sessions SET transcript_epoch = transcript_epoch + 1; END")
+        raw.execute("CREATE TRIGGER transcript_epoch_retired AFTER INSERT ON messages BEGIN SELECT 1; END")
+        raw.commit()
+    finally:
+        raw.close()
+    reopened = SessionDB(path)
+    try:
+        with reopened._lock:
+            names = {name for (name,) in reopened._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'transcript_epoch_%'")}
+            body = reopened._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'transcript_epoch_message_replace'").fetchone()[0]
+        from hermes_state_common import TRANSCRIPT_TRIGGERS
+        assert names == set(TRANSCRIPT_TRIGGERS)  # the retired trigger is gone
+        assert "NEW.id > 0" in body
+        before = reopened.get_transcript_epoch(SID)
+        reopened.append_message(SID, role="user", content="ordinary")
+        assert reopened.get_transcript_epoch(SID) == before
+    finally:
+        reopened.close()
+
+
+def test_new_message_ids_must_be_positive(db, tmp_path):
+    for value in (0, -1):
+        with pytest.raises(sqlite3.IntegrityError, match="positive"):
+            _raw(tmp_path, ("INSERT INTO messages(id, session_id, role, content, timestamp) "
+                            "VALUES (?, ?, 'user', 'x', 1)", (value, SID)))
+    assert db.get_messages(SID) == []
+
+
+def test_replacing_a_session_record_that_owns_messages_bumps(db, tmp_path):
+    first = db.append_message(SID, role="user", content="one")
+    db.append_message(SID, role="user", content="two")
+    db._execute_write(lambda c: c.execute("UPDATE messages SET content = 'edited' WHERE id = ?", (first,)))
+    before = db.get_transcript_epoch(SID)
+    assert before > 0
+    conn = sqlite3.connect(str(tmp_path / "state.db"))
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("INSERT OR REPLACE INTO sessions(id, source, started_at) VALUES (?, 'test', 1)", (SID,))
+        conn.commit()
+    finally:
+        conn.close()
+    assert [r["content"] for r in db.get_messages(SID)] == ["edited", "two"]
+    assert db.get_transcript_epoch(SID) > before  # not rolled back to the column default
+
+
+def test_creating_an_empty_session_does_not_bump_via_reinsert(db):
+    before = db.get_transcript_epoch(SID)
+    db.create_session("fresh", "test")
+    assert db.get_transcript_epoch("fresh") == 0 and db.get_transcript_epoch(SID) == before

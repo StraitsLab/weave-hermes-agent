@@ -679,6 +679,8 @@ def _changed_sql(columns) -> str:
 
 TRANSCRIPT_TRIGGERS = (
     "transcript_epoch_message_id_immutable",
+    "transcript_epoch_message_positive_id",
+    "transcript_epoch_session_reinsert",
     "transcript_epoch_message_replace",
     "transcript_epoch_message_insert_below_head",
     "transcript_epoch_message_update",
@@ -691,6 +693,9 @@ TRANSCRIPT_TRIGGER_SQL = f"""
 CREATE TRIGGER IF NOT EXISTS transcript_epoch_message_id_immutable BEFORE UPDATE ON messages
 WHEN OLD.id IS NOT NEW.id
 BEGIN SELECT RAISE(ABORT, 'messages.id is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS transcript_epoch_message_positive_id AFTER INSERT ON messages
+WHEN NEW.id <= 0
+BEGIN SELECT RAISE(ABORT, 'messages.id must be positive'); END;
 CREATE TRIGGER IF NOT EXISTS transcript_epoch_message_replace BEFORE INSERT ON messages
 WHEN NEW.id > 0 AND EXISTS (SELECT 1 FROM messages _m WHERE _m.id = NEW.id)
 BEGIN {_transcript_bump_sql("(SELECT _m.session_id FROM messages _m WHERE _m.id = NEW.id), NEW.session_id")} END;
@@ -706,6 +711,9 @@ BEGIN {_transcript_bump_sql("OLD.session_id")} END;
 CREATE TRIGGER IF NOT EXISTS transcript_epoch_session_insert AFTER INSERT ON sessions
 WHEN NEW.parent_session_id IS NOT NULL AND {_transcript_eligible_sql('NEW')}
 BEGIN {_transcript_bump_sql("NEW.parent_session_id")} END;
+CREATE TRIGGER IF NOT EXISTS transcript_epoch_session_reinsert AFTER INSERT ON sessions
+WHEN EXISTS (SELECT 1 FROM messages _m WHERE _m.session_id = NEW.id)
+BEGIN {_transcript_bump_sql("NEW.id, NEW.parent_session_id")} END;
 CREATE TRIGGER IF NOT EXISTS transcript_epoch_session_delete AFTER DELETE ON sessions
 WHEN OLD.parent_session_id IS NOT NULL AND {_transcript_eligible_sql('OLD')}
 BEGIN {_transcript_bump_sql("OLD.parent_session_id")} END;
@@ -1072,3 +1080,14 @@ def fts_rebuild_admission(db_path):
             pass
         finally:
             handle.close()
+
+
+def transcript_trigger_statements() -> dict:
+    """``{trigger name: CREATE TRIGGER statement}`` for TRANSCRIPT_TRIGGER_SQL."""
+    import re as _re
+    out = {}
+    for statement in _re.split(r";\s*\n(?=CREATE TRIGGER)", TRANSCRIPT_TRIGGER_SQL.strip()):
+        statement = statement.strip().rstrip(";") + ";" if not statement.strip().endswith("END;") else statement.strip()
+        name = _re.match(r"CREATE TRIGGER IF NOT EXISTS (\w+)", statement).group(1)
+        out[name] = statement[:-1] if statement.endswith(";") else statement
+    return out
