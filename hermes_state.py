@@ -187,6 +187,14 @@ class SessionPassiveAppendError(ValueError):
         super().__init__(message)
 
 
+class _PassiveAppendGroupAborted(Exception):
+    """Internal: roll back a passive append group that could not insert every item."""
+
+    def __init__(self, result: dict):
+        self.result = result
+        super().__init__(result.get("outcome"))
+
+
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 
 
@@ -11814,6 +11822,58 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
 
+    def append_passive_messages(
+        self,
+        session_id: str,
+        items: List[Dict[str, Any]],
+        *,
+        predecessor_sequence: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Insert-or-return up to eight externally finalized messages as ONE contiguous group.
+
+        Same per-item contract as :meth:`append_passive_message`, but every item
+        is decided inside one native write transaction: either all items are new
+        and are inserted back to back (no other writer can land between them),
+        or all already exist identically (``identical_retry`` for each).  Any
+        other mix answers ``idempotency_conflict`` for every item and writes
+        nothing, so a partial group can never be created or extended.
+        """
+        if not isinstance(items, list) or not 1 <= len(items) <= 8:
+            raise SessionPassiveAppendError("invalid_items", "items must hold 1..8 appends")
+        ids = [item.get("external_item_id") if isinstance(item, dict) else None for item in items]
+        if len(set(ids)) != len(ids):
+            raise SessionPassiveAppendError("invalid_items", "external_item_id values must be distinct")
+        checked = [self._passive_append_item(session_id, predecessor_sequence=predecessor_sequence, **item)
+                   for item in items]
+
+        def _do(conn):
+            outcomes = [self._passive_append_existing(conn, item) for item in checked]
+            if all(outcome is not None for outcome in outcomes):
+                if all(outcome["outcome"] == "identical_retry" for outcome in outcomes):
+                    return outcomes
+            if any(outcome is not None for outcome in outcomes):
+                return [{"outcome": "idempotency_conflict", "message_id": None, "sequence": None}
+                        for _ in checked]
+            results = []
+            for offset, item in enumerate(checked):
+                # The tail after ``offset`` group inserts; an empty session's tail is None.
+                base = predecessor_sequence or 0
+                expected = (base + offset) or None
+                result = self._passive_append_insert(conn, dict(item, predecessor_sequence=expected))
+                if result["outcome"] != "inserted":
+                    if results:
+                        # Unreachable while the group holds the write lock; roll the txn back
+                        # rather than ever commit a partial group.
+                        raise _PassiveAppendGroupAborted(result)
+                    return [result] + [dict(result) for _ in checked[1:]]
+                results.append(result)
+            return results
+
+        try:
+            return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        except _PassiveAppendGroupAborted as aborted:
+            return [dict(aborted.result) for _ in checked]
+
     def append_passive_message(
         self,
         session_id: str,
@@ -11839,6 +11899,36 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``idempotency_conflict``, or ``sequence_gap``.  A missing target raises
         :class:`SessionPassiveAppendError` with ``session_not_found``.
         """
+        item = self._passive_append_item(
+            session_id,
+            target_bem_session_id=target_bem_session_id,
+            external_item_id=external_item_id,
+            role=role,
+            content=content,
+            canonical_sha256=canonical_sha256,
+            participant_id=participant_id,
+            predecessor_sequence=predecessor_sequence,
+        )
+
+        def _do(conn):
+            existing = self._passive_append_existing(conn, item)
+            return existing if existing is not None else self._passive_append_insert(conn, item)
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def _passive_append_item(
+        self,
+        session_id: str,
+        *,
+        target_bem_session_id: str,
+        external_item_id: str,
+        role: str,
+        content: str,
+        canonical_sha256: str,
+        participant_id: str,
+        predecessor_sequence: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Validate one passive append; return it normalized for the write transaction."""
         if not isinstance(session_id, str) or not session_id:
             raise SessionPassiveAppendError("invalid_session", "session_id is required")
         if not isinstance(target_bem_session_id, str) or not re.fullmatch(
@@ -11882,117 +11972,146 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         stored_content = self._encode_content(content)
 
-        def _do(conn):
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS passive_append_idempotency (
-                   external_item_id TEXT PRIMARY KEY,
-                   session_id TEXT NOT NULL,
-                   target_bem_session_id TEXT NOT NULL,
-                   native_message_id INTEGER NOT NULL,
-                   canonical_sha256 TEXT NOT NULL,
-                   role TEXT NOT NULL,
-                   participant_id TEXT NOT NULL,
-                   predecessor_sequence INTEGER
-                )"""
+        return {
+            "session_id": session_id,
+            "target_bem_session_id": target_bem_session_id,
+            "external_item_id": external_item_id,
+            "role": role,
+            "stored_content": stored_content,
+            "canonical_sha256": canonical_sha256,
+            "participant_id": participant_id,
+            "predecessor_sequence": predecessor_sequence,
+        }
+
+    def _passive_append_existing(self, conn, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Inside the write txn: the stored outcome for a known item id, else None."""
+        session_id = item["session_id"]
+        target_bem_session_id = item["target_bem_session_id"]
+        external_item_id = item["external_item_id"]
+        role = item["role"]
+        canonical_sha256 = item["canonical_sha256"]
+        participant_id = item["participant_id"]
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS passive_append_idempotency (
+               external_item_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               target_bem_session_id TEXT NOT NULL,
+               native_message_id INTEGER NOT NULL,
+               canonical_sha256 TEXT NOT NULL,
+               role TEXT NOT NULL,
+               participant_id TEXT NOT NULL,
+               predecessor_sequence INTEGER
+            )"""
+        )
+        columns = {row["name"] for row in conn.execute(
+            "PRAGMA table_info(passive_append_idempotency)"
+        ).fetchall()}
+        if "target_bem_session_id" not in columns:
+            conn.execute("ALTER TABLE passive_append_idempotency ADD COLUMN target_bem_session_id TEXT")
+            conn.execute("UPDATE passive_append_idempotency SET target_bem_session_id = session_id")
+        existing = conn.execute(
+            "SELECT external_item_id, session_id, target_bem_session_id, native_message_id, "
+            "canonical_sha256, role, participant_id, predecessor_sequence "
+            "FROM passive_append_idempotency WHERE external_item_id = ?",
+            (external_item_id,),
+        ).fetchone()
+        if existing is not None:
+            same_payload = (
+                existing["session_id"] == session_id
+                and existing["target_bem_session_id"] == target_bem_session_id
+                and existing["canonical_sha256"] == canonical_sha256
+                and existing["role"] == role
+                and existing["participant_id"] == participant_id
             )
-            columns = {row["name"] for row in conn.execute(
-                "PRAGMA table_info(passive_append_idempotency)"
-            ).fetchall()}
-            if "target_bem_session_id" not in columns:
-                conn.execute("ALTER TABLE passive_append_idempotency ADD COLUMN target_bem_session_id TEXT")
-                conn.execute("UPDATE passive_append_idempotency SET target_bem_session_id = session_id")
-            existing = conn.execute(
-                "SELECT external_item_id, session_id, target_bem_session_id, native_message_id, "
-                "canonical_sha256, role, participant_id, predecessor_sequence "
-                "FROM passive_append_idempotency WHERE external_item_id = ?",
-                (external_item_id,),
-            ).fetchone()
-            if existing is not None:
-                same_payload = (
-                    existing["session_id"] == session_id
-                    and existing["target_bem_session_id"] == target_bem_session_id
-                    and existing["canonical_sha256"] == canonical_sha256
-                    and existing["role"] == role
-                    and existing["participant_id"] == participant_id
-                )
-                if same_payload:
-                    return {
-                        "outcome": "identical_retry",
-                        "message_id": existing["native_message_id"],
-                        "sequence": (existing["predecessor_sequence"] or 0) + 1,
-                    }
+            if same_payload:
                 return {
-                    "outcome": "idempotency_conflict",
-                    "message_id": None,
-                    "sequence": None,
+                    "outcome": "identical_retry",
+                    "message_id": existing["native_message_id"],
+                    "sequence": (existing["predecessor_sequence"] or 0) + 1,
                 }
-
-            session = conn.execute(
-                "SELECT id FROM sessions WHERE id = ?", (session_id,)
-            ).fetchone()
-            if session is None:
-                raise SessionPassiveAppendError(
-                    "session_not_found", "target session was not found"
-                )
-
-            active_count = conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1",
-                (session_id,),
-            ).fetchone()[0]
-            expected_predecessor = active_count or None
-            if predecessor_sequence != expected_predecessor:
-                return {
-                    "outcome": "sequence_gap",
-                    "message_id": None,
-                    "sequence": expected_predecessor,
-                }
-
-            self._check_transcript_write_guards(conn, session_id, None)
-            cursor = conn.execute(
-                """INSERT INTO messages (
-                   session_id, role, content, timestamp, platform_message_id,
-                   observed, active, display_metadata, display_kind
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    role,
-                    stored_content,
-                    time.time(),
-                    None,
-                    1,
-                    1,
-                    self._encode_display_metadata({"participant_id": participant_id}),
-                    "passive_append",
-                ),
-            )
-            message_id = cursor.lastrowid
-            conn.execute(
-                """INSERT INTO passive_append_idempotency (
-                   external_item_id, session_id, target_bem_session_id, native_message_id,
-                   canonical_sha256, role, participant_id, predecessor_sequence
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    external_item_id,
-                    session_id,
-                    target_bem_session_id,
-                    message_id,
-                    canonical_sha256,
-                    role,
-                    participant_id,
-                    predecessor_sequence,
-                ),
-            )
-            conn.execute(
-                "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
-                (session_id,),
-            )
             return {
-                "outcome": "inserted",
-                "message_id": message_id,
-                "sequence": active_count + 1,
+                "outcome": "idempotency_conflict",
+                "message_id": None,
+                "sequence": None,
             }
 
-        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        return None
+
+    def _passive_append_insert(self, conn, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Inside the write txn: insert one new item at its predecessor, or report the gap."""
+        session_id = item["session_id"]
+        target_bem_session_id = item["target_bem_session_id"]
+        external_item_id = item["external_item_id"]
+        role = item["role"]
+        stored_content = item["stored_content"]
+        canonical_sha256 = item["canonical_sha256"]
+        participant_id = item["participant_id"]
+        predecessor_sequence = item["predecessor_sequence"]
+        session = conn.execute(
+            "SELECT id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if session is None:
+            raise SessionPassiveAppendError(
+                "session_not_found", "target session was not found"
+            )
+
+        active_count = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1",
+            (session_id,),
+        ).fetchone()[0]
+        expected_predecessor = active_count or None
+        if predecessor_sequence != expected_predecessor:
+            return {
+                "outcome": "sequence_gap",
+                "message_id": None,
+                "sequence": expected_predecessor,
+            }
+
+        self._check_transcript_write_guards(conn, session_id, None)
+        cursor = conn.execute(
+            """INSERT INTO messages (
+               session_id, role, content, timestamp, platform_message_id,
+               observed, active, display_metadata, display_kind
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                role,
+                stored_content,
+                time.time(),
+                None,
+                1,
+                1,
+                self._encode_display_metadata({"participant_id": participant_id}),
+                "passive_append",
+            ),
+        )
+        message_id = cursor.lastrowid
+        conn.execute(
+            """INSERT INTO passive_append_idempotency (
+               external_item_id, session_id, target_bem_session_id, native_message_id,
+               canonical_sha256, role, participant_id, predecessor_sequence
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                external_item_id,
+                session_id,
+                target_bem_session_id,
+                message_id,
+                canonical_sha256,
+                role,
+                participant_id,
+                predecessor_sequence,
+            ),
+        )
+        conn.execute(
+            "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+            (session_id,),
+        )
+        return {
+            "outcome": "inserted",
+            "message_id": message_id,
+            "sequence": active_count + 1,
+        }
+
 
     def register_native_session_submit(
         self,

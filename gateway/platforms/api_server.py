@@ -2333,6 +2333,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/api/sessions/{session_id}/events", self._handle_session_events),
             ("GET", "/api/sessions/{session_id}/events/stream", self._handle_session_events_stream),
             ("POST", "/api/sessions/{session_id}/append", self._handle_session_append),
+            ("POST", "/api/sessions/{session_id}/append/group", self._handle_session_append_group),
             ("POST", "/api/sessions/{session_id}/credential/bind", self._handle_session_credential_bind),
             ("POST", "/api/sessions/{session_id}/submit", self._handle_session_submit),
             ("GET", "/api/sessions/{session_id}/submit/{native_request_ref}/events", self._handle_native_submit_events),
@@ -3524,6 +3525,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "session_passive_append": True,
+                "session_passive_append_group": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -3588,6 +3590,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_passive_append": {"method": "POST", "path": "/api/sessions/{session_id}/append"},
+                "session_passive_append_group": {"method": "POST", "path": "/api/sessions/{session_id}/append/group"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
                 "browser_control_register": {"method": "POST", "path": "/v1/browser-control/register"},
                 "browser_control_ws": {"method": "GET", "path": "/v1/browser-control/ws"},
@@ -5027,6 +5030,96 @@ class APIServerAdapter(BasePlatformAdapter):
             receipt,
             status=409,
         )
+
+    async def _handle_session_append_group(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/append/group — 1..8 passive appends committed contiguously.
+
+        Body: {"requests": [<hermes_append_request>...], "contents": [str...], "predecessor_sequence"?: int}.
+        Each request has the exact /append schema minus predecessor_sequence; the group shares one.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        requests_, contents = body.get("requests"), body.get("contents")
+        predecessor = body.get("predecessor_sequence")
+        invalid = web.json_response(_openai_error("Invalid append schema", code="invalid_append_schema"), status=400)
+        required = {
+            "kind", "authenticated", "external_item_id", "external_identity_scope",
+            "transcript_row", "atomic_insert_or_return", "target_bem_session_id",
+            "role", "canonical_sha256", "participant_id",
+        }
+        if (
+            set(body) - {"requests", "contents", "predecessor_sequence"}
+            or not isinstance(requests_, list) or not isinstance(contents, list)
+            or not 1 <= len(requests_) <= 8 or len(requests_) != len(contents)
+            or (predecessor is not None and (isinstance(predecessor, bool) or not isinstance(predecessor, int) or predecessor < 1))
+        ):
+            return invalid
+        items = []
+        for append_request, content in zip(requests_, contents):
+            if (
+                not isinstance(append_request, dict) or set(append_request) != required
+                or not isinstance(content, str)
+                or append_request["kind"] != "hermes_append_request"
+                or append_request["authenticated"] is not True
+                or append_request["external_identity_scope"] != "global"
+                or append_request["transcript_row"] != "normal"
+                or append_request["atomic_insert_or_return"] is not True
+            ):
+                return invalid
+            # Per-field rules (UUIDv7 ids, role, digest, UTF-8, 64 KiB) are enforced
+            # once, by SessionDB._passive_append_item, and surface below as 400.
+            items.append({
+                "target_bem_session_id": append_request["target_bem_session_id"],
+                "external_item_id": append_request["external_item_id"],
+                "role": append_request["role"],
+                "content": content,
+                "canonical_sha256": append_request["canonical_sha256"],
+                "participant_id": append_request["participant_id"],
+            })
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+        try:
+            results = await asyncio.to_thread(
+                db.append_passive_messages, session_id, items, predecessor_sequence=predecessor)
+        except Exception as exc:
+            from hermes_state import SessionPassiveAppendError
+
+            if isinstance(exc, SessionPassiveAppendError):
+                if exc.code == "session_not_found":
+                    return web.json_response(
+                        _openai_error("Target session was not found", code="session_not_found"), status=404)
+                return web.json_response(_openai_error("Invalid append schema", code=exc.code), status=400)
+            logger.warning("[%s] passive group append failed: %s", self.name, type(exc).__name__)
+            return web.json_response(
+                _openai_error("Session append unavailable", code="session_append_unavailable"), status=503)
+        receipts = []
+        for item, result in zip(items, results):
+            outcome = result["outcome"]
+            receipt = {
+                "kind": "hermes_append_receipt",
+                "receipt_id": item["external_item_id"],
+                "external_item_id": item["external_item_id"],
+                "outcome": outcome,
+                "terminal": outcome != "sequence_gap",
+                "retryable": outcome == "sequence_gap",
+                "ledger_recording": "idempotent",
+                "cross_service_2pc": False,
+            }
+            if outcome in {"inserted", "identical_retry"}:
+                receipt["native_item_ref"] = f"message:{result['message_id']}"
+                if outcome == "identical_retry":
+                    receipt["same_native_ref_on_identical_retry"] = True
+            receipts.append(receipt)
+        outcomes = {result["outcome"] for result in results}
+        status = 201 if outcomes == {"inserted"} else 200 if outcomes == {"identical_retry"} else 409
+        return web.json_response({"kind": "hermes_append_group_receipt", "receipts": receipts}, status=status)
 
     async def _handle_session_credential_bind(self, request: "web.Request") -> "web.Response":
         """Bind one controller-supplied bearer to an existing live session."""
