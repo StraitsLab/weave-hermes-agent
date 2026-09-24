@@ -447,6 +447,38 @@ class TestPrompt:
         assert captured.get("child") == resp.session_id
 
     @pytest.mark.asyncio
+    async def test_prompt_approval_callback_waits_the_configured_approval_timeout(
+        self, agent, mock_manager, monkeypatch,
+    ):
+        """Weave: a Work approval must outlive the callback's 60s default."""
+        import acp_adapter.server as acp_server
+
+        seen = {}
+        real = acp_server.make_approval_callback
+
+        def _capture(*args, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(acp_server, "make_approval_callback", _capture)
+        monkeypatch.setattr(acp_server, "_get_approval_timeout", lambda: 300)
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        state.agent.run_conversation = lambda *a, **k: {"final_response": "ok", "messages": []}
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="hi")],
+            session_id=resp.session_id,
+        )
+
+        assert seen["timeout"] == 300
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "result, expected",
         [

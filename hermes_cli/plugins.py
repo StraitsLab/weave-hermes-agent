@@ -163,6 +163,11 @@ _install_plugin_debug_handler()
 VALID_HOOKS: Set[str] = {
     "pre_tool_call",
     "post_tool_call",
+    # Weave (#830): credential for one native cron fire. Kwargs: job_id,
+    # session_id, provider, base_url. The first non-None answer (a
+    # SessionCredential) replaces the run's api_key; a raising callback fails
+    # the run closed. Invoked by cron.scheduler, not through invoke_hook.
+    "cron_run_credential",
     "transform_terminal_output",
     "transform_tool_result",
     # Transform LLM output before it's returned to the user.

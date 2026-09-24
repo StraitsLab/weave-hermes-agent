@@ -1690,6 +1690,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._native_submit_sequences: Dict[str, int] = {}
         self._native_submit_event_lock = threading.Lock()
         self._native_submit_terminals: Dict[str, None] = {}
+        # Weave: native_request_ref -> approval session key while the turn is
+        # attended, and the approval request_ids already published per ref.
+        # The pending approvals themselves live only in tools.approval's queue.
+        self._native_submit_approval_keys: Dict[str, str] = {}
+        self._native_submit_approvals_sent: Dict[str, set] = {}
         # POST /v1/mcp/reload — one reload at a time (set/cleared with no await
         # between, so the "already in progress" verdict can never queue another).
         self._mcp_reload_in_progress: bool = False
@@ -2328,11 +2333,14 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/api/sessions/{session_id}/events", self._handle_session_events),
             ("GET", "/api/sessions/{session_id}/events/stream", self._handle_session_events_stream),
             ("POST", "/api/sessions/{session_id}/append", self._handle_session_append),
+            ("POST", "/api/sessions/{session_id}/append/group", self._handle_session_append_group),
             ("POST", "/api/sessions/{session_id}/credential/bind", self._handle_session_credential_bind),
             ("POST", "/api/sessions/{session_id}/submit", self._handle_session_submit),
             ("GET", "/api/sessions/{session_id}/submit/{native_request_ref}/events", self._handle_native_submit_events),
             ("GET", "/api/sessions/{session_id}/submit/{native_request_ref}/clarify", self._handle_native_submit_clarify_events),
             ("POST", "/api/sessions/{session_id}/submit/{native_request_ref}/clarify/{clarify_id}", self._handle_native_submit_clarify_response),
+            ("GET", "/api/sessions/{session_id}/submit/{native_request_ref}/approvals", self._handle_native_submit_approval_events),
+            ("POST", "/api/sessions/{session_id}/submit/{native_request_ref}/approval/{request_id}", self._handle_native_submit_approval_response),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -3517,6 +3525,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "session_passive_append": True,
+                "session_passive_append_group": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -3581,6 +3590,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_passive_append": {"method": "POST", "path": "/api/sessions/{session_id}/append"},
+                "session_passive_append_group": {"method": "POST", "path": "/api/sessions/{session_id}/append/group"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
                 "browser_control_register": {"method": "POST", "path": "/v1/browser-control/register"},
                 "browser_control_ws": {"method": "GET", "path": "/v1/browser-control/ws"},
@@ -5021,6 +5031,96 @@ class APIServerAdapter(BasePlatformAdapter):
             status=409,
         )
 
+    async def _handle_session_append_group(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/append/group — 1..8 passive appends committed contiguously.
+
+        Body: {"requests": [<hermes_append_request>...], "contents": [str...], "predecessor_sequence"?: int}.
+        Each request has the exact /append schema minus predecessor_sequence; the group shares one.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        requests_, contents = body.get("requests"), body.get("contents")
+        predecessor = body.get("predecessor_sequence")
+        invalid = web.json_response(_openai_error("Invalid append schema", code="invalid_append_schema"), status=400)
+        required = {
+            "kind", "authenticated", "external_item_id", "external_identity_scope",
+            "transcript_row", "atomic_insert_or_return", "target_bem_session_id",
+            "role", "canonical_sha256", "participant_id",
+        }
+        if (
+            set(body) - {"requests", "contents", "predecessor_sequence"}
+            or not isinstance(requests_, list) or not isinstance(contents, list)
+            or not 1 <= len(requests_) <= 8 or len(requests_) != len(contents)
+            or (predecessor is not None and (isinstance(predecessor, bool) or not isinstance(predecessor, int) or predecessor < 1))
+        ):
+            return invalid
+        items = []
+        for append_request, content in zip(requests_, contents):
+            if (
+                not isinstance(append_request, dict) or set(append_request) != required
+                or not isinstance(content, str)
+                or append_request["kind"] != "hermes_append_request"
+                or append_request["authenticated"] is not True
+                or append_request["external_identity_scope"] != "global"
+                or append_request["transcript_row"] != "normal"
+                or append_request["atomic_insert_or_return"] is not True
+            ):
+                return invalid
+            # Per-field rules (UUIDv7 ids, role, digest, UTF-8, 64 KiB) are enforced
+            # once, by SessionDB._passive_append_item, and surface below as 400.
+            items.append({
+                "target_bem_session_id": append_request["target_bem_session_id"],
+                "external_item_id": append_request["external_item_id"],
+                "role": append_request["role"],
+                "content": content,
+                "canonical_sha256": append_request["canonical_sha256"],
+                "participant_id": append_request["participant_id"],
+            })
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+        try:
+            results = await asyncio.to_thread(
+                db.append_passive_messages, session_id, items, predecessor_sequence=predecessor)
+        except Exception as exc:
+            from hermes_state import SessionPassiveAppendError
+
+            if isinstance(exc, SessionPassiveAppendError):
+                if exc.code == "session_not_found":
+                    return web.json_response(
+                        _openai_error("Target session was not found", code="session_not_found"), status=404)
+                return web.json_response(_openai_error("Invalid append schema", code=exc.code), status=400)
+            logger.warning("[%s] passive group append failed: %s", self.name, type(exc).__name__)
+            return web.json_response(
+                _openai_error("Session append unavailable", code="session_append_unavailable"), status=503)
+        receipts = []
+        for item, result in zip(items, results):
+            outcome = result["outcome"]
+            receipt = {
+                "kind": "hermes_append_receipt",
+                "receipt_id": item["external_item_id"],
+                "external_item_id": item["external_item_id"],
+                "outcome": outcome,
+                "terminal": outcome != "sequence_gap",
+                "retryable": outcome == "sequence_gap",
+                "ledger_recording": "idempotent",
+                "cross_service_2pc": False,
+            }
+            if outcome in {"inserted", "identical_retry"}:
+                receipt["native_item_ref"] = f"message:{result['message_id']}"
+                if outcome == "identical_retry":
+                    receipt["same_native_ref_on_identical_retry"] = True
+            receipts.append(receipt)
+        outcomes = {result["outcome"] for result in results}
+        status = 201 if outcomes == {"inserted"} else 200 if outcomes == {"identical_retry"} else 409
+        return web.json_response({"kind": "hermes_append_group_receipt", "receipts": receipts}, status=status)
+
     async def _handle_session_credential_bind(self, request: "web.Request") -> "web.Response":
         """Bind one controller-supplied bearer to an existing live session."""
         auth_err = self._check_auth(request)
@@ -5418,6 +5518,11 @@ class APIServerAdapter(BasePlatformAdapter):
             queue.put_nowait(self._native_submit_event(native_request_ref, "clarify.request", _broadcast=False, **{
                 key: value for key, value in clarify.items() if key not in {"type", "native_request_ref"}
             }))
+        # Weave: likewise the approvals still pending in the approval queue.
+        for approval in self._native_submit_pending_approvals(native_request_ref)[:16]:
+            queue.put_nowait(self._native_submit_event(
+                native_request_ref, "approval.request", _broadcast=False, **approval,
+            ))
 
         response = web.StreamResponse(status=200, headers={
             "Content-Type": "text/event-stream",
@@ -5527,10 +5632,124 @@ class APIServerAdapter(BasePlatformAdapter):
         self._native_submit_clarifies[(native_request_ref, clarify_id)] = "pending"
         return SendResult(success=True, message_id=clarify_id)
 
+    # Weave: attended approvals on native submit. The approval queue in
+    # tools.approval stays the single authority for what is pending; these
+    # helpers only project it onto the native-submit stream and resolve it.
+    # Choices are once|deny only: "always" belongs to the Ledger, so Hermes
+    # never writes a session or permanent allowlist for these sessions.
+    _NATIVE_APPROVAL_CHOICES = ("once", "deny")
+
+    @staticmethod
+    def _native_approval_projection(approval: Dict[str, Any]) -> Dict[str, Any]:
+        # The queue payload honours security.redact_secrets; this egress is a
+        # safety boundary (same as gateway/run.py _redact_approval_command), so
+        # human-visible text is force-redacted for the live event AND replay.
+        def visible(key: str) -> str:
+            return redact_sensitive_text(str(approval.get(key) or ""), force=True)[:4096]
+
+        return {
+            "request_id": str(approval.get("request_id") or "")[:256],
+            "pattern_key": str(approval.get("pattern_key") or "")[:512],
+            "description": visible("description"),
+            "command": visible("command"),
+            "choices": list(APIServerAdapter._NATIVE_APPROVAL_CHOICES),
+        }
+
+    def _native_submit_pending_approvals(self, native_request_ref: str) -> List[Dict[str, Any]]:
+        session_key = self._native_submit_approval_keys.get(native_request_ref)
+        # Approvals are queued per session key; only the admission that owns the
+        # session's live turn may see or resolve them. An outer admission still
+        # registered while its queued follow-up runs owns nothing.
+        if not session_key or self._native_submit_active_ref(session_key) != native_request_ref:
+            return []
+        from tools.approval import list_gateway_approvals
+
+        return [
+            self._native_approval_projection(approval)
+            for approval in list_gateway_approvals(session_key)
+            if approval.get("request_id")
+        ]
+
+    async def send_exec_approval(
+        self, chat_id: str, command: str, session_key: str, description: str = "",
+        metadata: Optional[Dict[str, Any]] = None, allow_permanent: bool = True,
+        allow_session: bool = True, smart_denied: bool = False,
+    ) -> SendResult:
+        """Publish pending gateway approvals as ``approval.request`` on the native stream."""
+        native_request_ref = self._native_submit_active_ref(session_key)
+        if not native_request_ref or self._native_submit_approval_keys.get(native_request_ref) != session_key:
+            return SendResult(success=False, error="native approval surface unavailable")
+        sent = self._native_submit_approvals_sent.setdefault(native_request_ref, set())
+        published = []
+        for approval in self._native_submit_pending_approvals(native_request_ref):
+            if approval["request_id"] in sent:
+                continue
+            sent.add(approval["request_id"])
+            self._native_submit_event(native_request_ref, "approval.request", **approval)
+            published.append(approval["request_id"])
+        if not published:
+            return SendResult(success=False, error="no pending approval to publish")
+        return SendResult(success=True, message_id=published[-1])
+
+    async def _handle_native_submit_approval_events(self, request: "web.Request") -> "web.Response":
+        """Return the pending approvals of one attended native admission (reconnect)."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        native_request_ref = request.match_info["native_request_ref"]
+        if self._native_submit_ref_sessions.get(native_request_ref) != (
+            _api_request_profile.get() or "default", session_id
+        ):
+            return web.json_response(_openai_error("Native admission was not found", code="native_admission_not_found"), status=404)
+        events = [
+            {"type": "approval.request", "native_request_ref": native_request_ref, **approval}
+            for approval in self._native_submit_pending_approvals(native_request_ref)
+        ]
+        return web.json_response({"object": "list", "data": events})
+
+    async def _handle_native_submit_approval_response(self, request: "web.Request") -> "web.Response":
+        """Resolve exactly the pending approval named by admission ref and request id."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        native_request_ref = request.match_info["native_request_ref"]
+        request_id = request.match_info["request_id"]
+        if self._native_submit_ref_sessions.get(native_request_ref) != (
+            _api_request_profile.get() or "default", session_id
+        ):
+            return web.json_response(_openai_error("Native admission was not found", code="native_admission_not_found"), status=404)
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        choice = body.get("choice")
+        if set(body) != {"choice"} or choice not in self._NATIVE_APPROVAL_CHOICES:
+            return web.json_response(_openai_error(
+                "Invalid approval choice; expected one of: once, deny",
+                code="invalid_native_approval_choice",
+            ), status=400)
+        session_key = self._native_submit_approval_keys.get(native_request_ref)
+        if not session_key or not any(
+            approval["request_id"] == request_id
+            for approval in self._native_submit_pending_approvals(native_request_ref)
+        ):
+            return web.json_response(_openai_error("Native approval is not pending", code="native_approval_not_pending"), status=409)
+        from tools.approval import resolve_gateway_approval
+
+        if not resolve_gateway_approval(session_key, choice, request_id=request_id):
+            return web.json_response(_openai_error("Native approval is not pending", code="native_approval_not_pending"), status=409)
+        return web.json_response({"object": "hermes.session.approval.response", "resolved": True, "choice": choice})
+
     async def _on_native_submit_started(self, event: MessageEvent, session_key: str) -> None:
         native_request_ref = (getattr(event, "metadata", None) or {}).get("native_request_ref")
         if isinstance(native_request_ref, str) and native_request_ref:
             self._native_submit_active_refs[session_key] = native_request_ref
+            from tools.approval import mark_api_session_attended, native_submit_attended_enabled
+
+            if session_key and native_submit_attended_enabled():
+                self._native_submit_approval_keys[native_request_ref] = session_key
+                mark_api_session_attended(session_key)
             source = getattr(event, "source", None)
             chat_id = getattr(source, "chat_id", None)
             if isinstance(chat_id, str) and chat_id:
@@ -5599,6 +5818,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return
         if self._native_submit_active_refs.get(session_key) == native_request_ref:
             self._native_submit_active_refs.pop(session_key, None)
+        approval_key = self._native_submit_approval_keys.pop(native_request_ref, None)
+        self._native_submit_approvals_sent.pop(native_request_ref, None)
+        if approval_key and approval_key not in self._native_submit_approval_keys.values():
+            from tools.approval import mark_api_session_attended
+
+            mark_api_session_attended(approval_key, False)
         for key, state in list(self._native_submit_clarifies.items()):
             if key[0] == native_request_ref and state == "pending":
                 self._native_submit_clarifies[key] = "terminal"

@@ -5478,6 +5478,35 @@ class _BoundedCronSessionDB:
         return _bounded
 
 
+def _resolve_cron_run_credential(job_id, session_id, provider, base_url):
+    """Return the first ``cron_run_credential`` plugin answer, or None.
+
+    Unlike ``invoke_hook`` (which logs and skips a raising callback), a raise
+    here propagates so the cron run fails closed instead of running on the
+    ambient/no-key runtime. A non-None answer must be a ``SessionCredential``.
+    """
+    from hermes_cli.plugins import PluginManager, has_hook, iter_hook_callbacks
+
+    if not has_hook("cron_run_credential"):
+        return None
+    from agent.session_credential import SessionCredential
+
+    payload = {
+        "job_id": job_id,
+        "session_id": session_id,
+        "provider": provider,
+        "base_url": base_url,
+    }
+    for callback in iter_hook_callbacks("cron_run_credential"):
+        credential = PluginManager._invoke_hook_callback(callback, payload)
+        if credential is None:
+            continue
+        if not isinstance(credential, SessionCredential):
+            raise RuntimeError("cron_run_credential must return a SessionCredential")
+        return credential
+    return None
+
+
 def run_job(
     job: dict,
     *,
@@ -6423,6 +6452,17 @@ def run_job(
             )
         except Exception as e:
             logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
+
+        # Weave (#830): a plugin may mint a per-fire session credential for this
+        # run. No answer leaves the runtime untouched; a raising hook or a
+        # malformed answer fails the run closed (caught by the handler below).
+        _run_credential = _resolve_cron_run_credential(
+            job_id, _cron_session_id, runtime.get("provider"), runtime.get("base_url"),
+        )
+        if _run_credential is not None:
+            runtime = {**runtime, "api_key": _run_credential}
+            # A pool entry would silently swap in a different key on rotation.
+            credential_pool = None
 
         agent = AIAgent(
             model=model,
