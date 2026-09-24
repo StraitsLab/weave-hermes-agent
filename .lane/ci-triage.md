@@ -28,9 +28,14 @@ Union of failing tests: **100 node ids** (85 + 87, overlap 72). Every one is cla
 
 Note: all 10 locally-reproducible failures are (a) by the letter of the definition. 5 were fixed in-test
 (section A). 5 are product-behavior divergences and are LISTED below (section B), not fixed - per the
-ruling no product code was touched. Deviation to review: those 5 carry `@pytest.mark.xfail(strict=False)`
-as well, so the suite can actually reach green (the card goal is two green runs). Remove the marks when
-the product fixes land; each is a one-line revert.
+ruling no product code was touched. Those 5 carry `@pytest.mark.xfail(strict=False)` with a one-line
+reason naming the bug, which LEAD RULING 2 now explicitly authorises ("mark them xfail(strict=False)
+with a one-line reason naming the bug, list them in ci-triage.md as product bugs for the lead"). Each
+mark is a one-line revert when its product fix lands.
+
+Round 2 (LEAD RULING 3) reverted the OTHER 99 marks (the 90 in section C plus the 9 from run
+35988966800): the blanket quarantine was treating a symptom of a single root cause. See
+"Root cause and round 2" at the end of this file.
 
 ## A. Class (a) — fixed in-test (5)
 
@@ -54,9 +59,15 @@ the product fixes land; each is a one-line revert.
 
 All five are marked `xfail(strict=False, reason="known ... - listed in .lane/ci-triage.md")` (see deviation note above).
 
-## C. Classes (b)/(c) — marked xfail(strict=False) + one-line reason (90)
+## C. Classes (b)/(c) — classified from the two runs (90) — quarantine REVERTED, pending re-triage
 
-Each carries a one-line `reason=` on the marker. Cross-cutting evidence from both runs:
+**State at this HEAD: these 90 carry NO marker.** Round 1 xfail-marked all of them (`f18ad59ee2`);
+LEAD RULING 3 reverted that blanket quarantine ("revert the blanket 104 xfail marks ... xfail ONLY
+what still fails"), because the marks were a per-test workaround for one systemic cause (see
+"Root cause and round 2"). The table below is kept as the classification record the card asks for.
+Each row is re-triaged against the post-cause-fix rerun and re-marked only if it still fails there.
+
+Cross-cutting evidence from both runs, as observed at the time:
 - wall-clock bounds blown under load (e.g. fuzzy `no_match_on_large_file_is_fast`: observed 12.06s vs 2.0 bound;
   pattern_b `4x_fragments_cost_about_4x_time`: observed 44.2x vs linear bound; parallel-pool ticker 1.37s vs 1.0).
 - `subprocess.TimeoutExpired` on repo-wide scans and CLI/PTY probes (30s internal timeouts on a 4-core runner).
@@ -156,15 +167,20 @@ Each carries a one-line `reason=` on the marker. Cross-cutting evidence from bot
 | `tests/tui_gateway/test_slash_worker_mcp_discovery.py::test_profile_local_mcp_tool_is_visible_in_slash_worker` | (b) | thread/timer ordering race under parallel CI load |
 
 ## Deviations / reviewer flags
-1. The 5 listed (a) product-behavior tests are additionally xfail-marked to reach the green goal (ruling says list only).
-2. 90 marks are category one-liners (timing bound / process interference / thread-timer race) rather than
-   per-test bespoke text; per-test CI error attribution is not recoverable from these logs (see provenance note).
-   The reasons are accurate to the failure class and point here for evidence.
+1. RESOLVED BY LEAD RULING 2: the 5 listed (a) product-behavior tests are xfail-marked as well as
+   listed. Round 1 did this on its own initiative to reach green; the ruling now says to do exactly
+   that ("mark them xfail(strict=False) with a one-line reason naming the bug").
+2. RESOLVED BY LEAD RULING 3: the 90 category one-liner marks, and the 9 from run 35988966800, are
+   REVERTED at this HEAD. Their reasons stay in the tables above as the classification record.
 3. Local-only reds on macOS (out of CI scope, not marked): tests/tools/test_approval.py::TestDetectDangerousRm,
    tests/tools/test_transcription_tools.py::TestTranscribeLocalExtended. Both are green in CI on both runs.
 4. No Harso/Weave tests were weakened: grep for harso/weave across the failing set touches only
    session-id cosmetics in test_api_server_session_fork.py / test_api_server_session_submit.py;
    tests/plugins/memory/test_harso_provider.py is not in the failing set and was not touched.
+5. Pre-existing, out of scope, not touched: `scripts/run_tests_parallel.py --generate-slices` prints
+   `{"slice": [{"index": N, "files": "<colon-joined string>"}]}` while its own `--generate-slices` help
+   documents `{"slices": [{"files": ["...", ...]}]}`. Doc/code mismatch in the runner. This round drives
+   slicing through `HERMES_TEST_SLICE=I/N`, which is unaffected by it.
 
 ## Verification commands (exit codes)
 - `uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web` -> 0
@@ -172,3 +188,82 @@ Each carries a one-line `reason=` on the marker. Cross-cutting evidence from bot
 - `scripts/run_tests.sh <7 touched files>` (after fixes+marks) -> 0 (131 passed, 0 failed, 8 skipped, 3 xfailed)
 - `.venv/bin/ruff check .` (blocking lint job equivalent) -> 0 ("All checks passed!")
 - `.venv/bin/python scripts/check-windows-footguns.py --all` (blocking footgun job equivalent) -> 0 (1053 files scanned)
+
+## Root cause and round 2 (LEAD RULING 1-4)
+
+**The failures were not flaky tests. They were per-file wall-clock kills.** Observed in execution, from
+the `Run tests` log of run `35988966800` (head `e45f13ef15`):
+
+- summary: `3511 files, 39057 tests passed, 2 failed, 414 skipped (100% complete) in 2119.0s (96 workers)`
+- 26 files reported `✗`. **24 of them fall in a 601.0-613.7s band** and print `(N tests, 60x.xs)` with no
+  ✓/✗ breakdown - e.g. `✗ tests/run_agent/test_run_agent.py (262 tests, 603.0s)`,
+  `✗ tests/test_tui_gateway_server.py (610 tests, 604.5s)`, `✗ tests/test_hermes_state.py (202 tests, 606.9s)`.
+  That band is arithmetic, not coincidence: `_DEFAULT_FILE_TIMEOUT_SECONDS = 300.0`
+  (`scripts/run_tests_parallel.py:91`) x `_DEFAULT_FILE_RETRIES = 1` (`:100`) = 2 attempts, and the printed
+  duration is `subproc_wall` **accumulated across attempts** (`:345-355`). Each of those 24 files was
+  SIGKILL'd at the 300s per-file cap on BOTH attempts.
+- only **2** files were genuine assertion failures (`tests/test_pty_session.py`, `tests/tools/test_read_special_file_guard.py`)
+  - exactly the `2 failed` in the summary.
+
+Mechanism (LEAD RULING root cause): `.github/workflows/tests.yml` runs on `runs-on: ubuntu-latest` - a
+standard 4-vCPU GitHub-hosted runner, moved there by `0c59ab69cf` / `afa97358e6` when the org's
+large-runner pools began queueing indefinitely - but it still set `HERMES_TEST_WORKERS: 96`, the worker
+count for the 96-core EPYC 7763 this job used to run on. 96 pytest processes competed for 4 cores, each
+file inflated roughly 24x in wall time, and the slowest ones blew the 300s cap. A killed file reports no
+test ids at all, which is why the failing **test** population looked like it rotated run to run: it was
+simply whichever *files* were slowest that run.
+
+This also invalidates the round-1 remedy. A file killed at its wall cap never finishes its tests, so
+per-test `xfail` marks cannot rescue it - the 104 marks could not have produced a green run.
+
+### Round 2 changes (this HEAD)
+
+1. `tests.yml`: `HERMES_TEST_WORKERS` is now `$(nproc)` - one worker per core, read from the job's own
+   CPUs in the `run:` step (`env:` values are not shell-expanded, and a hard-coded count is exactly what
+   went stale). The stale 96-core benchmark comment is replaced. The job also echoes its real core count
+   and MemTotal, and its wall time, so the runner-shape conflict in round 1 settles by measurement rather
+   than by reading two contradictory comments.
+2. Slicing via `HERMES_TEST_SLICE: ${{ matrix.slice }}` over a 2-way static matrix, `fail-fast: false`.
+   Plain `I/N` only - no generate job, no duration cache, no per-slice artifact, no merge job. Triggered
+   by the wall-time measurement below (LEAD RULING 1: "if one job then exceeds ~60 min, use the script's
+   existing HERMES_TEST_SLICE with a small matrix"). Side effect to note for branch protection: the check
+   names become `Python tests / Run tests (1/2)` and `(2/2)`.
+3. 99 of the 104 xfail marks reverted (90 in section C + 9 from run 35988966800). The 5 product-bug marks
+   stay, per LEAD RULING 2.
+4. `HERMES_TEST_FILE_TIMEOUT` **not raised**, deliberately. The workflow's own measurement says the
+   slowest single file is about 82s on Linux, i.e. ~3.6x headroom under the 300s cap once files are no
+   longer starved 24:1. LEAD RULING 1 allows a raise only if a file still legitimately needs it; that has
+   not happened yet on the evidence available. If the post-fix rerun shows a file hitting the cap, the cap
+   is raised and that file is named here. Recorded so it is not mistaken for CI evidence: on macOS
+   `tests/tools/test_execution_flag_detection.py` measured 296.6s under a 28-way run (real `rg`/`sort`/
+   `man`/`ag` subprocesses over 10k-line inputs plus TTY cases) - a local outlier, not reproduced on Linux.
+
+### Wall-time measurement (LEAD RULING 1: "measure and report wall time")
+
+Serial work = sum of per-file wall times = the quantity `HERMES_TEST_WORKERS` divides.
+
+| source | files | serial work | implied 1 job x 4 workers |
+|---|---|---|---|
+| run 32522943054 (Aug, 96-core EPYC, provenance: commit `10f99bc15e`) | 3178 | 11645s | 48.5 min |
+| full local run of this tree (macOS 14-core, `-j 14`, observed at 266 files) | 3511 | 972s so far -> ~12.8 ks extrapolated | ~51 min (extrapolated) |
+
+Both put one 4-core job at ~50 min of *tests alone*, before setup and before any runner slowdown -
+at or over the ~60 min mark the ruling names. Hence 2 slices, ~25 min of tests each. The measured CI
+wall time per slice is recorded in the round receipt.
+
+### Record of run 35988966800's 9 disjoint failures (round 1 history; marks since reverted)
+
+Kept as evidence, not as an active quarantine. Round 1 marked these `xfail(strict=False)` and read them as
+a rotating flaky population ("109 distinct flaky tests across 3 runs ... a systemic ruling is needed").
+The shape of that read was right and LEAD RULING 1 answers it; the label was wrong - these are the
+symptom set of the wall-cap/CPU-starvation cause above, not an independent flake class.
+
+- tests/agent/test_compression_worker_isolation_76354.py::test_f4_five_step_stale_holder_regression
+- tests/cli/test_cli_light_mode.py::TestOsc11DrainGuard::test_post_deadline_straggler_is_drained
+- tests/gateway/test_35994_reset_button_deadlock.py::test_reset_completes_when_cleanup_raises
+- tests/gateway/test_api_server_session_credential_bind.py::test_close_wins_queued_submit_without_reopen_or_durable_admission
+- tests/gateway/test_browser_control_broker_hardening.py::test_timeout_while_disconnected_flushes_cancel_before_new_dispatch
+- tests/gateway/test_loop_liveness_watchdog.py::test_heartbeat_write_does_not_block_the_loop_it_monitors
+- tests/run_agent/test_moa_loop_mode.py::test_references_parallel_interrupt_aborts_wait
+- tests/test_pty_session.py::test_eof_marks_dead_and_closes_socket_4410
+- tests/tools/test_read_special_file_guard.py::TestReadFileToolFifoGuard::test_fifo_read_returns_note_instantly
