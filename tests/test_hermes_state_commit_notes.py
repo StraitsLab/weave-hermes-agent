@@ -457,3 +457,42 @@ def test_a_recreated_session_never_reissues_an_old_epoch(db):
         (first, SID)))
     page = db.read_transcript_events(SID, (old, first), 50)
     assert page["epoch"] != old and page["reset_required"]
+
+
+# ── round-5 review: recovery must not reissue an epoch ──────────────────────
+
+
+def test_recovered_database_never_reissues_an_epoch(tmp_path):
+    from hermes_cli.session_recovery import recover_session_database
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.create_session(SID, "test")
+    db.append_message(SID, role="user", content="original")
+    db.append_message(SID, role="assistant", content="answer")
+    cursor_epoch = db.get_transcript_epoch(SID)
+    assert db.set_latest_matching_message_display_kind(SID, role="user", content="original", display_kind="internal")
+    edited = db.get_transcript_epoch(SID)
+    assert edited > cursor_epoch
+    db.close()
+    output = tmp_path / "recovered.db"
+    recover_session_database(path, output, work_dir=tmp_path)
+    recovered = SessionDB(output)
+    try:
+        assert recovered.get_transcript_epoch(SID) >= edited  # never back to a generation a cursor carries
+        page = recovered.read_transcript_events(SID, (cursor_epoch, 2), 50)
+        assert page["reset_required"]
+        row = recovered.get_messages(SID)[0]["id"]
+        before = recovered.get_transcript_epoch(SID)
+        recovered._execute_write(lambda c: c.execute("UPDATE messages SET content = 'x' WHERE id = ?", (row,)))
+        assert recovered.get_transcript_epoch(SID) > before  # the sequence continues above copied epochs
+    finally:
+        recovered.close()
+
+
+def test_a_rewound_sequence_never_reissues_an_epoch(db):
+    db.append_message(SID, role="user", content="one")
+    high = db.get_transcript_epoch(SID)
+    db._execute_write(lambda c: c.execute("UPDATE state_meta SET value = '0' WHERE key = 'transcript_seq'"))
+    row = db.get_messages(SID)[0]["id"]
+    db._execute_write(lambda c: c.execute("UPDATE messages SET content = 'edited' WHERE id = ?", (row,)))
+    assert db.get_transcript_epoch(SID) > high
