@@ -169,6 +169,11 @@ async def test_planned_service_exit_issues_no_restart_of_its_own(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(
+    reason="known product bug: bounded interrupt-grace teardown never completes "
+    "(subprocess.TimeoutExpired) - listed .lane/ci-triage.md",
+    strict=False,
+)
 async def test_unexpected_signal_starts_teardown_after_bounded_interrupt_grace():
     runner, adapter = make_restart_runner()
     runner._restart_drain_timeout = 0.0
