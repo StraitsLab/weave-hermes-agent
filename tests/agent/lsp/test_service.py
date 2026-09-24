@@ -230,9 +230,6 @@ def test_reused_client_refreshes_last_used_and_survives_reap(mock_pyright):
         svc.shutdown()
 
 
-@pytest.mark.xfail(
-    reason='flaky (b/c): cross-file process/thread interference under 96-way file parallelism - see .lane/ci-triage.md', strict=False
-)
 def test_reaper_survives_sweep_error(mock_pyright):
     """One failing sweep must not kill the reaper loop — the loop's
     ``except Exception`` guard must swallow the error and keep sweeping."""

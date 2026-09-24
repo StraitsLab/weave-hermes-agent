@@ -273,9 +273,6 @@ async def test_named_profile_routes_isolate_same_session_id_and_credentials(tmp_
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    reason='flaky (b): timing/thread-ordering failure surfacing under the fork 96-way file parallelism on a 4-core runner (newly seen in run 35988966800, disjoint from the triaged 100) - see .lane/ci-triage.md', strict=False
-)
 async def test_close_wins_queued_submit_without_reopen_or_durable_admission(adapter_and_runner):
     """The real lifecycle lock makes close win before native submit admission."""
     adapter, runner = adapter_and_runner

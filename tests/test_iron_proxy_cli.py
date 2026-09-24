@@ -318,9 +318,6 @@ def test_cmd_start_refuses_when_bitwarden_mode_but_disabled(hermes_home, monkeyp
 
 
 
-@pytest.mark.xfail(
-    reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-)
 def test_cmd_setup_audit_log_failure_is_warning_not_abort(hermes_home, monkeypatch):
     """On the pinned v0.39 the daemon never writes audit.log, so a
     pre-create failure must not abort the wizard."""

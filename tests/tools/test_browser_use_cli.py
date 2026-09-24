@@ -731,9 +731,6 @@ class TestNativeScreenshots:
         assert result["meta"]["screenshot_path"] == shot
         assert shot in result["text_summary"]
 
-    @pytest.mark.xfail(
-        reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-    )
     def test_text_only_model_gets_plain_result_with_path(self, tmp_path, monkeypatch):
         shot = self._shot(tmp_path)
         cli = _fake_cli(tmp_path, f'cat > /dev/null\necho "{shot}"\n')

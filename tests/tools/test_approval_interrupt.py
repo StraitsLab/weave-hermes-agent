@@ -17,8 +17,6 @@ import os
 import threading
 import time
 
-import pytest
-
 
 def _clear_approval_state():
     """Reset all module-level approval state between tests."""
@@ -67,9 +65,6 @@ class TestApprovalInterrupt:
                 os.environ[k] = v
         _clear_approval_state()
 
-    @pytest.mark.xfail(
-        reason='flaky (b): tight timing bound cannot hold under 96-way file parallelism on a 4-core runner - see .lane/ci-triage.md', strict=False
-    )
     def test_interrupt_unblocks_pending_approval_quickly(self):
         """An interrupt on the waiting thread must resolve the wait as deny
         well before the (here, intentionally long) approval timeout."""

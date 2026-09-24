@@ -490,9 +490,6 @@ def test_turn_lease_fences_stale_transcript_flush_after_reclaim(tmp_path):
     db.release_session_turn_lease("shared", next_holder)
 
 
-@pytest.mark.xfail(
-    reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-)
 def test_turn_lease_revives_expired_row_still_owned_by_writer(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     db.create_session("shared", source="test")

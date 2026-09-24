@@ -145,9 +145,6 @@ async def test_reset_does_not_block_event_loop_during_cleanup():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    reason='flaky (b): timing/thread-ordering failure surfacing under the fork 96-way file parallelism on a 4-core runner (newly seen in run 35988966800, disjoint from the triaged 100) - see .lane/ci-triage.md', strict=False
-)
 async def test_reset_completes_when_cleanup_raises(caplog):
     """#35994: if the offloaded cleanup itself raises, the handler swallows it
     (logs a warning) and still rotates the session — it must not abort /new.

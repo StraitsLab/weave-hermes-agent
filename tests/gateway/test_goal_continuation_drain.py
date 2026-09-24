@@ -141,9 +141,6 @@ async def test_fifo_enqueued_continuation_is_drained_without_new_user_message():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    reason='flaky (b): tight timing bound cannot hold under 96-way file parallelism on a 4-core runner - see .lane/ci-triage.md', strict=False
-)
 async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_home):
     """_post_turn_goal_continuation resolves the FIFO key via
     _session_key_for_source; the adapter drain uses build_session_key on the

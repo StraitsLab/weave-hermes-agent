@@ -2,8 +2,6 @@
 
 from tools.fuzzy_match import IDENTICAL_STRINGS_ERROR, fuzzy_find_and_replace
 
-import pytest
-
 
 class TestExactMatch:
     def test_single_replacement(self):
@@ -618,9 +616,6 @@ class TestContextAwareCorrectness:
         assert count == 1, f"err={err}"
         assert "beta TWO" in result
 
-    @pytest.mark.xfail(
-        reason='flaky (b): tight timing bound cannot hold under 96-way file parallelism on a 4-core runner - see .lane/ci-triage.md', strict=False
-    )
     def test_no_match_on_large_file_is_fast(self):
         """The anchor pre-filter keeps a no-match scan from being O(file×pattern)."""
         import time

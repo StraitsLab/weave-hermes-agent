@@ -313,9 +313,6 @@ def test_gateway_runner_liveness_guards_start_and_stop():
     floor_timer.cancel.assert_called_once_with()
     assert runner._loop_liveness_watchdog is None
     assert runner._loop_floor_timer_handle is None
-@pytest.mark.xfail(
-    reason='flaky (b): timing/thread-ordering failure surfacing under the fork 96-way file parallelism on a 4-core runner (newly seen in run 35988966800, disjoint from the triaged 100) - see .lane/ci-triage.md', strict=False
-)
 def test_heartbeat_write_does_not_block_the_loop_it_monitors():
     """The heartbeat write must not freeze the loop the watchdog is watching.
 

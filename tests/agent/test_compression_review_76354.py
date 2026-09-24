@@ -44,9 +44,6 @@ def _drain_admission_slots():
 
 
 class TestF1CommitOverrunWhileHung:
-    @pytest.mark.xfail(
-        reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-    )
     def test_overrun_warning_fires_while_commit_still_blocked(self, monkeypatch):
         """The warning + on_commit_overrun fire DURING the hang, not after.
 
@@ -279,9 +276,6 @@ class TestF4CooldownClearOrdering:
 
 
 class TestF6ExecutorSaturation:
-    @pytest.mark.xfail(
-        reason='flaky (b): tight timing bound cannot hold under 96-way file parallelism on a 4-core runner - see .lane/ci-triage.md', strict=False
-    )
     def test_saturated_pool_fails_fast_and_never_runs_stale_job(self):
         """4 blocked summaries + 5th submission fails fast; recovery does not
         run the refused job."""

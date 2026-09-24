@@ -115,9 +115,6 @@ async def test_detach_keeps_draining_into_buffer():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    reason='flaky (b): timing/thread-ordering failure surfacing under the fork 96-way file parallelism on a 4-core runner (newly seen in run 35988966800, disjoint from the triaged 100) - see .lane/ci-triage.md', strict=False
-)
 async def test_eof_marks_dead_and_closes_socket_4410():
     from hermes_cli.pty_session import PtySession
     bridge = FakeBridge([b"bye", None])
@@ -165,9 +162,6 @@ async def test_new_key_at_capacity_raises_when_none_reapable():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    reason='flaky (b/c): cross-file process/thread interference under 96-way file parallelism - see .lane/ci-triage.md', strict=False
-)
 async def test_reaper_loop_invokes_reap(monkeypatch):
     from hermes_cli.pty_session import run_reaper
     reg = make_registry()

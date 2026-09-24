@@ -149,9 +149,6 @@ async def test_dead_room_worker_is_restarted_by_gateway_task_supervision(monkeyp
     assert runner._background_tasks == set()
 
 
-@pytest.mark.xfail(
-    reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-)
 def test_gateway_restart_resumes_queued_room_for_multiplexed_profile(tmp_path):
     db = tmp_path / "state.db"
     first, _ = _service(db, profiles=("default", "ops"))
@@ -194,9 +191,6 @@ def test_gateway_restart_resumes_queued_room_for_multiplexed_profile(tmp_path):
     assert hosted_room_driver.list_tasks(db, room_id="room-1", status="settled")
 
 
-@pytest.mark.xfail(
-    reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-)
 def test_dashboard_and_gateway_workers_share_one_fenced_execution_owner(tmp_path):
     db = tmp_path / "state.db"
     gateway, gateway_rpc = _service(db, profiles=("default", "ops"))

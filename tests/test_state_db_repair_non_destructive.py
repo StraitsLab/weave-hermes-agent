@@ -412,9 +412,6 @@ def test_actual_strategy_failure_still_consumes_one_attempt(tmp_path, monkeypatc
     assert ledger["failed_attempts"] == 1
 
 
-@pytest.mark.xfail(
-    reason='flaky (b/c): cross-file process/thread interference under 96-way file parallelism - see .lane/ci-triage.md', strict=False
-)
 def test_repair_outcome_is_recorded_while_cross_process_lock_is_held(
     tmp_path, monkeypatch
 ):

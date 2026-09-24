@@ -14,12 +14,7 @@ from types import SimpleNamespace
 from tools.environments.local import LocalEnvironment
 import tools.environments.base as base_mod
 
-import pytest
 
-
-@pytest.mark.xfail(
-    reason='flaky (b): tight timing bound cannot hold under 96-way file parallelism on a 4-core runner - see .lane/ci-triage.md', strict=False
-)
 def test_execute_returns_when_wait_loop_never_returns(monkeypatch):
     """A wedged inner wait cannot hold execute() past timeout + grace."""
     monkeypatch.setattr(base_mod, "_EXECUTE_WAIT_BOUND_GRACE_S", 0.05)

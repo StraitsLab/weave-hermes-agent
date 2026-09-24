@@ -86,9 +86,6 @@ _MESSAGES = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-)
 def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
     """Two agents sharing a session_id must not both rotate it.
 

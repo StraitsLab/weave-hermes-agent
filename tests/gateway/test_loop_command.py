@@ -95,9 +95,6 @@ async def test_gateway_loop_status_pause_stop(loop_env):
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-)
 async def test_gateway_loop_goal_note_when_goal_active(loop_env):
     from hermes_cli.goals import GoalManager
 

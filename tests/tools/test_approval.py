@@ -1517,9 +1517,6 @@ class TestApprovalTimeoutIsNotConsent:
         ]
         assert hook_calls[-1][1]["choice"] == "notify_failed"
 
-    @pytest.mark.xfail(
-        reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-    )
     def test_pending_approval_is_replayable_and_acknowledged(self, monkeypatch):
         from tools import approval as mod
 
@@ -1549,9 +1546,6 @@ class TestApprovalTimeoutIsNotConsent:
         thread.join(timeout=5)
         assert result_holder["result"]["approved"] is True
 
-    @pytest.mark.xfail(
-        reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-    )
     def test_stale_request_id_cannot_resolve_current_approval(self, monkeypatch):
         from tools import approval as mod
 

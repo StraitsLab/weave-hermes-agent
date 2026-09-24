@@ -1442,9 +1442,6 @@ async def test_base_processing_releases_post_delivery_callback_after_main_send()
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    reason='flaky (b/c): cross-file process/thread interference under 96-way file parallelism - see .lane/ci-triage.md', strict=False
-)
 async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
     monkeypatch,
 ):

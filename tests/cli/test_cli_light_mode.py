@@ -235,9 +235,6 @@ class TestOsc11DrainGuard:
         os.close(read_fd)
         os.close(write_fd)
 
-    @pytest.mark.xfail(
-        reason='flaky (b): timing/thread-ordering failure surfacing under the fork 96-way file parallelism on a 4-core runner (newly seen in run 35988966800, disjoint from the triaged 100) - see .lane/ci-triage.md', strict=False
-    )
     def test_post_deadline_straggler_is_drained(self, cli_mod, monkeypatch):
         """Bytes that arrive after the main loop has already finished (DA1
         answered instantly, reply straggles in during teardown) are eaten
@@ -387,9 +384,6 @@ def repo_root():
 
 @pytest.mark.skipif(_sys.platform == "win32", reason="POSIX PTY test")
 class TestOsc11Da1Fence:
-    @pytest.mark.xfail(
-        reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-    )
     def test_herdr_style_da1_only_returns_none_without_leak(self, repo_root):
         """Terminal answers DA1 instantly but swallows OSC 11 (herdr)."""
         result, leftover = _run_osc11_child(
@@ -398,9 +392,6 @@ class TestOsc11Da1Fence:
         assert result == "None"
         assert leftover == "b''"
 
-    @pytest.mark.xfail(
-        reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-    )
     def test_slow_inorder_reply_is_consumed_not_leaked(self, repo_root):
         """OSC 11 reply arrives at +300ms (past the old 100ms budget),
         DA1 right behind it.  The fence keeps us listening, so the color
@@ -415,9 +406,6 @@ class TestOsc11Da1Fence:
         assert result == "'#1E1E2E'"
         assert leftover == "b''"
 
-    @pytest.mark.xfail(
-        reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-    )
     def test_mute_terminal_times_out_clean(self, repo_root):
         """Terminal that answers nothing: give up at the safety-net
         deadline with no leftovers."""

@@ -13,16 +13,26 @@ concurrency:
 
 jobs:
   test:
-    name: Run tests
-    # One 96-core runner for the whole suite. There is no slicing. Slicing
-    # existed to spread the suite over 4-core runners. It cost a matrix job, a
-    # duration cache, a per-slice artifact and a merge job to do it.
+    name: Run tests (${{ matrix.slice }})
+    # Standard GitHub-hosted ubuntu-latest (4 vCPU / 16 GB). The org's larger
+    # runner pools queue indefinitely, so this is the only runner available
+    # (0c59ab69cf, afa97358e6). The 96-core EPYC 7763 this job used to run on
+    # is gone.
     #
-    # 96 cores clear the floor that the slowest single test file sets (about
-    # 82s). A second slice divides work that is already at that floor, and
-    # adds a second setup.
+    # Two slices, because one job on 4 cores no longer fits the 60-min mark:
+    # the suite is ~12.3 ks of serial test work (3511 files, per-file wall
+    # times summed over a full run), so 4 workers need ~51 min of tests alone
+    # before setup and before any runner slowdown. Each slice is therefore
+    # ~25 min of tests. Slicing is plain HERMES_TEST_SLICE only — no generate
+    # job, no duration cache, no per-slice artifact, no merge job.
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      # A red slice must not cancel its sibling: the failing file list from
+      # both is the evidence that decides what gets marked.
+      fail-fast: false
+      matrix:
+        slice: ["1/2", "2/2"]
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -96,30 +106,33 @@ jobs:
         # No --files: the runner discovers the suite itself. The discovered
         # set is identical to the list the removed matrix job used to pass in.
         run: |
+          set -euo pipefail
           source .venv/bin/activate
-          scripts/run_tests.sh
+          CORES="$(nproc)"
+          echo "▸ runner: $CORES cores, $(grep -m1 MemTotal /proc/meminfo | tr -s ' ')"
+          echo "▸ HERMES_TEST_WORKERS=$CORES (one per core), slice=${HERMES_TEST_SLICE:-none}"
+          START=$(date +%s)
+          trap 'echo "▸ Run tests wall time: $(( $(date +%s) - START ))s (slice ${HERMES_TEST_SLICE:-none})"' EXIT
+          HERMES_TEST_WORKERS="$CORES" scripts/run_tests.sh
         env:
           # This is the maximum number of test FILES that run together.
           # run_tests_parallel.py starts one pytest subprocess for each file
           # from a single ThreadPoolExecutor, so this value IS the limit. The
-          # default is cpu_count*2, which is 192 here.
+          # default is cpu_count*2.
           #
-          # Measured on this runner (96-core EPYC 7763, 377GB). Whole suite,
-          # two repetitions for each value. See run 32549672063:
+          # One worker per core. Measured on the 96-core runner this suite
+          # used to run on (run 32549672063, two reps per value): 48 workers
+          # 138s, 96w 126s, 144w 132s, 192w 132s, 240w 140s, 288w 142s. The
+          # curve is shallow and one worker per core wins; workers above the
+          # core count only add contention.
           #
-          #     workers   x cores   mean
-          #        48       0.5x    138s
-          #        96       1.0x    126s   <- fastest
-          #       144       1.5x    132s
-          #       192       2.0x    132s
-          #       240       2.5x    140s
-          #       288       3.0x    142s
-          #
-          # One worker for each core wins. The curve is shallow: 126s to 142s
-          # across a 6x range. The suite has sufficient concurrency at this
-          # size. The remaining time is the slowest files plus the setup.
-          # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
+          # It is set from `$(nproc)` in the step above rather than hard-coded
+          # here: `env:` values are not shell-expanded, and a hard-coded count
+          # is exactly what went stale. 96 belonged to the 96-core runner and
+          # was left behind when the job moved to ubuntu-latest — 96 pytest
+          # processes then competed for 4 cores, every file blew its 300s
+          # per-file wall cap, and "Run tests" failed differently each run.
+          HERMES_TEST_SLICE: ${{ matrix.slice }}
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

@@ -24,8 +24,6 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
-
 from agent.context_compressor import (
     ContextCompressor,
     pin_summary_route,
@@ -109,9 +107,6 @@ def _run(worker, *, chain, timeouts, messages, idle=0.05, ceiling=0.2):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason='known product divergence (a): an aborted stall is not retried once through the fallback chain - listed in .lane/ci-triage.md; un-xfail when fixed', strict=False
-)
 def test_stalled_summary_attempts_configured_fallback_chain():
     original = [{"role": "user", "content": "keep-me"}]
     compressed = [{"role": "user", "content": "summary of earlier turns"}]

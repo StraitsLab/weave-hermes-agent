@@ -13,9 +13,6 @@ from tools import approval as ap
 @pytest.mark.parametrize("interactive", ["", "1"])
 @pytest.mark.parametrize("mode", ["manual", "smart"])
 @pytest.mark.parametrize("entry", ["command", "gate"])
-@pytest.mark.xfail(
-    reason='flaky (b): tight timing bound cannot hold under 96-way file parallelism on a 4-core runner - see .lane/ci-triage.md', strict=False
-)
 def test_api_session_never_waits(monkeypatch, mode, entry, interactive, unattended):
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     for key in ("HERMES_EXEC_ASK", "HERMES_GATEWAY_SESSION", "HERMES_INTERACTIVE"):

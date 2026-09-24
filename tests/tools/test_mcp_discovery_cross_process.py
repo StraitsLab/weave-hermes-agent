@@ -14,8 +14,6 @@ import sys
 import textwrap
 import time
 
-import pytest
-
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -29,9 +27,6 @@ def _wait_for_file(path: Path, *, timeout: float = 10.0) -> None:
     raise AssertionError(f"timed out waiting for {path}")
 
 
-@pytest.mark.xfail(
-    reason='flaky (b/c): cross-file process/thread interference under 96-way file parallelism - see .lane/ci-triage.md', strict=False
-)
 def test_two_processes_each_complete_local_mcp_discovery(tmp_path):
     """A lock loser waits, acquires the lock, and builds its own registry."""
     hermes_home = tmp_path / "hermes-home"

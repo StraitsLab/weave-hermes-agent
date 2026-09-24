@@ -533,9 +533,6 @@ def test_run_reference_prepends_advisory_system_prompt(monkeypatch):
 
 
 
-@pytest.mark.xfail(
-    reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-)
 def test_references_run_in_parallel(monkeypatch):
     """References fan out concurrently (delegate-batch semantics), not serially.
 
@@ -612,9 +609,6 @@ def test_references_parallel_without_agent_is_unaffected(monkeypatch):
     assert out[0][1] == "resp-p1"
 
 
-@pytest.mark.xfail(
-    reason='flaky (b): timing/thread-ordering failure surfacing under the fork 96-way file parallelism on a 4-core runner (newly seen in run 35988966800, disjoint from the triaged 100) - see .lane/ci-triage.md', strict=False
-)
 def test_references_parallel_interrupt_aborts_wait(monkeypatch):
     """A user interrupt mid-fanout must stop the wait instead of blocking
     until every reference (including a wedged one) finishes or times out on

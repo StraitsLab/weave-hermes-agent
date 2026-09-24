@@ -217,9 +217,6 @@ class TestChromeFallback:
         )
         assert result == {"success": False, "error": "stop"}
 
-    @pytest.mark.xfail(
-        reason='flaky (b): thread/timer ordering race under parallel CI load - see .lane/ci-triage.md', strict=False
-    )
     def test_chrome_fallback_injects_required_sandbox_args(self):
         import tools.browser_tool as bt
 

@@ -203,9 +203,6 @@ def test_transport_disconnect_parks_pending_and_reconnect_completes_it():
     assert outcome.get("result") == {"after": "reconnect"}
 
 
-@pytest.mark.xfail(
-    reason='flaky (b): timing/thread-ordering failure surfacing under the fork 96-way file parallelism on a 4-core runner (newly seen in run 35988966800, disjoint from the triaged 100) - see .lane/ci-triage.md', strict=False
-)
 def test_timeout_while_disconnected_flushes_cancel_before_new_dispatch():
     broker = BrowserControlBroker(command_timeout=0.02)
     scope = _scope()

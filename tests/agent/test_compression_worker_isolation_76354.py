@@ -25,8 +25,6 @@ from unittest.mock import MagicMock, patch
 
 from hermes_state import SessionDB
 
-import pytest
-
 
 def _build_agent_with_db(db: SessionDB, session_id: str, **compressor_kwargs):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
@@ -68,9 +66,6 @@ def _build_agent_with_db(db: SessionDB, session_id: str, **compressor_kwargs):
     return agent
 
 
-@pytest.mark.xfail(
-    reason='flaky (b): tight timing bound cannot hold under 96-way file parallelism on a 4-core runner - see .lane/ci-triage.md', strict=False
-)
 def test_f3_mutating_engine_cannot_touch_live_transcript_after_timeout(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -135,9 +130,6 @@ def test_f3_mutating_engine_cannot_touch_live_transcript_after_timeout(
     assert live == baseline
 
 
-@pytest.mark.xfail(
-    reason='flaky (b): timing/thread-ordering failure surfacing under the fork 96-way file parallelism on a 4-core runner (newly seen in run 35988966800, disjoint from the triaged 100) - see .lane/ci-triage.md', strict=False
-)
 def test_f4_five_step_stale_holder_regression(tmp_path: Path) -> None:
     """Reviewer's exact 5-step durable-lease regression (#76354 F4).
 
