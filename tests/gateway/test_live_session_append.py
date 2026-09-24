@@ -445,3 +445,206 @@ async def test_http_required_constants_participant_gap_conflict_and_no_inference
         )
         assert conflict.status == 409
         assert (await conflict.json())["outcome"] == "idempotency_conflict"
+
+
+# --- Weave: multi-row passive append group (card + answer stay adjacent) ------
+
+CARD_ID = "018f22e2-7c00-7001-8001-000000000201"
+ANSWER_ID = "018f22e2-7c00-7001-8001-000000000202"
+OTHER_ID = "018f22e2-7c00-7001-8001-000000000203"
+
+
+def _item(item_id, role, content):
+    return {
+        "target_bem_session_id": SESSION_ID,
+        "external_item_id": item_id,
+        "role": role,
+        "content": content,
+        "canonical_sha256": _digest(content),
+        "participant_id": PARTICIPANT_ID,
+    }
+
+
+def _pair():
+    return [_item(CARD_ID, "user", "RESULT_CARD"), _item(ANSWER_ID, "assistant", "RESULT_MESSAGE")]
+
+
+def _rows(db):
+    return [(m["role"], m["content"]) for m in db.get_messages(SESSION_ID)]
+
+
+def test_group_inserts_contiguously_replays_and_refuses_mixes(session_db):
+    first = session_db.append_passive_messages(SESSION_ID, _pair())
+    assert [r["outcome"] for r in first] == ["inserted", "inserted"]
+    assert [r["sequence"] for r in first] == [1, 2]
+
+    # Crash-after-commit replay with a stale predecessor still answers identically.
+    replay = session_db.append_passive_messages(SESSION_ID, _pair(), predecessor_sequence=1)
+    assert [r["outcome"] for r in replay] == ["identical_retry", "identical_retry"]
+    assert [r["message_id"] for r in replay] == [r["message_id"] for r in first]
+
+    mixed = session_db.append_passive_messages(
+        SESSION_ID, [_item(CARD_ID, "user", "RESULT_CARD"), _item(OTHER_ID, "assistant", "X")],
+        predecessor_sequence=2,
+    )
+    assert [r["outcome"] for r in mixed] == ["idempotency_conflict", "idempotency_conflict"]
+    assert _rows(session_db) == [("user", "RESULT_CARD"), ("assistant", "RESULT_MESSAGE")]
+
+
+def test_group_stale_tail_writes_nothing(session_db):
+    session_db.append_message(SESSION_ID, "user", "EARLIER")
+    gap = session_db.append_passive_messages(SESSION_ID, _pair(), predecessor_sequence=None)
+    assert [r["outcome"] for r in gap] == ["sequence_gap", "sequence_gap"]
+    assert gap[0]["sequence"] == 1
+    assert _rows(session_db) == [("user", "EARLIER")]
+    placed = session_db.append_passive_messages(SESSION_ID, _pair(), predecessor_sequence=1)
+    assert [r["sequence"] for r in placed] == [2, 3]
+
+
+def test_group_rejects_bad_shapes_before_writing(session_db):
+    with pytest.raises(SessionPassiveAppendError):
+        session_db.append_passive_messages(SESSION_ID, [])
+    with pytest.raises(SessionPassiveAppendError):
+        session_db.append_passive_messages(SESSION_ID, [_item(CARD_ID, "user", "a")] * 2)
+    with pytest.raises(SessionPassiveAppendError):
+        session_db.append_passive_messages(SESSION_ID, [_item(CARD_ID, "user", "a")] * 9)
+    bad = _item(ANSWER_ID, "assistant", "b")
+    bad["canonical_sha256"] = _digest("other")
+    with pytest.raises(SessionPassiveAppendError):
+        session_db.append_passive_messages(SESSION_ID, [_item(CARD_ID, "user", "a"), bad])
+    assert _rows(session_db) == []
+
+
+def test_group_stays_adjacent_under_a_concurrent_writer(session_db):
+    """Scratch group probe as a test: ordinary writers never split the pair."""
+    import threading
+
+    session_db.append_message(SESSION_ID, "user", "EARLIER")
+    stop = threading.Event()
+
+    def writer():
+        n = 0
+        while not stop.is_set():
+            session_db.append_message(SESSION_ID, "user", f"CONCURRENT_{n}")
+            n += 1
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    try:
+        for _attempt in range(500):
+            tail = session_db.get_session(SESSION_ID)["message_count"] or None
+            out = session_db.append_passive_messages(SESSION_ID, _pair(), predecessor_sequence=tail)
+            assert len({r["outcome"] for r in out}) == 1  # never a partial group
+            if out[0]["outcome"] == "inserted":
+                break
+    finally:
+        stop.set()
+        thread.join()
+    assert [r["outcome"] for r in out] == ["inserted", "inserted"]
+    contents = [content for _role, content in _rows(session_db)]
+    card_at = contents.index("RESULT_CARD")
+    assert contents[card_at + 1] == "RESULT_MESSAGE"
+    assert contents.count("RESULT_CARD") == contents.count("RESULT_MESSAGE") == 1
+    # Single-row API unchanged alongside the group.
+    single = _append(session_db, ITEM_ONE, predecessor=session_db.get_session(SESSION_ID)["message_count"])
+    assert single["outcome"] == "inserted"
+    assert _append(session_db, ITEM_ONE)["outcome"] == "identical_retry"
+
+
+def _group_body(requests, predecessor=None):
+    body = {
+        "requests": [r["request"] for r in requests],
+        "contents": [r["content"] for r in requests],
+    }
+    if predecessor is not None:
+        body["predecessor_sequence"] = predecessor
+    return body
+
+
+@pytest.mark.asyncio
+async def test_http_group_receipts_status_and_schema(session_db):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-group"}))
+    adapter._session_db = session_db
+    headers = {"Authorization": "Bearer sk-group"}
+    app = web.Application()
+    app.router.add_post(
+        "/api/sessions/{session_id}/append/group", adapter._handle_session_append_group
+    )
+    pair = [
+        _request(CARD_ID, role="user", content="RESULT_CARD"),
+        _request(ANSWER_ID, role="assistant", content="RESULT_MESSAGE"),
+    ]
+    url = f"/api/sessions/{SESSION_ID}/append/group"
+    async with TestClient(TestServer(app)) as client:
+        assert (await client.post(url, json=_group_body(pair))).status == 401
+
+        first = await client.post(url, headers=headers, json=_group_body(pair))
+        assert first.status == 201
+        receipt = await first.json()
+        assert receipt["kind"] == "hermes_append_group_receipt"
+        assert [r["outcome"] for r in receipt["receipts"]] == ["inserted", "inserted"]
+        assert [r["external_item_id"] for r in receipt["receipts"]] == [CARD_ID, ANSWER_ID]
+
+        replay = await client.post(url, headers=headers, json=_group_body(pair, predecessor=1))
+        assert replay.status == 200
+        replay_receipts = (await replay.json())["receipts"]
+        assert [r["native_item_ref"] for r in replay_receipts] == [
+            r["native_item_ref"] for r in receipt["receipts"]
+        ]
+
+        gap = await client.post(
+            url, headers=headers,
+            json=_group_body([_request(OTHER_ID, content="late")], predecessor=1),
+        )
+        assert gap.status == 409
+        assert (await gap.json())["receipts"][0]["retryable"] is True
+
+        per_row_predecessor = _group_body(pair)
+        per_row_predecessor["requests"][0]["predecessor_sequence"] = 2
+        assert (await client.post(url, headers=headers, json=per_row_predecessor)).status == 400
+
+        bad_digest = _group_body([_request(OTHER_ID, content="x")])
+        bad_digest["contents"] = ["tampered"]
+        rejected = await client.post(url, headers=headers, json=bad_digest)
+        assert rejected.status == 400
+        assert (await rejected.json())["error"]["code"] == "invalid_canonical_digest"
+
+        too_many = _group_body([_request(OTHER_ID)] * 9)
+        assert (await client.post(url, headers=headers, json=too_many)).status == 400
+
+        missing = await client.post(
+            "/api/sessions/no-such-session/append/group", headers=headers,
+            json=_group_body([_request(OTHER_ID, content="late")]),
+        )
+        assert missing.status == 404
+    assert [c for _r, c in _rows(session_db)] == ["RESULT_CARD", "RESULT_MESSAGE"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", [[], {}, ["x"], 7])
+async def test_http_group_malformed_external_id_is_400_like_single_append(session_db, bad_id):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-group"}))
+    adapter._session_db = session_db
+    headers = {"Authorization": "Bearer sk-group"}
+    app = web.Application()
+    app.router.add_post("/api/sessions/{session_id}/append", adapter._handle_session_append)
+    app.router.add_post("/api/sessions/{session_id}/append/group", adapter._handle_session_append_group)
+    bad = _request(CARD_ID)
+    bad["request"]["external_item_id"] = bad_id
+    async with TestClient(TestServer(app)) as client:
+        single = await client.post(f"/api/sessions/{SESSION_ID}/append", headers=headers, json=bad)
+        group = await client.post(
+            f"/api/sessions/{SESSION_ID}/append/group", headers=headers,
+            json=_group_body([_request(ANSWER_ID), bad]),
+        )
+        group_body = await group.json()
+    assert single.status == 400
+    assert group.status == 400
+    assert group_body["error"]["code"] == "invalid_external_item_id"
+    assert _rows(session_db) == []
+
+
+def test_group_rejects_non_object_items_before_writing(session_db):
+    with pytest.raises(SessionPassiveAppendError):
+        session_db.append_passive_messages(SESSION_ID, [_item(CARD_ID, "user", "a"), "nope"])
+    assert _rows(session_db) == []

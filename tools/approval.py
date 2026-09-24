@@ -279,6 +279,30 @@ _UNATTENDED_APPROVAL_PLATFORMS = frozenset({
 })
 
 
+#: Weave: api_server session keys whose live native-submit turn has an
+#: approval surface (``approval.request`` on the submit stream plus the
+#: approval response route). Only the api_server adapter marks keys here, for
+#: the lifetime of one native turn, and only while
+#: ``approvals.native_submit_attended`` is on.
+_attended_api_sessions: set[str] = set()
+
+
+def native_submit_attended_enabled() -> bool:
+    """Read ``approvals.native_submit_attended`` (default True) at runtime."""
+    return is_truthy_value(_get_approval_config().get("native_submit_attended", True))
+
+
+def mark_api_session_attended(session_key: str, attended: bool = True) -> None:
+    """Mark or clear one api_server session key as having a human approval surface."""
+    if not session_key:
+        return
+    with _lock:
+        if attended:
+            _attended_api_sessions.add(session_key)
+        else:
+            _attended_api_sessions.discard(session_key)
+
+
 def _is_unattended_platform_approval_context() -> bool:
     """True when the session platform is a programmatic/unattended surface.
 
@@ -287,8 +311,16 @@ def _is_unattended_platform_approval_context() -> bool:
     who can resolve a pending approval. Treating them as gateway approval
     contexts blocks the session for the full approval timeout (60-300s) and
     then fails closed anyway — the deadlock in #37284/#87509.
+
+    Weave: an api_server native-submit turn marked attended (see
+    ``mark_api_session_attended``) has a live approval card surface, so it is
+    NOT unattended and takes the normal gateway round-trip.
     """
-    return _get_session_platform() in _UNATTENDED_APPROVAL_PLATFORMS
+    if _get_session_platform() not in _UNATTENDED_APPROVAL_PLATFORMS:
+        return False
+    # Lock-free read: a single set membership test is atomic, and callers may
+    # already hold the non-reentrant ``_lock``.
+    return get_current_session_key("") not in _attended_api_sessions
 
 
 def _is_single_query_approval_context() -> bool:

@@ -52,3 +52,23 @@ def test_api_session_never_waits(monkeypatch, mode, entry, interactive, unattend
             assert "unattended platform" in result["message"]
         wait.assert_not_called()
     Context().run(run)
+
+
+def test_only_the_marked_native_session_is_attended(monkeypatch):
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+
+    def run():
+        APIServerAdapter._bind_api_server_session(session_key="api-attended")
+        token = ap.set_current_session_key("api-attended")
+        try:
+            assert ap._is_unattended_platform_approval_context() is True
+            ap.mark_api_session_attended("api-attended")
+            assert ap._is_unattended_platform_approval_context() is False
+            assert ap._is_gateway_approval_context() is True
+            ap.mark_api_session_attended("api-attended", False)
+            assert ap._is_unattended_platform_approval_context() is True
+        finally:
+            ap.mark_api_session_attended("api-attended", False)
+            ap.reset_current_session_key(token)
+
+    Context().run(run)

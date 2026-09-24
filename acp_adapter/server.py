@@ -85,6 +85,7 @@ from agent.context_compressor import (
 )
 from agent.interrupt_compat import request_hard_interrupt
 from tools.approval import (
+    _get_approval_timeout,
     reset_hermes_interactive_context,
     set_hermes_interactive_context,
 )
@@ -2130,7 +2131,11 @@ class HermesACPAgent(acp.Agent):
                     streamed_message = True
                 message_cb(text)
 
-            approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
+            # Weave: wait the configured approvals.timeout (default 300s), not the
+            # callback's 60s default, so a Work attempt's approval outlives 60s.
+            approval_cb = make_approval_callback(
+                conn.request_permission, loop, session_id, timeout=_get_approval_timeout(),
+            )
             try:
                 from acp_adapter.edit_approval import make_acp_edit_approval_requester
 

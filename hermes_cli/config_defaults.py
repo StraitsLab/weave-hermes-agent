@@ -2560,6 +2560,11 @@ DEFAULT_CONFIG = {
         "cron_mode": "deny",
         "single_query_mode": "deny",
         "unattended_mode": "deny",
+        # Weave: api_server native-submit turns have a live approval surface
+        # (approval.request on the submit stream + once|deny response route).
+        # When true those turns raise an approval card instead of taking
+        # unattended_mode; false restores the instant unattended decision.
+        "native_submit_attended": True,
         # Operator-customizable policy text for smart approvals. When
         # non-empty, this is appended to the smart-approval guardian's
         # SYSTEM prompt (trusted channel) as additional rules — e.g.
