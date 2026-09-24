@@ -38,10 +38,26 @@ logger = logging.getLogger(__name__)
 # Availability check
 # ---------------------------------------------------------------------------
 
+def _vault_opted_in() -> bool:
+    """Fork gate (fork debt, not upstream @49b4286a22): the vault tools are offered only when config.yaml sets
+    ``vault.enabled: true``. Upstream exposes them wherever a browser is available; this fork lands the vault
+    inert, so a default CLI/API/messaging session with a browser still sees no vault tool until a profile
+    opts in (Harso: the V5 materializer). Raw read: an absent key means off, whatever the defaults say."""
+    try:
+        from hermes_cli.config import cfg_get, read_raw_config
+
+        return cfg_get(read_raw_config(), "vault", "enabled", default=False) is True
+    except Exception as exc:
+        logger.debug("vault opt-in read failed (%s); vault stays off", exc)
+        return False
+
+
 def _check_vault_available() -> bool:
     """Schema-gate: the vault tools ride with the browser. An empty vault still needs
     browser_vault_save_login so the agent can offer to remember a login the first time it meets a
     form; hiding the tools until an item exists meant nobody ever discovered the feature."""
+    if not _vault_opted_in():
+        return False
     from tools.browser_tool import check_browser_requirements
     from tools.browser_use_cli import is_browser_use_cli_mode
     # check_browser_requirements() is False by design in Browser Use mode (browser_exec replaces the
@@ -327,15 +343,34 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     their surface for the code their phone/email/app shows. The code goes into the page over the supervisor
     socket and never enters the conversation."""
     from agent.redact import register_vault_redaction_value
-    from agent.vault_backends import backend_for_handle
+    from agent.vault_backends import UnlockRequired, backend_for_handle
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
     effective_task_id = task_id or "default"
-    _focus_bound_origin(effective_task_id, "", "otp")
-    origin = _current_page_origin(effective_task_id)
+    backend = backend_for_handle(handle) if handle else None
+    # Fork fix (not upstream @49b4286a22): a handle's code is bound to the item's saved origins exactly like its
+    # password. Verify before anything is resolved or the user is prompted, or a code leaks to an unbound page.
+    allowed: list = []
+    if handle:
+        try:
+            meta = backend.get_meta(handle) if backend is not None else None
+        except UnlockRequired:
+            return json.dumps({"success": False, "error_type": "unlock_required",
+                               "error": f"{backend.display_name} is locked; call browser_vault_unlock."})
+        if meta is None:
+            return json.dumps({"success": False, "error": f"No vault item with handle {handle!r}. Use browser_vault_list."})
+        allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
+    origin = next((o for o in (_focus_bound_origin(effective_task_id, c, "otp") for c in allowed) if o), None)
+    if not allowed:
+        _focus_bound_origin(effective_task_id, "", "otp")
+    origin = origin or _current_page_origin(effective_task_id)
     if not origin:
         return json.dumps({"success": False, "error": "No page with a code field is open."})
+    if handle and origin not in allowed:
+        return json.dumps({"success": False, "error_type": "origin_mismatch",
+                           "error": (f"Refused: current page origin ({origin}) does not match the vault item's bound "
+                                     f"origin(s) ({', '.join(allowed) or 'none'}). Nothing was entered.")})
     site = origin.split("://", 1)[-1]
 
     nonce = secrets.token_hex(8)
@@ -351,7 +386,6 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
     code: Optional[str] = None
     source = "user"
-    backend = backend_for_handle(handle) if handle else None
     if backend is not None:
         try:
             code = backend.resolve_otp(handle)

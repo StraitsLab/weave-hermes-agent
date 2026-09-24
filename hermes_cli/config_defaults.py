@@ -674,6 +674,12 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Browser credential vault (browser_vault_* tools). Fork gate: off unless a
+    # profile opts in; when true the tools ride with an available browser.
+    "vault": {
+        "enabled": False,
+    },
+
     # Filesystem checkpoints — automatic snapshots before destructive file ops.
     # When enabled, the agent takes a snapshot of the working directory once
     # per conversation turn (on first write_file/patch call).  Use /rollback

@@ -263,11 +263,13 @@ class TestClassifier:
 class TestBrowserVaultTools:
     def test_check_fn_follows_the_browser_not_the_item_count(self, tmp_path):
         """The vault tools ride with the browser toolset: an empty vault must still expose
-        browser_vault_save_login (that is how the first login gets saved), and no browser means no tools."""
+        browser_vault_save_login (that is how the first login gets saved), and no browser means no tools.
+        Fork: only once the profile opts in with vault.enabled (tests/tools/test_vault_fork_inert.py)."""
         from tools import browser_vault_tool
 
         empty = VaultStore(base_dir=tmp_path / "empty-vault")
         with patch("agent.vault_store.get_vault_store", return_value=empty), \
+             patch.object(browser_vault_tool, "_vault_opted_in", return_value=True), \
              patch("tools.browser_use_cli.is_browser_use_cli_mode", return_value=False):
             with patch("tools.browser_tool.check_browser_requirements", return_value=True):
                 assert browser_vault_tool._check_vault_available() is True
@@ -275,6 +277,7 @@ class TestBrowserVaultTools:
                 assert browser_vault_tool._check_vault_available() is False
         # Browser Use mode: check_browser_requirements() is False by design, the vault must still ride along
         with patch("tools.browser_use_cli.is_browser_use_cli_mode", return_value=True), \
+             patch.object(browser_vault_tool, "_vault_opted_in", return_value=True), \
              patch("tools.browser_tool.check_browser_requirements", return_value=False):
             assert browser_vault_tool._check_vault_available() is True
 
@@ -868,3 +871,71 @@ class TestTwoFactor:
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval):
             out = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t"))
         assert out["error_type"] == "no_code_field" and "device" in out["error"]
+
+    @pytest.mark.parametrize("with_seed", [True, False])
+    def test_handle_code_refused_on_an_origin_the_item_is_not_bound_to(self, store, with_seed):
+        """Fork fix: a handle's code is origin-bound like its password. On an unbound page nothing is resolved,
+        nobody is prompted, and nothing is injected, whether the code would come from a seed or the user."""
+        from agent.vault_backends import unlock as unlock_mod
+        from tools import browser_vault_tool
+
+        secret = {"identifier_type": "username", "identifier": "tek", "password": "pw"}
+        if with_seed:
+            secret["otp_secret"] = "JBSWY3DPEHPK3PXP"
+        meta = store.add_item("login", "gh", secret, origin="https://trusted.example")
+        asked, injected, resolved = [], [], []
+        unlock_mod.set_code_prompt_callback(lambda site, hint: asked.append(site) or "123456")
+        controls = [{"index": 0, "type": "text", "name": "otp", "autocomplete": "one-time-code"}]
+        fake_eval = lambda t, e: {"success": True, "result": json.dumps(controls) if "querySelectorAll" in e else "https://attacker.example/2fa"}
+        focused = []
+        try:
+            with patch("agent.vault_store.get_vault_store", return_value=store), \
+                 patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+                 patch.object(store, "resolve_secret", side_effect=lambda h: resolved.append(h) or {}), \
+                 patch.object(browser_vault_tool, "_focus_bound_origin", lambda t, o, k: focused.append(o)), \
+                 patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
+                 patch.object(browser_vault_tool, "_eval_js_secret", side_effect=lambda t, e: injected.append(e)):
+                out = json.loads(browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t"))
+        finally:
+            unlock_mod.set_code_prompt_callback(None)
+        assert out["success"] is False and out["error_type"] == "origin_mismatch"
+        assert "https://attacker.example" in out["error"] and "https://trusted.example" in out["error"]
+        assert asked == [] and injected == [] and resolved == []
+        assert focused == ["https://trusted.example"]  # it looked for the bound tab, not any code field
+
+    def test_handle_code_on_the_bound_origin_pins_the_fill_to_that_origin(self, store):
+        from tools import browser_vault_tool
+
+        meta = store.add_item("login", "gh", {"identifier_type": "username", "identifier": "tek", "password": "pw",
+                                              "otp_secret": "JBSWY3DPEHPK3PXP"}, origin="https://trusted.example")
+        controls = [{"index": 0, "type": "text", "name": "otp", "autocomplete": "one-time-code"}]
+        fake_eval = lambda t, e: {"success": True, "result": json.dumps(controls)}
+        seen = {}
+
+        def fake_secret(t, e):
+            seen["expr"] = e
+            return {"success": True, "result": json.dumps({"filled": 1})}
+
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch.object(browser_vault_tool, "_focus_bound_origin", lambda t, o, k: o or None), \
+             patch.object(browser_vault_tool, "_current_page_origin", side_effect=AssertionError("bound tab was focused")), \
+             patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
+             patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret):
+            out = json.loads(browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t"))
+        assert out["success"] and out["origin"] == "https://trusted.example"
+        assert json.dumps("https://trusted.example") in seen["expr"]  # in-page TOCTOU assert binds the item origin
+
+    def test_unknown_handle_resolves_and_prompts_nothing(self, store):
+        from agent.vault_backends import unlock as unlock_mod
+        from tools import browser_vault_tool
+
+        asked = []
+        unlock_mod.set_code_prompt_callback(lambda site, hint: asked.append(site) or "123456")
+        try:
+            with patch("agent.vault_store.get_vault_store", return_value=store), \
+                 patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+                 patch.object(browser_vault_tool, "_eval_js_secret", side_effect=AssertionError("no injection")):
+                out = json.loads(browser_vault_tool.browser_vault_enter_code("vault_doesnotexist", task_id="t"))
+        finally:
+            unlock_mod.set_code_prompt_callback(None)
+        assert out["success"] is False and "No vault item" in out["error"] and asked == []

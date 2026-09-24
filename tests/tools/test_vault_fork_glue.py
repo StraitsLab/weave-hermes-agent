@@ -24,6 +24,27 @@ def test_atomic_write_bytes_forces_mode_and_replaces_whole(tmp_path):
     assert [p.name for p in target.parent.iterdir()] == ["vault.json.enc"], "temp file leaked"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="directory fsync is a POSIX no-op on Windows")
+def test_atomic_write_bytes_fsyncs_the_resolved_parent_of_a_symlinked_target(tmp_path, monkeypatch):
+    """Upstream 01a7efaed5: the rename lands in the real file's directory, so that is the one to fsync."""
+    import utils
+
+    real, links = tmp_path / "real", tmp_path / "links"
+    real.mkdir()
+    links.mkdir()
+    (real / "blob").write_bytes(b"old")
+    (links / "blob").symlink_to(real / "blob")
+    opened = []
+    real_open = os.open
+    monkeypatch.setattr(utils.os, "open", lambda p, flags, *a: opened.append(p) or real_open(p, flags, *a))
+
+    utils.atomic_write_bytes(links / "blob", b"new", mode=0o600, fsync_dir=True)
+
+    assert (real / "blob").read_bytes() == b"new" and (links / "blob").is_symlink()
+    dirs_opened = [p for p in opened if os.path.isdir(p)]  # mkstemp also os.open()s the temp file
+    assert dirs_opened == [str(real)]
+
+
 def test_title_reaches_callbacks_that_accept_it_and_legacy_callbacks_still_work(monkeypatch):
     from tools import approval
 

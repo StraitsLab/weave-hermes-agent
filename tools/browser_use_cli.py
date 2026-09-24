@@ -846,16 +846,22 @@ def browser_exec(
     except OSError as e:
         return tool_error(f"Failed to launch browser-use CLI: {e}")
 
+    # browser_vault_fill registers injected values with this forced model-egress
+    # boundary. Preserve raw stdout only for screenshot-path detection below.
+    # (Ported from upstream a48debd368; the multimodal screenshot result is built
+    # from this already-redacted dict.)
+    from agent.redact import redact_sensitive_text
+
     result = {
         "success": proc.returncode == 0,
         "exit_code": proc.returncode,
-        "output": proc.stdout,
+        "output": redact_sensitive_text(proc.stdout, force=True),
     }
     if workspace:
         result["workspace"] = workspace
     if session:
         result["session"] = session
-    stderr = (proc.stderr or "").strip()
+    stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
     if stderr:
         if len(stderr) > _STDERR_CAP_CHARS:
             stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
