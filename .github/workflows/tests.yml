@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   test:
-    name: Run tests (${{ matrix.slice }})
+    name: Run tests
     # Standard GitHub-hosted ubuntu-latest (4 vCPU / 16 GB). The org's larger
     # runner pools queue indefinitely, so this is the only runner available
     # (0c59ab69cf, afa97358e6). The 96-core EPYC 7763 this job used to run on
