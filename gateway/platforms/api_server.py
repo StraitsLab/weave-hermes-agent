@@ -5641,17 +5641,26 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _native_approval_projection(approval: Dict[str, Any]) -> Dict[str, Any]:
+        # The queue payload honours security.redact_secrets; this egress is a
+        # safety boundary (same as gateway/run.py _redact_approval_command), so
+        # human-visible text is force-redacted for the live event AND replay.
+        def visible(key: str) -> str:
+            return redact_sensitive_text(str(approval.get(key) or ""), force=True)[:4096]
+
         return {
             "request_id": str(approval.get("request_id") or "")[:256],
             "pattern_key": str(approval.get("pattern_key") or "")[:512],
-            "description": str(approval.get("description") or "")[:4096],
-            "command": str(approval.get("command") or "")[:4096],
+            "description": visible("description"),
+            "command": visible("command"),
             "choices": list(APIServerAdapter._NATIVE_APPROVAL_CHOICES),
         }
 
     def _native_submit_pending_approvals(self, native_request_ref: str) -> List[Dict[str, Any]]:
         session_key = self._native_submit_approval_keys.get(native_request_ref)
-        if not session_key:
+        # Approvals are queued per session key; only the admission that owns the
+        # session's live turn may see or resolve them. An outer admission still
+        # registered while its queued follow-up runs owns nothing.
+        if not session_key or self._native_submit_active_ref(session_key) != native_request_ref:
             return []
         from tools.approval import list_gateway_approvals
 

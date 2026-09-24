@@ -271,3 +271,91 @@ async def test_send_exec_approval_without_an_attended_turn_fails(adapter):
         description="delete",
     )
     assert result.success is False
+
+
+@pytest.mark.asyncio
+async def test_outer_admission_cannot_list_or_resolve_its_followups_approval(adapter):
+    """Real nesting: the queued follow-up B starts before outer A finishes. Approvals
+    are queued per session key, but only B (the live turn) may see or resolve them."""
+    followup = "native-approval-followup-ref"
+    adapter._session_db.register_native_session_submit(
+        SESSION_ID, external_request_id="req-2", message_sha256="1" * 64,
+        native_request_ref=followup,
+    )
+    adapter._native_submit_ref_sessions[followup] = ("default", SESSION_ID)
+    followup_event = type("Event", (), {"metadata": {"native_request_ref": followup}})()
+    await adapter._on_native_submit_started(_event(), SESSION_KEY)
+    await adapter._on_native_submit_started(followup_event, SESSION_KEY)
+    thread, outcome = _start_gate(adapter, asyncio.get_running_loop())
+    deadline = time.monotonic() + 30
+    while not adapter._native_submit_approvals_sent.get(followup):
+        assert time.monotonic() < deadline, "approval never reached the follow-up"
+        await asyncio.sleep(0.02)
+    request_id = ap.list_gateway_approvals(SESSION_KEY)[0]["request_id"]
+    client = await _client(adapter)
+    try:
+        outer_list = await (await client.get(
+            f"/api/sessions/{SESSION_ID}/submit/{REF}/approvals", headers=HEADERS)).json()
+        outer_resolve = await client.post(
+            f"/api/sessions/{SESSION_ID}/submit/{REF}/approval/{request_id}",
+            headers=HEADERS, json={"choice": "once"})
+        still_pending = [a["request_id"] for a in ap.list_gateway_approvals(SESSION_KEY)]
+        followup_list = await (await client.get(
+            f"/api/sessions/{SESSION_ID}/submit/{followup}/approvals", headers=HEADERS)).json()
+        followup_resolve = await client.post(
+            f"/api/sessions/{SESSION_ID}/submit/{followup}/approval/{request_id}",
+            headers=HEADERS, json={"choice": "deny"})
+    finally:
+        await client.close()
+    await asyncio.to_thread(thread.join, 30)
+
+    assert outer_list["data"] == []
+    assert outer_resolve.status == 409
+    assert still_pending == [request_id]
+    assert [e["request_id"] for e in followup_list["data"]] == [request_id]
+    assert followup_resolve.status == 200
+    assert outcome["result"]["approved"] is False
+    assert REF not in adapter._native_submit_approvals_sent
+
+    # Outer A finishing while follow-up B is still live must not strip B's surface.
+    await adapter._on_native_submit_finished(_event(), SESSION_KEY)
+    assert SESSION_KEY in ap._attended_api_sessions
+    assert adapter._native_submit_active_ref(SESSION_KEY) == followup
+    assert adapter._native_submit_approval_keys.get(followup) == SESSION_KEY
+
+
+@pytest.mark.asyncio
+async def test_card_force_redacts_secrets_when_global_redaction_is_off(adapter, monkeypatch):
+    import agent.redact as redact
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    secret = "ghp_" + "A1b2C3d4E5" * 4  # synthetic, credential-shaped
+    raw = f"git clone https://x-access-token:{secret}@github.com/o/r.git"
+    assert redact.redact_sensitive_text(raw) == raw, "precondition: global redaction off"
+    await adapter._on_native_submit_started(_event(), SESSION_KEY)
+    stream = await _stream_events(adapter)
+    entry = ap._ApprovalEntry({
+        "command": raw, "description": f"push with {secret}", "pattern_key": "probe",
+    })
+    with ap._lock:
+        ap._gateway_queues[SESSION_KEY] = [entry]
+    try:
+        sent = await adapter.send_exec_approval(
+            chat_id=SESSION_ID, command="[already redacted]", session_key=SESSION_KEY,
+        )
+        card = stream.get_nowait()
+        client = await _client(adapter)
+        try:
+            replay = await (await client.get(
+                f"/api/sessions/{SESSION_ID}/submit/{REF}/approvals", headers=HEADERS)).json()
+        finally:
+            await client.close()
+    finally:
+        with ap._lock:
+            ap._gateway_queues.pop(SESSION_KEY, None)
+
+    assert sent.success is True
+    for event in (card, replay["data"][0]):
+        assert secret not in event["command"]
+        assert secret not in event["description"]
+        assert event["command"].startswith("git clone")

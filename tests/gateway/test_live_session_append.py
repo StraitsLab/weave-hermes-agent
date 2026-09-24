@@ -618,3 +618,33 @@ async def test_http_group_receipts_status_and_schema(session_db):
         )
         assert missing.status == 404
     assert [c for _r, c in _rows(session_db)] == ["RESULT_CARD", "RESULT_MESSAGE"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", [[], {}, ["x"], 7])
+async def test_http_group_malformed_external_id_is_400_like_single_append(session_db, bad_id):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-group"}))
+    adapter._session_db = session_db
+    headers = {"Authorization": "Bearer sk-group"}
+    app = web.Application()
+    app.router.add_post("/api/sessions/{session_id}/append", adapter._handle_session_append)
+    app.router.add_post("/api/sessions/{session_id}/append/group", adapter._handle_session_append_group)
+    bad = _request(CARD_ID)
+    bad["request"]["external_item_id"] = bad_id
+    async with TestClient(TestServer(app)) as client:
+        single = await client.post(f"/api/sessions/{SESSION_ID}/append", headers=headers, json=bad)
+        group = await client.post(
+            f"/api/sessions/{SESSION_ID}/append/group", headers=headers,
+            json=_group_body([_request(ANSWER_ID), bad]),
+        )
+        group_body = await group.json()
+    assert single.status == 400
+    assert group.status == 400
+    assert group_body["error"]["code"] == "invalid_external_item_id"
+    assert _rows(session_db) == []
+
+
+def test_group_rejects_non_object_items_before_writing(session_db):
+    with pytest.raises(SessionPassiveAppendError):
+        session_db.append_passive_messages(SESSION_ID, [_item(CARD_ID, "user", "a"), "nope"])
+    assert _rows(session_db) == []

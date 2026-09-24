@@ -11840,11 +11840,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not isinstance(items, list) or not 1 <= len(items) <= 8:
             raise SessionPassiveAppendError("invalid_items", "items must hold 1..8 appends")
-        ids = [item.get("external_item_id") if isinstance(item, dict) else None for item in items]
-        if len(set(ids)) != len(ids):
-            raise SessionPassiveAppendError("invalid_items", "external_item_id values must be distinct")
+        if not all(isinstance(item, dict) for item in items):
+            raise SessionPassiveAppendError("invalid_items", "every append must be an object")
+        # Validate every item (string UUIDv7 ids included) before comparing ids, so a
+        # malformed id is a schema error and never an unhashable-type crash.
         checked = [self._passive_append_item(session_id, predecessor_sequence=predecessor_sequence, **item)
                    for item in items]
+        if len({item["external_item_id"] for item in checked}) != len(checked):
+            raise SessionPassiveAppendError("invalid_items", "external_item_id values must be distinct")
 
         def _do(conn):
             outcomes = [self._passive_append_existing(conn, item) for item in checked]
