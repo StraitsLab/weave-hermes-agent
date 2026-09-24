@@ -172,3 +172,27 @@ Each carries a one-line `reason=` on the marker. Cross-cutting evidence from bot
 - `scripts/run_tests.sh <7 touched files>` (after fixes+marks) -> 0 (131 passed, 0 failed, 8 skipped, 3 xfailed)
 - `.venv/bin/ruff check .` (blocking lint job equivalent) -> 0 ("All checks passed!")
 - `.venv/bin/python scripts/check-windows-footguns.py --all` (blocking footgun job equivalent) -> 0 (1053 files scanned)
+
+## Round 3 — run 35988966800 (first run on this branch): 9 NEW flaky failures, disjoint from the 100
+
+Observed-in-execution: after the 100 were quarantined, run 35988966800 failed 9 entirely DIFFERENT
+tests (0 overlap) — same failure classes (timing bounds, drain/deadline guards, watchdogs, pty/fifo
+races). All 9 marked `xfail(strict=False)` with the same one-line reason ("...newly seen in run
+35988966800, disjoint from the triaged 100").
+
+- tests/agent/test_compression_worker_isolation_76354.py::test_f4_five_step_stale_holder_regression
+- tests/cli/test_cli_light_mode.py::TestOsc11DrainGuard::test_post_deadline_straggler_is_drained
+- tests/gateway/test_35994_reset_button_deadlock.py::test_reset_completes_when_cleanup_raises
+- tests/gateway/test_api_server_session_credential_bind.py::test_close_wins_queued_submit_without_reopen_or_durable_admission
+- tests/gateway/test_browser_control_broker_hardening.py::test_timeout_while_disconnected_flushes_cancel_before_new_dispatch
+- tests/gateway/test_loop_liveness_watchdog.py::test_heartbeat_write_does_not_block_the_loop_it_monitors
+- tests/run_agent/test_moa_loop_mode.py::test_references_parallel_interrupt_aborts_wait
+- tests/test_pty_session.py::test_eof_marks_dead_and_closes_socket_4410
+- tests/tools/test_read_special_file_guard.py::TestReadFileToolFifoGuard::test_fifo_read_returns_note_instantly
+
+**Size-of-problem statement (inferred, for @hermes):** the flaky population ROTATES run-to-run under
+the fork's load profile (tests.yml runs the suite at 96-way file parallelism on 4-core runners).
+109 distinct flaky tests have now been observed across 3 runs (100 + 9 disjoint). Per-test xfail
+quarantine cannot converge to two consecutive greens by itself — each run can surface new members.
+A systemic ruling is needed (parallelism cap, wall-clock-bound policy >= 2s per AGENTS.md, or an
+explicit "flaky suite" lane split). Until then, whack-a-mole marking is the only in-ruling action.

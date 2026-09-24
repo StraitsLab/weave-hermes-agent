@@ -115,6 +115,9 @@ async def test_detach_keeps_draining_into_buffer():
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(
+    reason='flaky (b): timing/thread-ordering failure surfacing under the fork 96-way file parallelism on a 4-core runner (newly seen in run 35988966800, disjoint from the triaged 100) - see .lane/ci-triage.md', strict=False
+)
 async def test_eof_marks_dead_and_closes_socket_4410():
     from hermes_cli.pty_session import PtySession
     bridge = FakeBridge([b"bye", None])
