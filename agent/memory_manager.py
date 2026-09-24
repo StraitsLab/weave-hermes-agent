@@ -768,8 +768,8 @@ class MemoryManager:
     # -- Sync ----------------------------------------------------------------
 
     @staticmethod
-    def _provider_sync_accepts_messages(provider: MemoryProvider) -> bool:
-        """Return whether sync_turn accepts a messages keyword."""
+    def _provider_sync_accepts_keyword(provider: MemoryProvider, keyword: str) -> bool:
+        """Return whether sync_turn accepts ``keyword``."""
         try:
             signature = inspect.signature(provider.sync_turn)
         except (TypeError, ValueError):
@@ -777,7 +777,7 @@ class MemoryManager:
         params = list(signature.parameters.values())
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
             return True
-        return "messages" in signature.parameters
+        return keyword in signature.parameters
 
     def sync_all(
         self,
@@ -786,6 +786,7 @@ class MemoryManager:
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
+        turn_id: str = "",
     ) -> None:
         """Sync a completed turn to all providers.
 
@@ -816,19 +817,16 @@ class MemoryManager:
         def _run() -> None:
             for provider in providers:
                 try:
-                    if messages is not None and self._provider_sync_accepts_messages(provider):
-                        provider.sync_turn(
-                            user_content,
-                            assistant_content,
-                            session_id=session_id,
-                            messages=messages,
-                        )
-                    else:
-                        provider.sync_turn(
-                            user_content,
-                            assistant_content,
-                            session_id=session_id,
-                        )
+                    sync_kwargs: Dict[str, Any] = {"session_id": session_id}
+                    if messages is not None and self._provider_sync_accepts_keyword(provider, "messages"):
+                        sync_kwargs["messages"] = messages
+                    if turn_id and self._provider_sync_accepts_keyword(provider, "turn_id"):
+                        sync_kwargs["turn_id"] = turn_id
+                    provider.sync_turn(
+                        user_content,
+                        assistant_content,
+                        **sync_kwargs,
+                    )
                 except Exception as e:
                     logger.warning(
                         "Memory provider '%s' sync_turn failed: %s",

@@ -4553,6 +4553,12 @@ class AIAgent:
             sync_kwargs = {"session_id": self.session_id or ""}
             if messages is not None:
                 sync_kwargs["messages"] = messages
+            # WEV-1850: forward the turn's native identity (this turn's
+            # `_current_turn_id` — the caller's external_request_id when a
+            # native submit named the turn). Absent turns forward nothing.
+            turn_id = getattr(self, "_current_turn_id", "") or ""
+            if turn_id:
+                sync_kwargs["turn_id"] = turn_id
             self._memory_manager.sync_all(
                 user_text,
                 response_text,

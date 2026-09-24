@@ -217,6 +217,7 @@ class MemoryProvider(ABC):
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
+        turn_id: str = "",
     ) -> None:
         """Persist a completed turn to the backend.
 
@@ -226,6 +227,11 @@ class MemoryProvider(ABC):
         ``messages`` is the OpenAI-style conversation message list as of the
         completed turn, including any assistant tool calls and tool results.
         Providers that do not need raw turn context can ignore it.
+
+        ``turn_id`` is the turn's native identity (WEV-1850): stock Hermes'
+        per-turn id — the caller's ``external_request_id`` when a native
+        submit named the turn. Empty when the turn carries no native identity;
+        a provider must forward it unchanged and never mint one.
         """
 
     @abstractmethod

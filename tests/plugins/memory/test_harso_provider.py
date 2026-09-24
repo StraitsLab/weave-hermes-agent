@@ -8,7 +8,7 @@ import json
 import logging
 import urllib.error
 from email.message import Message
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 import pytest
@@ -275,8 +275,8 @@ class _Response:
         return False
 
 
-# Copy of weave-api app.py HarsoScopeInput/HarsoContextInput and core.py
-# UUID7_PATTERN. Validate serialized wire bodies without importing the API.
+# Copy of weave-api app.py HarsoScopeInput/HarsoContextInput/HarsoTurnInput and
+# core.py UUID7_PATTERN. Validate serialized wire bodies without importing the API.
 _UUID7_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 _SESSION = "weave-01990000-0000-7000-8000-000000000003"
 
@@ -294,6 +294,26 @@ class HarsoContextInput(HarsoScopeInput):
     query: Annotated[str, StringConstraints(
         strip_whitespace=True, min_length=1, max_length=4096
     )]
+
+
+# WEV-1850: stock Hermes' own per-turn id (the replay-context `turn_id` of the
+# turn's tools). Optional: absent means the turn carries no native identity.
+NativeTurnRef = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")]
+
+
+class HarsoFinalizedItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    role: Literal["user", "assistant"]
+    native_item_ref: Annotated[str, Field(pattern=r"^message:[1-9][0-9]{0,18}$")]
+    content: Annotated[str, StringConstraints(
+        strip_whitespace=True, min_length=1, max_length=65_536)]
+
+
+class HarsoTurnInput(HarsoScopeInput):
+    current_user_ref: Annotated[str, Field(pattern=r"^message:[1-9][0-9]{0,18}$")]
+    current_assistant_ref: Annotated[str, Field(pattern=r"^message:[1-9][0-9]{0,18}$")]
+    finalized_items: Annotated[list[HarsoFinalizedItem], Field(min_length=2, max_length=10)]
+    native_turn_ref: NativeTurnRef | None = None
 
 
 def _context_provider(monkeypatch):
@@ -619,6 +639,47 @@ def test_sync_turn_posts_exact_durable_pair_and_scope(monkeypatch):
         },
         "timeout": 5,
     }]
+
+
+# The turn's native identity (WEV-1850): stock Hermes' own per-turn id — the
+# caller's external_request_id when a native submit named the turn, the
+# runtime's own `<session>:<task>:<hex8>` otherwise. Both cross unchanged.
+_TURN_STOCK_ID = f"{_SESSION}:01990000-0000-7000-8000-000000000004:abcdef01"
+_TURN_EXTERNAL_ID = "01a0702f-5b79-7f00-8000-000000000001"
+
+
+@pytest.mark.parametrize("turn_id", [_TURN_STOCK_ID, _TURN_EXTERNAL_ID],
+                         ids=["stock-turn-id", "external-request-id"])
+def test_sync_turn_forwards_the_native_turn_identity(monkeypatch, turn_id):
+    provider = _provider(monkeypatch)
+    seen = _capture_turn(monkeypatch)
+    provider.sync_turn("question", "answer", messages=_turn_messages(), turn_id=turn_id)
+    assert len(seen) == 1
+    assert seen[0]["body"]["native_turn_ref"] == turn_id
+
+
+def test_sync_turn_omits_native_turn_ref_without_an_id(monkeypatch):
+    """A turn with no native identity posts no native_turn_ref. Never a
+    fabricated value: an invented id would bind this turn to another one."""
+    provider = _provider(monkeypatch)
+    seen = _capture_turn(monkeypatch)
+    provider.sync_turn("question", "answer", messages=_turn_messages())
+    provider.sync_turn("question", "answer", messages=_turn_messages(), turn_id="")
+    assert len(seen) == 2
+    assert all("native_turn_ref" not in entry["body"] for entry in seen)
+
+
+def test_manager_sync_forwards_the_turn_identity_end_to_end(monkeypatch):
+    """The full agent path: MemoryManager.sync_all -> provider -> wire body
+    still validates as weave-api's HarsoTurnInput (extra="forbid")."""
+    provider, manager = _context_provider(monkeypatch)
+    seen = _capture_turn(monkeypatch)
+    manager.sync_all("question", "answer", session_id=_SESSION,
+                     messages=_turn_messages(), turn_id=_TURN_STOCK_ID)
+    assert manager.flush_pending(timeout=10) is True
+    assert len(seen) == 1
+    body = HarsoTurnInput.model_validate(seen[0]["body"])
+    assert body.native_turn_ref == _TURN_STOCK_ID
 
 
 @pytest.mark.parametrize("messages", [

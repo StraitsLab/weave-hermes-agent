@@ -181,6 +181,7 @@ class HarsoMemoryProvider(MemoryProvider):
         *,
         session_id: str = "",
         messages: List[Dict[str, Any]] | None = None,
+        turn_id: str = "",
     ) -> None:
         """Submit persisted turn evidence on MemoryManager's background thread."""
         if not self.is_available():
@@ -218,15 +219,19 @@ class HarsoMemoryProvider(MemoryProvider):
                 "native_item_ref": f"message:{message['_row_id']}",
                 "content": content[:65536],
             })
-        response = self._post(
-            "/internal/harso/turns",
-            {
-                **self._scope(session_id),
-                "current_user_ref": finalized_items[0]["native_item_ref"],
-                "current_assistant_ref": finalized_items[1]["native_item_ref"],
-                "finalized_items": finalized_items,
-            },
-        )
+        payload = {
+            **self._scope(session_id),
+            "current_user_ref": finalized_items[0]["native_item_ref"],
+            "current_assistant_ref": finalized_items[1]["native_item_ref"],
+            "finalized_items": finalized_items,
+        }
+        # WEV-1850: the turn's native identity (the caller's external_request_id
+        # when a native submit named the turn). Forwarded verbatim — never minted
+        # here. A turn without one sends no key, so the Ledger's handoff-objective
+        # exclusion can never bind it to another turn.
+        if turn_id:
+            payload["native_turn_ref"] = turn_id
+        response = self._post("/internal/harso/turns", payload)
         if response is None:
             raise HarsoWriteError("harso_turn_unacknowledged")
         logger.debug("Harso turn disposition: %s", response.get("disposition"))
