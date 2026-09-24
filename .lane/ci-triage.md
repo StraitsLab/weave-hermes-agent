@@ -223,11 +223,17 @@ per-test `xfail` marks cannot rescue it - the 104 marks could not have produced 
    went stale). The stale 96-core benchmark comment is replaced. The job also echoes its real core count
    and MemTotal, and its wall time, so the runner-shape conflict in round 1 settles by measurement rather
    than by reading two contradictory comments.
-2. Slicing via `HERMES_TEST_SLICE: ${{ matrix.slice }}` over a 2-way static matrix, `fail-fast: false`.
-   Plain `I/N` only - no generate job, no duration cache, no per-slice artifact, no merge job. Triggered
-   by the wall-time measurement below (LEAD RULING 1: "if one job then exceeds ~60 min, use the script's
-   existing HERMES_TEST_SLICE with a small matrix"). Side effect to note for branch protection: the check
-   names become `Python tests / Run tests (1/2)` and `(2/2)`.
+2. Slicing was tried and REVERTED — LEAD RULING 1's condition ("if one job then exceeds ~60 min") is
+   not met. Measured on the runner at `workers=$(nproc)`: 1756 files / 21122 tests in 778.8s and
+   1755 files / 21333 tests in 967.4s, i.e. **3511 files, 42455 passed, 2 failed, 417 skipped in
+   1746.2s (~29 min)** of test time plus ~25s of setup. One job is comfortably under the ~60 min that
+   would justify a matrix, so there is one job and one check named `Run tests`. The 2-slice matrix had
+   two defects of its own: it renamed the check away from `Run tests` (branch protection), and
+   `HERMES_TEST_SLICE` exported into the runner's own self-tests, so
+   `tests/test_run_tests_parallel.py::test_multiple_absolute_paths_split_on_pathsep` sliced its two probe
+   dirs down to one and failed. Both are gone with the matrix. If the suite ever grows past ~60 min per
+   job, `HERMES_TEST_SLICE` / `--slice` in `scripts/run_tests_parallel.py` is the existing, sanctioned
+   knob to reach for.
 3. 99 of the 104 xfail marks reverted (90 in section C + 9 from run 35988966800). The 5 product-bug marks
    stay, per LEAD RULING 2.
 4. `HERMES_TEST_FILE_TIMEOUT` **not raised**, deliberately. The workflow's own measurement says the
@@ -237,6 +243,25 @@ per-test `xfail` marks cannot rescue it - the 104 marks could not have produced 
    is raised and that file is named here. Recorded so it is not mistaken for CI evidence: on macOS
    `tests/tools/test_execution_flag_detection.py` measured 296.6s under a 28-way run (real `rg`/`sort`/
    `man`/`ag` subprocesses over 10k-line inputs plus TTY cases) - a local outlier, not reproduced on Linux.
+
+### Residual failure set at the correct worker count (run 35995392476)
+
+Exactly **2** of 42455 tests failed. Everything in section C passed at 4 workers, so nothing there
+needed a marker — the rotating set is class **(c) environment flake, worker oversubscription**, not
+product bugs and not timing-boundary bugs.
+
+| test | classification | status |
+| --- | --- | --- |
+| `tests/test_run_tests_parallel.py::test_multiple_absolute_paths_split_on_pathsep` | not a test defect: the 2-slice job's own `HERMES_TEST_SLICE` leaked into this test's runner subprocess (`Discovered 1 test files` where `2` is asserted) | fixed by reverting the matrix (item 2 above) |
+| `tests/hermes_cli/test_doctor.py::test_run_doctor_termux_does_not_mark_browser_available_without_agent_browser` | (a) deterministic but ORDER-DEPENDENT: `1 passed in 7.51s` in isolation, `1 failed, 67 passed in 18.23s` at file scope | xfail(strict=False) carrying that reason. The leaking state is not isolated and is not guessed at. Reproduce: `python -m pytest tests/hermes_cli/test_doctor.py -q` (red) vs the single node id (green) |
+
+Local red is not CI red: a full macOS run of this same tree (`HERMES_TEST_WORKERS=14 scripts/run_tests.sh`)
+reports `3511 files, 40109 tests passed, 36 failed, 401 skipped in 1247.7s (14 workers)` — a different
+set (only the `test_doctor` termux test overlaps the CI residual), dominated by macOS-only behaviour
+(`Errno 63` / AF_UNIX path-length limits in `tests/gateway/test_scale_to_zero.py`, missing `CuaDriver.app`
+in `tests/computer_use/test_cua_no_overlay.py`, systemd abstract sockets in
+`tests/gateway/test_systemd_notify.py`, WSL2/PowerShell branches in `tests/tools/test_voice_mode.py`)
+plus load from 14 workers on 14 cores. Recorded so local red is not mistaken for CI red.
 
 ### Wall-time measurement (LEAD RULING 1: "measure and report wall time")
 
