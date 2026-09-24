@@ -677,9 +677,14 @@ def _changed_sql(columns) -> str:
     return " OR ".join(f"OLD.{c} IS NOT NEW.{c}" for c in columns)
 
 
+# Every session row insert takes a fresh epoch from the global sequence, so no
+# incarnation of a session id (INSERT OR REPLACE, delete + recreate) reissues an
+# epoch an older incarnation's cursors carry; sessions.id and messages.id are
+# immutable; new message ids are positive.
 TRANSCRIPT_TRIGGERS = (
     "transcript_epoch_message_id_immutable",
     "transcript_epoch_message_positive_id",
+    "transcript_epoch_session_id_immutable",
     "transcript_epoch_session_reinsert",
     "transcript_epoch_message_replace",
     "transcript_epoch_message_insert_below_head",
@@ -711,9 +716,11 @@ BEGIN {_transcript_bump_sql("OLD.session_id")} END;
 CREATE TRIGGER IF NOT EXISTS transcript_epoch_session_insert AFTER INSERT ON sessions
 WHEN NEW.parent_session_id IS NOT NULL AND {_transcript_eligible_sql('NEW')}
 BEGIN {_transcript_bump_sql("NEW.parent_session_id")} END;
+CREATE TRIGGER IF NOT EXISTS transcript_epoch_session_id_immutable BEFORE UPDATE ON sessions
+WHEN OLD.id IS NOT NEW.id
+BEGIN SELECT RAISE(ABORT, 'sessions.id is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS transcript_epoch_session_reinsert AFTER INSERT ON sessions
-WHEN EXISTS (SELECT 1 FROM messages _m WHERE _m.session_id = NEW.id)
-BEGIN {_transcript_bump_sql("NEW.id, NEW.parent_session_id")} END;
+BEGIN {_transcript_bump_sql("NEW.id")} END;
 CREATE TRIGGER IF NOT EXISTS transcript_epoch_session_delete AFTER DELETE ON sessions
 WHEN OLD.parent_session_id IS NOT NULL AND {_transcript_eligible_sql('OLD')}
 BEGIN {_transcript_bump_sql("OLD.parent_session_id")} END;

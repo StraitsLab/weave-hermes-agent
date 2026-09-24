@@ -429,4 +429,31 @@ def test_replacing_a_session_record_that_owns_messages_bumps(db, tmp_path):
 def test_creating_an_empty_session_does_not_bump_via_reinsert(db):
     before = db.get_transcript_epoch(SID)
     db.create_session("fresh", "test")
-    assert db.get_transcript_epoch("fresh") == 0 and db.get_transcript_epoch(SID) == before
+    assert db.get_transcript_epoch(SID) == before  # a new session never bumps an unrelated one
+
+
+# ── round-4 review: session identity ───────────────────────────────────────
+
+
+def test_session_ids_are_immutable(db):
+    db.append_message(SID, role="user", content="one")
+    db.create_session("spare", "test")
+    for sql in ("UPDATE sessions SET id = 'moved' WHERE id = ?",
+                "UPDATE OR REPLACE sessions SET id = ? WHERE id = 'spare'"):
+        with pytest.raises(sqlite3.IntegrityError, match="sessions.id is immutable"):
+            db._execute_write(lambda c, sql=sql: c.execute(sql, (SID,)))
+    assert [r["content"] for r in db.get_messages(SID)] == ["one"]
+
+
+def test_a_recreated_session_never_reissues_an_old_epoch(db):
+    first = db.append_message(SID, role="user", content="one")
+    db.append_message(SID, role="user", content="two")
+    old = db.get_transcript_epoch(SID)
+    db._execute_write(lambda c: (c.execute("DELETE FROM messages WHERE session_id = ?", (SID,)),
+                                 c.execute("DELETE FROM sessions WHERE id = ?", (SID,))))
+    db.create_session(SID, "test")
+    db._execute_write(lambda c: c.execute(
+        "INSERT INTO messages(id, session_id, role, content, timestamp) VALUES (?, ?, 'user', 'changed', 1)",
+        (first, SID)))
+    page = db.read_transcript_events(SID, (old, first), 50)
+    assert page["epoch"] != old and page["reset_required"]

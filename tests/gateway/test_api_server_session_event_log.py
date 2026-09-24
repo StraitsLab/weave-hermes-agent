@@ -137,8 +137,10 @@ async def test_events_validation_and_auth(adapter):
             assert resp.status == 400, query
         assert (await client.get("/api/sessions/nope/events", headers=AUTH)).status == 404
         body = await _get(client, f"/api/sessions/{SID}/events")
-        assert body == {"object": "conversation_events", "session_id": SID, "epoch": 0,
-                        "head": "0.0", "reset_required": True, "items": []}
+        epoch = body["epoch"]  # a session starts at a fresh, never-reissued epoch
+        assert isinstance(epoch, int) and epoch > 0
+        assert body == {"object": "conversation_events", "session_id": SID, "epoch": epoch,
+                        "head": f"{epoch}.0", "reset_required": True, "items": []}
     finally:
         await client.close()
 
