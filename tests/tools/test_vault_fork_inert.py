@@ -56,7 +56,7 @@ def _write_config(cfg: dict) -> None:
 
     home = get_hermes_home()
     home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
 
 
 def _session_tools(config: dict, platform: str) -> tuple[list, set]:
