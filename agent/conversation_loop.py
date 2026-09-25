@@ -1024,22 +1024,19 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 pass
             agent._cached_system_prompt = agent._build_system_prompt(system_message)
             agent._bot_capability_refreshed = True
-            # Persist the refreshed prompt so the NEXT turn restores the new
-            # bytes verbatim — the cache break is once per capability change,
-            # never per turn. (on_session_start deliberately not re-fired:
-            # this is a continuation, not a new session.)
-            if agent._session_db:
-                try:
-                    agent._session_db.update_system_prompt(
-                        agent.session_id, agent._cached_system_prompt
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Session DB update_system_prompt failed after Bot Chat "
-                        "capability refresh (session=%s): %s. The refresh will "
-                        "re-fire next turn.",
-                        agent.session_id, exc,
-                    )
+            _persist_refreshed_prompt(agent, "Bot Chat capability")
+            return
+        # Identity epoch (opt-in agent.identity_epoch_rebuild): a continuing
+        # session adopts a changed SOUL.md ONCE, keeping its id and history.
+        # The rebuilt prompt carries the new stamp, so the next turn reuses it.
+        if getattr(agent, "_identity_epoch_rebuild", False) is True and _identity_epoch_stale(agent, stored_prompt):
+            logger.info(
+                "SOUL identity epoch changed for session %s; rebuilding system "
+                "prompt once (one-time prefix-cache break).",
+                agent.session_id,
+            )
+            agent._cached_system_prompt = agent._build_system_prompt(system_message)
+            _persist_refreshed_prompt(agent, "identity epoch")
             return
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
@@ -1133,6 +1130,31 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 "miss the prefix cache.",
                 agent.session_id, exc,
             )
+
+
+def _persist_refreshed_prompt(agent, reason: str) -> None:
+    """Persist a continuation's rebuilt prompt so the next turn restores it
+    verbatim (one cache break per change; on_session_start not re-fired)."""
+    if not agent._session_db:
+        return
+    try:
+        agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+    except Exception as exc:
+        logger.warning(
+            "Session DB update_system_prompt failed after %s refresh "
+            "(session=%s): %s. The refresh will re-fire next turn.",
+            reason, agent.session_id, exc,
+        )
+
+
+def _identity_epoch_stale(agent, stored_prompt: str) -> bool:
+    try:
+        from agent.system_prompt import _agent_home
+        from tools.bot_mode_probe import stored_prompt_identity_stale
+
+        return stored_prompt_identity_stale(stored_prompt, _agent_home(agent))
+    except Exception:
+        return False
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:

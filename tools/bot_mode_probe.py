@@ -320,6 +320,32 @@ _EPOCH_PREFIX = "Capability epoch: "
 _EPOCH_RE_TEXT = r"Capability epoch: ([0-9a-f]{12})"
 
 
+def soul_digest(home: str | os.PathLike | None = None) -> str:
+    """sha256 hex of the profile's SOUL.md ("" if absent): the one SOUL hash
+    shared by the capability epoch and the identity epoch."""
+    import hashlib
+
+    from hermes_constants import get_hermes_home
+
+    soul = Path(home or get_hermes_home()) / "SOUL.md"
+    return hashlib.sha256(soul.read_bytes()).hexdigest() if soul.is_file() else ""
+
+
+def identity_epoch_line(home: str | os.PathLike | None = None) -> str:
+    """SOUL stamp for ``agent.identity_epoch_rebuild`` (carried like ``epoch_line``)."""
+    try:
+        return f"Identity epoch: {soul_digest(home)[:12] or 'none'}"
+    except Exception:
+        return ""
+
+
+def stored_prompt_identity_stale(stored_prompt: str, home: str | os.PathLike | None = None) -> bool:
+    """True when ``stored_prompt`` lacks the CURRENT identity stamp line (an
+    unstamped prompt is stale once). Fails closed to "not stale"."""
+    current = identity_epoch_line(home)
+    return bool(current) and current not in (stored_prompt or "").splitlines()
+
+
 def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     """12-hex digest of the capability surface for ``home``'s profile.
 
@@ -356,8 +382,7 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     except Exception:
         pass
     try:
-        soul = resolved / "SOUL.md"
-        surface["soul"] = hashlib.sha256(soul.read_bytes()).hexdigest() if soul.is_file() else ""
+        surface["soul"] = soul_digest(resolved)
     except Exception:
         surface["soul"] = ""
     try:

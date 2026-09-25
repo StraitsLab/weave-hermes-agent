@@ -212,6 +212,9 @@ DEFAULT_CONFIG = {
         # Bot Mode teammate-messaging protocol section (silent unless a
         # profile is managed by the desktop's Bot Mode).
         "bot_mode_protocol": True,
+        # Identity epoch (opt-in): rebuild the stored prompt ONCE when SOUL.md
+        # changes, so a continuing session adopts it. Off = byte-identical.
+        "identity_epoch_rebuild": False,
         # Embedder-supplied environment description appended to the system
         # prompt's environment-hints block. Lets a host that wraps Hermes
         # (sandbox runner, managed platform) explain the runtime environment

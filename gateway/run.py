@@ -5999,6 +5999,7 @@ class TurnRunner:
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
             skip_context_files=skip_context_files,
+            identity_digest=self._runner._identity_epoch_digest(ctx.user_config),
         )
         agent = None
         reused_cached_agent = False
@@ -28447,6 +28448,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return out
 
     @staticmethod
+    def _identity_epoch_digest(user_config: dict | None) -> str:
+        """SOUL stamp for ``_agent_config_signature`` when
+        ``agent.identity_epoch_rebuild`` is on, so a SOUL edit rebuilds the
+        cached agent. ``get_hermes_home()`` is the turn's profile (the
+        ``_profile_runtime_scope`` ContextVar survives ``copy_context``)."""
+        if cfg_get(user_config or {}, "agent", "identity_epoch_rebuild") is not True:
+            return ""
+        from tools.bot_mode_probe import identity_epoch_line
+
+        return identity_epoch_line()
+
+    @staticmethod
     def _agent_config_signature(
         model: str,
         runtime: dict,
@@ -28456,6 +28469,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_id: str | None = None,
         user_id_alt: str | None = None,
         skip_context_files: bool = False,
+        identity_digest: str = "",
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -28495,8 +28509,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _cache_keys_sorted = sorted((cache_keys or {}).items())
 
-        blob = _j.dumps(
-            [
+        blob_items = [
                 model,
                 _api_key_fingerprint,
                 runtime.get("base_url", ""),
@@ -28515,10 +28528,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (context files in vs out) — a toggled config edit must
                 # rebuild the cached agent, not silently reuse it.
                 bool(skip_context_files),
-            ],
-            sort_keys=True,
-            default=str,
-        )
+            ]
+        # Identity epoch (opt-in): appended only when set, so a flag-off
+        # signature hashes the exact pre-feature blob.
+        if identity_digest:
+            blob_items.append(identity_digest)
+        blob = _j.dumps(blob_items, sort_keys=True, default=str)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
     def _rehydrate_session_model_override(self, session_key: str) -> None:

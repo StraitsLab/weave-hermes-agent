@@ -761,6 +761,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         except Exception:
             pass
 
+    # Identity epoch stamp (opt-in agent.identity_epoch_rebuild): the SOUL.md
+    # digest this prompt was built from; the restore path rebuilds once when
+    # it goes stale. Flag off emits nothing (prompt bytes unchanged).
+    if getattr(agent, "_identity_epoch_rebuild", False) is True:
+        from tools.bot_mode_probe import identity_epoch_line
+
+        post_workspace_parts.append(identity_epoch_line(_agent_home(agent)))
+
     # Active-profile hint — names the Hermes profile the agent is running
     # under so it doesn't conflate ~/.hermes/skills/ (default profile) with
     # ~/.hermes/profiles/<active>/skills/ (this profile's). Deterministic
