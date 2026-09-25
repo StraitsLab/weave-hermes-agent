@@ -300,12 +300,28 @@ class TestScrollOptimization:
 
 class TestEmptyStdoutFailure:
 
-    def test_empty_stdout_returns_failure(self):
-        """Verify _run_browser_command returns failure on empty stdout."""
+    def test_empty_stdout_returns_failure(self, monkeypatch, tmp_path):
+        """_run_browser_command returns failure on empty stdout (rc=0) for a command that must answer."""
         import tools.browser_tool as bt
-        src = inspect.getsource(bt._run_browser_command)
-        assert "returned no output" in src, \
-            "_run_browser_command should treat empty stdout as failure"
+
+        class _Proc:
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(bt, "_find_agent_browser", lambda: "agent-browser")
+        monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda cmd: False)
+        monkeypatch.setattr(bt, "_is_local_mode", lambda: False)
+        monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(bt, "_get_browser_engine", lambda: "auto")
+        monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+        monkeypatch.setattr(bt, "_get_session_info", lambda task_id=None: {
+            "session_name": "h_empty", "cdp_url": None, "features": {"local": True}})
+        monkeypatch.setattr("tools.bot_desktop.runtime.published_env", lambda: {})
+        monkeypatch.setattr(bt.subprocess, "Popen", lambda *a, **k: _Proc())
+        result = bt._run_browser_command("t", "snapshot", [])
+        assert result["success"] is False and "returned no output" in result["error"]
 
     def test_empty_ok_commands_is_module_level_frozenset(self):
         """_EMPTY_OK_COMMANDS should be a module-level frozenset, not defined inside a function."""

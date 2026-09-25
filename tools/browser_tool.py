@@ -140,7 +140,10 @@ def _build_browser_env() -> dict:
     for _key in _BROWSER_PASSTHROUGH_KEYS:
         if _key in os.environ:
             env[_key] = os.environ[_key]
-    return env
+    # Headed Chromium opens on this profile's Bot Screen when one is running (a human can take it over). Pure:
+    # never starts a screen — that happens at the headed spawn in _dispatch_browser_command.
+    from tools.bot_desktop.runtime import desktop_env as _bot_desktop_env
+    return _bot_desktop_env(env)
 
 try:
     from tools.website_policy import check_website_access
@@ -1288,7 +1291,9 @@ def _annotate_lightpanda_fallback(result: Dict[str, Any], reason: str) -> Dict[s
 
 
 def _copy_fallback_warning(target: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
-    """Copy browser fallback metadata from an internal result into a tool response."""
+    """Copy browser fallback metadata (and a fence refusal ``code``) from an internal result into a tool response."""
+    if result.get("code"):
+        target["code"] = result["code"]  # machine-readable refusal (human_has_control)
     if result.get("fallback_warning"):
         target["fallback_warning"] = result["fallback_warning"]
         target["browser_engine"] = result.get("browser_engine")
@@ -2391,6 +2396,13 @@ def _cleanup_inactive_browser_sessions():
                 sessions_to_cleanup.append(task_id)
 
     for task_id in sessions_to_cleanup:
+        with _cleanup_lock:
+            session_info = _active_sessions.get(task_id)
+        from tools.browser_tool_session import human_holds_shared_browser
+        if session_info and human_holds_shared_browser(session_info):
+            # A human took the bot's screen (login, 2FA): the agent is idle BECAUSE they are working.
+            _update_session_activity(task_id)
+            continue
         try:
             elapsed = int(current_time - _session_last_activity.get(task_id, current_time))
             logger.info("Cleaning up inactive session for task: %s (inactive for %ss)", task_id, elapsed)
@@ -3788,6 +3800,18 @@ def _run_browser_command(
     except Exception as e:
         logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
         return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
+    # Bot Screen lease fence (tools/bot_desktop/UPSTREAM.md): refused while a human holds the shared browser,
+    # and a result that crossed a takeover is voided.
+    from tools.browser_tool_session import run_fenced
+    return run_fenced(session_info, lambda: _dispatch_browser_command(
+        task_id, session_info, browser_cmd, command, args, timeout, _engine_override))
+
+
+def _dispatch_browser_command(
+    task_id: str, session_info: Dict[str, Any], browser_cmd: str, command: str, args: List[str],
+    timeout: int, _engine_override: Optional[str],
+) -> Dict[str, Any]:
+    """Build the agent-browser argv for ``session_info`` and run it (plus the Lightpanda fallback)."""
     # Cleanup stops the supervisor before closing the backend; keep it stopped.
     if command != "close" and session_info.get("cdp_url"):
         _ensure_cdp_supervisor(task_id)
@@ -3847,6 +3871,11 @@ def _run_browser_command(
         logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
                      command, task_id, task_socket_dir, len(task_socket_dir))
 
+        if engine != "lightpanda":
+            # bot_desktop.auto_start: the first command forks the daemon, and a headed window needs its screen up
+            # before the env is built (the screen's DISPLAY is published only once it is up).
+            from tools.browser_tool_session import ensure_screen_for_headed_chromium
+            ensure_screen_for_headed_chromium()
         browser_env = _build_browser_env()
 
         # Ensure subprocesses inherit the same browser-specific PATH fallbacks
@@ -3859,8 +3888,10 @@ def _run_browser_command(
         # counterpart to our Python-side _cleanup_inactive_browser_sessions
         # — the daemon kills itself and its Chrome children when no CLI
         # commands arrive within the window.  Added in agent-browser 0.24.
+        # While a Bot Screen is up the lease-aware janitor owns the shared browser instead (24 h).
         if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in browser_env:
-            idle_ms = str(BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
+            from tools.browser_tool_session import daemon_idle_timeout_seconds
+            idle_ms = str(daemon_idle_timeout_seconds() * 1000)
             browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = idle_ms
 
         # Chromium-only launch flags are rejected by Lightpanda. Strip both
@@ -4425,10 +4456,10 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
 
         return json.dumps(response, ensure_ascii=False)
     else:
-        return json.dumps({
+        return json.dumps(_copy_fallback_warning({
             "success": False,
             "error": result.get("error", "Navigation failed")
-        }, ensure_ascii=False)
+        }, result), ensure_ascii=False)
 
 
 def browser_snapshot(
@@ -5106,6 +5137,16 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     if _is_camofox_mode():
         return _camofox_eval(expression, task_id)
 
+    # The supervisor fast path answers over its own WebSocket and never reaches _run_browser_command, so the Bot
+    # Screen lease fence brackets the whole page read here too (same fence, same session identity).
+    from tools.browser_tool_session import run_fenced
+    fenced = run_fenced(_active_sessions.get(effective_task_id) or {},
+                        lambda: {"raw": _browser_eval_page(expression, effective_task_id)})
+    return fenced["raw"] if "raw" in fenced else json.dumps(fenced, ensure_ascii=False)
+
+
+def _browser_eval_page(expression: str, effective_task_id: str) -> str:
+    """``_browser_eval`` past the Camofox branch: supervisor fast path, else the agent-browser ``eval``."""
     # ── Private-network guard (eval return-value path) ──────────────────────
     # The literal pre-scan above closes the direct-fetch sub-path
     # (`fetch('http://127.0.0.1/secret')`).  The post-eval page-URL recheck
