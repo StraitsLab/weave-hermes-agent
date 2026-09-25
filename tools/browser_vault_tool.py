@@ -294,12 +294,25 @@ def browser_vault_unlock(backend_name: str) -> str:
 
 
 def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> str:
-    """Ask the user (masked prompt on their surface) for the login of the CURRENT page, store it in the local
-    vault bound to that origin, and fill the password at once. The values never enter the conversation."""
+    """Ask the user (masked prompt on their surface) for the login of the CURRENT page, store it through the
+    login backend that saves in this session, bound to that origin, and fill the password at once. The values
+    never enter the conversation.
+
+    Fork (V5): the save goes through the backend seam, never straight to the local Fernet store. A backend that
+    must not receive a password typed into this process (the Harso vault: the user saves in the Harso app,
+    which posts to weave-api directly) is never offered one: the user is not prompted and nothing is stored."""
+    from agent.vault_backends import enabled_backends
     from agent.vault_backends.unlock import can_prompt_here, get_save_login_prompt_callback
-    from agent.vault_store import get_vault_store
 
     effective_task_id = task_id or "default"
+    backends = enabled_backends()
+    saver = next((b for b in backends if b.can_save), None)
+    if saver is None:
+        where = next((b.display_name for b in backends), "the vault")
+        return json.dumps({"success": False, "error_type": "save_in_app",
+                           "error": (f"Logins are saved by the user in the app ({where}), never through you. Tell them "
+                                     "to add this site's login under Settings → Vault, then call browser_vault_list. "
+                                     "Never ask for the password in chat.")})
     # The supervisor's default page session is whatever tab it attached to first (on Browser Use that is
     # the daemon's blank tab); the login form lives in the tab with a password field, so focus that one.
     _focus_bound_origin(effective_task_id, "", "login")
@@ -320,8 +333,7 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     identifier = str(answer["identifier"]).strip()
     id_type = "email" if "@" in identifier else ("phone" if identifier.lstrip("+").isdigit() else "username")
     try:
-        meta = get_vault_store().add_item("login", site, {"identifier_type": id_type, "identifier": identifier,
-                                                        "password": str(answer["password"])}, origin=origin)
+        meta = saver.save_login(site, origin, identifier, id_type, str(answer["password"]))
     except Exception as exc:
         return json.dumps({"success": False, "error_type": "save_failed", "error": str(exc)[:200]})
     finally:
@@ -344,6 +356,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     socket and never enters the conversation."""
     from agent.redact import redact_sensitive_text, register_vault_redaction_value
     from agent.vault_backends import UnlockRequired, backend_for_handle
+    from agent.vault_backends.base import VaultUnavailable, VaultUseRefused
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
@@ -352,15 +365,21 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     # Fork fix (not upstream @49b4286a22): a handle's code is bound to the item's saved origins exactly like its
     # password. Verify before anything is resolved or the user is prompted, or a code leaks to an unbound page.
     allowed: list = []
+    has_otp = False
     if handle:
         try:
             meta = backend.get_meta(handle) if backend is not None else None
         except UnlockRequired:
             return json.dumps({"success": False, "error_type": "unlock_required",
                                "error": f"{backend.display_name} is locked; call browser_vault_unlock."})
+        except VaultUseRefused as refusal:
+            return json.dumps({"success": False, "error_type": refusal.error_type, "error": str(refusal)})
+        except VaultUnavailable as exc:
+            return json.dumps({"success": False, "error_type": "vault_unavailable", "error": str(exc)[:200]})
         if meta is None:
             return json.dumps({"success": False, "error": f"No vault item with handle {handle!r}. Use browser_vault_list."})
         allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
+        has_otp = meta.has_otp
     origin = next((o for o in (_focus_bound_origin(effective_task_id, c, "otp") for c in allowed) if o), None)
     if not allowed:
         _focus_bound_origin(effective_task_id, "", "otp")
@@ -386,9 +405,16 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
     code: Optional[str] = None
     source = "user"
-    if backend is not None:
+    # Fork (V5): ask the backend only for an item that stores an authenticator key, and name the exact origin
+    # the code goes into (the Harso vault mints the code server-side after checking that origin and the grant).
+    # A refusal is the answer (approval pending, wrong site, rate limit): the user is not asked instead.
+    if backend is not None and has_otp:
         try:
-            code = backend.resolve_otp(handle)
+            code = backend.resolve_otp(handle, origin=origin)
+        except VaultUseRefused as refusal:
+            if refusal.error_type != "otp_unavailable":
+                return json.dumps({"success": False, "error_type": refusal.error_type, "error": str(refusal)})
+            code = None
         except Exception:
             code = None
         if code:
@@ -449,6 +475,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         select_password_fill,
     )
     from agent.vault_backends import UnlockRequired, backend_for_handle
+    from agent.vault_backends.base import VaultUnavailable, VaultUseRefused
     from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
 
     effective_task_id = task_id or "default"
@@ -463,6 +490,10 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
+    except VaultUseRefused as refusal:
+        return json.dumps({"success": False, "error_type": refusal.error_type, "error": str(refusal)})
+    except VaultUnavailable as exc:
+        return json.dumps({"success": False, "error_type": "vault_unavailable", "error": str(exc)[:200]})
     if meta is None:
         return json.dumps(
             {
@@ -474,6 +505,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
+    if meta.kind not in ("login", "payment", "address"):
+        return json.dumps({"success": False, "error_type": "not_fillable",
+                           "error": f"Vault item {handle!r} is a {meta.kind} item; use browser_vault_enter_code for codes."})
     if meta.kind != "login" and not meta.origin:
         return json.dumps({"success": False, "error_type": "no_origin",
                            "error": f"Vault item {handle!r} has no bound origin; {meta.kind} items are filled only on the site they were saved for."})
@@ -535,16 +569,22 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
 
     # ── Resolve secret and fill (secret never enters any logged string) ─────
+    # Fork (V5): every resolve names the exact origin being filled; the Harso vault's authority re-checks it
+    # (and the grant, and the rate limit) before any value leaves weave-api.
     try:
         if meta.kind == "login":
-            secret = {"password": backend.resolve_password(handle)}
+            secret = {"password": backend.resolve_password(handle, origin=page_origin)}
             fills = select_password_fill(classified, secret["password"])
         else:
-            secret = backend.resolve_secret(handle)
+            secret = backend.resolve_secret(handle, origin=page_origin)
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
+    except VaultUseRefused as refusal:
+        return json.dumps({"success": False, "error_type": refusal.error_type, "error": str(refusal)})
+    except VaultUnavailable as exc:
+        return json.dumps({"success": False, "error_type": "vault_unavailable", "error": str(exc)[:200]})
     if not fills:
         return json.dumps(
             {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}

@@ -332,7 +332,7 @@ class TestBrowserVaultTools:
             def get_meta(self, handle):
                 return meta if handle == meta.id else None
 
-            def resolve_password(self, handle):
+            def resolve_password(self, handle, *, origin=None):
                 return "s3cret-pw"
 
         controls = [
@@ -377,7 +377,7 @@ class TestBrowserVaultTools:
             def get_meta(self, handle):
                 return meta if handle == meta.id else None
 
-            def resolve_password(self, handle):
+            def resolve_password(self, handle, *, origin=None):
                 return "s3cret-pw"
 
         with patch("agent.vault_backends.backend_for_handle", return_value=_ManagerBackend()), \

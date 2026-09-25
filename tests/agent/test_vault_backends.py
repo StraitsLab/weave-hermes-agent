@@ -62,7 +62,7 @@ class _UnlockableBackend(LoginBackend):
         self._require()
         return next((m for m in self.list_items() if m.id == handle), None)
 
-    def resolve_password(self, handle: str) -> str:
+    def resolve_password(self, handle: str, *, origin: Optional[str] = None) -> str:
         self._require()
         self.resolved.append(handle)
         return _PASSWORD

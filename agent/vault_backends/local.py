@@ -1,4 +1,4 @@
-"""Local Fernet vault as a login backend (the always-on default)."""
+"""Local Fernet vault as a login backend (the default)."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ class LocalLoginBackend(LoginBackend):
     name = "local"
     display_name = "Hermes vault"
     prefix = "vault_"
+    can_save = True
 
     def list_items(self) -> List[VaultItemMeta]:
         return _store().list_items()
@@ -26,13 +27,18 @@ class LocalLoginBackend(LoginBackend):
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
         return _store().get_meta(handle)
 
-    def resolve_password(self, handle: str) -> str:
+    def resolve_password(self, handle: str, *, origin: Optional[str] = None) -> str:
         return str(_store().resolve_secret(handle).get("password") or "")
 
-    def resolve_otp(self, handle: str) -> Optional[str]:
+    def resolve_otp(self, handle: str, *, origin: Optional[str] = None) -> Optional[str]:
         from agent.vault_store import totp_now
         seed = str(_store().resolve_secret(handle).get("otp_secret") or "")
         return totp_now(seed) if seed else None
 
-    def resolve_secret(self, handle: str) -> Dict[str, str]:
+    def resolve_secret(self, handle: str, *, origin: Optional[str] = None) -> Dict[str, str]:
         return {k: str(v) for k, v in _store().resolve_secret(handle).items()}
+
+    def save_login(self, label: str, origin: str, identifier: str, identifier_type: str,
+                   password: str) -> VaultItemMeta:
+        return _store().add_item("login", label, {"identifier_type": identifier_type, "identifier": identifier,
+                                                  "password": password}, origin=origin)
