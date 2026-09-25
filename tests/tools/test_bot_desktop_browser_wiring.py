@@ -347,3 +347,27 @@ def test_suspect_session_is_not_recycled_under_a_human_lease(monkeypatch, tmp_pa
         assert killed == [(424242, 123.0)], "handed back (or never taken): the suspect session is recycled"
     finally:
         bt._suspect_browser_sessions.clear()
+
+
+@pytest.mark.parametrize("screen_stops", [False, True])
+@pytest.mark.parametrize("takeover", [False, True])
+def test_a_screen_that_vanishes_before_completion_does_not_unfence_the_result(monkeypatch, takeover, screen_stops):
+    """Admitted against a published screen; a takeover + handback while the command ran; the launcher then exits (or
+    stop() drops its env) before completion. The page data was the human's — losing the screen must not skip the
+    epoch check. Without a takeover the result stands either way."""
+    screen = {"DISPLAY": ":37"}
+    monkeypatch.setattr(runtime, "published_env", lambda: dict(screen))
+
+    def finish():
+        if takeover:
+            lease.acquire("human-viewer")
+            lease.release("human-viewer")
+        if screen_stops:
+            screen.clear()
+
+    _wire(monkeypatch, on_wait=finish)
+    result = bt._run_browser_command("t", "snapshot", [])
+    if takeover:
+        assert result["code"] == "human_has_control" and _SECRET not in json.dumps(result)
+    else:
+        assert result["success"] is True and _SECRET in json.dumps(result)

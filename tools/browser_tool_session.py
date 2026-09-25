@@ -64,19 +64,20 @@ def run_fenced(session_key: str, act: Callable[[Dict[str, Any]], Dict[str, Any]]
     - before ``resolve`` (default: the cached session) — a cached shared browser under a human lease is refused
       before resolution could recycle or tear it down;
     - after ``resolve`` — refused before any browser I/O if a human holds it now;
-    - after ``act`` — sharing is decided again, because a cold ``act`` may have started the screen itself; a lease
-      that moved at any point since admission voids the result."""
+    - after ``act`` — a lease that moved at any point since admission voids the result.
+    After admission the obligation is keyed on provenance (a LOCAL session), never on the screen being published
+    right now: a moved epoch means a human held the lease, and that alone makes every local browser shared
+    (``_shares_bot_desktop_browser``). The screen may appear during a cold ``act`` or vanish before completion
+    (launcher exit / stop) — neither may switch the check off."""
     from tools.bot_desktop import lease as _bd_lease
     admitted = _bd_lease.get()
     if admitted.holder == _bd_lease.HUMAN and _shares_bot_desktop_browser(_cached_session(session_key)):
         return {"success": False, "error": _HUMAN_HAS_CONTROL, "code": "human_has_control"}
     session_info = resolve() if resolve else _cached_session(session_key)
-    if _shares_bot_desktop_browser(session_info) and _lease_moved(admitted):
+    if _is_local(session_info) and _lease_moved(admitted):
         return {"success": False, "error": _HUMAN_HAS_CONTROL, "code": "human_has_control"}
     result = act(session_info)
-    if not (_shares_bot_desktop_browser(session_info) or _shares_bot_desktop_browser(_cached_session(session_key))):
-        return result
-    if _lease_moved(admitted):
+    if (_is_local(session_info) or _is_local(_cached_session(session_key))) and _lease_moved(admitted):
         return {"success": False, "code": "human_has_control", "error": _VOIDED}
     return result
 
@@ -94,10 +95,14 @@ def _cached_session(session_key: str) -> Dict[str, Any]:
         return _active_sessions.get(session_key) or {}
 
 
+def _is_local(session_info: Dict[str, Any]) -> bool:
+    return bool((session_info.get("features") or {}).get("local"))
+
+
 def _shares_bot_desktop_browser(session_info: Dict[str, Any]) -> bool:
     """Decided by provenance, not transport: every LOCAL session is a browser Hermes launched with this profile's
     Bot Screen DISPLAY. A human lease with the screen already gone still fences."""
-    if not (session_info.get("features") or {}).get("local"):
+    if not _is_local(session_info):
         return False
     from tools.bot_desktop import lease as _bd_lease, runtime as _bd_runtime
     return bool(_bd_runtime.published_env().get("DISPLAY")) or _bd_lease.human_holds()
