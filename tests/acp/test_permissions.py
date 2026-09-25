@@ -27,6 +27,7 @@ def _invoke_callback(
     smart_denied=False,
     timeout=60.0,
     use_prompt_path=False,
+    pattern_key=None,
 ):
     loop = MagicMock(spec=asyncio.AbstractEventLoop)
     request_permission = AsyncMock(name="request_permission")
@@ -50,6 +51,7 @@ def _invoke_callback(
                 allow_session=allow_session,
                 smart_denied=smart_denied,
                 approval_callback=cb,
+                pattern_key=pattern_key,
             )
         else:
             result = cb(
@@ -127,6 +129,43 @@ class TestApprovalBridge:
 
 
 
+
+    def test_gate_pattern_key_rides_raw_input_without_a_title(self):
+        """Weave: the gate's allowlist key reaches the ACP client so it can correlate a plugin approval."""
+        _, kwargs, _, _, _ = _invoke_callback(
+            AllowedOutcome(option_id="allow_once", outcome="selected"),
+            use_prompt_path=True,
+            pattern_key="plugin_rule:0199a000-0000-7000-8000-000000000001",
+        )
+
+        assert kwargs["tool_call"].raw_input == {
+            "command": "rm -rf /",
+            "description": "dangerous command",
+            "pattern_key": "plugin_rule:0199a000-0000-7000-8000-000000000001",
+        }
+
+    def test_no_pattern_key_keeps_the_stock_raw_input(self):
+        _, kwargs, _, _, _ = _invoke_callback(
+            AllowedOutcome(option_id="allow_once", outcome="selected"),
+            use_prompt_path=True,
+        )
+
+        assert kwargs["tool_call"].raw_input == {"command": "rm -rf /", "description": "dangerous command"}
+
+    def test_a_callback_without_the_keyword_still_answers(self):
+        seen = []
+
+        def legacy(command, description, *, allow_permanent=True):
+            seen.append((command, description, allow_permanent))
+            return "once"
+
+        result = prompt_dangerous_approval(
+            "rm -rf /", "dangerous command", approval_callback=legacy,
+            pattern_key="plugin_rule:0199a000-0000-7000-8000-000000000001",
+        )
+
+        assert result == "once"
+        assert seen == [("rm -rf /", "dangerous command", True)]
 
     def test_allow_always_maps_correctly(self):
         result, _, _, _, _ = _invoke_callback(

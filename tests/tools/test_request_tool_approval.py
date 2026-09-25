@@ -96,6 +96,17 @@ class TestRequestToolApproval:
         assert calls["permanent"] == []  # session != always
 
 
+    def test_cli_gate_forwards_the_plugin_pattern_key(self, monkeypatch):
+        """Weave: the CLI/ACP prompt receives ``plugin_rule:<rule_key>`` so a client can correlate it."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        seen = []
+        monkeypatch.setattr(approval, "prompt_dangerous_approval",
+                            lambda *a, **k: seen.append(k.get("pattern_key")) or "deny")
+        request_tool_approval("mcp__linear__save_issue", "Create a Linear issue",
+                              rule_key="0199a000-0000-7000-8000-000000000001")
+        assert seen == ["plugin_rule:0199a000-0000-7000-8000-000000000001"]
+
     def test_cron_deny_mode_blocks(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)

@@ -79,7 +79,7 @@ def _build_permission_options(
     return options
 
 
-def _build_permission_tool_call(command: str, description: str):
+def _build_permission_tool_call(command: str, description: str, pattern_key: str | None = None):
     """Return the ACP tool-call update attached to a permission request.
 
     ``request_permission`` expects a ``ToolCallUpdate`` payload — produced
@@ -97,7 +97,10 @@ def _build_permission_tool_call(command: str, description: str):
         kind="execute",
         status="pending",
         content=[_acp.tool_content(_acp.text_block(content_text))],
-        raw_input={"command": command, "description": description},
+        # Weave: the gate's allowlist key rides along only when the gate named one, so a client can
+        # correlate the prompt (``plugin_rule:<ref>``); every other prompt keeps the stock shape.
+        raw_input={"command": command, "description": description,
+                   **({"pattern_key": pattern_key} if isinstance(pattern_key, str) and pattern_key else {})},
     )
 
 
@@ -140,6 +143,7 @@ def make_approval_callback(
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        pattern_key: str | None = None,
         **_: object,
     ) -> str:
         from agent.async_utils import safe_schedule_threadsafe
@@ -150,7 +154,7 @@ def make_approval_callback(
             smart_denied=smart_denied,
         )
 
-        tool_call = _build_permission_tool_call(command, description)
+        tool_call = _build_permission_tool_call(command, description, pattern_key)
         coro = request_permission_fn(
             session_id=session_id,
             tool_call=tool_call,
