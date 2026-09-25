@@ -933,18 +933,18 @@ def test_oversized_prefetch_body_is_dropped_without_reading_it_all(monkeypatch):
     assert reads == [262145]
 
 
-def test_stalled_server_bounds_the_turn_and_frees_the_thread(monkeypatch):
-    """Real socket path: a server that never answers costs the turn at most the
-    manager deadline, and the prefetch-only socket timeout ends the thread."""
+@pytest.fixture
+def _stalled_server(monkeypatch):
+    """Real local HTTP server whose handler holds the request until released."""
     import http.server
     import threading
-    import time
 
-    release = threading.Event()
+    entered, release = threading.Event(), threading.Event()
 
     class Stall(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
-            release.wait(10)
+            entered.set()
+            release.wait(30)
 
         def log_message(self, *_args):
             pass
@@ -952,18 +952,48 @@ def test_stalled_server_bounds_the_turn_and_frees_the_thread(monkeypatch):
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stall)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        provider, manager = _context_provider(monkeypatch)
+        _provider_unused, manager = _context_provider(monkeypatch)
         monkeypatch.setenv("WEAVE_HARSO_ENDPOINT", f"http://127.0.0.1:{server.server_port}")
-        manager.set_external_prefetch_timeout(0.2)
-        _write_config("plugins:\n  harso:\n    prefetch_timeout: 0.6\n")
-        started = time.monotonic()
-        assert manager.prefetch_all("What did we decide?") == ""
-        assert time.monotonic() - started < 0.5
-        thread = manager._external_prefetch_threads["harso"]
-        assert thread.is_alive()  # outer deadline returned; socket still open
-        thread.join(timeout=2.0)
-        assert not thread.is_alive()  # prefetch-only socket timeout freed it
+        yield manager, entered, release
     finally:
         release.set()
         server.shutdown()
         server.server_close()
+
+
+def test_stalled_server_costs_the_turn_only_the_manager_deadline(_stalled_server):
+    """The caller returns at the manager deadline while the socket is still
+    open; ordering is proven by events, not by a narrow timing window."""
+    import time
+
+    manager, entered, release = _stalled_server
+    manager.set_external_prefetch_timeout(0.2)
+    _write_config("plugins:\n  harso:\n    prefetch_timeout: 5\n")
+    started = time.monotonic()
+    assert manager.prefetch_all("What did we decide?") == ""
+    # The socket allows 5s, so returning well inside it proves the manager
+    # deadline, with >=2s of scheduler slack either side.
+    assert time.monotonic() - started < 2.5
+    assert entered.wait(5)  # the request reached the server, which holds it
+    thread = manager._external_prefetch_threads["harso"]
+    assert thread.is_alive()  # held until release: server never answered
+    assert manager.prefetch_all("again") == ""  # no second thread piles up
+    assert manager._external_prefetch_threads["harso"] is thread
+    release.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+
+def test_stalled_server_is_freed_by_the_prefetch_socket_timeout(_stalled_server):
+    """The prefetch-only socket timeout ends the thread while the server is
+    still stalled; the shared 5s timeout would not."""
+    manager, entered, release = _stalled_server
+    manager.set_external_prefetch_timeout(0.2)
+    _write_config("plugins:\n  harso:\n    prefetch_timeout: 0.6\n")
+    assert manager.prefetch_all("What did we decide?") == ""
+    # Absent only if a descheduled caller saw it finish inside the join.
+    thread = manager._external_prefetch_threads.get("harso")
+    if thread is not None:
+        thread.join(timeout=4.0)  # 0.6s socket + 3.4s slack; 5s would miss it
+        assert not thread.is_alive()
+    assert entered.wait(5) and not release.is_set()  # server never answered
