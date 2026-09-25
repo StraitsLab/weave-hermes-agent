@@ -7,7 +7,7 @@ daemon-idle helper (``browser_tool_session.py:166-208,656-700`` @ ee5ee84a), tri
 module indirection the fork does not have.
 """
 
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from tools.browser_tool import (
     CHROMIUM_SANDBOX_BYPASS_ARGS,
@@ -49,24 +49,49 @@ def ensure_screen_for_headed_chromium() -> None:
         ensure_started_for_tool()
 
 
-def run_fenced(session_info: Dict[str, Any], fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
-    """Run ``fn`` under the Bot Screen lease fence when ``session_info`` is the bot's LOCAL browser.
+_HUMAN_HAS_CONTROL = ("A human has taken over this desktop (they may be entering a credential). Screen actions and "
+                      "captures are refused until they hand control back. Tell the user what you need in your reply.")
+_VOIDED = ("A human took over the bot's screen while this browser command ran; its result was discarded. Tell the "
+           "user what you need; retry once they hand back.")
 
-    While a human holds the lease every action AND read against that browser is refused (the page may show their
-    credential); a takeover while ``fn`` ran voids its result. Cloud / user-supplied CDP sessions run unfenced."""
-    if not _shares_bot_desktop_browser(session_info):
-        return fn()
+
+def run_fenced(session_key: str, act: Callable[[Dict[str, Any]], Dict[str, Any]],
+               resolve: Optional[Callable[[], Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Resolve the ``session_key`` browser and ``act`` on it under the Bot Screen lease fence when that browser is
+    the bot's LOCAL one (the page may show a human's credential). Cloud / user-supplied CDP sessions run unfenced.
+
+    The epoch is taken FIRST and kept to the end, so every step is inside it:
+    - before ``resolve`` (default: the cached session) — a cached shared browser under a human lease is refused
+      before resolution could recycle or tear it down;
+    - after ``resolve`` — refused before any browser I/O if a human holds it now;
+    - after ``act`` — sharing is decided again, because a cold ``act`` may have started the screen itself; a lease
+      that moved at any point since admission voids the result."""
     from tools.bot_desktop import lease as _bd_lease
-    try:
-        admitted = _bd_lease.assert_agent_may_act()
-    except _bd_lease.HumanHasControl as e:
-        return {"success": False, "error": str(e), "code": "human_has_control"}
-    result = fn()
-    if _bd_lease.get().epoch != admitted.epoch:
-        return {"success": False, "code": "human_has_control",
-                "error": "A human took over the bot's screen while this browser command ran; its result was "
-                         "discarded. Tell the user what you need; retry once they hand back."}
+    admitted = _bd_lease.get()
+    if admitted.holder == _bd_lease.HUMAN and _shares_bot_desktop_browser(_cached_session(session_key)):
+        return {"success": False, "error": _HUMAN_HAS_CONTROL, "code": "human_has_control"}
+    session_info = resolve() if resolve else _cached_session(session_key)
+    if _shares_bot_desktop_browser(session_info) and _lease_moved(admitted):
+        return {"success": False, "error": _HUMAN_HAS_CONTROL, "code": "human_has_control"}
+    result = act(session_info)
+    if not (_shares_bot_desktop_browser(session_info) or _shares_bot_desktop_browser(_cached_session(session_key))):
+        return result
+    if _lease_moved(admitted):
+        return {"success": False, "code": "human_has_control", "error": _VOIDED}
     return result
+
+
+def _lease_moved(admitted: Any) -> bool:
+    """A human holds the lease now, or held it at some point since ``admitted`` was read."""
+    from tools.bot_desktop import lease as _bd_lease
+    now = _bd_lease.get()
+    return now.holder == _bd_lease.HUMAN or now.epoch != admitted.epoch
+
+
+def _cached_session(session_key: str) -> Dict[str, Any]:
+    from tools.browser_tool import _active_sessions, _cleanup_lock
+    with _cleanup_lock:
+        return _active_sessions.get(session_key) or {}
 
 
 def _shares_bot_desktop_browser(session_info: Dict[str, Any]) -> bool:

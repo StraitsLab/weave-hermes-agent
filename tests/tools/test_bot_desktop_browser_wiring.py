@@ -243,3 +243,107 @@ def test_secret_write_re_admits_after_a_takeover_during_the_code_prompt(monkeypa
     res = vault._eval_js_secret("default", "fill()")
     assert res["success"] is False and res["error_type"] == "human_has_control"
     assert evaluated == ["fill()"], "the credential must not reach the page under a human lease"
+
+
+# ── Round-2 review (PR #46, t_1c916cd1): every screen-creating / page-reading step sits inside ONE epoch ──────
+
+
+@pytest.mark.parametrize("takeover", [False, True])
+def test_cold_start_keeps_the_epoch_from_before_the_screen_existed(monkeypatch, takeover):
+    """No screen and no session yet: the command itself starts the screen. A takeover + handback while it runs
+    must still void the result (the fence cannot be decided only after the screen appears)."""
+    screen: dict = {}
+    monkeypatch.setattr(runtime, "published_env", lambda: dict(screen))
+    monkeypatch.setattr(runtime, "ensure_started_for_tool", lambda: screen.setdefault("DISPLAY", ":37"))
+
+    def takeover_and_handback():
+        if takeover:
+            lease.acquire("human-viewer")
+            lease.release("human-viewer")
+
+    _wire(monkeypatch, on_wait=takeover_and_handback)
+    info = {"session_name": "h_bot", "bb_session_id": None, "cdp_url": None, "features": {"local": True}}
+
+    def resolve_cold(task_id=None):
+        bt._active_sessions.setdefault(task_id, info)  # created on first use, as _get_session_info does
+        return info
+
+    monkeypatch.setattr(bt, "_get_session_info", resolve_cold)
+    result = bt._run_browser_command("t", "snapshot", [])
+    if takeover:
+        assert result["code"] == "human_has_control" and _SECRET not in json.dumps(result)
+    else:
+        assert result["success"] is True and screen == {"DISPLAY": ":37"}
+
+
+@pytest.mark.parametrize("takeover", [False, True])
+def test_snapshot_supervisor_merge_is_inside_the_fence(monkeypatch, takeover):
+    """The supervisor's dialogs/frame tree are read after the CLI snapshot passed its own fence."""
+    from types import SimpleNamespace
+
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY, SupervisorSnapshot
+
+    _wire(monkeypatch)
+    bt._active_sessions["t"] = {"session_name": "h_bot", "cdp_url": None, "features": {"local": True}}
+
+    def between_cli_and_merge():
+        if takeover:
+            lease.acquire("human-viewer")
+        return 10_000
+
+    monkeypatch.setattr(bt, "get_browser_snapshot_threshold", between_cli_and_merge)
+    snap = SupervisorSnapshot(pending_dialogs=(), recent_dialogs=(), frame_tree={"top": {"name": "HUMAN-FRAME"}},
+                              console_errors=(), active=True, cdp_url="ws://x", task_id="t")
+    monkeypatch.setattr(SUPERVISOR_REGISTRY, "get", lambda tid: SimpleNamespace(snapshot=lambda: snap))
+    raw = bt.browser_snapshot(task_id="t")
+    if takeover:
+        assert "HUMAN-FRAME" not in raw and _SECRET not in raw
+        assert json.loads(raw)["code"] == "human_has_control"
+    else:
+        assert "HUMAN-FRAME" in raw
+
+
+@pytest.mark.parametrize("takeover", [False, True])
+def test_suspect_session_is_not_recycled_under_a_human_lease(monkeypatch, tmp_path, takeover):
+    """A session a prior timeout marked suspect is recycled at next use — but never while a human holds the shared
+    browser: tracking, the suspect flag and the daemon all survive until they hand back."""
+    import gateway.status
+    from tools.process_registry import ProcessRegistry
+
+    real_get_session_info = bt._get_session_info
+    _wire(monkeypatch)
+    monkeypatch.setattr(bt, "_get_session_info", real_get_session_info)
+    monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+    for name in ("_start_browser_cleanup_thread", "_ensure_cdp_supervisor", "_stop_cdp_supervisor",
+                 "_maybe_stop_recording"):
+        monkeypatch.setattr(bt, name, lambda *a: None)
+    monkeypatch.setattr(bt, "_session_has_expired", lambda info: False)
+    monkeypatch.setattr(bt, "_local_backend_process_dead", lambda info: False)
+    monkeypatch.setattr(bt, "_get_cdp_override", lambda: None)
+    monkeypatch.setattr(bt, "_get_cloud_provider", lambda: None)
+    monkeypatch.setattr(bt, "_real_profile_cdp", lambda: (None, None))
+    monkeypatch.setattr(bt, "_is_browser_use_cli_mode", lambda: False)
+    info = {"session_name": "h_bot", "bb_session_id": None, "cdp_url": None, "features": {"local": True}}
+    bt._active_sessions["t"] = info
+    bt._browser_session_backend("t").mark_suspect("previous command timed out")
+    (tmp_path / "agent-browser-h_bot").mkdir()
+    (tmp_path / "agent-browser-h_bot" / "h_bot.pid").write_text("424242")
+    monkeypatch.setattr(bt, "_verify_reapable_browser_daemon", lambda *a: True)
+    monkeypatch.setattr(gateway.status, "get_process_start_time", lambda pid: 123.0)
+    killed: list = []
+    monkeypatch.setattr(ProcessRegistry, "_terminate_host_pid", lambda *a: killed.append(a))
+    try:
+        if takeover:
+            lease.acquire("human-viewer")
+        result = bt._run_browser_command("t", "snapshot", [])
+        if takeover:
+            assert killed == [], "the human's browser was killed before the command was refused"
+            assert result["code"] == "human_has_control"
+            assert bt._active_sessions.get("t") is info and "t" in bt._suspect_browser_sessions
+            lease.release("human-viewer")
+            assert bt._run_browser_command("t", "snapshot", [])["success"] is True
+        else:
+            assert result["success"] is True
+        assert killed == [(424242, 123.0)], "handed back (or never taken): the suspect session is recycled"
+    finally:
+        bt._suspect_browser_sessions.clear()

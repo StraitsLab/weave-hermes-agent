@@ -3082,6 +3082,12 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
         # Check if we already have a session for this task
         existing_session = _active_sessions.get(task_id)
 
+    # Never recycle/replace the Bot Screen's shared browser while a human holds it (they may be mid-login): keep
+    # the entry and any suspect flag, and let the caller's lease fence refuse. Recovery runs once they hand back.
+    if existing_session is not None:
+        from tools.browser_tool_session import human_holds_shared_browser
+        if human_holds_shared_browser(existing_session):
+            return existing_session
     # Suspect-session recycle (#72205 / #85125 3b): a previous command
     # timeout marked this cached session suspect via the SuspectableBackend
     # adapter.  ensure_healthy() tears it down here, at next use, and we fall
@@ -3727,6 +3733,10 @@ def _pid_exists(pid: int) -> bool:
     return True
 
 
+class _SessionCreationError(Exception):
+    """Session resolution failed inside the Bot Screen fence (the cause carries the real error)."""
+
+
 def _run_browser_command(
     task_id: str,
     command: str,
@@ -3794,17 +3804,24 @@ def _run_browser_command(
     if is_interrupted():
         return {"success": False, "error": "Interrupted"}
 
-    # Get session info (creates Browserbase session with proxies if needed)
-    try:
-        session_info = _get_session_info(task_id)
-    except Exception as e:
-        logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
-        return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
-    # Bot Screen lease fence (tools/bot_desktop/UPSTREAM.md): refused while a human holds the shared browser,
-    # and a result that crossed a takeover is voided.
+    # Bot Screen lease fence (tools/bot_desktop/UPSTREAM.md): admission precedes session resolution (a suspect or
+    # dead cached session is recycled there — never under a human lease), and one epoch spans resolution, a cold
+    # screen start and the command; a result that crossed a takeover is voided.
     from tools.browser_tool_session import run_fenced
-    return run_fenced(session_info, lambda: _dispatch_browser_command(
-        task_id, session_info, browser_cmd, command, args, timeout, _engine_override))
+
+    def _resolve() -> Dict[str, Any]:
+        # Get session info (creates Browserbase session with proxies if needed)
+        try:
+            return _get_session_info(task_id)
+        except Exception as e:
+            raise _SessionCreationError() from e
+
+    try:
+        return run_fenced(task_id, lambda session_info: _dispatch_browser_command(
+            task_id, session_info, browser_cmd, command, args, timeout, _engine_override), resolve=_resolve)
+    except _SessionCreationError as e:
+        logger.warning("Failed to create browser session for task=%s: %s", task_id, e.__cause__)
+        return {"success": False, "error": f"Failed to create browser session: {str(e.__cause__)}"}
 
 
 def _dispatch_browser_command(
@@ -4485,6 +4502,15 @@ def browser_snapshot(
 
     effective_task_id = _last_session_key(task_id or "default")
 
+    # The supervisor merge below reads the page (dialogs, frame tree) over its own WebSocket after the CLI
+    # snapshot returned: one Bot Screen lease fence brackets the whole snapshot, merge included.
+    from tools.browser_tool_session import run_fenced
+    fenced = run_fenced(effective_task_id, lambda _session: {"raw": _browser_snapshot_page(full, effective_task_id)})
+    return fenced["raw"] if "raw" in fenced else json.dumps(fenced, ensure_ascii=False)
+
+
+def _browser_snapshot_page(full: bool, effective_task_id: str) -> str:
+    """``browser_snapshot`` past the Camofox branch: agent-browser snapshot plus the supervisor merge."""
     # Build command args based on full flag
     args = []
     if not full:
@@ -5140,8 +5166,7 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     # The supervisor fast path answers over its own WebSocket and never reaches _run_browser_command, so the Bot
     # Screen lease fence brackets the whole page read here too (same fence, same session identity).
     from tools.browser_tool_session import run_fenced
-    fenced = run_fenced(_active_sessions.get(effective_task_id) or {},
-                        lambda: {"raw": _browser_eval_page(expression, effective_task_id)})
+    fenced = run_fenced(effective_task_id, lambda _session: {"raw": _browser_eval_page(expression, effective_task_id)})
     return fenced["raw"] if "raw" in fenced else json.dumps(fenced, ensure_ascii=False)
 
 

@@ -805,11 +805,10 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     """Vault operations focus, inspect and fill the page over the supervisor socket, bypassing
     ``_run_browser_command``; they honour the Bot Screen lease like every other page access, or a human typing a
     credential on the taken-over screen could be read or written to (upstream ee5ee84a browser_vault_tool.py:688)."""
-    from tools.browser_tool import _active_sessions, _last_session_key
+    from tools.browser_tool import _last_session_key
     from tools.browser_tool_session import run_fenced
 
-    session = _active_sessions.get(_last_session_key(task_id or "default")) or {}
-    res = run_fenced(session, lambda: {"raw": fn()})
+    res = run_fenced(_last_session_key(task_id or "default"), lambda _session: {"raw": fn()})
     return res["raw"] if "raw" in res else json.dumps(res)
 
 
