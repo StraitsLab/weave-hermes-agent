@@ -13960,8 +13960,13 @@ def main():
         "grant",
         help="Request the grants (opens the dialog attributed to CuaDriver)",
     )
+    from hermes_cli.live_view_bridge import build_screen_parser
+    build_screen_parser(computer_use_sub)
+
     def cmd_computer_use(args):
         action = getattr(args, "computer_use_action", None)
+        if action == "screen":
+            sys.exit(args.screen_func(args))
         if action == "install":
             from hermes_cli.tools_config import (
                 _cua_driver_contract_status,
