@@ -473,6 +473,58 @@ def test_a_short_address_field_is_scrubbed_from_a_fill_failure(weave, admitted_t
     assert f"[{line2}]" not in _browser_exec_output(f"DOM apartment=[{line2}]")
 
 
+def _fill_line2(weave, line2):
+    from tools.browser_vault_tool import browser_vault_fill
+
+    weave.address = {"address_line2": line2}
+    controls = [{"autocomplete": "address-line2", "formIndex": 0, "index": 0, "label": "", "name": "unit",
+                 "type": "text"}]
+    with _page(origin="https://shop.example", controls=controls) as injected:
+        out = json.loads(browser_vault_fill(ADDR_HANDLE, task_id="t"))
+    assert out["success"] is True and line2 in injected[0]
+
+
+@pytest.mark.parametrize("line2", ["7", "9B", "12C", "123D"])
+@pytest.mark.parametrize("serialized", [False, True])
+def test_a_short_address_line_in_serialized_browser_exec_output_is_scrubbed(weave, admitted_turn, line2, serialized):
+    """JSON text puts a value alone on a line as ``\\n12C``: the escape is a boundary, not a glued word char."""
+    _fill_line2(weave, line2)
+    text = f"Apartment\n{line2}\nShipping\t{line2}"
+    egress = _browser_exec_output(json.dumps({"result": text}) if serialized else text)
+    assert line2 not in json.loads(egress)["output"], egress
+
+
+@pytest.mark.parametrize("line2", ["7", "9B", "12C", "123D"])
+@pytest.mark.parametrize("serialized", [False, True])
+def test_a_short_address_line_in_serialized_cdp_output_is_scrubbed(weave, admitted_turn, line2, serialized):
+    from tools import browser_cdp_tool as cdp
+
+    _fill_line2(weave, line2)
+    text = f"Apartment\n{line2}\nShipping"
+    expression = "JSON.stringify(document.body.innerText)" if serialized else "document.body.innerText"
+
+    async def exchange(endpoint, method, params, target_id, timeout):
+        assert method == "Runtime.evaluate" and params["expression"] == expression
+        return {"result": {"type": "string", "value": json.dumps(text) if serialized else text}}
+
+    with patch.object(cdp, "_resolve_cdp_endpoint", return_value="ws://127.0.0.1:1/synthetic"), \
+         patch.object(cdp, "_browser_cdp_private_guard", return_value=None), \
+         patch.object(cdp, "_cdp_call", side_effect=exchange):
+        egress = cdp.browser_cdp("Runtime.evaluate", params={"expression": expression, "returnByValue": True})
+    assert line2 not in json.loads(egress)["result"]["result"]["value"], egress
+
+
+def test_escape_boundary_keeps_the_short_token_collision_controls():
+    from agent.redact import redact_registered_vault_values, register_vault_redaction_value
+
+    register_vault_redaction_value("US", whole_token=True)
+    serialized = json.dumps("STATUS\nCOUNTRY\tBUS\nUS\u00a0US")  # -> ...\nUS\u00a0US (ASCII escapes)
+    assert "\\u00a0US" in serialized
+    out = redact_registered_vault_values(serialized)
+    assert "STATUS" in out and "COUNTRY" in out and "BUS" in out
+    assert out.count("«redacted-vault-secret»") == 2, out
+
+
 def test_a_token_registration_never_downgrades_an_exact_secret():
     from agent.redact import redact_registered_vault_values, register_vault_redaction_value
 

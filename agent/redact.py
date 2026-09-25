@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 _VAULT_REDACTION_MAX_PER_PROFILE = 64
 _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: whole_token (bool)}
 _VAULT_REDACTION_LOCK = threading.Lock()
+# Left edge of a whole-token value: start, a non-word char, OR a serialized escape sequence
+# (``\n``, ``\t``, ``\u00a0``...). Browser output is often JSON text, where a value standing alone
+# on a line reads ``\n12C``; the escape's letter must not count as a glued word character.
+_TOKEN_LEFT_BOUNDARY = r"(?:(?<!\w)|(?<=\\[bfnrt])|(?<=\\u[0-9A-Fa-f]{4}))"
 
 
 def _vault_scope() -> str:
@@ -87,7 +91,7 @@ def redact_registered_vault_values(text: str) -> str:
         if value not in text:
             continue
         if whole_token:
-            left = r"(?<!\w)" if re.match(r"\w", value[0]) else ""
+            left = _TOKEN_LEFT_BOUNDARY if re.match(r"\w", value[0]) else ""
             right = r"(?!\w)" if re.match(r"\w", value[-1]) else ""
             text = re.sub(f"{left}{re.escape(value)}{right}", "«redacted-vault-secret»", text)
         else:
