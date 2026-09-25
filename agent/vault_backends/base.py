@@ -51,6 +51,9 @@ class LoginBackend(ABC):
     # password only when one can, so a backend whose secrets must never pass through the runtime (weave)
     # is never handed one.
     can_save: bool = False
+    # Fork (V5): every value this backend resolves is protected (the model never sees it), addresses included.
+    # The local vault keeps upstream's rule that an address is not a secret; a Harso item is (VAULT-design §4).
+    protects_all_values: bool = False
 
     def owns(self, handle: str) -> bool:
         return handle.startswith(self.prefix)
@@ -162,9 +165,11 @@ def enabled_backends() -> List[LoginBackend]:
     cfg = _cfg()
     choice = cfg.get("backend", "local")
     if choice == "weave":
-        from agent.vault_backends.weave import WeaveLoginBackend
+        from agent.vault_backends.weave import WeaveLoginBackend, timeout_seconds
 
-        return [WeaveLoginBackend(str(cfg.get("weave_api_url") or ""))]
+        # Read per call from the profile's config.yaml (mtime-cached): an edit applies to the next vault call.
+        return [WeaveLoginBackend(str(cfg.get("weave_api_url") or ""),
+                                  timeout_seconds(cfg.get("weave_timeout_seconds")))]
     if choice != "local":
         logger.warning("vault.backend %.40r is not a known backend; the vault has no login source", choice)
         return []

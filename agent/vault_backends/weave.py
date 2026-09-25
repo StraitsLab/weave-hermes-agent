@@ -25,13 +25,20 @@ tool sends the user to the Harso app instead of asking for a password (§5).
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, List, Optional
 
 from agent.vault_backends.base import LoginBackend, VaultUnavailable, VaultUseRefused
 from agent.vault_store import VaultItemMeta
 
-_TIMEOUT_S = 10.0
+logger = logging.getLogger(__name__)
+
+_DEFAULT_TIMEOUT_S = 10.0
+_MAX_TIMEOUT_S = 120.0
+# weave-api's own presenter shapes (ledger_mcp.CONNECTOR_BEARER / ATTEMPT_CONNECTOR_BEARER). A bearer that does not
+# match is refused before HTTPX sees it: a malformed header value is echoed by httpcore's DEBUG logging.
+_BEARER = re.compile(r"^(?:wvc1|wva1)_[A-Za-z0-9_-]{43}$")
 _HANDLE = re.compile(r"^wv:[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 _SESSION = re.compile(r"^weave-([0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$")
 _FILLABLE = ("login", "address", "totp")  # api_key is injected by the egress proxy (V7), never resolved here
@@ -51,9 +58,24 @@ _APPROVAL = ("The user has not allowed this use yet. A request is waiting in the
 
 
 def _bearer() -> str:
+    """The runtime's bearer, exactly as held. Absent -> ""; present but malformed -> refused, never trimmed or
+    repaired, and never handed to the transport (content-free error)."""
     from agent.secret_scope import get_secret
 
-    return get_secret("WEAVE_API_MCP_BEARER", "") or ""
+    bearer = get_secret("WEAVE_API_MCP_BEARER", "") or ""
+    if bearer and not _BEARER.fullmatch(bearer):
+        raise VaultUnavailable("the runtime bearer for the Harso vault is malformed")
+    return bearer
+
+
+def timeout_seconds(raw: Any) -> float:
+    """``vault.weave_timeout_seconds``: a number in (0, 120]. Anything else is the default (logged, content-free)."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0 < raw <= _MAX_TIMEOUT_S:
+        if raw is not None:
+            logger.warning("vault.weave_timeout_seconds must be a number in (0, %s]; using %s",
+                           _MAX_TIMEOUT_S, _DEFAULT_TIMEOUT_S)
+        return _DEFAULT_TIMEOUT_S
+    return float(raw)
 
 
 def _run_context(bearer: str) -> tuple[Optional[str], Optional[str]]:
@@ -102,9 +124,11 @@ class WeaveLoginBackend(LoginBackend):
     name = "weave"
     display_name = "Harso vault"
     prefix = "wv:"
+    protects_all_values = True
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, timeout_s: float = _DEFAULT_TIMEOUT_S):
         self._base = base_url.rstrip("/")
+        self._timeout_s = timeout_s
 
     def _call(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         import httpx
@@ -113,7 +137,7 @@ class WeaveLoginBackend(LoginBackend):
         if not self._base.startswith(("https://", "http://")) or not bearer:
             raise VaultUnavailable("the Harso vault is not configured in this session")
         try:
-            with httpx.Client(timeout=_TIMEOUT_S, follow_redirects=False) as client:
+            with httpx.Client(timeout=self._timeout_s, follow_redirects=False) as client:
                 response = client.request(method, self._base + path, json=body,
                                           headers={"Authorization": f"Bearer {bearer}"})
         except httpx.HTTPError as exc:

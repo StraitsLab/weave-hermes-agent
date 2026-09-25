@@ -681,10 +681,13 @@ DEFAULT_CONFIG = {
     # `weave` makes the Harso vault the ONLY source: every list/fill/code goes to
     # weave-api at `weave_api_url` (an origin, e.g. https://api.example) with the
     # runtime's own WEAVE_API_MCP_BEARER, and nothing is stored locally.
+    # `weave_timeout_seconds` bounds each weave-api call (HTTPX connect/read/
+    # write/pool timeout, not a total deadline); a number in (0, 120].
     "vault": {
         "enabled": False,
         "backend": "local",
         "weave_api_url": "",
+        "weave_timeout_seconds": 10.0,
     },
 
     # Filesystem checkpoints — automatic snapshots before destructive file ops.

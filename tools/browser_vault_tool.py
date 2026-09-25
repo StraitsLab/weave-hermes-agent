@@ -593,8 +593,18 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     # Register the secret bytes with the model-egress redaction boundary
     # BEFORE they touch the page: any later browser_* result (including
     # browser_cdp Runtime.evaluate reads) that echoes them is scrubbed.
-    # Address values are not secrets but the card fields are: register every payment value.
-    for value in (secret.values() if meta.kind == "payment" else [secret.get("password", "")]):
+    # Local address values are not secrets but the card fields are: register every payment value. A backend
+    # that protects every value (fork V5: the Harso vault) registers the whole resolved payload, addresses too,
+    # except address tokens under 4 characters ("US", "CA"): an exact-substring scrub of those would mangle
+    # every later browser result ("STATUS") while hiding nothing identifying.
+    if meta.kind == "payment":
+        protected = list(secret.values()) + [f["value"] for f in fills]  # + derived forms (cc-exp "MM/YY")
+    elif getattr(backend, "protects_all_values", False) is True:
+        protected = [v for v in list(secret.values()) + [f["value"] for f in fills]
+                     if isinstance(v, str) and len(v) >= 4]
+    else:
+        protected = [secret.get("password", "")]
+    for value in protected:
         register_vault_redaction_value(value)
 
     try:

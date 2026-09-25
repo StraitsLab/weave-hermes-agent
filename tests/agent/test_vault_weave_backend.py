@@ -209,7 +209,8 @@ def test_defaults_keep_the_vault_off_and_local():
     from hermes_cli.config_defaults import DEFAULT_CONFIG
     from tools.browser_vault_tool import _vault_opted_in
 
-    assert DEFAULT_CONFIG["vault"] == {"enabled": False, "backend": "local", "weave_api_url": ""}
+    assert DEFAULT_CONFIG["vault"] == {"enabled": False, "backend": "local", "weave_api_url": "",
+                                       "weave_timeout_seconds": 10.0}
     assert _vault_opted_in() is False
     assert [b.name for b in enabled_backends()] == ["local"]
 
@@ -365,6 +366,54 @@ def test_address_fill_resolves_fields_for_the_exact_origin(weave, admitted_turn)
     assert out["success"] is True and out["fields"] == ["address-line1", "postal-code"]
     assert weave.resolves()[0]["body"]["action"] == "fill_address"
     assert "1 Canary Lane" in injected[0]
+
+
+def _browser_exec_output(stdout: str) -> str:
+    """Run the REAL browser_exec result construction (model egress) over a synthetic subprocess stdout."""
+    import subprocess
+
+    from tools import browser_use_cli as browser
+
+    with patch.object(browser, "_find_cli", return_value=["synthetic-browser"]), \
+         patch.object(browser, "_base_subprocess_env", return_value={}), \
+         patch.object(browser, "_resolve_real_profile_cdp", return_value=None), \
+         patch.object(browser, "_resolve_backend_cdp", return_value=None), \
+         patch.object(browser, "_workspace_dir", return_value=None), \
+         patch.object(browser, "_read_browser_cfg", return_value={}), \
+         patch.object(browser, "_find_screenshot", return_value=None), \
+         patch.object(browser.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout, "")):
+        out = browser.browser_exec("print(page_info())", task_id="t")
+    return out if isinstance(out, str) else json.dumps(out)
+
+
+_ADDR_CONTROLS = [{"autocomplete": "address-line1", "formIndex": 0, "index": 0, "label": "", "name": "a1", "type": "text"},
+                  {"autocomplete": "address-level2", "formIndex": 0, "index": 1, "label": "", "name": "city", "type": "text"},
+                  {"autocomplete": "postal-code", "formIndex": 0, "index": 2, "label": "", "name": "zip", "type": "text"}]
+
+
+def test_harso_address_values_never_reach_a_later_browser_result(weave, admitted_turn):
+    """A Harso address is protected like a password: once filled, no later browser output can echo it."""
+    from tools.browser_vault_tool import browser_vault_fill
+
+    with _page(origin="https://shop.example", controls=_ADDR_CONTROLS) as injected:
+        out = json.loads(browser_vault_fill(ADDR_HANDLE, task_id="t"))
+    assert out["success"] is True and "1 Canary Lane" in injected[0]
+    egress = _browser_exec_output("DOM text: 1 Canary Lane, Springfield 12345 (US)")
+    for value in ("1 Canary Lane", "Springfield", "12345"):
+        assert value not in egress, value
+    # Two-letter tokens are not registered: scrubbing "US" would mangle every later result ("STATUS").
+    assert "(US)" in egress and "STATUS" in _browser_exec_output("STATUS ok")
+
+
+def test_harso_address_fill_failure_registers_first_and_scrubs_the_error(weave, admitted_turn):
+    from tools import browser_vault_tool
+
+    with _page(origin="https://shop.example", controls=_ADDR_CONTROLS), \
+         patch.object(browser_vault_tool, "_eval_js_secret",
+                      return_value={"success": False, "error": "Uncaught: bad value 1 Canary Lane"}):
+        raw = browser_vault_tool.browser_vault_fill(ADDR_HANDLE, task_id="t")
+    assert json.loads(raw)["success"] is False and "1 Canary Lane" not in raw
+    assert "1 Canary Lane" not in _browser_exec_output("DOM text: 1 Canary Lane")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -567,3 +616,72 @@ def test_native_submit_run_needs_an_admitted_submit(tmp_path):
         assert db.native_submit_run("") is None
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Runtime bearer: validated before the transport ever sees it
+# ---------------------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("good", [CELL_BEARER, ATTEMPT_BEARER])
+@pytest.mark.parametrize("damage", ["\n", " ", "\r\n", "x", "leading"])
+def test_a_malformed_bearer_is_refused_before_httpx_and_never_logged(api, monkeypatch, caplog, good, damage):
+    """weave-api's presenter shapes, exactly: a damaged bearer is refused, not trimmed, and never reaches HTTPX
+    (httpcore's DEBUG log echoes a rejected header value)."""
+    from agent.vault_backends.base import VaultUnavailable
+    from agent.vault_backends.weave import WeaveLoginBackend
+
+    bad = damage + good if damage == "leading" else good + damage
+    monkeypatch.setenv("WEAVE_API_MCP_BEARER", bad)
+    caplog.set_level(logging.DEBUG)
+    with patch("httpx.Client", side_effect=AssertionError("the transport must not see a malformed bearer")):
+        with pytest.raises(VaultUnavailable, match="malformed") as caught:
+            WeaveLoginBackend(api.url).list_items()
+    assert good not in str(caught.value) and good not in caplog.text and api.requests == []
+
+
+@pytest.mark.parametrize("bearer", [CELL_BEARER, ATTEMPT_BEARER])
+def test_a_well_formed_bearer_reaches_weave_api_unchanged(api, monkeypatch, bearer):
+    from agent.vault_backends.weave import WeaveLoginBackend
+
+    monkeypatch.setenv("WEAVE_API_MCP_BEARER", bearer)
+    WeaveLoginBackend(api.url).list_items()
+    assert [r["authorization"] for r in api.requests] == [f"Bearer {bearer}"]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Timeout: runtime config, applied per call
+# ---------------------------------------------------------------------------------------------------------------
+
+def _applied_timeouts(monkeypatch):
+    import httpx
+
+    seen: list = []
+    real = httpx.Client.__init__
+
+    def spy(self, *args, **kwargs):
+        seen.append(kwargs.get("timeout"))
+        real(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.Client, "__init__", spy)
+    return seen
+
+
+def test_the_timeout_comes_from_the_real_config_and_an_edit_applies_to_the_next_call(api, monkeypatch):
+    from agent.vault_backends.base import enabled_backends
+
+    monkeypatch.setenv("WEAVE_API_MCP_BEARER", CELL_BEARER)
+    seen = _applied_timeouts(monkeypatch)
+    _write_config({"vault": {"enabled": True, "backend": "weave", "weave_api_url": api.url}})
+    enabled_backends()[0].list_items()
+    _write_config({"vault": {"enabled": True, "backend": "weave", "weave_api_url": api.url,
+                             "weave_timeout_seconds": 2.5}})
+    enabled_backends()[0].list_items()
+    assert seen == [10.0, 2.5]
+
+
+@pytest.mark.parametrize("raw", [0, -1, 121, "5", True, float("nan"), [3]])
+def test_an_invalid_timeout_falls_back_to_the_default(raw):
+    from agent.vault_backends.weave import timeout_seconds
+
+    assert timeout_seconds(raw) == 10.0
+    assert timeout_seconds(None) == 10.0 and timeout_seconds(120) == 120.0 and timeout_seconds(0.5) == 0.5
