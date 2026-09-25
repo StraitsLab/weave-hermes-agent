@@ -269,6 +269,24 @@ def test_no_frame_body_or_header_value_in_logs(screen, caplog):
         assert secret not in caplog.text
 
 
+# R1 (review t_33313d00) — mutant: drop the bridge's redaction of the lease module's log arguments
+_STALE = "cf328dc1b31f4a18b8fd973a1094209c"
+
+
+def _stale_release(control) -> None:
+    for action, viewer in [("take", _STALE), ("take", "new-owner"), ("release", _STALE)]:
+        assert control({"op": "lease", "action": action, "viewer_id": viewer})["ok"]
+
+
+def test_a_stale_release_does_not_log_the_releasers_viewer_id(screen, caplog):
+    caplog.set_level(logging.DEBUG)
+    client = _client()
+    _stale_release(lambda body: _control(client, body))
+    assert lease.get(profile_key=str(bridge.get_hermes_home())).viewer_id == "new-owner"
+    assert any(r.name == "tools.bot_desktop.lease" for r in caplog.records), "the lease's own trace still lands"
+    assert _STALE not in caplog.text
+
+
 # T-1b-6 — mutant: bind 0.0.0.0
 def test_binds_loopback_only_and_refuses_any_other_host():
     sock = bridge.bind_loopback("127.0.0.1:0")
@@ -352,6 +370,35 @@ def test_cli_bridge_serves_control_on_the_port_it_writes(screen):
     finally:
         proc.terminate()
         proc.wait(10)
+
+
+def test_cli_stale_release_leaves_no_viewer_id_in_agent_log(screen):
+    from websockets.sync.client import connect
+
+    tmp = Path(screen).parent
+    home = tmp / "home"
+    home.mkdir()
+    (tmp / "bridge.key").write_text(SECRET, encoding="utf-8")
+    proc = _cli(tmp, {**os.environ, "HERMES_HOME": str(home), "HERMES_BD_SOCKET": screen})
+    try:
+        port_file = tmp / "bridge.port"
+        deadline = time.time() + 30
+        while not port_file.exists() and proc.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+        assert port_file.exists(), proc.stderr.read() if proc.poll() is not None else "no port file"
+        port = int(port_file.read_text(encoding="utf-8"))
+
+        def control(body: dict) -> dict:
+            with connect(f"ws://127.0.0.1:{port}/control", additional_headers=_auth(), open_timeout=10) as ws:
+                ws.send(json.dumps(body))
+                return json.loads(ws.recv(timeout=10))
+        _stale_release(control)
+    finally:
+        proc.terminate()
+        proc.wait(10)
+    log = (home / "logs" / "agent.log").read_text(encoding="utf-8")
+    assert "another viewer holds" in log, "the scan must see the lease module's stale-release record"
+    assert _STALE not in log
 
 
 def test_cli_bridge_refuses_to_start_without_the_socket_env(screen):

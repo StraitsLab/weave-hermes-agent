@@ -73,5 +73,8 @@ Copied from upstream `hermes_cli/web_routers/display.py` @ `ee5ee84a` (upstream 
 - New: `WS /control` (one JSON request, one reply) for lease take/release/force/status and `type`. `type`
   sends RFB KeyEvent down/up pairs on its own short connection (keysym = code point for Latin-1, else
   `0x01000000 + code point`), re-checks the lease before each key, and never sends ClientCutText.
+- New: the bridge adds a filter to the `tools.bot_desktop.lease` logger that keeps each record but replaces its
+  arguments with `[redacted]`. `release()` logs a stale releaser's viewer id, and that id is a capability.
+  `lease.py` itself is not changed.
 - CLI: `hermes computer-use screen bridge --listen 127.0.0.1:0 --secret-file F --port-file F`. It binds
   127.0.0.1 only and writes the port file 0600.

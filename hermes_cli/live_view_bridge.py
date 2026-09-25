@@ -60,6 +60,21 @@ def _should_evict(held: dict, lease, viewer_id: str) -> bool:
     return bool(held["ever"])
 
 
+class _RedactArgs(logging.Filter):
+    """The lease module logs a stale releaser's viewer id (``lease.py`` release), and a viewer id is a
+    capability. The bridge keeps the record and drops its arguments; ``lease.py`` stays upstream-identical."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, dict):
+            record.args = dict.fromkeys(record.args, "[redacted]")
+        elif record.args:
+            record.args = ("[redacted]",) * len(record.args)
+        return True
+
+
+_REDACT_LEASE_ARGS = _RedactArgs()
+
+
 def socket_path_from_env() -> Path:
     raw = os.environ.get("HERMES_BD_SOCKET", "")
     if not raw or not os.path.isabs(raw):
@@ -77,6 +92,7 @@ def create_app(*, secret: str, socket_path: Optional[Path] = None) -> Starlette:
     if not secret:
         raise ValueError("bridge secret is empty")
     sock = socket_path or socket_path_from_env()
+    logging.getLogger("tools.bot_desktop.lease").addFilter(_REDACT_LEASE_ARGS)  # idempotent: same object
     profile_home = str(get_hermes_home())
     expected = f"HMAC {secret}".encode()
     async def _admit(ws: WebSocket) -> bool:
