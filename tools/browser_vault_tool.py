@@ -463,7 +463,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     The password is resolved server-side and injected via in-page JS over
     the supervisor CDP WebSocket; the result reports only counts/metadata.
     """
-    from agent.redact import register_vault_redaction_value
+    from agent.redact import redact_registered_vault_values, register_vault_redaction_value
     from agent.vault_login_classifier import (
         ClassifiedLoginControl,
         LoginControl,
@@ -594,18 +594,19 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     # BEFORE they touch the page: any later browser_* result (including
     # browser_cdp Runtime.evaluate reads) that echoes them is scrubbed.
     # Local address values are not secrets but the card fields are: register every payment value. A backend
-    # that protects every value (fork V5: the Harso vault) registers the whole resolved payload, addresses too,
-    # except address tokens under 4 characters ("US", "CA"): an exact-substring scrub of those would mangle
-    # every later browser result ("STATUS") while hiding nothing identifying.
+    # that protects every value (fork V5: the Harso vault) registers the whole resolved payload, addresses too.
+    # Passwords and card values are exact-substring at every length. An address value under 4 characters
+    # ("US", "7", "12C") is still registered, as a whole token: an exact-substring scrub of it would mangle
+    # every later browser result ("STATUS"), a token scrub hides it wherever it stands alone.
     if meta.kind == "payment":
         protected = list(secret.values()) + [f["value"] for f in fills]  # + derived forms (cc-exp "MM/YY")
     elif getattr(backend, "protects_all_values", False) is True:
-        protected = [v for v in list(secret.values()) + [f["value"] for f in fills]
-                     if isinstance(v, str) and len(v) >= 4]
+        protected = list(secret.values()) + [f["value"] for f in fills]
     else:
         protected = [secret.get("password", "")]
     for value in protected:
-        register_vault_redaction_value(value)
+        short_address = meta.kind == "address" and isinstance(value, str) and len(value) < 4
+        register_vault_redaction_value(value, whole_token=short_address)
 
     try:
         fill_result = _eval_js_secret(
@@ -614,10 +615,10 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     except Exception as exc:
         # Strip any secret material from exception text before surfacing.
         return json.dumps(
-            {"success": False, "error": scrub_secret_from_text(str(exc), secret)}
+            {"success": False, "error": redact_registered_vault_values(scrub_secret_from_text(str(exc), secret))}
         )
     if not fill_result.get("success"):
-        err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
+        err = redact_registered_vault_values(scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret))
         out = {"success": False, "error": err}
         if fill_result.get("error_type"):
             out["error_type"] = fill_result["error_type"]

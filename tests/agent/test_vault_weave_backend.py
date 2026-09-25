@@ -61,6 +61,8 @@ class FakeWeaveApi:
             KEY: _item(KEY, "api_key", ["https://api.example"]),
         }
         self.decision = "once"          # once | always | approval_required
+        self.password = PASSWORD
+        self.address = {"address_line1": "1 Canary Lane", "city": "Springfield", "postal_code": "12345", "country": "US"}
         self.force: tuple | None = None  # (status, body) override for every call
         self.force_resolve: tuple | None = None  # (status, body) override for POST /v1/vault/resolve only
         api = self
@@ -105,9 +107,8 @@ class FakeWeaveApi:
                     if api.decision == "approval_required":
                         return self._send(200, {"decision": "approval_required", "approval_ref": "0199dddd-0000-7000-8000-000000000001",
                                                 "choices": ["once", "always", "deny"]})
-                    value = {"fill_login": {"password": PASSWORD}, "enter_otp": {"otp": OTP},
-                             "fill_address": {"fields": {"address_line1": "1 Canary Lane", "city": "Springfield",
-                                                         "postal_code": "12345", "country": "US"}}}[body["action"]]
+                    value = {"fill_login": {"password": api.password}, "enter_otp": {"otp": OTP},
+                             "fill_address": {"fields": dict(api.address)}}[body["action"]]
                     return self._send(200, {"decision": api.decision, "action": body["action"], **value})
                 return self._send(404, {"error": {"code": "NOT_FOUND", "message": "no route"}})
 
@@ -399,10 +400,10 @@ def test_harso_address_values_never_reach_a_later_browser_result(weave, admitted
         out = json.loads(browser_vault_fill(ADDR_HANDLE, task_id="t"))
     assert out["success"] is True and "1 Canary Lane" in injected[0]
     egress = _browser_exec_output("DOM text: 1 Canary Lane, Springfield 12345 (US)")
-    for value in ("1 Canary Lane", "Springfield", "12345"):
+    for value in ("1 Canary Lane", "Springfield", "12345", "(US)"):
         assert value not in egress, value
-    # Two-letter tokens are not registered: scrubbing "US" would mangle every later result ("STATUS").
-    assert "(US)" in egress and "STATUS" in _browser_exec_output("STATUS ok")
+    # Short tokens are masked as whole tokens only: "US" is hidden, "STATUS" is not mangled.
+    assert "STATUS" in _browser_exec_output("STATUS ok")
 
 
 def test_harso_address_fill_failure_registers_first_and_scrubs_the_error(weave, admitted_turn):
@@ -414,6 +415,70 @@ def test_harso_address_fill_failure_registers_first_and_scrubs_the_error(weave, 
         raw = browser_vault_tool.browser_vault_fill(ADDR_HANDLE, task_id="t")
     assert json.loads(raw)["success"] is False and "1 Canary Lane" not in raw
     assert "1 Canary Lane" not in _browser_exec_output("DOM text: 1 Canary Lane")
+
+
+@pytest.mark.parametrize("password", ["z", "z9", "z9!", "z9!q"])
+def test_a_harso_password_of_any_length_never_reaches_a_later_browser_result(weave, admitted_turn, password):
+    from tools.browser_vault_tool import browser_vault_fill
+
+    weave.password = password
+    with _page() as injected:
+        out = json.loads(browser_vault_fill(HANDLE, task_id="t"))
+    assert out["success"] is True and password in injected[0]
+    assert f"[{password}]" not in _browser_exec_output(f"DOM password=[{password}]")
+    # A secret is exact-substring, never token-scoped: glued to other characters it is still hidden.
+    assert password not in _browser_exec_output(f"DOM value=ab{password}cd").replace("DOM value=", "")
+
+
+@pytest.mark.parametrize("password", ["z", "z9", "z9!", "z9!q"])
+def test_a_short_password_is_scrubbed_from_a_fill_failure(weave, admitted_turn, password):
+    from tools import browser_vault_tool
+
+    weave.password = password
+    with _page(), patch.object(browser_vault_tool, "_eval_js_secret",
+                               return_value={"success": False, "error": f"Uncaught: bad [{password}]"}):
+        raw = browser_vault_tool.browser_vault_fill(HANDLE, task_id="t")
+    assert json.loads(raw)["success"] is False and f"[{password}]" not in raw
+    assert f"[{password}]" not in _browser_exec_output(f"DOM password=[{password}]")
+
+
+_LINE2_CONTROLS = _ADDR_CONTROLS + [{"autocomplete": "address-line2", "formIndex": 0, "index": 3, "label": "",
+                                     "name": "a2", "type": "text"}]
+
+
+@pytest.mark.parametrize("line2", ["7", "9B", "12C", "Apt 4"])
+def test_a_short_identifying_address_field_never_reaches_a_later_browser_result(weave, admitted_turn, line2):
+    from tools.browser_vault_tool import browser_vault_fill
+
+    weave.address = {**weave.address, "address_line2": line2}
+    with _page(origin="https://shop.example", controls=_LINE2_CONTROLS) as injected:
+        out = json.loads(browser_vault_fill(ADDR_HANDLE, task_id="t"))
+    assert out["success"] is True and line2 in injected[0]
+    egress = _browser_exec_output(f"DOM apartment=[{line2}] unit {line2}, 1 Canary Lane")
+    assert line2 not in egress.replace("«redacted-vault-secret»", ""), egress
+    # Token-scoped, not a blanket substring scrub: text that merely contains the short value survives.
+    assert "STATUS" in _browser_exec_output("STATUS ok") and "COUNTRY" in _browser_exec_output("COUNTRY")
+
+
+@pytest.mark.parametrize("line2", ["7", "12C"])
+def test_a_short_address_field_is_scrubbed_from_a_fill_failure(weave, admitted_turn, line2):
+    from tools import browser_vault_tool
+
+    weave.address = {**weave.address, "address_line2": line2}
+    with _page(origin="https://shop.example", controls=_LINE2_CONTROLS), \
+         patch.object(browser_vault_tool, "_eval_js_secret",
+                      return_value={"success": False, "error": f"Uncaught: bad apartment [{line2}]"}):
+        raw = browser_vault_tool.browser_vault_fill(ADDR_HANDLE, task_id="t")
+    assert json.loads(raw)["success"] is False and f"[{line2}]" not in raw
+    assert f"[{line2}]" not in _browser_exec_output(f"DOM apartment=[{line2}]")
+
+
+def test_a_token_registration_never_downgrades_an_exact_secret():
+    from agent.redact import redact_registered_vault_values, register_vault_redaction_value
+
+    register_vault_redaction_value("12C")
+    register_vault_redaction_value("12C", whole_token=True)
+    assert "12C" not in redact_registered_vault_values("x12Cy")
 
 
 # ---------------------------------------------------------------------------------------------------------------
