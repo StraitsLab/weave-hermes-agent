@@ -54,3 +54,5 @@ Ported from upstream `tests/tools/test_bot_desktop_*.py` @ `ee5ee84a`. Removed o
   (attach-to-dock `--cdp`, headed-spawn auto-start, janitor, daemon idle) are rewritten against the fork's
   `browser_tool.py` in the wiring PR.
 - `test_bot_desktop_install.py`: not ported with `install.py`.
+- `test_bot_desktop_resources.py::test_start_refuses_and_status_explains_when_memory_is_short`: marked
+  `linux_only`. `runtime.status()` reports no memory blocker off a supported host, so upstream's copy fails on macOS.
