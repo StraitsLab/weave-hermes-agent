@@ -34,8 +34,12 @@ logger = logging.getLogger(__name__)
 # output with profile A's passwords (which would also confirm to B that the bytes exist), and
 # bounded per profile: a fill-heavy session evicts its oldest entries rather than growing forever.
 _VAULT_REDACTION_MAX_PER_PROFILE = 64
-_VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
+_VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: whole_token (bool)}
 _VAULT_REDACTION_LOCK = threading.Lock()
+# Left edge of a whole-token value: start, a non-word char, OR a serialized escape sequence
+# (``\n``, ``\t``, ``\u00a0``...). Browser output is often JSON text, where a value standing alone
+# on a line reads ``\n12C``; the escape's letter must not count as a glued word character.
+_TOKEN_LEFT_BOUNDARY = r"(?:(?<!\w)|(?<=\\[bfnrt])|(?<=\\u[0-9A-Fa-f]{4}))"
 
 
 def _vault_scope() -> str:
@@ -43,12 +47,17 @@ def _vault_scope() -> str:
     return str(get_hermes_home())
 
 
-def register_vault_redaction_value(value) -> None:
+def register_vault_redaction_value(value, *, whole_token: bool = False) -> None:
     """Register an exact vault secret value for model-facing redaction.
 
     Called by the vault fill path BEFORE the injection happens, so no later browser tool result
     can echo the value back into model context. Also registers the form a text input normalizes
     it to (CR/LF stripped), since that is what the page holds.
+
+    ``whole_token`` (fork V5): mask the value only where it stands alone (not flanked by word
+    characters). For short protected values that are not secrets (an address ``US``, ``7``, ``12C``):
+    they are still masked everywhere they appear as a token, without scrubbing ``STATUS``. Secrets are
+    registered exact-substring (the default); an exact registration is never downgraded.
     """
     if not isinstance(value, str) or not value:
         return
@@ -57,8 +66,9 @@ def register_vault_redaction_value(value) -> None:
         bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
         for v in (value, normalized):
             if v:
+                token = bool(whole_token) and bucket.get(v, True) is True
                 bucket.pop(v, None)  # re-registering refreshes recency
-                bucket[v] = None
+                bucket[v] = token
         while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
             del bucket[next(iter(bucket))]
 
@@ -75,9 +85,16 @@ def redact_registered_vault_values(text: str) -> str:
         return text
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_REDACTION_VALUES.get(_vault_scope())
-        values = sorted(bucket, key=len, reverse=True) if bucket else ()  # longest first: a substring never shadows its superstring
-    for value in values:
-        if value in text:
+        # longest first: a substring never shadows its superstring
+        values = sorted(bucket.items(), key=lambda kv: len(kv[0]), reverse=True) if bucket else ()
+    for value, whole_token in values:
+        if value not in text:
+            continue
+        if whole_token:
+            left = _TOKEN_LEFT_BOUNDARY if re.match(r"\w", value[0]) else ""
+            right = r"(?!\w)" if re.match(r"\w", value[-1]) else ""
+            text = re.sub(f"{left}{re.escape(value)}{right}", "«redacted-vault-secret»", text)
+        else:
             text = text.replace(value, "«redacted-vault-secret»")
     return text
 

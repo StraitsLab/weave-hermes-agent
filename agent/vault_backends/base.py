@@ -9,12 +9,15 @@ namespaced by ``prefix`` so ``backend_for_handle`` needs no lookup table.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from agent.vault_store import VaultItemMeta
+
+logger = logging.getLogger(__name__)
 
 
 class UnlockRequired(Exception):
@@ -25,11 +28,32 @@ class UnlockRequired(Exception):
         self.backend = backend
 
 
+class VaultUseRefused(Exception):
+    """Fork (V5): the authority behind a backend declined this one use (approval pending, wrong site, rate
+    limit, item changed). ``error_type`` is the tool's typed result; the message is content-free."""
+
+    def __init__(self, error_type: str, message: str):
+        super().__init__(message)
+        self.error_type = error_type
+
+
+class VaultUnavailable(RuntimeError):
+    """Fork (V5): the backend could not serve the call (unconfigured, unreachable, malformed answer).
+    Content-free by contract: never a secret, a bearer or a response body."""
+
+
 class LoginBackend(ABC):
-    name: str                # config key: local | onepassword | bitwarden
+    name: str                # config key: local | weave | onepassword | bitwarden
     display_name: str        # user-facing
-    prefix: str              # handle prefix ("vault_", "op:", "bw:")
+    prefix: str              # handle prefix ("vault_", "wv:", "op:", "bw:")
     needs_unlock: bool = False
+    # Fork (V5): can this backend store a login typed into this process? The tool asks the user for a
+    # password only when one can, so a backend whose secrets must never pass through the runtime (weave)
+    # is never handed one.
+    can_save: bool = False
+    # Fork (V5): every value this backend resolves is protected (the model never sees it), addresses included.
+    # The local vault keeps upstream's rule that an address is not a secret; a Harso item is (VAULT-design §4).
+    protects_all_values: bool = False
 
     def owns(self, handle: str) -> bool:
         return handle.startswith(self.prefix)
@@ -44,19 +68,26 @@ class LoginBackend(ABC):
     @abstractmethod
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]: ...
 
+    # Fork (V5): every resolve names the exact page origin it fills. A backend whose authority checks the
+    # site (weave) refuses without it; the local and manager backends are bound by the tool's own check.
     @abstractmethod
-    def resolve_password(self, handle: str) -> str:
+    def resolve_password(self, handle: str, *, origin: Optional[str] = None) -> str:
         """Server-side only; raises ``UnlockRequired`` when locked."""
 
-    def resolve_otp(self, handle: str) -> Optional[str]:
+    def resolve_otp(self, handle: str, *, origin: Optional[str] = None) -> Optional[str]:
         """Current one-time code for a login that stores a TOTP seed, else None (the user is asked).
         Server-side only, like resolve_password."""
         return None
 
-    def resolve_secret(self, handle: str) -> Dict[str, str]:
+    def resolve_secret(self, handle: str, *, origin: Optional[str] = None) -> Dict[str, str]:
         """Full payload of a payment/address item (server-side only). External managers list only
         logins, so the base returns the password-only shape."""
-        return {"password": self.resolve_password(handle)}
+        return {"password": self.resolve_password(handle, origin=origin)}
+
+    def save_login(self, label: str, origin: str, identifier: str, identifier_type: str,
+                   password: str) -> VaultItemMeta:
+        """Store one login bound to ``origin`` (only when ``can_save``)."""
+        raise NotImplementedError(f"{self.display_name} does not store logins from this session")
 
 
 def run_with_stdin_secret(argv: Sequence[str], *, env: Dict[str, str], secret: str, timeout: float,
@@ -124,10 +155,24 @@ def is_enabled(name: str) -> bool:
 
 
 def enabled_backends() -> List[LoginBackend]:
-    """Local first (always on), then every detected external manager the user has not turned off."""
+    """Local first, then every detected external manager the user has not turned off.
+
+    Fork (V5): ``vault.backend: weave`` makes the Harso vault the ONLY login source (a Harso cell or Work
+    attempt): no local Fernet file and no manager CLI session may hold a secret there. Any other value than
+    ``local``/``weave`` leaves the vault with no source at all rather than guessing one."""
     from agent.vault_backends.local import LocalLoginBackend
 
     cfg = _cfg()
+    choice = cfg.get("backend", "local")
+    if choice == "weave":
+        from agent.vault_backends.weave import WeaveLoginBackend, timeout_seconds
+
+        # Read per call from the profile's config.yaml (mtime-cached): an edit applies to the next vault call.
+        return [WeaveLoginBackend(str(cfg.get("weave_api_url") or ""),
+                                  timeout_seconds(cfg.get("weave_timeout_seconds")))]
+    if choice != "local":
+        logger.warning("vault.backend %.40r is not a known backend; the vault has no login source", choice)
+        return []
     out: List[LoginBackend] = [LocalLoginBackend()]
     for cls in external_backend_classes():
         if is_enabled(cls.name):

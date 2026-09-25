@@ -12195,6 +12195,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    def native_submit_run(self, external_request_id: str) -> Optional[Dict[str, str]]:
+        """Fork (Harso vault V5): the admitted native submit that named a turn, read-only.
+
+        Returns ``native_request_ref`` (the run weave-api's Ledger recorded for the turn), the session it was
+        admitted into, and that session's lineage root (the conversation's first session, across compression
+        and rotation forks). ``None`` when no admitted submit carries this id.
+        """
+        if not external_request_id:
+            return None
+        try:
+            with self._read_ctx() as conn:
+                row = conn.execute(
+                    "SELECT session_id, native_request_ref FROM native_session_submit_idempotency "
+                    "WHERE external_request_id = ? AND admission IS NOT NULL",
+                    (external_request_id,),
+                ).fetchone()
+        except sqlite3.OperationalError:
+            return None  # no native submit was ever admitted in this profile (table absent)
+        if row is None:
+            return None
+        session_id, native_request_ref = row[0], row[1]
+        return {"session_id": session_id, "native_request_ref": native_request_ref,
+                "root_session_id": self._session_lineage_root_to_tip(session_id)[0]}
+
     def append_messages_batch(
         self,
         session_id: str,
