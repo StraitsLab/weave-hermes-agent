@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 from agent.conversation_loop import _restore_or_build_system_prompt
+from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_state import SessionDB
 from run_agent import AIAgent
@@ -92,49 +93,23 @@ def _edit(home, text):
     (home / "SOUL.md").write_text(text, encoding="utf-8")
 
 
-def test_continuing_session_adopts_new_soul_exactly_once(tmp_path):
-    _, db = run_turn(home := write_home(tmp_path / "p1"), SID, [])
-    assert "SOUL-A-v1" in _stored(db, SID) and "Identity epoch: " in _stored(db, SID)
+def test_continuing_session_reuses_unchanged_soul_and_adopts_new_soul_exactly_once(tmp_path):
+    _, db = run_turn(home := write_home(tmp_path / "profiles" / "a"), SID, [])
+    _, db_b = run_turn(sib := write_home(tmp_path / "profiles" / "b", "SOUL-B-v1\n"), "sb", [])
+    assert "SOUL-A-v1" in (v1 := _stored(db, SID)) and "Identity epoch: " in v1
+    for _ in range(2):  # unchanged SOUL: stored bytes reused, no rebuild (no cache break)
+        assert (same := run_turn(home, SID, HISTORY, db)[0]).builds == [] and same._cached_system_prompt == v1 == _stored(db, SID)
     db.append_message(SID, "user", "hi")
+    db.safe_fork_session(SID, "child")  # a forked child inherits the stamp ...
+    assert _stored(db, "child") == v1
     _edit(home, "SOUL-A-v2\n")
     agent, db = run_turn(home, SID, HISTORY, db)
     assert agent.builds == [1] and agent._cached_system_prompt == (v2 := _stored(db, SID))
     assert "SOUL-A-v2" in v2 and "SOUL-A-v1" not in v2
     assert [m["content"] for m in db.get_messages(SID)] == ["hi"]  # same id, history kept
     assert (again := run_turn(home, SID, HISTORY, db)[0]).builds == [] and again._cached_system_prompt == v2
-
-
-def test_unchanged_soul_reuses_stored_bytes(tmp_path):
-    _, db = run_turn(home := write_home(tmp_path / "p1"), SID, [])
-    v1 = _stored(db, SID)
-    for _ in range(2):
-        agent, db = run_turn(home, SID, HISTORY, db)
-        assert agent.builds == [] and agent._cached_system_prompt == v1 == _stored(db, SID)
-
-
-def test_held_running_turn_keeps_its_prompt(tmp_path):
-    held, db = run_turn(home := write_home(tmp_path / "p1"), SID, [])
-    _edit(home, "SOUL-A-v2\n")  # mid-turn edit: the running turn's prompt and the stored row are untouched
-    assert held._cached_system_prompt == _stored(db, SID) and "SOUL-A-v1" in held._cached_system_prompt
-    assert "SOUL-A-v2" in run_turn(home, SID, HISTORY, db)[0]._cached_system_prompt
-
-
-def test_sibling_profile_home_unaffected(tmp_path):
-    a, b = write_home(tmp_path / "profiles" / "a"), write_home(tmp_path / "profiles" / "b", "SOUL-B-v1\n")
-    (_, db_a), (_, db_b) = run_turn(a, "sa", []), run_turn(b, "sb", [])
-    b_v1 = _edit(a, "SOUL-A-v2\n") or _stored(db_b, "sb")
-    agent_a, agent_b = run_turn(a, "sa", HISTORY, db_a)[0], run_turn(b, "sb", HISTORY, db_b)[0]
-    assert "SOUL-A-v2" in agent_a._cached_system_prompt and "SOUL-B" not in agent_a._cached_system_prompt
-    assert agent_b.builds == [] and agent_b._cached_system_prompt == b_v1
-
-
-def test_forked_child_inherits_stamp_and_rebuilds_on_first_turn(tmp_path):
-    _, db = run_turn(home := write_home(tmp_path / "p1"), SID, [])
-    db.append_message(SID, "user", "hi")
-    db.safe_fork_session(SID, "child")
-    assert _stored(db, "child") == _stored(db, SID)  # stamp inherited
-    _edit(home, "SOUL-A-v2\n")
-    assert run_turn(home, "child", HISTORY, db)[0].builds == [1] and "SOUL-A-v2" in _stored(db, "child")
+    assert run_turn(home, "child", HISTORY, db)[0].builds == [1] and "SOUL-A-v2" in _stored(db, "child")  # ... and rebuilds
+    assert run_turn(sib, "sb", HISTORY, db_b)[0].builds == [] and "SOUL-B" not in v2  # sibling home untouched
 
 
 def test_gateway_cached_agent_rebuilt_on_digest_change_and_reused_otherwise(tmp_path):
@@ -146,8 +121,7 @@ def test_gateway_cached_agent_rebuilt_on_digest_change_and_reused_otherwise(tmp_
     _edit(home, "GW-SOUL-V1")
     db, runner, histories, captures = SessionDB(home / "state.db"), _make_turn_runner(), {}, []
     runner._session_db = type("DB", (), {"_db": db, "get_session": AsyncMock(side_effect=db.get_session)})()
-    # Pin only the process-global tool-registry generation (background registrations bump it under load).
-    keys = runner._extract_cache_busting_config
+    keys = runner._extract_cache_busting_config  # pin the process-global registry generation (bumped under load)
     runner._extract_cache_busting_config = lambda c: {**keys(c), "tools.registry_generation": 0}
 
     class Stub(AIAgent):  # real agent + real turn prologue; only inference is replaced
@@ -182,27 +156,39 @@ def test_reused_agent_adopts_new_soul_at_next_turn_boundary(tmp_path):  # same l
     agent, db = run_turn(home := write_home(tmp_path / "p1"), SID, [])
     agent.compression_enabled, agent.builds = False, []
     turn = lambda: _prologue(agent, HISTORY).active_system_prompt  # noqa: E731
-    assert "SOUL-A-v1" in turn() and agent.builds == []
-    _edit(home, "SOUL-A-v2\n")
-    v2 = turn()
-    assert agent.builds == [1] and "SOUL-A-v2" in v2 and v2 == _stored(db, SID)
+    assert "SOUL-A-v1" in turn() and agent.builds == [] and _edit(home, "SOUL-A-v2\n") is None
+    assert "SOUL-A-v2" in (v2 := turn()) and agent.builds == [1] and v2 == _stored(db, SID)
     assert turn() == v2 and agent.builds == [1]
     agent._identity_epoch_rebuild = False  # flag off: never re-checks
     _edit(home, "SOUL-A-v3\n")
     assert turn() == v2 and agent.builds == [1]
 
 
-def test_soul_swapped_during_build_converges_next_turn(tmp_path, monkeypatch):  # stamp certifies loaded bytes
+@pytest.mark.parametrize("pre,post,fail,held,final", [  # the stamp certifies the bytes the loader read
+    (None, "SOUL-A-v2\n", False, "SOUL-A-v1", "SOUL-A-v2"),  # edit mid-turn, after the held turn's read
+    ("SOUL-A-B\n", "SOUL-A-v1\n", False, "SOUL-A-B", "SOUL-A-v1"),  # A->B->A: loader saw B, disk rolled back
+    ("SOUL-A-v2\n", None, True, DEFAULT_AGENT_IDENTITY, "SOUL-A-v2"),  # transient read OSError -> fallback
+])
+def test_held_turn_keeps_loaded_prompt_and_next_turn_converges(tmp_path, monkeypatch, pre, post, fail, held, final):
     import run_agent
+    home, load, read, seen = write_home(tmp_path / "p1"), run_agent.load_soul_md, Path.read_bytes, []
 
-    home, load = write_home(tmp_path / "p1"), run_agent.load_soul_md
+    def read_once(p):  # fault the loader's OWN SOUL.md read: edit right after it, or NotADirectoryError
+        if p.name != "SOUL.md" or seen.append(p) or len(seen) > 1:
+            return read(p)
+        return (read(p / "x" if fail else p), post and _edit(home, post))[0]
+
+    def faulty(*a, **k):
+        with monkeypatch.context() as m:
+            return (pre and _edit(home, pre), m.setattr(Path, "read_bytes", read_once), load(*a, **k))[2]
+
     with monkeypatch.context() as m:
-        m.setattr(run_agent, "load_soul_md", lambda *a, **k: (load(*a, **k), _edit(home, "SOUL-A-v2\n"))[0])
-        held, db = run_turn(home, SID, [])
-    assert "SOUL-A-v1" in held._cached_system_prompt and "Identity epoch: unstable" in held._cached_system_prompt
+        m.setattr(run_agent, "load_soul_md", faulty)
+        first, db = run_turn(home, SID, [])
+    assert first._cached_system_prompt == _stored(db, SID) and held in _stored(db, SID) and final not in _stored(db, SID)
     later, db = run_turn(home, SID, HISTORY, db)
-    assert later.builds == [1] and "SOUL-A-v2" in _stored(db, SID)
-    assert run_turn(home, SID, HISTORY, db)[0].builds == []
+    assert later.builds == [1] and final in _stored(db, SID) and later._cached_system_prompt == _stored(db, SID)
+    assert run_turn(home, SID, HISTORY, db)[0].builds == []  # converged: no rebuild loop
 
 
 @pytest.mark.parametrize("label,flag", [("flag_absent", None), ("flag_false", False)])

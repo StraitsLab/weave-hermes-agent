@@ -367,10 +367,10 @@ def _session_start_like(agent: Any, now: Any) -> Any:
     return now
 
 
-def _identity_epoch_line(agent: Any) -> str:
+def _identity_epoch_line(agent: Any, digest: Optional[str] = None) -> str:
     from tools.bot_mode_probe import identity_epoch_line  # fails closed to ""
 
-    return identity_epoch_line(_agent_home(agent))
+    return identity_epoch_line(_agent_home(agent), digest)
 
 
 def refresh_stale_identity_epoch(agent: Any, prompt: Optional[str], system_message: Optional[str] = None) -> bool:
@@ -497,23 +497,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
-    # Identity epoch: digest SOUL.md around the load; a mid-load change stamps "unstable" (next turn rebuilds).
-    _epoch_on = getattr(agent, "_identity_epoch_rebuild", False) is True
-    _epoch_stamp = _identity_epoch_line(agent) if _epoch_on else ""
+    # Identity epoch: stamp the digest of the bytes the loader read; a failed read stamps "unstable" (rebuilds).
+    _epoch_on, _soul_snapshot = getattr(agent, "_identity_epoch_rebuild", False) is True, {}
     if agent.load_soul_identity or not agent.skip_context_files:
         # Scope the SOUL.md read to the agent's OWN home (see _agent_home) —
         # ambient resolution on a thread that lost the HERMES_HOME ContextVar
         # reads the launch profile's SOUL.md instead (#50233).
-        _soul_content = _r.load_soul_md(_ctx_len, home_override=_agent_home(agent))
+        _soul_kw = {"snapshot": _soul_snapshot} if _epoch_on else {}  # flag off: the pin's exact call
+        _soul_content = _r.load_soul_md(_ctx_len, home_override=_agent_home(agent), **_soul_kw)
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
+    else:
+        _soul_snapshot["digest"] = None  # SOUL is not this prompt's identity: stamp the disk digest
 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
-    if _epoch_on and _identity_epoch_line(agent) != _epoch_stamp:
-        _epoch_stamp = "Identity epoch: unstable"
+    _epoch_stamp = _identity_epoch_line(agent, _soul_snapshot.get("digest", "unstable")) if _epoch_on else ""
 
     # Pointer to the docs (and, when it exists, the hermes-agent skill) for
     # user questions about Hermes itself. The skill_view() pointer is a

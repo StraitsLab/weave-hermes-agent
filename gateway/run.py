@@ -28450,11 +28450,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     @staticmethod
     def _identity_epoch_digest(user_config: dict | None) -> str:
         """SOUL stamp keying the agent cache when ``agent.identity_epoch_rebuild`` is on (turn's profile home)."""
-        if cfg_get(user_config or {}, "agent", "identity_epoch_rebuild") is not True:
-            return ""
         from tools.bot_mode_probe import identity_epoch_line
 
-        return identity_epoch_line()
+        return identity_epoch_line() if cfg_get(user_config or {}, "agent", "identity_epoch_rebuild") is True else ""
 
     @staticmethod
     def _agent_config_signature(
