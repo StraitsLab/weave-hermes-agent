@@ -28449,10 +28449,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _identity_epoch_digest(user_config: dict | None) -> str:
-        """SOUL stamp for ``_agent_config_signature`` when
-        ``agent.identity_epoch_rebuild`` is on, so a SOUL edit rebuilds the
-        cached agent. ``get_hermes_home()`` is the turn's profile (the
-        ``_profile_runtime_scope`` ContextVar survives ``copy_context``)."""
+        """SOUL stamp keying the agent cache when ``agent.identity_epoch_rebuild`` is on (turn's profile home)."""
         if cfg_get(user_config or {}, "agent", "identity_epoch_rebuild") is not True:
             return ""
         from tools.bot_mode_probe import identity_epoch_line
@@ -28509,7 +28506,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _cache_keys_sorted = sorted((cache_keys or {}).items())
 
-        blob_items = [
+        blob = _j.dumps(
+            [
                 model,
                 _api_key_fingerprint,
                 runtime.get("base_url", ""),
@@ -28528,12 +28526,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (context files in vs out) — a toggled config edit must
                 # rebuild the cached agent, not silently reuse it.
                 bool(skip_context_files),
-            ]
-        # Identity epoch (opt-in): appended only when set, so a flag-off
-        # signature hashes the exact pre-feature blob.
-        if identity_digest:
-            blob_items.append(identity_digest)
-        blob = _j.dumps(blob_items, sort_keys=True, default=str)
+            ] + ([identity_digest] if identity_digest else []),  # opt-in; flag off = pin bytes
+            sort_keys=True,
+            default=str,
+        )
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
     def _rehydrate_session_model_override(self, session_key: str) -> None:

@@ -367,6 +367,30 @@ def _session_start_like(agent: Any, now: Any) -> Any:
     return now
 
 
+def _identity_epoch_line(agent: Any) -> str:
+    from tools.bot_mode_probe import identity_epoch_line  # fails closed to ""
+
+    return identity_epoch_line(_agent_home(agent))
+
+
+def refresh_stale_identity_epoch(agent: Any, prompt: Optional[str], system_message: Optional[str] = None) -> bool:
+    """Opt-in ``agent.identity_epoch_rebuild``: at an idle turn boundary, rebuild ONCE when ``prompt``'s SOUL
+    stamp is stale (same session id/history) and persist it. Fails closed: a probe error never burns cache."""
+    if getattr(agent, "_identity_epoch_rebuild", False) is not True:
+        return False
+    current = _identity_epoch_line(agent)  # "" on probe failure
+    if not current or current in (prompt or "").splitlines():
+        return False
+    logger.info("SOUL identity epoch changed for session %s; rebuilding system prompt once.", agent.session_id)
+    agent._cached_system_prompt = agent._build_system_prompt(system_message)
+    if agent._session_db:
+        try:
+            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+        except Exception as exc:
+            logger.warning("update_system_prompt failed after identity epoch refresh (session=%s): %s", agent.session_id, exc)
+    return True
+
+
 def _agent_home(agent: Any) -> Optional[Path]:
     """The agent's OWN profile home.
 
@@ -473,6 +497,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
+    # Identity epoch: digest SOUL.md around the load; a mid-load change stamps "unstable" (next turn rebuilds).
+    _epoch_on = getattr(agent, "_identity_epoch_rebuild", False) is True
+    _epoch_stamp = _identity_epoch_line(agent) if _epoch_on else ""
     if agent.load_soul_identity or not agent.skip_context_files:
         # Scope the SOUL.md read to the agent's OWN home (see _agent_home) —
         # ambient resolution on a thread that lost the HERMES_HOME ContextVar
@@ -485,6 +512,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+    if _epoch_on and _identity_epoch_line(agent) != _epoch_stamp:
+        _epoch_stamp = "Identity epoch: unstable"
 
     # Pointer to the docs (and, when it exists, the hermes-agent skill) for
     # user questions about Hermes itself. The skill_view() pointer is a
@@ -761,13 +790,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         except Exception:
             pass
 
-    # Identity epoch stamp (opt-in agent.identity_epoch_rebuild): the SOUL.md
-    # digest this prompt was built from; the restore path rebuilds once when
-    # it goes stale. Flag off emits nothing (prompt bytes unchanged).
-    if getattr(agent, "_identity_epoch_rebuild", False) is True:
-        from tools.bot_mode_probe import identity_epoch_line
-
-        post_workspace_parts.append(identity_epoch_line(_agent_home(agent)))
+    if _epoch_on:  # flag off emits nothing (pin bytes)
+        post_workspace_parts.append(_epoch_stamp)
 
     # Active-profile hint — names the Hermes profile the agent is running
     # under so it doesn't conflate ~/.hermes/skills/ (default profile) with

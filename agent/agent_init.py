@@ -2066,7 +2066,6 @@ def init_agent(
     # Bot Mode teammate protocol section (tools/bot_mode_probe.py) — pure
     # filesystem reads, no warm needed. Silent on non-Bot-Mode installs.
     agent._bot_mode_protocol = bool(_agent_section.get("bot_mode_protocol", True))
-    # Identity epoch (opt-in, default off): see _restore_or_build_system_prompt.
     agent._identity_epoch_rebuild = _agent_section.get("identity_epoch_rebuild", False) is True
     # Session-title hint for the "Bot Chat" gate: hosts that defer the DB
     # title write past the first prompt build (tui_gateway pending_title)
