@@ -265,8 +265,9 @@ class _Response:
     def __init__(self, payload):
         self._payload = payload
 
-    def read(self):
-        return json.dumps(self._payload).encode()
+    def read(self, amt=None):
+        body = json.dumps(self._payload).encode()
+        return body if amt is None else body[:amt]
 
     def __enter__(self):
         return self
@@ -436,7 +437,7 @@ def test_prefetch_sends_native_session_and_exact_scope_headers(monkeypatch):
             "hermes_session_ref": "native-session",
             "query": "What did we decide?",
         },
-        "timeout": 5,
+        "timeout": 0.8,  # prefetch-only; below MemoryManager's 1s caller wait
     }
 
 
@@ -863,3 +864,106 @@ def test_provider_reports_unavailable_when_scope_lacks_profile_identity(monkeypa
     finally:
         reset_secret_scope(token)
         set_multiplex_active(previous)
+
+
+# -- MEM-B1: prefetch-only socket timeout and response-byte cap -------------
+
+def _write_config(text):
+    import os
+    from pathlib import Path
+
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(text)
+
+
+def test_prefetch_uses_its_own_timeout_and_writes_keep_theirs(monkeypatch):
+    provider = _provider(monkeypatch)
+    seen = _capture_turn(monkeypatch)
+    provider.prefetch("What did we decide?", session_id=_SESSION)
+    provider.sync_turn("q", "a", messages=_turn_messages())
+    assert [entry["timeout"] for entry in seen] == [0.8, 5]
+
+
+def test_prefetch_limits_are_runtime_config_read_per_call(monkeypatch):
+    provider = _provider(monkeypatch)
+    seen = _capture_turn(monkeypatch, {"items": [{"citation": "[harso: e1]", "text": "x" * 2000}]})
+    _write_config("plugins:\n  harso:\n    prefetch_timeout: 0.3\n")
+    assert provider.prefetch("q", session_id=_SESSION).startswith("[harso: e1] x")
+    _write_config("plugins:\n  harso:\n    prefetch_timeout: 0.45\n    prefetch_max_bytes: 1024\n")
+    assert provider.prefetch("q", session_id=_SESSION) == ""  # body is over 1 KiB
+    assert [entry["timeout"] for entry in seen] == [0.3, 0.45]
+
+
+@pytest.mark.parametrize("setting", [
+    "prefetch_timeout: 0", "prefetch_timeout: 6", "prefetch_timeout: true",
+    "prefetch_timeout: fast", "prefetch_max_bytes: 10", "prefetch_max_bytes: 1.5",
+])
+def test_invalid_prefetch_limits_fall_back_to_defaults(monkeypatch, setting):
+    provider = _provider(monkeypatch)
+    seen = _capture_turn(monkeypatch, {"items": [{"citation": "[harso: e1]", "text": "ok"}]})
+    _write_config(f"plugins:\n  harso:\n    {setting}\n")
+    assert provider.prefetch("q", session_id=_SESSION) == "[harso: e1] ok"
+    assert seen[0]["timeout"] == 0.8
+
+
+def test_valid_body_one_byte_over_the_cap_is_dropped(monkeypatch, caplog):
+    provider = _provider(monkeypatch)
+    _write_config("plugins:\n  harso:\n    prefetch_max_bytes: 1024\n")
+    body = {"items": [{"citation": "[harso: e1]", "text": ""}]}
+    body["items"][0]["text"] = "x" * (1025 - len(json.dumps(body).encode()))
+    assert len(json.dumps(body).encode()) == 1025  # parseable, just too large
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: _Response(body))
+    with caplog.at_level(logging.WARNING, logger="plugins.memory.harso"):
+        assert provider.prefetch("q", session_id=_SESSION) == ""
+    assert "exceeded 1024 bytes" in caplog.text
+    body["items"][0]["text"] = body["items"][0]["text"][1:]  # exactly at the cap
+    assert provider.prefetch("q", session_id=_SESSION).startswith("[harso: e1] x")
+
+
+def test_oversized_prefetch_body_is_dropped_without_reading_it_all(monkeypatch):
+    provider = _provider(monkeypatch)
+    reads = []
+
+    class Huge(_Response):
+        def read(self, amt=None):
+            reads.append(amt)
+            return b"{" + b" " * (amt or 10**7)
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: Huge({}))
+    assert provider.prefetch("q", session_id=_SESSION) == ""
+    assert reads == [262145]
+
+
+def test_stalled_server_bounds_the_turn_and_frees_the_thread(monkeypatch):
+    """Real socket path: a server that never answers costs the turn at most the
+    manager deadline, and the prefetch-only socket timeout ends the thread."""
+    import http.server
+    import threading
+    import time
+
+    release = threading.Event()
+
+    class Stall(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            release.wait(10)
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stall)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        provider, manager = _context_provider(monkeypatch)
+        monkeypatch.setenv("WEAVE_HARSO_ENDPOINT", f"http://127.0.0.1:{server.server_port}")
+        manager.set_external_prefetch_timeout(0.2)
+        _write_config("plugins:\n  harso:\n    prefetch_timeout: 0.6\n")
+        started = time.monotonic()
+        assert manager.prefetch_all("What did we decide?") == ""
+        assert time.monotonic() - started < 0.5
+        thread = manager._external_prefetch_threads["harso"]
+        assert thread.is_alive()  # outer deadline returned; socket still open
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()  # prefetch-only socket timeout freed it
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()

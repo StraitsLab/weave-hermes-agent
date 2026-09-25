@@ -15,6 +15,11 @@ from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 _TIMEOUT_SECONDS = 5
+# Prefetch-only runtime settings (config.yaml ``plugins.harso``). The socket
+# timeout stays below MemoryManager's caller-wait bound so a slow server frees
+# the prefetch thread soon after the turn stops waiting; writes keep 5s.
+_PREFETCH_TIMEOUT_SECONDS = 0.8
+_PREFETCH_MAX_BYTES = 262144
 _MAX_CONTEXT_ITEMS = 5
 _MAX_CONTEXT_TEXT = 1200
 _P = r"(?:0\.[0-9]{2}|1\.00)"
@@ -27,6 +32,33 @@ _ROUTING_HINT = re.compile(
 
 class HarsoWriteError(RuntimeError):
     """Content-free failure that lets D4 record an unacknowledged mirror."""
+
+
+def _prefetch_limits() -> tuple[float, int]:
+    """Read ``plugins.harso.prefetch_timeout`` / ``prefetch_max_bytes`` per call."""
+    timeout, max_bytes = _PREFETCH_TIMEOUT_SECONDS, _PREFETCH_MAX_BYTES
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        section = cfg_get(load_config_readonly(), "plugins", "harso", default={})
+    except Exception:
+        section = {}
+    if not isinstance(section, dict):
+        return timeout, max_bytes
+    raw = section.get("prefetch_timeout")
+    if raw is not None:
+        if (not isinstance(raw, bool) and isinstance(raw, (int, float))
+                and 0 < raw <= _TIMEOUT_SECONDS):
+            timeout = float(raw)
+        else:
+            logger.warning("plugins.harso.prefetch_timeout invalid; using %.1fs", timeout)
+    raw = section.get("prefetch_max_bytes")
+    if raw is not None:
+        if type(raw) is int and 1024 <= raw <= 16 * 1024 * 1024:
+            max_bytes = raw
+        else:
+            logger.warning("plugins.harso.prefetch_max_bytes invalid; using %d", max_bytes)
+    return timeout, max_bytes
 
 
 class HarsoMemoryProvider(MemoryProvider):
@@ -83,7 +115,14 @@ class HarsoMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return []
 
-    def _post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any] | None:
+    def _post(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+        *,
+        timeout: float = _TIMEOUT_SECONDS,
+        max_bytes: int | None = None,
+    ) -> Dict[str, Any] | None:
         request = urllib.request.Request(
             f"{self._endpoint}{path}",
             data=json.dumps(payload).encode("utf-8"),
@@ -95,8 +134,15 @@ class HarsoMemoryProvider(MemoryProvider):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=_TIMEOUT_SECONDS) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                if max_bytes is None:
+                    body = response.read()
+                else:
+                    body = response.read(max_bytes + 1)
+                    if len(body) > max_bytes:
+                        logger.warning("Harso response exceeded %d bytes; dropped", max_bytes)
+                        return None
+                payload = json.loads(body.decode("utf-8"))
                 return payload if isinstance(payload, dict) else None
         except (OSError, ValueError, urllib.error.HTTPError) as exc:
             logger.warning("Harso request unavailable: %s", exc)
@@ -125,12 +171,15 @@ class HarsoMemoryProvider(MemoryProvider):
         # HarsoContextInput's wire-contract ceiling, not a recall tuning knob.
         # Keep the head: user intent normally precedes pasted supporting text.
         query = query[:4096]
+        timeout, max_bytes = _prefetch_limits()
         response = self._post(
             "/internal/harso/context",
             {
                 **self._scope(session_id),
                 "query": query,
             },
+            timeout=timeout,
+            max_bytes=max_bytes,
         )
         if not response:
             return ""
