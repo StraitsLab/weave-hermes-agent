@@ -281,6 +281,29 @@ class TestPrologueStamping:
             ctx = _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
 
+    def test_prefetch_deadline_refreshes_from_config_each_turn(self):
+        """MEM-B1: a config.yaml edit reaches the SAME manager on the next
+        turn (a cached gateway agent is never rebuilt for it)."""
+        from pathlib import Path
+
+        from agent.memory_manager import MemoryManager
+
+        agent = _FakeAgent()
+        manager = MemoryManager(external_prefetch_timeout=5.0)
+        agent._memory_manager = manager
+        config = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            config.write_text("memory:\n  external_prefetch_timeout: 0.4\n")
+            _build(agent, user_message="what did we decide about the schema?")
+            assert agent._memory_manager is manager
+            assert manager._external_prefetch_timeout == 0.4
+            config.write_text("memory:\n  external_prefetch_timeout: 0.7\n")
+            _build(agent, user_message="and the migration order?")
+            assert manager._external_prefetch_timeout == 0.7
+            config.write_text("memory:\n  external_prefetch_timeout: -1\n")
+            _build(agent, user_message="and rollback?")
+            assert manager._external_prefetch_timeout == 1.0  # invalid -> default
+
 
 # ---------------------------------------------------------------------------
 # Flush: persist-override rows keep the sent bytes in the sidecar (#48677)

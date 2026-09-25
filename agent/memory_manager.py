@@ -78,7 +78,37 @@ logger = logging.getLogger(__name__)
 # teardown indefinitely — the worker threads are daemon, so anything still
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
-_EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+# Caller-wait bound for one external provider's pre-inference prefetch.
+# Runtime value: config.yaml ``memory.external_prefetch_timeout``.
+_EXTERNAL_PREFETCH_TIMEOUT_S = 1.0
+_EXTERNAL_PREFETCH_TIMEOUT_MAX_S = 30.0
+
+
+def _valid_prefetch_timeout(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if 0 < value <= _EXTERNAL_PREFETCH_TIMEOUT_MAX_S else None
+
+
+def configured_external_prefetch_timeout(config: Any) -> float:
+    """Validated ``memory.external_prefetch_timeout`` from a loaded config.
+
+    Missing keeps the default; an invalid value (non-numeric, non-finite,
+    <= 0 or above the ceiling) also falls back to the default, loudly.
+    """
+    section = config.get("memory") if isinstance(config, dict) else None
+    raw = section.get("external_prefetch_timeout") if isinstance(section, dict) else None
+    if raw is None:
+        return _EXTERNAL_PREFETCH_TIMEOUT_S
+    value = _valid_prefetch_timeout(raw)
+    if value is None:
+        logger.warning(
+            "memory.external_prefetch_timeout must be a number in (0, %.0f]; using %.1fs",
+            _EXTERNAL_PREFETCH_TIMEOUT_MAX_S, _EXTERNAL_PREFETCH_TIMEOUT_S,
+        )
+        return _EXTERNAL_PREFETCH_TIMEOUT_S
+    return value
 
 
 def configured_memory_manager(
@@ -472,13 +502,9 @@ class MemoryManager:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
-        self._external_prefetch_timeout = (
-            _EXTERNAL_PREFETCH_TIMEOUT_S
-            if external_prefetch_timeout is None
-            else float(external_prefetch_timeout)
-        )
-        if self._external_prefetch_timeout <= 0:
-            raise ValueError("external_prefetch_timeout must be positive")
+        self._external_prefetch_timeout = _EXTERNAL_PREFETCH_TIMEOUT_S
+        if external_prefetch_timeout is not None:
+            self.set_external_prefetch_timeout(external_prefetch_timeout)
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
         # Background executor for end-of-turn sync/prefetch. Lazily created on
@@ -505,6 +531,19 @@ class MemoryManager:
         self._native_inflight: Dict[str, threading.Event] = {}
         self._native_owners: Dict[str, int] = {}
         self._native_journal = native_journal
+
+    def set_external_prefetch_timeout(self, seconds: Any) -> None:
+        """Change the caller-wait bound for the next external prefetch.
+
+        Runtime refresh seam: updates this manager in place, so a stuck
+        provider thread stays tracked and keeps being skipped.
+        """
+        value = _valid_prefetch_timeout(seconds)
+        if value is None:
+            raise ValueError(
+                f"external_prefetch_timeout must be in (0, {_EXTERNAL_PREFETCH_TIMEOUT_MAX_S:g}]"
+            )
+        self._external_prefetch_timeout = value
 
     # -- Registration --------------------------------------------------------
 

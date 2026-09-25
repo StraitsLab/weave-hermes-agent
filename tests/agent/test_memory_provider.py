@@ -310,6 +310,89 @@ class TestMemoryManager:
         assert external.prefetch_queries == ["query", "query 3"]
         assert external.name not in mgr._external_prefetch_threads
 
+    # -- MEM-B1: bounded caller wait, no thread pile-up, runtime deadline ----
+
+    @staticmethod
+    def _prefetch_threads():
+        return [t for t in threading.enumerate()
+                if t.name.startswith("memory-prefetch-") and t.is_alive()]
+
+    def test_default_deadline_bounds_caller_wait_to_one_second(self):
+        mgr = MemoryManager()
+        external = BlockingPrefetchProvider("slow-memory")
+        mgr.add_provider(external)
+        try:
+            started = time.monotonic()
+            assert mgr.prefetch_all("query") == ""
+            assert time.monotonic() - started < 1.5
+        finally:
+            external.release.set()
+
+    def test_blocked_provider_over_many_turns_adds_no_threads(self):
+        class EchoBlocking(BlockingPrefetchProvider):
+            def prefetch(self, query, *, session_id=""):
+                super().prefetch(query, session_id=session_id)
+                return f"late answer for {query}"
+
+        mgr = MemoryManager(external_prefetch_timeout=0.05)
+        external = EchoBlocking("stuck-memory")
+        mgr.add_provider(external)
+        before = len(self._prefetch_threads())
+
+        assert mgr.prefetch_all("turn 0") == ""
+        assert external.started.wait(timeout=1.0)
+        for turn in range(1, 50):
+            started = time.monotonic()
+            assert mgr.prefetch_all(f"turn {turn}") == ""
+            assert time.monotonic() - started < 0.5
+            assert len(self._prefetch_threads()) - before <= 1
+        assert external.prefetch_queries == ["turn 0"]
+
+        external.release.set()
+        mgr._external_prefetch_threads["stuck-memory"].join(timeout=1.0)
+        # The stuck turn's late result is dropped; the next turn gets its own.
+        assert mgr.prefetch_all("turn 50") == "late answer for turn 50"
+        assert external.prefetch_queries == ["turn 0", "turn 50"]
+        assert len(self._prefetch_threads()) == before
+
+    def test_runtime_deadline_refresh_keeps_stuck_guard(self):
+        mgr = MemoryManager(external_prefetch_timeout=5.0)
+        external = BlockingPrefetchProvider("stuck-memory")
+        mgr.add_provider(external)
+        mgr.set_external_prefetch_timeout(0.05)
+        try:
+            started = time.monotonic()
+            assert mgr.prefetch_all("first") == ""
+            assert time.monotonic() - started < 1.0
+            mgr.set_external_prefetch_timeout(0.1)
+            assert mgr.prefetch_all("second") == ""
+            assert external.prefetch_queries == ["first"]
+        finally:
+            external.release.set()
+
+    @pytest.mark.parametrize("bad", [0, -1, 31, float("inf"), float("nan"), True, "1"])
+    def test_invalid_deadline_is_rejected(self, bad):
+        mgr = MemoryManager(external_prefetch_timeout=0.5)
+        with pytest.raises(ValueError):
+            mgr.set_external_prefetch_timeout(bad)
+        with pytest.raises(ValueError):
+            MemoryManager(external_prefetch_timeout=bad)
+        assert mgr._external_prefetch_timeout == 0.5
+
+    def test_configured_deadline_reads_memory_section(self):
+        from agent.memory_manager import (
+            _EXTERNAL_PREFETCH_TIMEOUT_S,
+            configured_external_prefetch_timeout as read,
+        )
+
+        assert read({"memory": {"external_prefetch_timeout": 0.25}}) == 0.25
+        assert read({"memory": {"external_prefetch_timeout": 2}}) == 2.0
+        for cfg in ({}, None, {"memory": None}, {"memory": {}},
+                    {"memory": {"external_prefetch_timeout": 0}},
+                    {"memory": {"external_prefetch_timeout": "fast"}},
+                    {"memory": {"external_prefetch_timeout": 1e9}}):
+            assert read(cfg) == _EXTERNAL_PREFETCH_TIMEOUT_S
+
 
 
 class TestPluginMemoryDiscovery:

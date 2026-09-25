@@ -2097,6 +2097,10 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Seconds a turn waits for the external provider's pre-inference
+        # prefetch before continuing without it, in (0, 30]. Re-read every
+        # turn. A provider still stuck past this is skipped until it returns.
+        "external_prefetch_timeout": 1.0,
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

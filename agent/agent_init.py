@@ -1905,9 +1905,14 @@ def init_agent(
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
             if _mem_provider_name and _mem_provider_name.strip():
-                from agent.memory_manager import MemoryManager as _MemoryManager
+                from agent.memory_manager import (
+                    MemoryManager as _MemoryManager,
+                    configured_external_prefetch_timeout as _prefetch_timeout,
+                )
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(
+                    external_prefetch_timeout=_prefetch_timeout(_agent_cfg)
+                )
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
