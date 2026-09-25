@@ -70,7 +70,9 @@ def test_launcher_child_gets_the_socket_under_the_state_dir(tmp_path, monkeypatc
 
 
 def test_dock_browser_starts_with_the_preset_agent_browser_args(monkeypatch):
-    monkeypatch.setattr("tools.browser_tool._needs_chromium_sandbox_bypass", lambda: False)
+    from tools import browser_tool_session as session  # the names dock_argv reads (patching browser_tool would leak)
+
+    monkeypatch.setattr(session, "_needs_chromium_sandbox_bypass", lambda: False)
     monkeypatch.setenv("AGENT_BROWSER_ARGS", "--no-sandbox, --disable-dev-shm-usage,--disk-cache-size=268435456")
     argv = browser.dock_argv("/opt/chrome", "/p/dir")
     assert argv[-3:] == ["--no-sandbox", "--disable-dev-shm-usage", "--disk-cache-size=268435456"]
