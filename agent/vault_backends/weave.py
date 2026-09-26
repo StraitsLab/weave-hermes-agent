@@ -125,6 +125,7 @@ class WeaveLoginBackend(LoginBackend):
     display_name = "Harso vault"
     prefix = "wv:"
     protects_all_values = True
+    otp_without_seed = True
 
     def __init__(self, base_url: str, timeout_s: float = _DEFAULT_TIMEOUT_S):
         self._base = base_url.rstrip("/")

@@ -819,6 +819,30 @@ class TestTwoFactor:
         code = re.search(r'"value": "(\d{6})"', seen["expr"]).group(1)
         assert code not in raw  # the code went to the page, not to the model
 
+    def test_a_local_login_without_a_key_is_not_resolved_for_a_code(self, store):
+        """Only a backend that supplies codes without a seed (Harso) is asked for a seedless login; the local
+        vault keeps the has_otp gate and goes straight to the user."""
+        from agent.vault_backends import unlock as unlock_mod
+        from tools import browser_vault_tool
+
+        meta = _add_login(store, origin="https://acme.test")
+        assert store.get_meta(meta.id).has_otp is False
+        resolved, asked = [], []
+        unlock_mod.set_code_prompt_callback(lambda site, hint: asked.append(site) or "246810")
+        controls = [{"index": 0, "type": "text", "name": "otp", "autocomplete": "one-time-code"}]
+        try:
+            with patch("agent.vault_store.get_vault_store", return_value=store), \
+                 patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+                 patch("agent.vault_backends.local.LocalLoginBackend.resolve_otp",
+                       side_effect=lambda h, origin=None: resolved.append(h)), \
+                 patch.object(browser_vault_tool, "_focus_bound_origin", lambda t, o, k: o or None), \
+                 patch.object(browser_vault_tool, "_eval_js", return_value={"success": True, "result": json.dumps(controls)}), \
+                 patch.object(browser_vault_tool, "_eval_js_secret", return_value={"success": True, "result": json.dumps({"filled": 1})}):
+                out = json.loads(browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t"))
+        finally:
+            unlock_mod.set_code_prompt_callback(None)
+        assert (out["success"], out["source"], asked, resolved) == (True, "user", ["acme.test"], [])
+
     def test_without_a_key_the_user_is_asked_and_split_boxes_get_one_digit_each(self, store):
         from agent.vault_backends import unlock as unlock_mod
         from tools import browser_vault_tool

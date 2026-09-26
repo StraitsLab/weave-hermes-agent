@@ -376,6 +376,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     # password. Verify before anything is resolved or the user is prompted, or a code leaks to an unbound page.
     allowed: list = []
     has_otp = False
+    seedless_login = False
     if handle:
         try:
             meta = backend.get_meta(handle) if backend is not None else None
@@ -390,6 +391,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
             return json.dumps({"success": False, "error": f"No vault item with handle {handle!r}. Use browser_vault_list."})
         allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
         has_otp = meta.has_otp
+        seedless_login = meta.kind == "login" and backend.otp_without_seed
     origin = next((o for o in (_focus_bound_origin(effective_task_id, c, "otp") for c in allowed) if o), None)
     if not allowed:
         _focus_bound_origin(effective_task_id, "", "otp")
@@ -415,10 +417,11 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
     code: Optional[str] = None
     source = "user"
-    # Fork (V5): ask the backend only for an item that stores an authenticator key, and name the exact origin
-    # the code goes into (the Harso vault mints the code server-side after checking that origin and the grant).
-    # A refusal is the answer (approval pending, wrong site, rate limit): the user is not asked instead.
-    if backend is not None and has_otp:
+    # Fork (V5): ask the backend only for an item that stores an authenticator key, or for any login when the
+    # backend supplies codes without one (V-otp: Harso reads the mailed code), and name the exact origin the code goes
+    # into (the Harso vault checks that origin and the grant server-side). A refusal is the answer (approval
+    # pending, wrong site, rate limit): the user is not asked instead, except for otp_unavailable (no code).
+    if backend is not None and (has_otp or seedless_login):
         try:
             code = backend.resolve_otp(handle, origin=origin)
         except VaultUseRefused as refusal:
