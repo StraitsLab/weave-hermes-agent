@@ -39,7 +39,8 @@ _MAX_TIMEOUT_S = 120.0
 # weave-api's own presenter shapes (ledger_mcp.CONNECTOR_BEARER / ATTEMPT_CONNECTOR_BEARER). A bearer that does not
 # match is refused before HTTPX sees it: a malformed header value is echoed by httpcore's DEBUG logging.
 _BEARER = re.compile(r"^(?:wvc1|wva1)_[A-Za-z0-9_-]{43}$")
-_HANDLE = re.compile(r"^wv:[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+_REF = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+_HANDLE = re.compile(r"^wv:" + _REF.pattern[1:])
 _SESSION = re.compile(r"^weave-([0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$")
 _FILLABLE = ("login", "address", "totp")  # api_key is injected by the egress proxy (V7), never resolved here
 
@@ -55,6 +56,10 @@ _REFUSALS = {
 }
 _APPROVAL = ("The user has not allowed this use yet. A request is waiting in their Harso app; tell them, "
              "and call this tool again after they allow it. Do not ask for the password in chat.")
+_DENIED = ("The user did not allow this use of the vault item. Nothing was filled. Do not retry it, and do not ask "
+           "for the password in chat.")
+# The same verbs as weave-api's card copy (vault.card_description).
+_VERB = {"fill_login": "sign in", "fill_address": "fill in the address", "enter_otp": "enter the 2FA code"}
 
 
 def _bearer() -> str:
@@ -107,6 +112,25 @@ def _run_context(bearer: str) -> tuple[Optional[str], Optional[str]]:
     if run is None or match is None:
         raise VaultUseRefused("no_run", "The vault can only be used in a turn sent from the Harso app.")
     return match.group(1), run["native_request_ref"]
+
+
+def _work_gate(approval_ref: Any, handle: str, action: str, origin: str) -> None:
+    """A Work attempt has no chat to wait in: ask the attempt's own approval gate, keyed by the Ledger card.
+
+    The gate's pattern key ``plugin_rule:<approval_ref>`` rides the ACP permission to the attempt host, which puts
+    the ref on its attention receipt; the Ledger binds that exact card, and the user's decision settles it. The gate
+    runs regardless of ``approvals.mode`` (Work runs ``off``); only an explicit allow returns here. An allow here
+    grants nothing by itself: the caller re-resolves, and only the Ledger's settled card releases a value.
+    """
+    from tools.approval import request_tool_approval
+
+    if not isinstance(approval_ref, str) or not _REF.fullmatch(approval_ref):
+        raise VaultUnavailable("the Harso vault returned an invalid answer")
+    tool = "browser_vault_enter_code" if action == "enter_otp" else "browser_vault_fill"
+    result = request_tool_approval(tool, f"Use Harso vault item {handle} to {_VERB[action]} on {origin}",
+                                   rule_key=approval_ref)
+    if not result.get("approved"):
+        raise VaultUseRefused("denied", _DENIED)
 
 
 def _meta(raw: Any) -> VaultItemMeta:
@@ -185,7 +209,10 @@ class WeaveLoginBackend(LoginBackend):
             body.update(conversation_id=conversation_id, run_id=run_id)
         answer = self._call("POST", "/v1/vault/resolve", body)
         if answer.get("decision") == "approval_required":
-            raise VaultUseRefused("approval_required", _APPROVAL)
+            if not bearer.startswith("wva1_"):  # a cell turn waits for the chat card
+                raise VaultUseRefused("approval_required", _APPROVAL)
+            _work_gate(answer.get("approval_ref"), handle, action, origin)
+            answer = self._call("POST", "/v1/vault/resolve", body)  # exactly once: the card is decided now
         value = answer.get(field)
         if answer.get("decision") not in ("once", "always") or answer.get("action") != action or not value:
             raise VaultUnavailable("the Harso vault returned an invalid answer")
