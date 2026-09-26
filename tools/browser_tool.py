@@ -395,20 +395,27 @@ def _get_open_command_timeout(*, first_open: bool = False) -> int:
     return max(base, floor)
 
 
+# THE Chromium flags for a host where its sandbox cannot work: agent-browser gets them through
+# AGENT_BROWSER_ARGS and the Bot Screen dock's Browser icon through tools.bot_desktop.browser.dock_argv.
+CHROMIUM_SANDBOX_BYPASS_ARGS = ("--no-sandbox", "--disable-dev-shm-usage")
+
+
+def apparmor_restricts_unprivileged_userns() -> bool:
+    """Ubuntu 23.10+ default: unprivileged user namespaces are denied (Chromium: 'No usable sandbox')."""
+    try:
+        with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", encoding="utf-8") as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
 def _needs_chromium_sandbox_bypass() -> bool:
     """Return True when Chromium needs --no-sandbox to start reliably."""
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return True
     if _running_in_docker():
         return True
-    userns_restrict = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
-    try:
-        with open(userns_restrict, encoding="utf-8") as f:
-            if f.read().strip() == "1":
-                return True
-    except OSError:
-        pass
-    return False
+    return apparmor_restricts_unprivileged_userns()
 
 
 def _apply_chromium_sandbox_args(browser_env: Dict[str, str]) -> None:
@@ -422,7 +429,7 @@ def _apply_chromium_sandbox_args(browser_env: Dict[str, str]) -> None:
             "browser: sandbox bypass needed (root/docker/AppArmor userns) — "
             "injecting --no-sandbox"
         )
-        browser_env["AGENT_BROWSER_ARGS"] = "--no-sandbox,--disable-dev-shm-usage"
+        browser_env["AGENT_BROWSER_ARGS"] = ",".join(CHROMIUM_SANDBOX_BYPASS_ARGS)
 
 
 def _read_command_output_files(stdout_path: str, stderr_path: str) -> tuple[str, str]:
