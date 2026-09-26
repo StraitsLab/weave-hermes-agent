@@ -568,13 +568,59 @@ def test_otp_approval_pending_is_the_answer_the_user_is_not_asked_instead(weave,
     assert asked == [] and injected == []
 
 
-def test_an_item_without_an_authenticator_key_is_never_resolved_for_a_code(weave, admitted_turn):
+_OTP_BOX = [{"index": 0, "type": "text", "name": "otp", "autocomplete": "one-time-code"}]
+
+
+def test_a_login_without_an_authenticator_key_still_asks_harso_for_the_code(weave, admitted_turn):
+    """V-otp: Harso reads a seedless login's code from the owner's mail, so the tool must ask it. Regression: the
+    V5 has_otp gate skipped the resolve and sent a seedless login straight to the user prompt."""
+    from agent.vault_backends import unlock as unlock_mod
     from tools.browser_vault_tool import browser_vault_enter_code
 
     weave.items[ITEM]["has_otp"] = False
+    asked = []
+    unlock_mod.set_code_prompt_callback(lambda site, hint: asked.append(site) or "000000")
+    try:
+        with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+             _page(controls=_OTP_BOX) as injected:
+            raw = browser_vault_enter_code(HANDLE, task_id="t")
+    finally:
+        unlock_mod.set_code_prompt_callback(None)
+    out = json.loads(raw)
+    assert (out["success"], out["source"], asked) == (True, "weave", [])
+    assert [r["body"] for r in weave.resolves()] == [{"handle": HANDLE, "action": "enter_otp", "page_origin": ORIGIN,
+                                                      "conversation_id": CONV, "run_id": NATIVE_REF}]
+    assert OTP in injected[0] and OTP not in raw
+
+
+def test_no_mailed_code_hands_the_seedless_login_to_the_user(weave, admitted_turn):
+    """otp_unavailable (no code in the owner's mail) keeps the V5 take-over: the user is asked for the code."""
+    from agent.vault_backends import unlock as unlock_mod
+    from tools.browser_vault_tool import browser_vault_enter_code
+
+    weave.items[ITEM]["has_otp"] = False
+    weave.force_resolve = (409, {"error": {"code": "VAULT_OTP_UNAVAILABLE", "message": "No sign-in code is available"}})
+    asked = []
+    unlock_mod.set_code_prompt_callback(lambda site, hint: asked.append(site) or "246810")
+    try:
+        with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+             _page(controls=_OTP_BOX) as injected:
+            out = json.loads(browser_vault_enter_code(HANDLE, task_id="t"))
+        with patch("agent.vault_backends.unlock.can_prompt_here", return_value=False), _page(controls=_OTP_BOX):
+            headless = json.loads(browser_vault_enter_code(HANDLE, task_id="t"))
+    finally:
+        unlock_mod.set_code_prompt_callback(None)
+    assert (out["success"], out["source"], asked) == (True, "user", ["www.amazon.com"])
+    assert "246810" in injected[0] and len(weave.resolves()) == 2
+    assert headless["error_type"] == "prompt_unavailable"
+
+
+def test_a_non_login_harso_item_is_never_resolved_for_a_code(weave, admitted_turn):
+    from tools.browser_vault_tool import browser_vault_enter_code
+
     with patch("agent.vault_backends.unlock.can_prompt_here", return_value=False), \
-         _page(controls=[{"index": 0, "type": "text", "name": "otp", "autocomplete": "one-time-code"}]):
-        out = json.loads(browser_vault_enter_code(HANDLE, task_id="t"))
+         _page(origin="https://shop.example", controls=_OTP_BOX):
+        out = json.loads(browser_vault_enter_code(ADDR_HANDLE, task_id="t"))
     assert out["error_type"] == "prompt_unavailable" and weave.resolves() == []
 
 
