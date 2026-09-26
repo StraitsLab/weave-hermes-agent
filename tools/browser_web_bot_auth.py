@@ -20,6 +20,7 @@ import hashlib
 import logging
 import re
 import secrets
+import threading
 import time
 from typing import Dict, Optional
 from urllib.parse import urlsplit
@@ -32,6 +33,9 @@ TAG = "web-bot-auth"
 VALIDITY_SECONDS = 60
 SIGNED_HEADERS = ("Signature", "Signature-Input", "Signature-Agent")
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+# Every call into the plugin signer (hook, public_key, sign) answers within this or the request goes unsigned.
+SIGNER_TIMEOUT_S = 5.0
+_slots = threading.BoundedSemaphore(8)
 
 
 def _b64url(data: bytes) -> str:
@@ -66,9 +70,38 @@ def authority_of(url: str) -> str:
     return host if parts.port in (None, default_port) else f"{host}:{parts.port}"
 
 
+def _bounded(fn, *args):
+    """``fn(*args)`` on a daemon thread, awaited for at most ``SIGNER_TIMEOUT_S`` (raises ``TimeoutError``).
+
+    A plugin signer may call out to weave-api/KMS and never answer. At most 8 such calls run at once; a
+    call that times out keeps its slot until it returns, so a dead signer cannot pile up threads."""
+    deadline = time.monotonic() + SIGNER_TIMEOUT_S
+    if not _slots.acquire(timeout=SIGNER_TIMEOUT_S):
+        raise TimeoutError("signer busy")
+    box: dict = {}
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            box["value"] = fn(*args)
+        except BaseException as exc:  # noqa: BLE001 — re-raised in the caller
+            box["error"] = exc
+        finally:
+            _slots.release()
+            done.set()
+
+    threading.Thread(target=run, name="web-bot-auth-signer", daemon=True).start()
+    if not done.wait(max(0.0, deadline - time.monotonic())):
+        raise TimeoutError("signer did not answer in time")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
 class RequestSigner:
     """Signs requests through a plugin signer. Each signature is verified against the signer's public key before
-    it is used, so a broken signer yields an unsigned request, never a wrong signature."""
+    it is used, so a broken signer yields an unsigned request, never a wrong signature. Construct it off the
+    request path: ``public_key()`` may call out (``request_signer`` bounds it)."""
 
     def __init__(self, signer) -> None:
         public_key = signer.public_key()
@@ -85,7 +118,7 @@ class RequestSigner:
                   f'alg="ed25519";expires={created + validity_seconds};nonce={_sf_string(nonce)};tag="{TAG}"')
         base = (f'"@authority": {authority_of(url)}\n"signature-agent": {self.agent}\n'
                 f'"@signature-params": {params}').encode("ascii")
-        signature = self._sign(base)
+        signature = _bounded(self._sign, base)
         self._verify(signature, base)
         return {"Signature-Agent": self.agent, "Signature-Input": f"sig1={params}",
                 "Signature": f"sig1=:{base64.b64encode(signature).decode('ascii')}:"}
@@ -102,18 +135,42 @@ def web_bot_auth_enabled() -> bool:
         return False
 
 
+_lock = threading.Lock()
 _resolved: Optional[RequestSigner] = None
+_resolving: Optional[tuple] = None  # (done event, deadline) of the one in-flight resolution
 
 
 def request_signer() -> Optional[RequestSigner]:
-    """The process's signer while ``browser.web_bot_auth`` is on: resolved once it succeeds, retried (and logged)
-    while it does not. A supervisor keeps the signer it started with."""
-    global _resolved
+    """The process's signer while ``browser.web_bot_auth`` is on, else None. Callers apply it to live sessions
+    (``CDPSupervisor.set_request_signer``), so the flag governs existing browsers too.
+
+    Resolved once it succeeds, retried while it does not. Resolution (the hook and ``public_key()``) runs on one
+    background thread; callers wait for it until ``SIGNER_TIMEOUT_S`` after it began, then go unsigned, so a
+    hung plugin delays browsing once, by at most that long, and never stacks up resolutions."""
+    global _resolving
     if not web_bot_auth_enabled():
         return None
-    if _resolved is None:
-        _resolved = resolve_request_signer()
+    with _lock:
+        if _resolved is not None:
+            return _resolved
+        if _resolving is None:
+            _resolving = (threading.Event(), time.monotonic() + SIGNER_TIMEOUT_S)
+            threading.Thread(target=_resolve_in_background, args=(_resolving[0],), name="web-bot-auth-resolve",
+                             daemon=True).start()
+        done, deadline = _resolving
+    if not done.wait(max(0.0, deadline - time.monotonic())):
+        logger.warning("web bot auth: request signer not ready within %.0fs; browser requests stay unsigned",
+                       SIGNER_TIMEOUT_S)
     return _resolved
+
+
+def _resolve_in_background(done: threading.Event) -> None:
+    global _resolved, _resolving
+    signer = resolve_request_signer()
+    with _lock:
+        if _resolving is not None and _resolving[0] is done:  # not superseded (tests reset the module state)
+            _resolved, _resolving = signer, None
+    done.set()
 
 
 def resolve_request_signer() -> Optional[RequestSigner]:

@@ -3835,19 +3835,24 @@ def _dispatch_browser_command(
     # Cleanup stops the supervisor before closing the backend; keep it stopped.
     if command != "close" and session_info.get("cdp_url"):
         _ensure_cdp_supervisor(task_id)
-    elif command != "close" and args != ["cdp-url"] and web_bot_auth_request_signer() is not None:
-        # Web Bot Auth (fork, AB-2): a local session has no CDP URL of its own; ask its daemon (which launches the
-        # browser) so the supervisor intercepts before this command's first request leaves. Idempotent per session.
+    elif command != "close" and args != ["cdp-url"]:
+        # Web Bot Auth (fork, AB-2): a local session has no CDP URL of its own. A live supervisor takes the current
+        # flag; otherwise, when signing is on, ask the daemon (which launches the browser) for its endpoint so the
+        # supervisor intercepts before this command's first request leaves.
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
 
+        signer = web_bot_auth_request_signer()
         supervisor = SUPERVISOR_REGISTRY.get(task_id)
-        res = None if supervisor is not None and supervisor.snapshot().active else _dispatch_browser_command(
-            task_id, session_info, browser_cmd, "get", ["cdp-url"], timeout, _engine_override)
-        local_cdp = str(((res or {}).get("data") or {}).get("cdpUrl") or "") if (res or {}).get("success") else ""
-        if local_cdp:
-            _ensure_cdp_supervisor(task_id, _resolve_cdp_override(local_cdp))
-        elif res is not None:
-            logger.warning("web bot auth: no CDP endpoint for the local browser; requests stay unsigned")
+        if supervisor is not None and supervisor.snapshot().active:
+            supervisor.set_request_signer(signer)
+        elif signer is not None:
+            res = _dispatch_browser_command(task_id, session_info, browser_cmd, "get", ["cdp-url"], timeout,
+                                            _engine_override)
+            local_cdp = str((res.get("data") or {}).get("cdpUrl") or "") if res.get("success") else ""
+            if local_cdp:
+                _ensure_cdp_supervisor(task_id, _resolve_cdp_override(local_cdp))
+            else:
+                logger.warning("web bot auth: no CDP endpoint for the local browser; requests stay unsigned")
 
     # Build the command with the appropriate backend flag.
     # Cloud mode: --cdp <websocket_url> connects to Browserbase.

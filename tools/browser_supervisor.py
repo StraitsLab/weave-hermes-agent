@@ -27,6 +27,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from urllib.parse import urlsplit
 
 # ``websockets`` costs ~22 ms at import and is only needed when a supervisor
 # actually connects to a CDP endpoint (``_connect_ws``). With
@@ -95,9 +96,15 @@ RECENT_DIALOGS_MAX = 20
 DIALOG_BRIDGE_HOST = "hermes-dialog-bridge.invalid"
 DIALOG_BRIDGE_URL_PATTERN = f"http://{DIALOG_BRIDGE_HOST}/*"
 
-# Web Bot Auth (fork, AB-2): a request whose signature takes longer than this goes unsigned; signing never stalls
-# browsing on a slow signer.
-SIGN_TIMEOUT_S = 5.0
+
+def _is_dialog_bridge(url: str) -> bool:
+    """Exactly the bridge origin ``http://hermes-dialog-bridge.invalid`` (never a lookalike, path or query)."""
+    try:
+        parts = urlsplit(url)
+        return (parts.scheme, parts.netloc) == ("http", DIALOG_BRIDGE_HOST)
+    except ValueError:
+        return False
+
 
 # Script injected into every frame via Page.addScriptToEvaluateOnNewDocument.
 # Overrides alert/confirm/prompt to round-trip through a sync XHR that we
@@ -431,6 +438,33 @@ class CDPSupervisor:
             self._thread.join(timeout=timeout)
         with self._state_lock:
             self._active = False
+
+    def set_request_signer(self, signer: Any, timeout: float = 5.0) -> None:
+        """Web Bot Auth (fork, AB-2): sign with ``signer`` from now on, or stop intercepting when it is None.
+
+        Called on every reuse of a live supervisor so ``browser.web_bot_auth`` governs existing sessions in both
+        directions. Only the browser-level interceptor changes; the page sessions' dialog bridge is untouched."""
+        if signer is self.request_signer:
+            return
+        self.request_signer = signer
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return  # applied at the next (re)attach
+        try:
+            asyncio.run_coroutine_threadsafe(self._apply_request_interception(), loop).result(timeout=timeout)
+        except Exception as e:
+            if signer is not None:
+                self.request_signer = None  # not intercepting: the next reuse tries again
+            logger.warning("web bot auth: could not %s request interception (%s)",
+                           "enable" if signer is not None else "disable", type(e).__name__)
+
+    async def _apply_request_interception(self) -> None:
+        # Browser-level (no session): pauses every request of every target — each redirect hop, subresource,
+        # worker and new tab — before it leaves, so ``_sign_and_continue`` can add the Web Bot Auth headers.
+        if self.request_signer is not None:
+            await self._cdp("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+        else:
+            await self._cdp("Fetch.disable")
 
     def snapshot(self) -> SupervisorSnapshot:
         """Return an immutable snapshot of current state."""
@@ -812,10 +846,8 @@ class CDPSupervisor:
     async def _attach_initial_page(self) -> None:
         """Find a page target, attach flattened session, enable domains, install dialog bridge."""
         if self.request_signer is not None:
-            # Browser-level (no session): pauses every request of every target — each redirect hop, subresource,
-            # worker and new tab — before it leaves, so ``_sign_and_continue`` can add the Web Bot Auth headers.
             try:
-                await self._cdp("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+                await self._apply_request_interception()
             except Exception as e:
                 logger.warning("web bot auth: Fetch.enable failed (%s); browser requests stay unsigned",
                                type(e).__name__)
@@ -1181,17 +1213,18 @@ class CDPSupervisor:
         request_id = params.get("requestId")
         if not request_id:
             return
-        if session_id is None and self.request_signer is not None:
-            # The browser-level Web Bot Auth interceptor. A bridge XHR continues unsigned to the page session's
-            # interceptor below. Run as a task: the signer may call out, and the reader must keep pumping.
-            task = asyncio.create_task(self._continue_request(request_id, None) if DIALOG_BRIDGE_HOST in url
-                                       else self._sign_and_continue(request_id, params.get("request") or {}))
+        if session_id is None:
+            # The browser-level Web Bot Auth interceptor (only ever enabled at the root). A bridge XHR continues
+            # unsigned to the page session's interceptor below. Run as a task: the signer may call out, and the
+            # reader must keep pumping.
+            signer = None if _is_dialog_bridge(url) else self.request_signer
+            task = asyncio.create_task(self._sign_and_continue(request_id, params.get("request") or {}, signer))
             self._signing_tasks.add(task)
             task.add_done_callback(self._signing_tasks.discard)
             return
         # Only care about our bridge URLs. Fetch can still deliver other
         # intercepted requests if patterns were ever broadened.
-        if DIALOG_BRIDGE_HOST not in url:
+        if not _is_dialog_bridge(url):
             # Not ours — forward unchanged so the page sees its own request.
             try:
                 await self._cdp(
@@ -1267,18 +1300,17 @@ class CDPSupervisor:
         elif error:
             logger.debug("web bot auth: continueRequest failed: %s", error)
 
-    async def _sign_and_continue(self, request_id: str, request: Dict[str, Any]) -> None:
+    async def _sign_and_continue(self, request_id: str, request: Dict[str, Any], signer: Any) -> None:
         """Add the Web Bot Auth headers and let the request go. Any signing failure lets it go unsigned, logged."""
-        from tools.browser_web_bot_auth import SIGNED_HEADERS
+        from tools import browser_web_bot_auth as wba
 
         url = str(request.get("url") or "")
         headers = None
-        if url.startswith(("http://", "https://")):
+        if signer is not None and url.startswith(("http://", "https://")):
             try:
-                signed = await asyncio.wait_for(asyncio.to_thread(self.request_signer.headers, url),
-                                                timeout=SIGN_TIMEOUT_S)
+                signed = await asyncio.wait_for(asyncio.to_thread(signer.headers, url), timeout=wba.SIGNER_TIMEOUT_S)
                 kept = [{"name": k, "value": str(v)} for k, v in (request.get("headers") or {}).items()
-                        if k.lower() not in {h.lower() for h in SIGNED_HEADERS}]
+                        if k.lower() not in {h.lower() for h in wba.SIGNED_HEADERS}]
                 headers = kept + [{"name": k, "value": v} for k, v in signed.items()]
             except Exception as e:
                 logger.warning("web bot auth: signing failed (%s); request continues unsigned", type(e).__name__)
@@ -1575,15 +1607,15 @@ class _SupervisorRegistry:
         """
         with self._lock:
             existing = self._by_task.get(task_id)
-            if existing is not None:
-                if existing.cdp_url == cdp_url:
-                    thread_ok = existing._thread is not None and existing._thread.is_alive()
-                    loop_ok = existing._loop is not None and existing._loop.is_running()
-                    if thread_ok and loop_ok:
-                        return existing
-                    # Unhealthy — tear down and recreate.
+            healthy = (existing is not None and existing.cdp_url == cdp_url
+                       and existing._thread is not None and existing._thread.is_alive()
+                       and existing._loop is not None and existing._loop.is_running())
+            if existing is not None and not healthy:
                 # URL changed or unhealthy — tear down, fall through to re-create.
                 self._by_task.pop(task_id, None)
+        if healthy and existing is not None:
+            existing.set_request_signer(request_signer())  # Web Bot Auth (fork, AB-2): the flag governs live sessions.
+            return existing
         if existing is not None:
             existing.stop()
 

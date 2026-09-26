@@ -114,6 +114,9 @@ def _ensure_supervisor(task_id: str):
 
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
     if supervisor is not None:
+        from tools.browser_web_bot_auth import request_signer
+
+        supervisor.set_request_signer(request_signer())  # Web Bot Auth (fork, AB-2): the flag governs live sessions
         return supervisor
     from tools.browser_tool import _last_session_key
     from tools.browser_tool import _get_dialog_policy_config, _resolve_cdp_override

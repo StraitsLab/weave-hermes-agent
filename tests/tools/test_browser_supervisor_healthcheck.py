@@ -86,6 +86,9 @@ def stub_cdp_supervisor(monkeypatch):
         def start(self, timeout: float = 15.0) -> None:
             self.start_called = True
 
+        def set_request_signer(self, signer) -> None:
+            self.request_signer = signer
+
         def stop(self) -> None:
             self.stop_called = True
             # Release the parked thread so the process exits cleanly.
