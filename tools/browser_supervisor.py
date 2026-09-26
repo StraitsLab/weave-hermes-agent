@@ -95,6 +95,10 @@ RECENT_DIALOGS_MAX = 20
 DIALOG_BRIDGE_HOST = "hermes-dialog-bridge.invalid"
 DIALOG_BRIDGE_URL_PATTERN = f"http://{DIALOG_BRIDGE_HOST}/*"
 
+# Web Bot Auth (fork, AB-2): a request whose signature takes longer than this goes unsigned; signing never stalls
+# browsing on a slow signer.
+SIGN_TIMEOUT_S = 5.0
+
 # Script injected into every frame via Page.addScriptToEvaluateOnNewDocument.
 # Overrides alert/confirm/prompt to round-trip through a sync XHR that we
 # intercept via Fetch.requestPaused. Works on Browserbase (whose CDP proxy
@@ -310,6 +314,7 @@ class CDPSupervisor:
         *,
         dialog_policy: str = DEFAULT_DIALOG_POLICY,
         dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S,
+        request_signer: Any = None,
     ) -> None:
         if dialog_policy not in _VALID_POLICIES:
             raise ValueError(
@@ -320,6 +325,9 @@ class CDPSupervisor:
         self.cdp_url = cdp_url
         self.dialog_policy = dialog_policy
         self.dialog_timeout_s = float(dialog_timeout_s)
+        # Web Bot Auth (fork, AB-2): a ``tools.browser_web_bot_auth.RequestSigner``, or None (no interception).
+        self.request_signer = request_signer
+        self._signing_tasks: set = set()
 
         # State protected by ``_state_lock`` for cross-thread reads.
         self._state_lock = threading.Lock()
@@ -803,6 +811,14 @@ class CDPSupervisor:
 
     async def _attach_initial_page(self) -> None:
         """Find a page target, attach flattened session, enable domains, install dialog bridge."""
+        if self.request_signer is not None:
+            # Browser-level (no session): pauses every request of every target — each redirect hop, subresource,
+            # worker and new tab — before it leaves, so ``_sign_and_continue`` can add the Web Bot Auth headers.
+            try:
+                await self._cdp("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+            except Exception as e:
+                logger.warning("web bot auth: Fetch.enable failed (%s); browser requests stay unsigned",
+                               type(e).__name__)
         resp = await self._cdp("Target.getTargets")
         targets = resp.get("result", {}).get("targetInfos", [])
         page_target = next((t for t in targets if t.get("type") == "page"), None)
@@ -1165,6 +1181,14 @@ class CDPSupervisor:
         request_id = params.get("requestId")
         if not request_id:
             return
+        if session_id is None and self.request_signer is not None:
+            # The browser-level Web Bot Auth interceptor. A bridge XHR continues unsigned to the page session's
+            # interceptor below. Run as a task: the signer may call out, and the reader must keep pumping.
+            task = asyncio.create_task(self._continue_request(request_id, None) if DIALOG_BRIDGE_HOST in url
+                                       else self._sign_and_continue(request_id, params.get("request") or {}))
+            self._signing_tasks.add(task)
+            task.add_done_callback(self._signing_tasks.discard)
+            return
         # Only care about our bridge URLs. Fetch can still deliver other
         # intercepted requests if patterns were ever broadened.
         if DIALOG_BRIDGE_HOST not in url:
@@ -1227,6 +1251,38 @@ class CDPSupervisor:
                 lambda: asyncio.create_task(self._dialog_timeout_expired(dialog.id)),
             )
             self._dialog_watchdogs[dialog.id] = handle
+
+    async def _continue_request(self, request_id: str, headers: Optional[List[Dict[str, str]]]) -> None:
+        params: Dict[str, Any] = {"requestId": request_id}
+        if headers is not None:
+            params["headers"] = headers
+        try:
+            error = (await self._cdp("Fetch.continueRequest", params, timeout=5.0)).get("error")
+        except Exception as e:
+            error = type(e).__name__
+        if error and headers is not None:
+            # A refused header set must not leave the request paused: let it go unsigned.
+            logger.warning("web bot auth: signed continue refused (%s); request continues unsigned", error)
+            await self._continue_request(request_id, None)
+        elif error:
+            logger.debug("web bot auth: continueRequest failed: %s", error)
+
+    async def _sign_and_continue(self, request_id: str, request: Dict[str, Any]) -> None:
+        """Add the Web Bot Auth headers and let the request go. Any signing failure lets it go unsigned, logged."""
+        from tools.browser_web_bot_auth import SIGNED_HEADERS
+
+        url = str(request.get("url") or "")
+        headers = None
+        if url.startswith(("http://", "https://")):
+            try:
+                signed = await asyncio.wait_for(asyncio.to_thread(self.request_signer.headers, url),
+                                                timeout=SIGN_TIMEOUT_S)
+                kept = [{"name": k, "value": str(v)} for k, v in (request.get("headers") or {}).items()
+                        if k.lower() not in {h.lower() for h in SIGNED_HEADERS}]
+                headers = kept + [{"name": k, "value": v} for k, v in signed.items()]
+            except Exception as e:
+                logger.warning("web bot auth: signing failed (%s); request continues unsigned", type(e).__name__)
+        await self._continue_request(request_id, headers)
 
     async def _fulfill_bridge_request(
         self, dialog: PendingDialog, *, accept: bool, prompt_text: str
@@ -1484,6 +1540,8 @@ class CDPSupervisor:
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
+from tools.browser_web_bot_auth import request_signer  # noqa: E402  (fork, AB-2)
+
 
 class _SupervisorRegistry:
     """Process-global (task_id → supervisor) map with idempotent start/stop.
@@ -1534,6 +1592,7 @@ class _SupervisorRegistry:
             cdp_url=cdp_url,
             dialog_policy=dialog_policy,
             dialog_timeout_s=dialog_timeout_s,
+            request_signer=request_signer(),  # Web Bot Auth (fork, AB-2): every supervisor signs, or none does.
         )
         supervisor.start(timeout=start_timeout)
         with self._lock:
