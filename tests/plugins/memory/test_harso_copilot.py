@@ -467,3 +467,36 @@ def test_session_search_stays_when_harso_memory_is_gated_off(monkeypatch):
     agent.disabled_toolsets = ["memory"]
     inject_memory_provider_tools(agent)
     assert "session_search" in {t["function"]["name"] for t in agent.tools}
+
+
+def _failed_registration_manager(monkeypatch):
+    """Switch on, provider live, but its tool schema fails to register (get_all_tool_schemas swallows the error)."""
+    _switch(True)
+    provider = _provider(monkeypatch)
+    manager = _manager(provider)
+
+    def broken():
+        raise RuntimeError("schema registration failed")
+
+    monkeypatch.setattr(provider, "get_tool_schemas", broken)
+    assert manager.copilot_active() is True and manager.get_all_tool_schemas() == []
+    return manager
+
+
+def test_session_search_stays_when_switch_on_but_harso_memory_absent(monkeypatch):
+    """C §11/T24: never a moment with no search — the probe says on, yet harso_memory is not on the surface."""
+    agent = _tool_agent(_failed_registration_manager(monkeypatch))
+    inject_memory_provider_tools(agent)
+    names = {t["function"]["name"] for t in agent.tools}
+    assert "harso_memory" not in names
+    assert "session_search" in names and "session_search" in agent.valid_tool_names
+
+
+def test_session_search_dropped_when_switch_on_and_harso_memory_present(monkeypatch):
+    """Positive control for the test above: the same manager with a working schema drops session_search."""
+    _switch(True)
+    agent = _tool_agent(_manager(_provider(monkeypatch)))
+    inject_memory_provider_tools(agent)
+    names = {t["function"]["name"] for t in agent.tools}
+    assert "harso_memory" in names and "session_search" not in names
+    assert "session_search" not in agent.valid_tool_names
