@@ -73,7 +73,7 @@
     {
       "id": "steer_close",
       "marker_class": "steer_delimiter",
-      "pattern": "[\\[\\u3010\\u3014\\u3016\\u27e6]\\s*/\\s*out[\\s_\\-\\u2010-\\u2015\\u2212]*of[\\s_\\-\\u2010-\\u2015\\u2212]*band(?:[\\s_\\-\\u2010-\\u2015\\u2212]*user[\\s_\\-\\u2010-\\u2015\\u2212]*message)?(?![a-z0-9])",
+      "pattern": "[\\[\\u3010\\u3014\\u3016\\u27e6]\\s*/\\s*out[\\s_\\-\\u2010-\\u2015\\u2212]*of[\\s_\\-\\u2010-\\u2015\\u2212]*band(?:[\\s_\\-\\u2010-\\u2015\\u2212]*user[\\s_\\-\\u2010-\\u2015\\u2212]*message)?",
       "replacement": "(quoted text: end out-of-band",
       "examples": [
         "[/OUT-OF-BAND USER MESSAGE]",
@@ -83,7 +83,7 @@
     {
       "id": "steer_open",
       "marker_class": "steer_delimiter",
-      "pattern": "[\\[\\u3010\\u3014\\u3016\\u27e6]\\s*out[\\s_\\-\\u2010-\\u2015\\u2212]*of[\\s_\\-\\u2010-\\u2015\\u2212]*band(?:[\\s_\\-\\u2010-\\u2015\\u2212]*user[\\s_\\-\\u2010-\\u2015\\u2212]*message)?(?![a-z0-9])",
+      "pattern": "[\\[\\u3010\\u3014\\u3016\\u27e6]\\s*out[\\s_\\-\\u2010-\\u2015\\u2212]*of[\\s_\\-\\u2010-\\u2015\\u2212]*band(?:[\\s_\\-\\u2010-\\u2015\\u2212]*user[\\s_\\-\\u2010-\\u2015\\u2212]*message)?",
       "replacement": "(quoted text: out-of-band user message",
       "examples": [
         "[OUT-OF-BAND USER MESSAGE — a direct message from the user]",

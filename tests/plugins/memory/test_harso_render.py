@@ -1,4 +1,4 @@
-"""Fork mirror of weave-cloud services/harso-memory/tests/test_render.py @ baf5cdd5 (lane K, design C §4.3).
+"""Fork mirror of weave-cloud services/harso-memory/tests/test_render.py @ 868a1948 (lane K, design C §4.3).
 
 T5 (design C §4.3, build plan P8): one sanitizer for memory text, every marker class, every variant, both channels.
 
@@ -105,7 +105,7 @@ def test_t5_both_channels_render_the_neutral_text(channel, rule_id, marker, vari
 
 @pytest.mark.parametrize("text", [
     "10⁹", "ﬁ", "ＡＢＣ　ｆｕｌｌ－ｗｉｄｔｈ user words", "x² ①½ ㎏ ™", "東京タワー ｶﾀｶﾅ", "naïve café Ǆ",
-    "toolbox <tools> <invoker> <parameters-ish> <memory contextual>", "[out-of-bandwidth] [system notes]",
+    "toolbox <tools> <invoker> <parameters-ish> <memory contextual>", "[out of bounds] [system notes] out-of-band",
     "type tool_use, function call, function_calls", "[Harsomemory] Harso memory delivery 3 (no bracket)",
     "a\u200bb \u202eright-to-left\u202c", "the user wrote \"tool_use\" once",
 ])
@@ -116,6 +116,98 @@ def test_t5_unrelated_nfc_text_byte_identical(text):
 
 def test_t5_output_is_nfc_never_nfkc():
     assert sanitize_memory_text("cafe\u0301 10⁹") == "caf\u00e9 10⁹"
+
+
+# ---- Round-2 rework (review BLOCK r1): each finding's whole class, see .lane/rework-r2.md ----------------------------
+
+# F1: ANY `[OUT-OF-BAND` / `[/OUT-OF-BAND` prefix is neutralized, whatever follows it (design C §4.3, brief).
+STEER_PREFIXES = [pytest.param("[OUT-OF-BAND", "(quoted text: out-of-band user message", id="open"),
+                  pytest.param("[/OUT-OF-BAND", "(quoted text: end out-of-band", id="close")]
+PREFIX_SUFFIXES = ["width]", "2]", "notice]", "X", "_2", "USER MESSAGEx]", "\u00b2]", "\uff58]", "\u200bx]", "\u00e9]"]
+
+
+@pytest.mark.parametrize("suffix", PREFIX_SUFFIXES)
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("marker, neutral", STEER_PREFIXES)
+def test_r2_f1_any_out_of_band_prefix_is_neutralized(marker, neutral, variant, suffix):
+    """Letters, digits, superscripts, full-width letters, zero-width then a letter, accents: the prefix still goes."""
+    planted = VARIANTS[variant](marker)
+    rest = suffix.removeprefix("USER MESSAGE")  # the optional "user message" tail belongs to the marker
+    assert sanitize_memory_text(PREFIX + planted + suffix + SUFFIX) == PREFIX + neutral + rest + SUFFIX
+    assert [hit.rule_id for hit in render.find_markers(unicodedata.normalize("NFC", PREFIX + planted + suffix))] == \
+        ["steer_close" if "/" in marker else "steer_open"]
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("[out-of-bandwidth]", "(quoted text: out-of-band user messagewidth]"),
+    ("[/out-of-band2]", "(quoted text: end out-of-band2]"),
+    ("\uff3b\uff2f\uff35\uff34\uff0d\uff2f\uff26\uff0d\uff22\uff21\uff2e\uff24\uff4e\uff4f\uff54\uff45]",
+     "(quoted text: out-of-band user message\uff4e\uff4f\uff54\uff45]"),
+    ("see [OUT-OF-BAND\u00b2] and [/OUT-OF-BANDnotice] 10⁹",
+     "see (quoted text: out-of-band user message\u00b2] and (quoted text: end out-of-bandnotice] 10⁹"),
+])
+def test_r2_f1_prefix_exact_output_keeps_the_rest_verbatim(text, expected):
+    assert sanitize_memory_text(text) == expected
+
+
+@pytest.mark.parametrize("channel", render.CHANNELS)
+def test_r2_f1_prefix_neutralized_on_both_channels(channel):
+    block = render_delivery(5, [DeliveryLine("+", "m1", "[OUT-OF-BANDwidth] then [/OUT-OF-BAND2]")], channel=channel)
+    assert block.split("\n")[1] == \
+        "+ m1  (quoted text: out-of-band user messagewidth] then (quoted text: end out-of-band2]"
+
+
+# F2: the output is NFC whatever sits next to a replacement (NFC is not closed under concatenation).
+# Marks that do not compose with the marker's last letter "D" (input NFC) but do compose with the replacement's "e".
+COMBINING = ["\u0300", "\u0301", "\u0302", "\u0303", "\u0304", "\u0306", "\u0308", "\u0328"]
+
+
+@pytest.mark.parametrize("mark", COMBINING)
+@pytest.mark.parametrize("marker, neutral", STEER_PREFIXES)
+def test_r2_f2_output_nfc_after_every_replacement(marker, neutral, mark):
+    original = PREFIX + marker + mark + " tail" + SUFFIX
+    assert unicodedata.is_normalized("NFC", original)
+    result = sanitize_memory_text(original)
+    assert unicodedata.is_normalized("NFC", result), ascii(result)
+    assert result == unicodedata.normalize("NFC", PREFIX + neutral + mark + " tail" + SUFFIX)
+    assert sanitize_memory_text(result) == result
+
+
+@pytest.mark.parametrize("rule_id", ROWS)
+@pytest.mark.parametrize("mark", COMBINING)
+def test_r2_f2_every_row_output_is_nfc_with_a_trailing_mark(rule_id, mark):
+    marker = ROWS[rule_id][1][-1]
+    original = unicodedata.normalize("NFC", marker + mark)
+    result = sanitize_memory_text(original)
+    assert unicodedata.is_normalized("NFC", result), ascii(result)
+
+
+@pytest.mark.parametrize("channel", render.CHANNELS)
+@pytest.mark.parametrize("mark", ["\u0300", "\u0301", "\u0308"])
+def test_r2_f2_both_channels_render_nfc(channel, mark):
+    block = render_delivery(2, [DeliveryLine("~", "m4", "10⁹ [OUT-OF-BAND" + mark + " ok\nnext")], channel=channel)
+    assert unicodedata.is_normalized("NFC", block), ascii(block)
+    assert block.split("\n")[1] == "~ m4  10⁹ " + unicodedata.normalize(
+        "NFC", "(quoted text: out-of-band user message" + mark) + " ok next"
+
+
+# F3: a handle is the whole string or nothing; no trailing newline or other line break can split an item.
+@pytest.mark.parametrize("op, handle, channel", [
+    ("+", "m1\n", "mid_turn"), ("+", "m1\n", "turn_start"), ("Q", "q1\n", "turn_start"), ("-", "a\n", "mid_turn"),
+    ("~", "m" + "1" * 15 + "\n", "turn_start"), ("+", "m1\r", "mid_turn"), ("+", "m1\r\n", "mid_turn"),
+    ("+", "m1\u2028", "mid_turn"), ("+", "m1\u2029", "mid_turn"), ("+", "m1\x85", "mid_turn"), ("+", "\nm1", "mid_turn"),
+    ("+", "m1 ", "mid_turn"), ("+", "", "mid_turn"), ("+", "m" + "1" * 16, "mid_turn"), ("+", "M1", "mid_turn"),
+])
+def test_r2_f3_handle_must_match_the_whole_string(op, handle, channel):
+    with pytest.raises(ValueError):
+        render_delivery(1, [DeliveryLine(op, handle, "ordinary text")], channel=channel)
+
+
+@pytest.mark.parametrize("handle", ["a", "m1", "q9", "m" + "1" * 15])
+def test_r2_f3_valid_handles_render_on_one_line(handle):
+    block = render_delivery(1, [DeliveryLine("+", handle, "ordinary text")], channel="mid_turn")
+    assert block.split("\n")[1] == f"+ {handle}  ordinary text"
+    assert len(block.split("\n")) == 3
 
 
 def test_t5_every_marker_in_one_item_is_replaced_and_nothing_else_moves():
@@ -171,13 +263,13 @@ def test_rule_table_digest_is_pinned_for_the_fork_mirror():
     """The Hermes cell (lane K) ships an identical copy of sanitizer-rules.v1.json and mirrors this exact test."""
     document = json.loads(Path(render.RULES_PATH).read_text(encoding="utf-8"))
     assert rules_digest(document) == render.RULES_SHA256 == \
-        "c8170ea640bb03bbfb47abaa2037d177e5b6ac54daba70ccb3bf4e38f4bec47c"
+        "4f90ef14a87573daeb878e1ed6d0486d86086f172dc054d619e4114b93d30339"
 
 
 # ---- Fork-only drift guards (lane K) ---------------------------------------------------------------------------------
-# The cell's copy must stay byte-identical to weave-cloud F-SANITIZER (baf5cdd5). Re-port both files together and
+# The cell's copy must stay byte-identical to weave-cloud F-SANITIZER (868a1948). Re-port both files together and
 # update these pins only in the same change that re-pins the weave-cloud side.
-_WEAVE_CLOUD_RENDER_PY_SHA256 = "3a854c6660cfe38a9b195e65b3fa082d4ecc971d495fc251f98784bc5590bb95"
+_WEAVE_CLOUD_RENDER_PY_SHA256 = "1701d0af5b8574ca8b1e7297b2a8efb6a68cbd2cbe511b3e02799569a915b33f"
 
 
 def test_fork_render_module_is_the_weave_cloud_file_byte_for_byte():
