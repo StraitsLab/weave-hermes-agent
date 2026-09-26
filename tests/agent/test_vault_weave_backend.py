@@ -37,6 +37,7 @@ PASSWORD = "canary-Pw-7f3e1d9c-never-in-output"
 OTP = "482913"
 COMMAND_ID = "0199cccc-0000-7000-8000-0000000000c1"
 NATIVE_REF = "4f1c2b0e9d8a7c6b5a4f3e2d1c0b9a88"
+CARD = "0199dddd-0000-7000-8000-000000000001"
 
 _CONTROLS = [{"autocomplete": "username", "formIndex": 0, "index": 0, "label": "", "name": "email", "type": "email"},
              {"autocomplete": "current-password", "formIndex": 0, "index": 1, "label": "", "name": "pw",
@@ -61,6 +62,8 @@ class FakeWeaveApi:
             KEY: _item(KEY, "api_key", ["https://api.example"]),
         }
         self.decision = "once"          # once | always | approval_required
+        self.decisions: list = []       # per-resolve decisions, consumed in order before ``decision``
+        self.approval_ref = CARD
         self.password = PASSWORD
         self.address = {"address_line1": "1 Canary Lane", "city": "Springfield", "postal_code": "12345", "country": "US"}
         self.force: tuple | None = None  # (status, body) override for every call
@@ -104,12 +107,13 @@ class FakeWeaveApi:
                         return self._send(404, {"error": {"code": "VAULT_ITEM_UNAVAILABLE", "message": "Vault item was not found"}})
                     if body["page_origin"] not in item["allowed_origins"]:
                         return self._send(403, {"error": {"code": "VAULT_ORIGIN_REFUSED", "message": "This item is not bound to this site"}})
-                    if api.decision == "approval_required":
-                        return self._send(200, {"decision": "approval_required", "approval_ref": "0199dddd-0000-7000-8000-000000000001",
+                    decision = api.decisions.pop(0) if api.decisions else api.decision
+                    if decision == "approval_required":
+                        return self._send(200, {"decision": "approval_required", "approval_ref": api.approval_ref,
                                                 "choices": ["once", "always", "deny"]})
                     value = {"fill_login": {"password": api.password}, "enter_otp": {"otp": OTP},
                              "fill_address": {"fields": dict(api.address)}}[body["action"]]
-                    return self._send(200, {"decision": api.decision, "action": body["action"], **value})
+                    return self._send(200, {"decision": decision, "action": body["action"], **value})
                 return self._send(404, {"error": {"code": "NOT_FOUND", "message": "no route"}})
 
             def do_GET(self):
@@ -339,10 +343,105 @@ def test_approval_required_fills_nothing_and_tells_the_model_to_wait(weave, admi
     from tools.browser_vault_tool import browser_vault_fill
 
     weave.decision = "approval_required"
-    with _page() as injected:
+    with _page() as injected, _acp_gate("once") as asked:
         out = json.loads(browser_vault_fill(HANDLE, task_id="t"))
     assert (out["success"], out["error_type"]) == (False, "approval_required")
     assert "Harso app" in out["error"] and injected == []
+    assert asked == [] and len(weave.resolves()) == 1  # a cell turn waits for the chat card; it never raises the gate
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Work attempt: the vault card is decided through the attempt's own approval gate (V-4b)
+# ---------------------------------------------------------------------------------------------------------------
+
+@contextmanager
+def _acp_gate(choice):
+    """The ACP session's approval wiring (acp_adapter/server.py): interactive context plus the per-thread callback,
+    which is what turns the gate into a permission request the attempt host raises as an attention."""
+    from tools import approval, terminal_tool
+
+    asked: list = []
+
+    def callback(command, description, **kwargs):
+        asked.append(kwargs.get("pattern_key"))
+        return choice
+
+    previous = terminal_tool._get_approval_callback()
+    token = approval.set_hermes_interactive_context(True)
+    terminal_tool.set_approval_callback(callback)
+    try:
+        yield asked
+    finally:
+        terminal_tool.set_approval_callback(previous)
+        approval.reset_hermes_interactive_context(token)
+
+
+@pytest.fixture
+def work(weave, monkeypatch):
+    """A Work attempt: its own bearer, and the Work home's ``approvals.mode: off`` (WEV-1532) in the real config."""
+    monkeypatch.setenv("WEAVE_API_MCP_BEARER", ATTEMPT_BEARER)
+    _write_config({"vault": {"enabled": True, "backend": "weave", "weave_api_url": weave.url},
+                   "approvals": {"mode": "off"}})
+    weave.decisions = ["approval_required"]
+    return weave
+
+
+@pytest.mark.parametrize("settled", ["once", "always"])
+def test_a_work_attempt_asks_its_gate_by_card_ref_then_resolves_exactly_once_more(work, settled):
+    from tools.browser_vault_tool import browser_vault_fill
+
+    work.decision = settled
+    with _page() as injected, _acp_gate("once") as asked:
+        out = json.loads(browser_vault_fill(HANDLE, task_id="t"))
+    assert out["success"] is True and PASSWORD in injected[0]
+    assert asked == [f"plugin_rule:{CARD}"]
+    first, second = work.resolves()
+    assert first["body"] == second["body"] == {"handle": HANDLE, "action": "fill_login", "page_origin": ORIGIN}
+
+
+def test_the_work_gate_fires_even_though_work_runs_with_approvals_off(work):
+    """approvals.mode: off bypasses dangerous-command prompts in Work; it must not bypass a vault card."""
+    from tools import approval
+    from tools.browser_vault_tool import browser_vault_enter_code
+
+    assert approval._get_approval_mode() == "off"
+    controls = [{"index": 0, "type": "text", "name": "otp", "autocomplete": "one-time-code"}]
+    with _page(controls=controls) as injected, _acp_gate("once") as asked:
+        out = json.loads(browser_vault_enter_code(HANDLE, task_id="t"))
+    assert out["success"] is True and OTP in injected[0]
+    assert asked == [f"plugin_rule:{CARD}"] and [r["body"]["action"] for r in work.resolves()] == ["enter_otp"] * 2
+
+
+@pytest.mark.parametrize("choice", ["deny", "timeout"])
+def test_a_work_denial_fills_nothing_and_never_resolves_again(work, choice):
+    from tools.browser_vault_tool import browser_vault_fill
+
+    with _page() as injected, _acp_gate(choice) as asked:
+        out = json.loads(browser_vault_fill(HANDLE, task_id="t"))
+    assert (out["success"], out["error_type"]) == (False, "denied") and "Do not retry" in out["error"]
+    assert asked == [f"plugin_rule:{CARD}"] and injected == [] and len(work.resolves()) == 1
+
+
+def test_a_card_still_undecided_after_an_allow_fills_nothing(work):
+    from tools.browser_vault_tool import browser_vault_fill
+
+    work.decisions = ["approval_required", "approval_required"]
+    with _page() as injected, _acp_gate("once") as asked:
+        out = json.loads(browser_vault_fill(HANDLE, task_id="t"))
+    assert (out["success"], out["error_type"]) == (False, "vault_unavailable")
+    assert len(asked) == 1 and injected == [] and len(work.resolves()) == 2  # no third call, no loop
+
+
+@pytest.mark.parametrize("ref", [None, "", "not-a-ref", "0199dddd-0000-4000-8000-000000000001",
+                                 CARD.upper(), f"{CARD}\n", f"{CARD}:x", f"x{CARD}", 7])
+def test_a_card_ref_that_is_not_an_exact_uuid7_never_reaches_the_gate(work, ref):
+    from tools.browser_vault_tool import browser_vault_fill
+
+    work.approval_ref = ref
+    with _page() as injected, _acp_gate("once") as asked:
+        out = json.loads(browser_vault_fill(HANDLE, task_id="t"))
+    assert (out["success"], out["error_type"]) == (False, "vault_unavailable")
+    assert asked == [] and injected == [] and len(work.resolves()) == 1
 
 
 @pytest.mark.parametrize("status,code,error_type", [(429, "VAULT_RATE_LIMITED", "rate_limited"),
@@ -566,6 +665,123 @@ def test_otp_approval_pending_is_the_answer_the_user_is_not_asked_instead(weave,
         unlock_mod.set_code_prompt_callback(None)
     assert (out["success"], out["error_type"]) == (False, "approval_required")
     assert asked == [] and injected == []
+
+
+_OTP_CONTROLS = [{"index": 0, "type": "text", "name": "otp", "autocomplete": "one-time-code"}]
+
+
+@contextmanager
+def _code_prompt():
+    """A surface that CAN ask the user for a code: a failure mistaken for "no key" would ask it and fill the answer."""
+    from agent.vault_backends import unlock as unlock_mod
+
+    asked: list = []
+    unlock_mod.set_code_prompt_callback(lambda site, hint: asked.append(site) or "000000")
+    try:
+        with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True):
+            yield asked
+    finally:
+        unlock_mod.set_code_prompt_callback(None)
+
+
+def _gate_fault(work, fault):
+    """One Work-gate failure: what the authority or the attempt's gate does between the card and the value."""
+    if fault == "invalid_ref":
+        work.approval_ref = "invalid"
+    elif fault == "still_pending":
+        work.decisions = ["approval_required", "approval_required"]
+
+    def gate(*args, **kwargs):
+        if fault == "gate_raises":
+            raise RuntimeError("callback failure carrying text the model must not see")
+        if fault == "gate_returns_none":
+            return None
+        if fault == "second_http_503":
+            work.force_resolve = (503, {"error": {"code": "UNAVAILABLE", "message": "down"}})
+        if fault == "second_not_json":
+            work.force_resolve = (200, "not an object")
+        if fault == "second_not_digits":
+            work.force_resolve = (200, {"decision": "once", "action": "enter_otp", "otp": "12ab56"})
+        if fault == "second_wrong_action":
+            work.force_resolve = (200, {"decision": "once", "action": "fill_login", "otp": OTP})
+        return {"approved": True, "message": None}
+
+    return gate
+
+
+@pytest.mark.parametrize("fault", ["invalid_ref", "still_pending", "gate_raises", "gate_returns_none", "second_http_503",
+                                   "second_not_json", "second_not_digits", "second_wrong_action"])
+def test_a_work_code_failure_is_the_answer_never_a_prompt_for_a_code(work, fault):
+    """An item WITH an authenticator key: any failure between the Work card and the code is a typed refusal
+    (vault_unavailable, or denied when the gate gives no allow). It is never read as "no key", so nobody is asked
+    for a code and no advice to save a key is given (V-4b round 2, F1)."""
+    from tools import approval
+    from tools.browser_vault_tool import browser_vault_enter_code
+
+    with _page(controls=_OTP_CONTROLS) as injected, _code_prompt() as asked, \
+         patch.object(approval, "request_tool_approval", side_effect=_gate_fault(work, fault)):
+        raw = browser_vault_enter_code(HANDLE, task_id="t")
+    out = json.loads(raw)
+    typed = "denied" if fault == "gate_returns_none" else "vault_unavailable"  # no answer from the gate is no allow
+    assert (out["success"], out["error_type"]) == (False, typed), out
+    assert asked == [] and injected == [] and "authenticator" not in out["error"]
+    assert "must not see" not in raw and len(work.resolves()) == (1 if fault in ("invalid_ref", "gate_raises",
+                                                                              "gate_returns_none") else 2)
+
+
+@pytest.mark.parametrize("fault", ["invalid_ref", "still_pending", "gate_raises", "second_http_503"])
+def test_a_work_code_failure_is_the_answer_on_a_headless_surface_too(work, fault):
+    """The reviewer's four cases where no prompt exists (an ACP Work session): typed, not prompt_unavailable."""
+    from tools import approval
+    from tools.browser_vault_tool import browser_vault_enter_code
+
+    with _page(controls=_OTP_CONTROLS) as injected, \
+         patch("agent.vault_backends.unlock.can_prompt_here", return_value=False), \
+         patch.object(approval, "request_tool_approval", side_effect=_gate_fault(work, fault)):
+        out = json.loads(browser_vault_enter_code(HANDLE, task_id="t"))
+    assert (out["success"], out["error_type"]) == (False, "vault_unavailable") and injected == []
+
+
+@pytest.mark.parametrize("force", [(503, {"error": {"code": "UNAVAILABLE", "message": "down"}}), (200, ["not", "dict"]),
+                                   (200, {"decision": "once", "action": "enter_otp", "otp": ""})])
+def test_a_cell_code_failure_is_the_answer_never_a_prompt_for_a_code(weave, admitted_turn, force):
+    """Same class on a cell turn's first (only) resolve: the vault failing is not the item lacking a key."""
+    from tools.browser_vault_tool import browser_vault_enter_code
+
+    weave.force_resolve = force
+    with _page(controls=_OTP_CONTROLS) as injected, _code_prompt() as asked:
+        out = json.loads(browser_vault_enter_code(HANDLE, task_id="t"))
+    assert (out["success"], out["error_type"]) == (False, "vault_unavailable") and asked == [] and injected == []
+
+
+def test_the_authority_saying_no_usable_key_still_asks_the_user(weave, admitted_turn):
+    """The one refusal that DOES mean "no code from the vault": the user is asked, as before."""
+    from tools.browser_vault_tool import browser_vault_enter_code
+
+    weave.force_resolve = (409, {"error": {"code": "VAULT_OTP_UNAVAILABLE", "message": "no key"}})
+    with _page(controls=_OTP_CONTROLS) as injected, _code_prompt() as asked:
+        out = json.loads(browser_vault_enter_code(HANDLE, task_id="t"))
+    assert out["success"] is True and asked == ["www.amazon.com"] and "000000" in injected[0]
+
+
+@pytest.mark.parametrize("kind", ["login", "address"])
+@pytest.mark.parametrize("fault", ["gate_raises", "gate_returns_none"])
+def test_a_work_gate_that_fails_fills_nothing_on_every_fill_path(work, kind, fault):
+    """Sibling of the code path: a gate that raises or answers nothing is a typed, content-free refusal."""
+    from tools import approval
+    from tools.browser_vault_tool import browser_vault_fill
+
+    handle, origin, controls = HANDLE, ORIGIN, _CONTROLS
+    if kind == "address":
+        handle, origin = ADDR_HANDLE, "https://shop.example"
+        controls = [{"index": 0, "type": "text", "name": "city", "autocomplete": "address-level2"}]
+    with _page(origin, controls) as injected, \
+         patch.object(approval, "request_tool_approval", side_effect=_gate_fault(work, fault)):
+        raw = browser_vault_fill(handle, task_id="t")
+    out = json.loads(raw)
+    assert (out["success"], out["error_type"]) == ((False, "vault_unavailable") if fault == "gate_raises"
+                                                   else (False, "denied"))
+    assert injected == [] and "must not see" not in raw and len(work.resolves()) == 1
 
 
 def test_an_item_without_an_authenticator_key_is_never_resolved_for_a_code(weave, admitted_turn):
