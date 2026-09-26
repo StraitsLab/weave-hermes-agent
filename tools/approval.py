@@ -3258,7 +3258,8 @@ def prompt_dangerous_approval(command: str, description: str,
                               approval_callback=None,
                               *, allow_session: bool = True,
                               smart_denied: bool = False,
-                              title: str | None = None) -> str:
+                              title: str | None = None,
+                              pattern_key: str | None = None) -> str:
     """Prompt the user to approve a dangerous command (CLI only).
 
     Args:
@@ -3301,6 +3302,7 @@ def prompt_dangerous_approval(command: str, description: str,
             allow_session=allow_session,
             smart_denied=smart_denied,
             title=title,
+            pattern_key=pattern_key,
         )
 
 
@@ -3321,7 +3323,8 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                                      approval_callback=None,
                                      *, allow_session: bool = True,
                                      smart_denied: bool = False,
-                                     title: str | None = None) -> str:
+                                     title: str | None = None,
+                                     pattern_key: str | None = None) -> str:
     # Redact secrets before any user-visible rendering. The original
     # `command` is still what executes after approval; only the displayed
     # copy is scrubbed. Reuses the same redaction module used for memory
@@ -3343,6 +3346,10 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                 callback_kwargs["smart_denied"] = True
             if title and _callback_accepts(approval_callback, "title"):
                 callback_kwargs["title"] = title
+            # Weave: the gate's allowlist key (``plugin_rule:<ref>`` for a plugin approval) lets an ACP
+            # client correlate the prompt with the plugin's own record. Same guard as ``title``.
+            if pattern_key and _callback_accepts(approval_callback, "pattern_key"):
+                callback_kwargs["pattern_key"] = pattern_key
             return approval_callback(
                 display_command, display_description, **callback_kwargs
             )
@@ -4082,7 +4089,8 @@ def _run_approval_gate(
         surface="cli",
     )
     choice = prompt_dangerous_approval(display_target, description,
-                                       approval_callback=approval_callback)
+                                       approval_callback=approval_callback,
+                                       pattern_key=pattern_key)
     _fire_approval_hook(
         "post_approval_response",
         command=display_target,
