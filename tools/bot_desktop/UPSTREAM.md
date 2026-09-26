@@ -80,3 +80,25 @@ Ported from upstream `tests/tools/test_bot_desktop_*.py` @ `ee5ee84a`. Removed o
 - `test_bot_desktop_install.py`: not ported with `install.py`.
 - `test_bot_desktop_resources.py::test_start_refuses_and_status_explains_when_memory_is_short`: marked
   `linux_only`. `runtime.status()` reports no memory blocker off a supported host, so upstream's copy fails on macOS.
+
+## Live-view bridge (LV-1b, `hermes_cli/live_view_bridge.py`)
+
+Copied from upstream `hermes_cli/web_routers/display.py` @ `ee5ee84a` (upstream sha256 `26a44043d8f45c23ee2511d060f41007aeb42cef4ad108da721e1b5a0d5c6d7c`).
+`display.py` is not ported and not imported: its `web_server_chat` import does not exist in the fork.
+
+- `_should_evict` and the close-code / refresh constants: verbatim.
+- `_bridge` recorded hunks: it takes the socket as an explicit absolute path, read once at start from
+  `HERMES_BD_SOCKET` (the variable `launcher.sh` gives Xvnc), instead of `<HERMES_HOME>/bot-desktop/rfb.sock`
+  (plan §2.3 item 5, N3); the `activity` stamp sits beside that socket; the viewer id is an argument (the
+  `X-Weave-Viewer` header) instead of a ticket field; the end-of-pump debug log names only the exception type.
+  The pump, filter, lease gate, eviction and clean-close hand-back are otherwise unchanged.
+- Not copied: the dashboard ticket route (`display_ws`, `_consume_display_ticket`). Auth is
+  `Authorization: HMAC <secret>` compared with `hmac.compare_digest`; failure closes 4401 before any RFB byte.
+- New: `WS /control` (one JSON request, one reply) for lease take/release/force/status and `type`. `type`
+  sends RFB KeyEvent down/up pairs on its own short connection (keysym = code point for Latin-1, else
+  `0x01000000 + code point`), re-checks the lease before each key, and never sends ClientCutText.
+- New: the bridge adds a filter to the `tools.bot_desktop.lease` logger that keeps each record but replaces its
+  arguments with `[redacted]`. `release()` logs a stale releaser's viewer id, and that id is a capability.
+  `lease.py` itself is not changed.
+- CLI: `hermes computer-use screen bridge --listen 127.0.0.1:0 --secret-file F --port-file F`. It binds
+  127.0.0.1 only and writes the port file 0600.
