@@ -864,6 +864,10 @@ def build_turn_context(
     # ── System prompt (cached per session for prefix caching) ──
     if agent._cached_system_prompt is None:
         restore_or_build_system_prompt(agent, system_message, conversation_history)
+    else:
+        # Reused (CLI/native) agent: opt-in identity epoch check at the idle turn boundary.
+        from agent.system_prompt import refresh_stale_identity_epoch
+        refresh_stale_identity_epoch(agent, agent._cached_system_prompt, system_message)
 
     active_system_prompt = agent._cached_system_prompt
 

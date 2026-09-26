@@ -320,6 +320,24 @@ _EPOCH_PREFIX = "Capability epoch: "
 _EPOCH_RE_TEXT = r"Capability epoch: ([0-9a-f]{12})"
 
 
+def soul_digest(home: str | os.PathLike | None = None, raw: bytes | None = None) -> str:
+    """sha256 of SOUL.md ("" if absent), or of ``raw`` bytes already read; shared by capability + identity epochs."""
+    import hashlib
+    from hermes_constants import get_hermes_home
+
+    soul = Path(home or get_hermes_home()) / "SOUL.md"
+    if raw is None and not soul.is_file():
+        return ""
+    return hashlib.sha256(soul.read_bytes() if raw is None else raw).hexdigest()
+
+
+def identity_epoch_line(home: str | os.PathLike | None = None, digest: str | None = None) -> str:  # "" on error
+    try:
+        return f"Identity epoch: {(soul_digest(home) if digest is None else digest)[:12] or 'none'}"
+    except Exception:
+        return ""
+
+
 def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     """12-hex digest of the capability surface for ``home``'s profile.
 
@@ -356,8 +374,7 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     except Exception:
         pass
     try:
-        soul = resolved / "SOUL.md"
-        surface["soul"] = hashlib.sha256(soul.read_bytes()).hexdigest() if soul.is_file() else ""
+        surface["soul"] = soul_digest(resolved)
     except Exception:
         surface["soul"] = ""
     try:

@@ -1041,6 +1041,9 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                         agent.session_id, exc,
                     )
             return
+        from agent.system_prompt import refresh_stale_identity_epoch
+        if refresh_stale_identity_epoch(agent, stored_prompt, system_message):
+            return
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt

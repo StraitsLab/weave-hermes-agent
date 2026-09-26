@@ -2192,8 +2192,11 @@ def _truncate_content(
 def load_soul_md(
     context_length: Optional[int] = None,
     home_override: "Path | None" = None,
+    snapshot: "dict | None" = None,
 ) -> Optional[str]:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
+
+    ``snapshot`` gets ``digest`` of the exact bytes read ("" if absent); unset if the read fails.
 
     Used as the agent identity (slot #1 in the system prompt).  When this
     returns content, ``build_context_files_prompt`` should be called with
@@ -2214,9 +2217,16 @@ def load_soul_md(
     _home = Path(home_override) if home_override is not None else get_hermes_home()
     soul_path = _home / "SOUL.md"
     if not soul_path.exists():
+        if snapshot is not None:
+            snapshot["digest"] = ""
         return None
     try:
-        content = soul_path.read_text(encoding="utf-8").strip()
+        raw = soul_path.read_bytes()  # ONE read: content and digest describe the same bytes
+        if snapshot is not None:
+            from tools.bot_mode_probe import soul_digest
+
+            snapshot["digest"] = soul_digest(raw=raw)
+        content = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").strip()  # == read_text()
         if not content:
             return None
         content = _scan_context_content(content, "SOUL.md")
