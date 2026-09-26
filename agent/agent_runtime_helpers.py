@@ -4907,19 +4907,14 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
         return
     marker = format_steer_marker(steer_text)
-    existing_content = messages[target_idx].get("content", "")
-    if not isinstance(existing_content, str):
-        # Anthropic multimodal content blocks — preserve them and append
-        # a text block at the end.
-        try:
-            blocks = list(existing_content) if existing_content else []
-            blocks.append({"type": "text", "text": marker.lstrip()})
-            messages[target_idx]["content"] = blocks
-        except Exception:
-            # Fall back to string replacement if content shape is unexpected.
-            messages[target_idx]["content"] = f"{existing_content}{marker}"
-    else:
-        messages[target_idx]["content"] = existing_content + marker
+    from agent.tool_row_append import append_to_tool_row, requeue_steer
+
+    if not append_to_tool_row(agent, messages[target_idx], marker):
+        # The row cannot be made durable (stored row changed underneath);
+        # delivering through it would diverge live from replay. Re-queue so
+        # the next drain point / next-turn fallback delivers the words.
+        requeue_steer(agent, steer_text)
+        return
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars): %s",
         len(steer_text),

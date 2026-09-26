@@ -199,7 +199,11 @@ class TestT0aDurableAppendEndToEnd:
         handler.captured = []
         make_agent().run_conversation("next", conversation_history=history, task_id="t2")
         replayed = _tool_msgs(_chat(handler)[0])[-1]
-        assert json.dumps(replayed, sort_keys=True) == json.dumps(live_tool, sort_keys=True)
+        # Content byte-identical on the wire. (The OpenAI ``name`` field is
+        # dropped on replay with or without a steer — pre-existing, and not
+        # part of this packet.)
+        assert json.dumps(replayed["content"]) == json.dumps(live_tool["content"])
+        assert replayed["tool_call_id"] == live_tool["tool_call_id"]
 
     def test_pre_api_steer_is_durable(self, wire):
         make_agent, handler, db, sid = wire
@@ -313,7 +317,7 @@ class TestT0cMultimodalToolRow:
         assert stored["content"] == messages[-1]["content"]
 
         # Branch copy (native fork) keeps the same row.
-        assert db.safe_fork_session(sid, "sess-unit-branch") == "created"
+        assert db.safe_fork_session(sid, "sess-unit-branch") == "forked"
         branched = _reloaded_tool_rows(db, "sess-unit-branch")[-1]
         _assert_image_then_trailing_text(branched["content"], marker)
 

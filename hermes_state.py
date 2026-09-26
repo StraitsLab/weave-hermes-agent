@@ -13104,6 +13104,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
+    def append_to_tool_message(
+        self,
+        session_id: str,
+        row_id: int,
+        tool_call_id: Optional[str],
+        expected_content: Any,
+        new_content: Any,
+    ) -> int:
+        """Durably rewrite one already-saved ACTIVE tool row's ``content``.
+
+        Used when user/system text (a mid-turn /steer, the run-budget wrap-up
+        notice) is appended to a tool result AFTER the incremental flush
+        persisted it: the flush never rewrites persisted rows, so without this
+        the replayed transcript silently loses the appended text.
+
+        Guarded: the row must still be the same active tool row
+        (``id``/``session_id``/``role``/``tool_call_id``) AND still hold
+        ``expected_content`` (encoded exactly as the flush encoded it). Any
+        mismatch writes nothing. Returns the number of rows updated (0 or 1).
+        """
+        expected = self._encode_content(expected_content)
+        encoded = self._encode_content(new_content)
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET content = ? "
+                "WHERE id = ? AND session_id = ? AND role = 'tool' "
+                "AND active = 1 AND tool_call_id IS ? AND content IS ?",
+                (encoded, row_id, session_id, tool_call_id, expected),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do)
+
     def get_messages(
         self,
         session_id: str,

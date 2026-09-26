@@ -45,6 +45,11 @@ from agent.model_metadata import (
 )
 from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
+from agent.tool_row_append import (
+    split_trailing_appends,
+    steer_texts,
+    with_steers,
+)
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
@@ -4135,7 +4140,9 @@ class ContextCompressor(ContextEngine):
                 isinstance(content, dict) and content.get("_multimodal")
             ):
                 # Image-bearing shapes share one strip policy with pass 3.5
-                # (also drops the stale api_content sidecar on rewrite).
+                # (also drops the stale api_content sidecar on rewrite). Image
+                # parts become placeholders in place, so a trailing steer
+                # text block survives untouched.
                 new_msg = _strip_images_from_tool_msg(msg)
                 if new_msg is None:
                     return False
@@ -4144,6 +4151,12 @@ class ContextCompressor(ContextEngine):
                 return True
             if not isinstance(content, str):
                 return False
+            # A user /steer (and the run-budget wrap-up notice) rides at the
+            # END of a tool result. Judge and summarize the tool body only;
+            # the steer markers are carried verbatim after the summary (the
+            # wrap-up notice is dropped with the body).
+            full_content = content
+            content, steers = split_trailing_appends(full_content)
             if not content or content == _PRUNED_TOOL_PLACEHOLDER:
                 return False
             if content.startswith("[Duplicate tool output"):
@@ -4170,7 +4183,7 @@ class ContextCompressor(ContextEngine):
                 if isinstance(_skill, str) and _skill.lower() in protected_skills:
                     return False
             summary = _summarize_tool_result(tool_name, tool_args, content)
-            result[idx] = {**msg, "content": summary}
+            result[idx] = {**msg, "content": with_steers(summary, steers)}
             pruned += 1
             return True
 
@@ -4489,9 +4502,12 @@ class ContextCompressor(ContextEngine):
             # Tool results: keep enough content for the summarizer
             if role == "tool":
                 tool_id = msg.get("tool_call_id", "")
+                # Truncate the tool body only; a trailing user /steer is the
+                # user's words and must reach the summarizer whole.
+                content, steers = split_trailing_appends(content)
                 if len(content) > self._CONTENT_MAX:
                     content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
-                parts.append(f"[TOOL RESULT {tool_id}]: {content}")
+                parts.append(f"[TOOL RESULT {tool_id}]: {with_steers(content, steers)}")
                 continue
 
             # Assistant messages: include tool call names AND arguments
@@ -4546,6 +4562,7 @@ class ContextCompressor(ContextEngine):
         relevant_files: list[str] = []
         blockers: list[str] = []
         last_dropped_turns: list[str] = []
+        user_steers: list[str] = []
 
         def _compact_fallback_turn(value: Any) -> str:
             text = _redact_compaction_text(_content_text_for_contains(value))
@@ -4633,6 +4650,13 @@ class ContextCompressor(ContextEngine):
                 tool_actions.append(
                     _summarize_tool_result(tool_name, tool_args, text or "")
                 )
+                # A /steer riding on this tool result is a real user message:
+                # keep it verbatim-ish (redacted, whitespace-folded).
+                _body, _steers = split_trailing_appends(msg.get("content"))
+                for _steer in steer_texts(_steers):
+                    _steer = _compact_fallback_turn(_steer)
+                    if _steer:
+                        user_steers.append(_steer)
                 if re.search(
                     r"\b(error|failed|exception|traceback|timeout|timed out|fatal)\b",
                     text,
@@ -4678,6 +4702,10 @@ class ContextCompressor(ContextEngine):
             )
 
         reason_text = f" Summary failure reason: {reason}." if reason else ""
+        if user_steers:
+            active_task += (
+                "\n\n## Mid-turn User Steers\n" + _bullets(user_steers, limit=8)
+            )
         body = f"""{HISTORICAL_TASK_HEADING}
 {active_task}
 
@@ -4765,6 +4793,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             content = msg.get("content")
             if not isinstance(content, str):
                 continue
+            # Keep trailing /steer markers verbatim (see _demote_tool_result_at).
+            content, steers = split_trailing_appends(content)
             if len(content) < _LEAN_TAIL_DEMOTE_MIN_CHARS:
                 continue
             if SKILL_PRUNED_MARKER_PREFIX in content:
@@ -4774,7 +4804,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             stub = _lean_recovery_stub(
                 msg.get("tool_name") or "", len(content), session_id,
             )
-            replaced = {**msg, "content": stub}
+            replaced = {**msg, "content": with_steers(stub, steers)}
             drop_stale_api_content(replaced)
             result[i] = replaced
             demoted += 1

@@ -221,6 +221,7 @@ from agent.tool_dispatch_helpers import (
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
+from agent.tool_row_append import persisted_message_content
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
 
@@ -2356,20 +2357,12 @@ class AIAgent:
                     and sanitize_context(content).strip() != content.strip()
                 ):
                     _row_api_content = content
-                # Persist multimodal tool results as their text summary only —
-                # base64 images would bloat the session DB and aren't useful
-                # for cross-session replay.
-                if _is_multimodal_tool_result(content):
-                    content = _multimodal_text_summary(content)
-                elif isinstance(content, list):
-                    # List of OpenAI-style content parts: strip images, keep text.
-                    _txt = []
-                    for p in content:
-                        if isinstance(p, dict) and p.get("type") == "text":
-                            _txt.append(str(p.get("text", "")))
-                        elif isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
-                            _txt.append("[screenshot]")
-                    content = "\n".join(_txt) if _txt else None
+                # Persisted shape (single owner: agent.tool_row_append):
+                # multimodal envelopes -> text summary; tool-row block lists
+                # stay structural so a replayed tool row (and any steer
+                # block appended to it) is what the live request sent;
+                # other roles keep text-only flattening.
+                content = persisted_message_content(role, content)
                 tool_calls_data = None
                 if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
                     tool_calls_data = [

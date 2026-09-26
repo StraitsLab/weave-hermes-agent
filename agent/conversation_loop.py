@@ -119,12 +119,7 @@ _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correctio
 # One-time wrap-up notice appended when a wall-clock run budget crosses its
 # 80% threshold (agent.run_budget_seconds / --run-budget). Mirrors the Codex
 # CLI budget wrap-up template: stop new work, deliver from current state.
-RUN_BUDGET_WRAPUP_NOTICE = (
-    "[SYSTEM NOTICE — run time budget nearly exhausted] "
-    "Run time budget nearly exhausted. Stop new discovery/verification work "
-    "now. Produce the required final deliverable (answer/JSON/summary) from "
-    "the state you already have, completing only mandatory writes."
-)
+from agent.tool_row_append import RUN_BUDGET_WRAPUP_NOTICE  # noqa: E402  (single owner; re-exported)
 
 
 def _midturn_request_pressure_tokens(
@@ -215,20 +210,16 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
         return False
     if (time.time() - started) < 0.8 * float(budget):
         return False
+    from agent.tool_row_append import append_to_tool_row
+
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
         if isinstance(msg, dict) and msg.get("role") == "tool":
-            existing = msg.get("content", "")
-            if isinstance(existing, str):
-                msg["content"] = existing + f"\n\n{RUN_BUDGET_WRAPUP_NOTICE}"
-            else:
-                # Multimodal content blocks — append a text block.
-                try:
-                    blocks = list(existing) if existing else []
-                    blocks.append({"type": "text", "text": RUN_BUDGET_WRAPUP_NOTICE})
-                    msg["content"] = blocks
-                except Exception:
-                    return False
+            # Durable append (same helper as /steer): an already-saved tool
+            # row is rewritten in state.db so replay matches the live send.
+            # A refused append leaves the latch open to retry next iteration.
+            if not append_to_tool_row(agent, msg, f"\n\n{RUN_BUDGET_WRAPUP_NOTICE}"):
+                return False
             agent._run_budget_wrapup_injected = True
             logger.info(
                 "Run budget wrap-up notice injected (budget=%.0fs, elapsed=%.0fs)",
@@ -236,6 +227,33 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
                 time.time() - started,
             )
             return True
+    return False
+
+
+def drain_pending_steer_before_api_call(agent: Any, messages: List[Dict[str, Any]]) -> bool:
+    """Deliver a /steer that arrived during the previous API call.
+
+    Appended (durably, via ``append_to_tool_row``) to the newest tool result
+    so the model sees it on THIS iteration. With no tool result yet, or when
+    the append cannot be made durable, the steer is put back for the
+    post-tool drain / next-turn fallback. Returns True when delivered.
+    """
+    steer_text = agent._drain_pending_steer()
+    if not steer_text:
+        return False
+    from agent.prompt_builder import format_steer_marker
+    from agent.tool_row_append import append_to_tool_row, requeue_steer
+
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            if append_to_tool_row(agent, msg, format_steer_marker(steer_text)):
+                logger.debug(
+                    "Pre-API-call steer drain: injected into tool msg at index %d", idx,
+                )
+                return True
+            break
+    requeue_steer(agent, steer_text)
     return False
 
 
@@ -2192,44 +2210,7 @@ def run_conversation(
         # iteration, no tools yet), the steer stays pending for the next
         # tool batch — injecting into a user message would break role
         # alternation, and there's no tool output to piggyback on.
-        _pre_api_steer = agent._drain_pending_steer()
-        if _pre_api_steer:
-            _injected = False
-            for _si in range(len(messages) - 1, -1, -1):
-                _sm = messages[_si]
-                if isinstance(_sm, dict) and _sm.get("role") == "tool":
-                    from agent.prompt_builder import format_steer_marker
-                    marker = format_steer_marker(_pre_api_steer)
-                    existing = _sm.get("content", "")
-                    if isinstance(existing, str):
-                        _sm["content"] = existing + marker
-                    else:
-                        # Multimodal content blocks — append text block
-                        try:
-                            blocks = list(existing) if existing else []
-                            blocks.append({"type": "text", "text": marker})
-                            _sm["content"] = blocks
-                        except Exception:
-                            pass
-                    _injected = True
-                    logger.debug(
-                        "Pre-API-call steer drain: injected into tool msg at index %d",
-                        _si,
-                    )
-                    break
-            if not _injected:
-                # No tool message to inject into — put it back so
-                # the post-tool-execution drain picks it up later.
-                _lock = getattr(agent, "_pending_steer_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        if agent._pending_steer:
-                            agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
-                        else:
-                            agent._pending_steer = _pre_api_steer
-                else:
-                    existing = getattr(agent, "_pending_steer", None)
-                    agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+        drain_pending_steer_before_api_call(agent, messages)
 
         # ── Wall-clock run-budget wrap-up notice ───────────────────────
         # One-shot: when a run budget (agent.run_budget_seconds /
