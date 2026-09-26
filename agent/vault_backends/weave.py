@@ -127,9 +127,12 @@ def _work_gate(approval_ref: Any, handle: str, action: str, origin: str) -> None
     if not isinstance(approval_ref, str) or not _REF.fullmatch(approval_ref):
         raise VaultUnavailable("the Harso vault returned an invalid answer")
     tool = "browser_vault_enter_code" if action == "enter_otp" else "browser_vault_fill"
-    result = request_tool_approval(tool, f"Use Harso vault item {handle} to {_VERB[action]} on {origin}",
-                                   rule_key=approval_ref)
-    if not result.get("approved"):
+    try:
+        result = request_tool_approval(tool, f"Use Harso vault item {handle} to {_VERB[action]} on {origin}",
+                                       rule_key=approval_ref)
+    except Exception:  # content-free: the gate's own error text is not the model's to see
+        raise VaultUnavailable("the approval request for this vault use could not be raised") from None
+    if not isinstance(result, dict) or result.get("approved") is not True:
         raise VaultUseRefused("denied", _DENIED)
 
 
@@ -225,9 +228,19 @@ class WeaveLoginBackend(LoginBackend):
         return value
 
     def resolve_otp(self, handle: str, *, origin: Optional[str] = None) -> Optional[str]:
-        value = self._resolve(handle, "enter_otp", origin, "otp")
-        if not isinstance(value, str) or not value.isdigit():
-            raise VaultUnavailable("the Harso vault returned an invalid answer")
+        """Only called for an item that stores an authenticator key, so every failure here is the answer: it is
+        raised as a typed refusal, which the code tool returns as is. Anything else would be read as "no key" and
+        the user asked for a code instead (only ``otp_unavailable``, from the authority, means that)."""
+        try:
+            value = self._resolve(handle, "enter_otp", origin, "otp")
+            if not isinstance(value, str) or not value.isdigit():
+                raise VaultUnavailable("the Harso vault returned an invalid answer")
+        except VaultUseRefused:
+            raise
+        except VaultUnavailable as exc:
+            raise VaultUseRefused("vault_unavailable", str(exc)[:200]) from None
+        except Exception:
+            raise VaultUseRefused("vault_unavailable", "the Harso vault could not answer") from None
         return value
 
     def resolve_secret(self, handle: str, *, origin: Optional[str] = None) -> Dict[str, str]:
