@@ -3837,10 +3837,11 @@ def compress_context(
                 evidence_messages = messages_without_memory(evidence_messages)
         except Exception:
             _strip_memory = False
-        try:
-            agent.context_compressor.strip_memory_deliveries = _strip_memory
-        except Exception:
-            pass
+        if _strip_memory or hasattr(agent.context_compressor, "strip_memory_deliveries"):
+            try:
+                agent.context_compressor.strip_memory_deliveries = _strip_memory
+            except Exception:
+                pass
         if checkpoint_required:
             supports_checkpoint = getattr(
                 memory_manager, "supports_pre_compress_checkpoint", None
