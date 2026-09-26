@@ -4456,6 +4456,11 @@ class ContextCompressor(ContextEngine):
         for msg in turns:
             role = msg.get("role", "unknown")
             content = msg.get("content")
+            if getattr(self, "strip_memory_deliveries", False) is True:
+                # Harso copilot on (design C §5.3): no delivery text in the summary.
+                from agent.memory_delivery import strip_memory_deliveries
+
+                content = strip_memory_deliveries(content)
             if isinstance(content, list):
                 text_parts: list[str] = []
                 for part in content:
@@ -4591,9 +4596,15 @@ class ContextCompressor(ContextEngine):
                             parsed = args
                         _collect_paths_from_jsonish(parsed)
 
+        _strip_memory = getattr(self, "strip_memory_deliveries", False) is True
         for msg in turns_to_summarize:
             role = msg.get("role", "unknown")
-            text = _compact_fallback_turn(msg.get("content"))
+            _fallback_content = msg.get("content")
+            if _strip_memory:
+                from agent.memory_delivery import strip_memory_deliveries
+
+                _fallback_content = strip_memory_deliveries(_fallback_content)
+            text = _compact_fallback_turn(_fallback_content)
             _collect_path_mentions(text, relevant_files)
             synthetic_user = (
                 role == "user" and self._is_synthetic_compression_user_turn(msg)

@@ -41,6 +41,7 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
+from agent.memory_delivery import memory_fence_note
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     _review_fork_first_request_pending,
@@ -2384,6 +2385,7 @@ def run_conversation(
                         api_msg.get("content", ""),
                         _ext_prefetch_cache,
                         _plugin_user_context,
+                        memory_note=memory_fence_note(agent),
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed

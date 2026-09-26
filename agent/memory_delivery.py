@@ -113,3 +113,58 @@ def copilot_active(agent: Any) -> bool:
         return probe() is True
     except Exception:
         return False
+
+
+def memory_fence_note(agent: Any):
+    """The turn-start fence note for this agent (C §4.1), or None = today's note, byte for byte."""
+    if not copilot_active(agent):
+        return None
+    try:
+        note = agent._memory_manager.memory_fence_note()
+    except Exception:
+        return None
+    return note if isinstance(note, str) and note.strip() else None
+
+
+def _resolve_append_helper():
+    """Packet P0's ``append_to_tool_row(agent, messages, part, *, kind)`` (design C §4.2), or None until it lands.
+
+    Without the durable helper a mid-turn append would be lost from ``state.db`` (the tool row is already flushed), so
+    the cell does not append at all: the server keeps the delivery pending (design C §10, "durable write fails").
+    """
+    try:
+        from agent import agent_runtime_helpers
+    except Exception:
+        return None
+    helper = getattr(agent_runtime_helpers, "append_to_tool_row", None)
+    return helper if callable(helper) else None
+
+
+def deliver_mid_turn_memory(agent: Any, messages: List[Dict[str, Any]]) -> bool:
+    """Late fetch + append to the newest tool result's sent bytes, kind=memory (design C §4.2). Never raises.
+
+    Only when the newest message is a string tool result of this step (appending to an older, already-sent row would
+    rewrite history). The block comes from the plugin's ``render_wire_delivery``, which runs the ported sanitizer
+    (design C §4.3) on every item text before the header/close framing is added.
+    """
+    try:
+        if not copilot_active(agent) or not messages:
+            return False
+        newest = messages[-1]
+        if not isinstance(newest, dict) or newest.get("role") != "tool":
+            return False
+        if not isinstance(newest.get("content"), str):
+            # Typed (list) sidecars are P0's storage change; until then the server keeps the delivery pending.
+            return False
+        helper = _resolve_append_helper()
+        if helper is None:
+            return False
+        block = agent._memory_manager.fetch_mid_turn_delivery(
+            session_id=getattr(agent, "session_id", "") or "",
+            visible_seqs=visible_seqs(messages),
+        )
+        if not isinstance(block, str) or not seqs_in(block):
+            return False
+        return bool(helper(agent, messages, "\n\n" + block, kind="memory"))
+    except Exception:
+        return False

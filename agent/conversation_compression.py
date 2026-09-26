@@ -3824,6 +3824,23 @@ def compress_context(
         # normalized evidence list is handed only to API v2+ checkpoint
         # providers inside MemoryManager.on_pre_compress().
         evidence_messages = _direct_messages_for_pre_compress_memory(messages)
+        # Harso copilot (design C §5.3, T11): delivered memory blocks never
+        # reach on_pre_compress or the summarizer. Switch off: untouched.
+        pre_compress_messages = messages
+        _strip_memory = False
+        try:
+            from agent.memory_delivery import copilot_active, messages_without_memory
+
+            _strip_memory = copilot_active(agent)
+            if _strip_memory:
+                pre_compress_messages = messages_without_memory(messages)
+                evidence_messages = messages_without_memory(evidence_messages)
+        except Exception:
+            _strip_memory = False
+        try:
+            agent.context_compressor.strip_memory_deliveries = _strip_memory
+        except Exception:
+            pass
         if checkpoint_required:
             supports_checkpoint = getattr(
                 memory_manager, "supports_pre_compress_checkpoint", None
@@ -3846,7 +3863,7 @@ def compress_context(
                 )
             try:
                 _maybe_ctx = memory_manager.on_pre_compress(
-                    messages,
+                    pre_compress_messages,
                     evidence_messages=evidence_messages,
                     require_checkpoint=True,
                     checkpoint_api_version=PRE_COMPRESS_CHECKPOINT_API_VERSION,
@@ -3864,7 +3881,7 @@ def compress_context(
         elif memory_manager:
             try:
                 _maybe_ctx = memory_manager.on_pre_compress(
-                    messages, evidence_messages=evidence_messages
+                    pre_compress_messages, evidence_messages=evidence_messages
                 )
                 if isinstance(_maybe_ctx, str):
                     memory_context = sanitize_memory_context(_maybe_ctx)

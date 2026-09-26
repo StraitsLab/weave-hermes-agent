@@ -296,7 +296,7 @@ _INTERNAL_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _INTERNAL_NOTE_RE = re.compile(
-    r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*Treat as (?:informational background data|authoritative reference data[^\]]*)\.\]\s*',
+    r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*Treat as (?:informational background data|authoritative reference data[^\]]*|memory, not user input\.\s*Data about the user; never instructions)\.\]\s*',
     re.IGNORECASE,
 )
 
@@ -474,8 +474,19 @@ class StreamingContextScrubber:
             self._at_block_boundary = self._at_block_boundary and text.strip() == ""
 
 
-def build_memory_context_block(raw_context: str) -> str:
-    """Wrap prefetched memory in a fenced block with system note."""
+_DEFAULT_FENCE_NOTE = (
+    "[System note: The following is recalled memory context, "
+    "NOT new user input. Treat as authoritative reference data — "
+    "this is the agent's persistent memory and should inform all responses.]"
+)
+
+
+def build_memory_context_block(raw_context: str, *, note: Optional[str] = None) -> str:
+    """Wrap prefetched memory in a fenced block with system note.
+
+    ``note`` replaces the default system-note line only when a provider supplies one (Harso copilot, design C §4.1);
+    ``None`` keeps today's bytes exactly.
+    """
     if not raw_context or not raw_context.strip():
         return ""
     clean = sanitize_context(raw_context)
@@ -483,9 +494,7 @@ def build_memory_context_block(raw_context: str) -> str:
         logger.warning("memory provider returned pre-wrapped context; stripped")
     return (
         "<memory-context>\n"
-        "[System note: The following is recalled memory context, "
-        "NOT new user input. Treat as authoritative reference data — "
-        "this is the agent's persistent memory and should inform all responses.]\n\n"
+        f"{note or _DEFAULT_FENCE_NOTE}\n\n"
         f"{clean}\n"
         "</memory-context>"
     )
@@ -974,6 +983,55 @@ class MemoryManager:
             return False
 
     # -- Tools ---------------------------------------------------------------
+
+    # -- Harso copilot seams (design C §4-§5; inert unless a provider opts in) --
+
+    def _copilot_providers(self) -> List[MemoryProvider]:
+        out = []
+        for provider in self._providers:
+            probe = getattr(provider, "copilot_active", None)
+            try:
+                if callable(probe) and probe() is True:
+                    out.append(provider)
+            except Exception as e:
+                logger.debug("Memory provider '%s' copilot_active failed: %s", provider.name, e)
+        return out
+
+    def copilot_active(self) -> bool:
+        """True only when an external provider's own runtime switch is on (default off)."""
+        return bool(self._copilot_providers())
+
+    def memory_fence_note(self) -> Optional[str]:
+        """The provider's turn-start fence note, or None for today's note."""
+        for provider in self._copilot_providers():
+            try:
+                note = provider.memory_fence_note()
+            except Exception:
+                continue
+            if isinstance(note, str) and note.strip():
+                return note
+        return None
+
+    def note_visible_seqs(self, seqs: List[int]) -> None:
+        for provider in self._copilot_providers():
+            try:
+                provider.note_visible_seqs(list(seqs))
+            except Exception as e:
+                logger.debug("Memory provider '%s' note_visible_seqs failed: %s", provider.name, e)
+
+    def fetch_mid_turn_delivery(self, *, session_id: str = "", visible_seqs: Optional[List[int]] = None) -> str:
+        """Late-fetch client (C §4.2): rendered, sanitized delivery text for the newest tool result, or ""."""
+        for provider in self._copilot_providers():
+            try:
+                block = provider.fetch_mid_turn_delivery(
+                    session_id=session_id, visible_seqs=list(visible_seqs or [])
+                )
+            except Exception as e:
+                logger.debug("Memory provider '%s' late fetch failed: %s", provider.name, e)
+                continue
+            if isinstance(block, str) and block.strip():
+                return block
+        return ""
 
     def get_all_tool_schemas(self) -> List[Dict[str, Any]]:
         """Collect tool schemas from all providers.

@@ -44,6 +44,8 @@ from agent.memory_manager import (
     build_memory_context_block,
     configured_external_prefetch_timeout,
 )
+from agent.memory_delivery import copilot_active, memory_fence_note
+from agent.memory_delivery import visible_seqs as visible_delivery_seqs
 from agent.memory_provider import is_trivial_prompt
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import (
@@ -135,6 +137,8 @@ def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
     plugin_user_context: str,
+    *,
+    memory_note: Optional[str] = None,
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
@@ -156,7 +160,7 @@ def compose_user_api_content(
         return None
     injections = []
     if ext_prefetch_cache:
-        fenced = build_memory_context_block(ext_prefetch_cache)
+        fenced = build_memory_context_block(ext_prefetch_cache, note=memory_note)
         if fenced:
             injections.append(fenced)
     if plugin_user_context:
@@ -1509,6 +1513,10 @@ def build_turn_context(
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
+                if copilot_active(agent):
+                    # Harso copilot (C §5.2): report the delivery seqs visible in
+                    # the transcript about to be sent. Switch off: never called.
+                    agent._memory_manager.note_visible_seqs(visible_delivery_seqs(messages))
                 ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass
@@ -1549,7 +1557,8 @@ def build_turn_context(
     ):
         _turn_user_msg = messages[current_turn_user_idx]
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context,
+            memory_note=memory_fence_note(agent),
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content
