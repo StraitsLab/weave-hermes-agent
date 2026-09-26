@@ -68,7 +68,7 @@ def stub_cdp_supervisor(monkeypatch):
     created: list[SimpleNamespace] = []
 
     class _StubSupervisor:
-        def __init__(self, *, task_id, cdp_url, dialog_policy, dialog_timeout_s):
+        def __init__(self, *, task_id, cdp_url, dialog_policy, dialog_timeout_s, request_signer=None):
             self.task_id = task_id
             self.cdp_url = cdp_url
             self.dialog_policy = dialog_policy
