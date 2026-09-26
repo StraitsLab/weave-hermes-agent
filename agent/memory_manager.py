@@ -283,6 +283,23 @@ def inject_memory_provider_tools(agent: Any) -> int:
         existing_tool_names.add(tool_name)
         added += 1
 
+    # Harso copilot (design C §11, T24): session_search goes off in the SAME
+    # switch that exposes harso_memory — and only if harso_memory actually
+    # reached this tool surface, so there is never a moment with no search.
+    copilot_probe = getattr(memory_manager, "copilot_active", None)
+    if "harso_memory" in existing_tool_names and callable(copilot_probe):
+        try:
+            copilot_on = copilot_probe() is True
+        except Exception:
+            copilot_on = False
+        if copilot_on and "session_search" in existing_tool_names:
+            tools[:] = [
+                tool for tool in tools
+                if not (isinstance(tool, dict)
+                        and tool.get("function", {}).get("name") == "session_search")
+            ]
+            valid_tool_names.discard("session_search")
+
     return added
 
 
