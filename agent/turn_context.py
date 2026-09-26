@@ -40,7 +40,10 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import (
+    build_memory_context_block,
+    configured_external_prefetch_timeout,
+)
 from agent.memory_provider import is_trivial_prompt
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import (
@@ -1490,6 +1493,15 @@ def build_turn_context(
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
     if agent._memory_manager:
+        try:
+            # Runtime refresh: a config.yaml edit reaches the next prefetch on
+            # this same manager (a cached gateway agent is not rebuilt).
+            from hermes_cli.config import load_config_readonly
+            agent._memory_manager.set_external_prefetch_timeout(
+                configured_external_prefetch_timeout(load_config_readonly())
+            )
+        except Exception:
+            pass
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
