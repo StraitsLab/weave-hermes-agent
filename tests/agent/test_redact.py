@@ -1108,7 +1108,14 @@ class TestVaultValueEncodedForms:
         lambda v: __import__("urllib.parse").parse.quote_plus(v),                     # form GET, utf-8 page
         lambda v: __import__("urllib.parse").parse.quote_plus(v, encoding="cp1252"),  # form GET, no charset
         lambda v: __import__("html").escape(v, quote=True),                           # serialized DOM
-    ], ids=["raw", "json", "json2", "json-ascii", "uri", "uri-lower", "form", "form-1252", "html"])
+        lambda v: "".join("\\u%04x" % ord(c) for c in v),                           # every char \\u-escaped
+        lambda v: __import__("re").sub(r"\\u[0-9a-f]{4}", lambda m: m.group(0).upper().replace("U", "u"),
+                                       __import__("json").dumps(v, ensure_ascii=True)[1:-1]),  # \\u00FC
+        lambda v: __import__("json").dumps(v)[1:-1].replace("/", "\\/"),           # JSON's optional \\/ escape
+        lambda v: str(KeyError(v)),                                                   # Python repr (KeyError, %r)
+        ascii,                                                                        # repr with \\xfc
+    ], ids=["raw", "json", "json2", "json-ascii", "uri", "uri-lower", "form", "form-1252", "html", "u-all", "u-upper",
+            "json-solidus", "repr", "ascii"])
     def test_every_encoding_of_a_registered_value_is_scrubbed(self, encode):
         from agent.redact import redact_registered_vault_values
 
@@ -1126,3 +1133,38 @@ class TestVaultValueEncodedForms:
 
         redact.register_vault_redaction_value("US", whole_token=True)
         assert redact.redact_registered_vault_values("STATUS US") == "STATUS «redacted-vault-secret»"
+
+
+_TIMED_SCRUB = """
+import sys, time
+from agent import redact
+values, text = eval(sys.argv[1]), eval(sys.argv[2])
+for v in values:
+    redact.register_vault_redaction_value(v)
+start = time.monotonic()
+redact.redact_registered_vault_values(text)
+print(time.monotonic() - start)
+"""
+
+
+class TestVaultValueScrubIsBoundedTime:
+    """F2 (#58 r1): matching cost must not depend on the secret's structure. Each case runs in a child process
+    under a hard timeout, because a backtracking matcher holds the GIL and cannot be interrupted in-process."""
+
+    @pytest.mark.parametrize("values, text", [
+        (["\\X"], "\\" * 100_000 + "Y"),                                   # reviewer dos.log row 1
+        (["\\\\X"], "\\" * 1_000 + "Y"),                                 # reviewer dos.log row 2
+        (["abc" + "\\" * 8 + "Z"], "abc" + "\\" * 40 + "Y"),             # reviewer dos.log row 3
+        (["abc" + "\\" * 8 + "Z"], "abc" + "\\" * 1_000 + "Y"),
+        (['a\\"\\"\\"b'], '\\"' * 50_000 + "c"),                     # mixed backslash and quote
+        (["aaaa/aaaa/aaaa/X"], "aaaa/" * 20_000 + "Y"),                       # repeated prefix
+        ([f"p{i}\\\\\\x/y" for i in range(8)], ("\\" * 40 + "/") * 2_500),  # 8 registrations, 100KB
+    ], ids=["1bs-100k", "2bs-1k", "8bs-40", "8bs-1k", "mixed", "prefix", "8regs-100k"])
+    def test_near_miss_output_is_scrubbed_in_bounded_time(self, values, text):
+        import subprocess
+        import sys
+
+        proc = subprocess.run([sys.executable, "-c", _TIMED_SCRUB, repr(values), repr(text)],
+                              capture_output=True, text=True, timeout=10)
+        assert proc.returncode == 0, proc.stderr
+        assert float(proc.stdout) < 0.5
