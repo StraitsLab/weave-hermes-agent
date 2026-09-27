@@ -118,10 +118,11 @@ class TestF1aStructuredSerializer:
         agent, db, sid = store
         messages = _turn([{"type": "text", "text": BIG_BODY}] + _image_blocks())
         agent._flush_messages_to_session_db(messages)
-        _drained(agent, messages, MULTILINE_STEER)
+        steer = MULTILINE_STEER + "\n" + LONG_STEER
+        _drained(agent, messages, steer)
         replay = db.get_messages_as_conversation(sid)
         text = _compressor()._serialize_for_summary(replay)
-        assert MULTILINE_STEER in text
+        assert steer in text
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +298,7 @@ class TestF1dInputBudget:
             assert f"L{i}:" + MULTILINE_STEER in out
         assert out.count(LONG_STEER) == 40
 
+    # DESIGN GUARD (not a RED variant): protects the r2 mechanism itself.
     @pytest.mark.parametrize("method", METHODS)
     def test_tool_output_lookalike_blocks_get_no_reservation(self, method):
         c = _compressor()
@@ -316,14 +318,18 @@ class TestF1dInputBudget:
         assert getattr(c, method)(text) is None
 
     def test_generate_summary_makes_no_call_when_steers_cannot_fit(self, monkeypatch):
-        import agent.auxiliary_client as aux
+        import agent.context_compressor as cc
 
-        def _boom(**_kw):
-            raise AssertionError("summarizer must not be called with a lossy input")
+        calls = []
 
-        monkeypatch.setattr(aux, "call_llm", _boom)
+        def _record(**kw):
+            calls.append(kw)
+            raise RuntimeError("summarizer must not be called with a lossy input")
+
+        monkeypatch.setattr(cc, "call_llm", _record)
         c = _compressor()
         assert c._generate_summary(_budget_messages(40, lambda i: f"{i}" + "q" * 5000)) is None
+        assert calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +365,7 @@ class TestF1eSpanIdentification:
         assert out[2]["content"].endswith(format_steer_marker(QUOTING_STEER))
         assert len(out[2]["content"]) < 2000
 
+    # DESIGN GUARD (not a RED variant): protects the r2 mechanism itself.
     def test_records_are_exact_when_tool_output_ends_with_open_marker(self, store):
         # The tool body itself ends with an unclosed opening marker. Marker
         # parsing alone must keep that ambiguous tail (conservative); the
@@ -384,11 +391,15 @@ class TestF1eSpanIdentification:
         agent, db, sid = store
         messages = _turn([{"type": "text", "text": BIG_BODY}] + _image_blocks())
         agent._flush_messages_to_session_db(messages)
-        _drained(agent, messages, QUOTING_STEER + " " + LONG_STEER)
+        # The user's prefix (longer than the per-message tail) precedes a
+        # quoted opening marker: it must not be treated as tool body.
+        steer = "USER-PREFIX-KEEP " + LONG_STEER + "\n\n" + STEER_MARKER_OPEN + "\nquoted"
+        _drained(agent, messages, steer)
         replay = db.get_messages_as_conversation(sid)
         text = _compressor()._serialize_for_summary(replay)
-        assert "USER-PREFIX-KEEP" in text and LONG_STEER in text
+        assert "USER-PREFIX-KEEP " + LONG_STEER in text
 
+    # DESIGN GUARD (not a RED variant): protects the r2 mechanism itself.
     def test_repeated_prune_with_records_is_stable(self, store):
         agent, db, sid = store
         messages = _turn(BIG_BODY)
