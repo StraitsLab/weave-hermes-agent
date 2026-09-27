@@ -3305,6 +3305,39 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
+        # A non-push adapter (api_server: HTTP request/response only) has no
+        # send(). Its chat_id is the raw session id, so append the brief to
+        # that transcript directly, at the session the client's reads resolve
+        # to (compression continuation). No wake turn: it would spend a model
+        # turn and rewrite the brief.
+        from gateway.wake import adapter_supports_push
+
+        if runtime_adapter is not None and not adapter_supports_push(runtime_adapter):
+            from gateway.mirror import mirror_to_session
+            from hermes_state import SessionDB
+
+            try:
+                with SessionDB() as db:
+                    target_sid = db.resolve_resume_session_id(str(chat_id))
+            except Exception as e:
+                delivery_errors.append(
+                    f"transcript append to {platform_name}:{chat_id} failed: {e}"
+                )
+                continue
+            if not mirror_to_session(
+                platform_name, str(chat_id), cleaned_delivery_content.strip(),
+                source_label="cron", session_id=target_sid, role="assistant",
+            ):
+                delivery_errors.append(
+                    f"transcript append to {platform_name}:{chat_id} failed"
+                )
+            elif media_files:
+                delivery_errors.append(
+                    f"{len(media_files)} media attachment(s) not delivered to "
+                    f"{platform_name}:{chat_id} (adapter has no push channel)"
+                )
+            continue
+
         # Prefer the resolved live transport when the gateway is running. This
         # supports E2EE native adapters and relay-fronted logical platforms.
         # The live-send path (which SEEDS the flat in_channel continuation
