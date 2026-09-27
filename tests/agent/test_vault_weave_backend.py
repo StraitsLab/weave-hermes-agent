@@ -14,6 +14,7 @@ not receive; and nothing changes for a profile that does not select the weave ba
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -105,6 +106,9 @@ class FakeWeaveApi:
                     item = api.items.get(body["handle"].removeprefix("wv:"))
                     if item is None:
                         return self._send(404, {"error": {"code": "VAULT_ITEM_UNAVAILABLE", "message": "Vault item was not found"}})
+                    if body["action"] == "inject":  # V-7b-1: authorize only; a new once/deny card, never a key
+                        return self._send(200, {"decision": "approval_required", "approval_ref": api.approval_ref,
+                                                "choices": ["once", "deny"]})
                     if body["page_origin"] not in item["allowed_origins"]:
                         return self._send(403, {"error": {"code": "VAULT_ORIGIN_REFUSED", "message": "This item is not bound to this site"}})
                     decision = api.decisions.pop(0) if api.decisions else api.decision
@@ -1018,3 +1022,237 @@ def test_an_invalid_timeout_falls_back_to_the_default(raw):
 
     assert timeout_seconds(raw) == 10.0
     assert timeout_seconds(None) == 10.0 and timeout_seconds(120) == 120.0 and timeout_seconds(0.5) == 0.5
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# V-7b-3: vault_authorize_write opens the api_key write card and hands back only the approval ref
+# ---------------------------------------------------------------------------------------------------------------
+
+# The V-7b-1 pinned vector (weave-cloud services/weave-api/tests/test_vault.py), copied byte for byte.
+WRITE_URL = "https://api.stripe.com/v1/charges?expand[]=customer"
+WRITE_BODY = b'{"amount":2000,"currency":"sgd"}'
+WRITE_BODY_SHA256 = "b521722344e10c11d9973a2b7fc30b0e0f52dda4352bae38089ebbf92dbc8bef"
+WRITE_DIGEST = "e66c20164532482bd64f1638ccc424328ad6cff21408ef054779ecbe93471714"
+STRIPE = "0199bbbb-0000-7000-8000-00000000000d"
+STRIPE_HANDLE = f"wv:{STRIPE}"
+CANARY_KEY = "sk_live_canary-3b9e-never-in-output"
+
+
+@pytest.fixture
+def stripe(weave):
+    weave.items[STRIPE] = _item(STRIPE, "api_key", ["https://api.stripe.com"])
+    return weave
+
+
+def _authorize(handle=STRIPE_HANDLE, method="POST", url=WRITE_URL, body=WRITE_BODY.decode()):
+    from tools.vault_write_tool import vault_authorize_write
+
+    return vault_authorize_write(handle, method, url, body)
+
+
+def test_an_allowed_write_returns_only_the_card_ref_and_header_and_pins_the_7b1_digest(stripe, admitted_turn):
+    with _acp_gate("once") as asked:
+        raw = _authorize()
+    assert json.loads(raw) == {"approval_ref": CARD, "header": "X-Weave-Vault-Approval"}
+    assert asked == [f"plugin_rule:{CARD}"]  # the relay reads the card by this key
+    [resolve] = stripe.resolves()
+    assert resolve["body"] == {"handle": STRIPE_HANDLE, "action": "inject", "method": "POST", "url": WRITE_URL,
+                               "body_sha256": WRITE_BODY_SHA256, "conversation_id": CONV, "run_id": NATIVE_REF}
+    # The digest weave-api binds the card to, recomputed from exactly what the fork sent: the pinned literal.
+    origin, target = "https://api.stripe.com", resolve["body"]["url"][len("https://api.stripe.com"):]
+    assert resolve["body"]["url"].startswith(origin + "/")
+    digest = hashlib.sha256(f"POST\n{origin}{target}\n{resolve['body']['body_sha256']}".encode()).hexdigest()
+    assert digest == WRITE_DIGEST
+
+
+def test_an_empty_body_hashes_the_empty_string(stripe, admitted_turn):
+    with _acp_gate("once"):
+        _authorize(method="DELETE", url="https://api.stripe.com/v1/customers/cus_1", body="")
+    assert stripe.resolves()[0]["body"]["body_sha256"] == hashlib.sha256(b"").hexdigest()
+
+
+@pytest.mark.parametrize("choice", ["deny", "timeout"])
+def test_a_denied_write_gets_no_header_and_is_never_asked_again(stripe, admitted_turn, choice):
+    with _acp_gate(choice) as asked:
+        raw = _authorize()
+    out = json.loads(raw)
+    assert (out["success"], out["error_type"]) == (False, "denied") and "Do not retry" in out["error"]
+    assert "header" not in out and "approval_ref" not in out and CARD not in raw
+    assert asked == [f"plugin_rule:{CARD}"] and len(stripe.resolves()) == 1
+
+
+def test_a_gate_that_raises_is_content_free_and_sends_nothing(stripe, admitted_turn):
+    from tools import approval
+
+    with patch.object(approval, "request_tool_approval", side_effect=RuntimeError("gate text the model must not see")):
+        raw = _authorize()
+    assert json.loads(raw)["error_type"] == "vault_unavailable" and "must not see" not in raw and CARD not in raw
+
+
+@pytest.mark.parametrize("status,code,error_type", [
+    (409, "VAULT_WRITE_UNAVAILABLE", "write_unavailable"),       # runtime flag vault.write_cards off (default)
+    (422, "CONTENT_INVALID", "request_invalid"),                 # GET/HEAD, not an api_key, not the exact form
+    (403, "VAULT_ORIGIN_REFUSED", "origin_mismatch"),
+    (429, "VAULT_RATE_LIMITED", "rate_limited"),
+    (404, "VAULT_ITEM_UNAVAILABLE", "not_found"),
+])
+def test_an_authority_refusal_is_typed_and_never_raises_a_card(stripe, admitted_turn, status, code, error_type):
+    stripe.force_resolve = (status, {"error": {"code": code, "message": "refused"}})
+    with _acp_gate("once") as asked:
+        out = json.loads(_authorize())
+    assert (out["success"], out["error_type"]) == (False, error_type) and "header" not in out
+    assert asked == [] and len(stripe.resolves()) == 1
+
+
+def test_a_work_attempt_gets_work_unsupported_until_v4b(stripe, monkeypatch):
+    monkeypatch.setenv("WEAVE_API_MCP_BEARER", ATTEMPT_BEARER)
+    stripe.force_resolve = (409, {"error": {"code": "VAULT_WORK_APPROVAL_UNSUPPORTED", "message": "refused"}})
+    with _acp_gate("once") as asked:
+        out = json.loads(_authorize())
+    assert (out["success"], out["error_type"]) == (False, "work_unsupported") and asked == []
+    assert "conversation_id" not in stripe.resolves()[0]["body"]  # an attempt is its own run
+
+
+@pytest.mark.parametrize("answer,expected", [
+    # A well-formed card with an extra field: only the ref and the header leave, never the extra.
+    ({"decision": "approval_required", "approval_ref": CARD, "choices": ["once", "deny"], "api_key": CANARY_KEY},
+     {"approval_ref": CARD, "header": "X-Weave-Vault-Approval"}),
+    # Anything but approval_required is not a card, even carrying a valid ref.
+    ({"decision": "once", "action": "inject", "approval_ref": CARD, "api_key": CANARY_KEY}, "vault_unavailable"),
+    ({"decision": "approval_required", "approval_ref": CANARY_KEY}, "vault_unavailable"),
+])
+def test_no_key_reaches_a_tool_result_whatever_the_authority_answers(stripe, admitted_turn, caplog, answer, expected):
+    caplog.set_level(logging.DEBUG)
+    stripe.force_resolve = (200, answer)
+    with _acp_gate("once") as asked:
+        raw = _authorize()
+    assert CANARY_KEY not in raw and CANARY_KEY not in caplog.text and CELL_BEARER not in raw
+    out = json.loads(raw)
+    if isinstance(expected, dict):
+        assert out == expected
+    else:
+        assert (out["success"], out["error_type"]) == (False, expected) and asked == []
+
+
+def test_a_turn_the_app_did_not_send_opens_no_card(stripe):
+    out = json.loads(_authorize())
+    assert (out["success"], out["error_type"]) == (False, "no_run") and stripe.resolves() == []
+
+
+def test_no_handle_lists_only_this_sites_api_keys_as_metadata_and_opens_no_card(stripe, admitted_turn):
+    stripe.items[KEY]["allowed_origins"] = ["https://api.example"]  # another site's key: not offered
+    totp = "0199bbbb-0000-7000-8000-00000000000e"
+    stripe.items[totp] = _item(totp, "totp", ["https://api.stripe.com"])
+    for same_site_non_key in (ITEM, ADDR, totp):  # the kind filter, not the origin, must keep these out
+        stripe.items[same_site_non_key]["allowed_origins"] = ["https://api.stripe.com"]
+    out = json.loads(_authorize(handle=""))
+    assert (out["success"], out["error_type"]) == (False, "handle_required")
+    assert out["api_keys"] == [{"handle": STRIPE_HANDLE, "label": "Api_Key", "allowed_origins": ["https://api.stripe.com"]}]
+    assert stripe.resolves() == []
+
+
+def test_a_malformed_handle_never_reaches_the_network(stripe, admitted_turn):
+    out = json.loads(_authorize(handle="wv:../../v1/vault/items"))
+    assert (out["success"], out["error_type"]) == (False, "not_found") and stripe.requests == []
+
+
+def test_the_tool_is_offered_only_with_the_harso_vault(api):
+    from tools.vault_write_tool import _check_available
+
+    assert _check_available() is False  # no config
+    _write_config({"vault": {"enabled": True, "backend": "local"}})
+    assert _check_available() is False
+    _write_config({"vault": {"enabled": False, "backend": "weave", "weave_api_url": api.url}})
+    assert _check_available() is False
+    _write_config({"vault": {"enabled": True, "backend": "weave", "weave_api_url": api.url}})
+    assert _check_available() is True
+
+
+def test_a_harso_cell_selection_offers_the_tool_only_with_the_harso_vault(api):
+    """The real resolver path over the cell's materialized selection (file/skills/terminal/web, no browser)."""
+    import model_tools  # noqa: F401 — tool discovery
+    from hermes_cli.tools_config import _get_platform_tools
+    from model_tools import get_tool_definitions
+
+    cell = {"platform_toolsets": {"api_server": ["file", "skills", "terminal", "web"]}}
+
+    def offered():
+        enabled = sorted(_get_platform_tools(cell, "api_server", include_default_mcp_servers=False))
+        defs = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True, skip_tool_search_assembly=True)
+        return "vault_authorize_write" in {d["function"]["name"] for d in defs}
+
+    assert offered() is False
+    _write_config({"vault": {"enabled": True, "backend": "weave", "weave_api_url": api.url}})
+    assert offered() is True
+
+
+# Round 2 (F1): every malformed input or authority answer is a typed, content-free result at the tool boundary,
+# through the real registry dispatch: no card, no header, no parser or exception text, never a second request.
+def _dispatch(**changes):
+    import tools.vault_write_tool  # noqa: F401 — registers the tool
+    from tools.registry import registry
+
+    args = {"handle": STRIPE_HANDLE, "method": "POST", "url": WRITE_URL, "body": WRITE_BODY.decode(), **changes}
+    return registry.dispatch("vault_authorize_write", args)
+
+
+@pytest.mark.parametrize("changes", [
+    {"handle": "", "url": "https://[invalid"},                   # unmatched bracket
+    {"handle": "", "url": "https://[::1"},
+    {"handle": "", "url": "https://[invalid]/"},                 # not an IPv6 literal
+    {"handle": "", "url": "https://example.com\uff0fother/"},    # NFKC-invalid authority
+    {"url": "https://[bad/"},                                    # with a handle: never reaches the authority either
+    {"body": "\ud800"}, {"body": "\udfff"},                      # unpaired surrogates: not sendable as UTF-8
+    {"url": "https://api.stripe.com/v1/\ud800"},                 # ...nor in the URL or method sent to the authority
+    {"method": "PO\udfffST"}, {"handle": "", "url": "https://api.stripe.com/\udfff"},
+])
+def test_a_request_that_cannot_be_sent_is_request_invalid_and_sends_nothing(stripe, admitted_turn, changes):
+    with _acp_gate("once") as asked:
+        raw = _dispatch(**changes)
+    out = json.loads(raw)
+    assert (out["success"], out["error_type"]) == (False, "request_invalid") and "header" not in out
+    assert "Error" not in raw and "example.com" not in raw and "[" not in out["error"]
+    assert asked == [] and stripe.requests == []
+
+
+@pytest.mark.parametrize("handle,force,resolve", [
+    (STRIPE_HANDLE, None, (503, {"error": "service unavailable"})),
+    (STRIPE_HANDLE, None, (503, {"error": ["service unavailable"]})),
+    (STRIPE_HANDLE, None, (503, {"error": 1})),
+    (STRIPE_HANDLE, None, (503, {"error": {"code": ["CONTENT_INVALID"]}})),
+    (STRIPE_HANDLE, None, (503, {"error": {"code": {"value": "CONTENT_INVALID"}}})),
+    ("", (200, {"items": [_item(STRIPE, "api_key", ["https://api.stripe.com"]) | {"allowed_origins": 1}]}), None),
+    ("", (200, {"items": [_item(STRIPE, "api_key", ["https://api.stripe.com"]) | {"allowed_origins": True}]}), None),
+])
+def test_a_malformed_authority_answer_is_vault_unavailable_and_content_free(stripe, admitted_turn, handle, force,
+                                                                               resolve):
+    stripe.force, stripe.force_resolve = force, resolve
+    with _acp_gate("once") as asked:
+        raw = _dispatch(handle=handle)
+    out = json.loads(raw)
+    assert (out["success"], out["error_type"]) == (False, "vault_unavailable") and "header" not in out
+    assert "Error" not in raw and "service unavailable" not in raw and "CONTENT_INVALID" not in raw
+    assert asked == [] and len(stripe.requests) == 1
+
+
+def test_a_backend_that_cannot_be_selected_is_vault_unavailable(stripe, admitted_turn):
+    from agent.vault_backends import base
+
+    with patch.object(base, "enabled_backends", side_effect=RuntimeError("config text the model must not see")):
+        raw = _dispatch()
+    assert json.loads(raw)["error_type"] == "vault_unavailable" and "must not see" not in raw
+    assert stripe.requests == []
+
+
+@pytest.mark.parametrize("error", ["down", ["down"], 1, {"code": ["VAULT_ITEM_UNAVAILABLE"]}, {"code": {"x": 1}}])
+def test_a_malformed_error_envelope_is_unavailable_on_every_backend_path(api, monkeypatch, error):
+    """The shared ``_call`` parser: fill's get_meta and list_items see the same typed failure as the write tool."""
+    from agent.vault_backends.base import VaultUnavailable
+    from agent.vault_backends.weave import WeaveLoginBackend
+
+    monkeypatch.setenv("WEAVE_API_MCP_BEARER", ATTEMPT_BEARER)
+    api.force = (503, {"error": error})
+    backend = WeaveLoginBackend(api.url)
+    for call in (lambda: backend.get_meta(HANDLE), backend.list_items):
+        with pytest.raises(VaultUnavailable, match=r"^the Harso vault answered HTTP 503$"):
+            call()
