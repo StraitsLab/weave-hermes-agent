@@ -232,6 +232,9 @@ class TestLoadConfigParseFailure:
 
 
 _NULL_ROOTS = ["null\n", "~\n", "!!null null\n", "---\nnull\n...\n"]
+# A mapping NODE that constructs a set: passes a node-kind check, must still refuse.
+_SET_ROOTS = ["!!set {}\n", "!<tag:yaml.org,2002:set> {}\n", "%TAG !e! tag:yaml.org,2002:\n--- !e!set {}\n",
+              "\ufeff--- !!set\n{}\n...\n", "!!set {a: null}\n"]
 
 
 class TestLoadConfigStrict:
@@ -269,7 +272,7 @@ class TestLoadConfigStrict:
 
     @pytest.mark.parametrize("text", [
         "cron: [unclosed\n", "[1, 2]\n", "just a string\n",
-        *_NULL_ROOTS, "---\n", "a: 1\n---\nb: 2\n",
+        *_NULL_ROOTS, *_SET_ROOTS, "---\n", "a: 1\n---\nb: 2\n",
     ])
     def test_malformed_or_non_mapping_user_config_raises(self, tmp_path, text):
         from hermes_cli.config import load_config_strict
@@ -280,7 +283,7 @@ class TestLoadConfigStrict:
                 load_config_strict()
             assert isinstance(load_config(), dict)  # plain loader still fails open
 
-    @pytest.mark.parametrize("text", [*_NULL_ROOTS, "---\n", "a: 1\n---\nb: 2\n"])
+    @pytest.mark.parametrize("text", [*_NULL_ROOTS, *_SET_ROOTS, "---\n", "a: 1\n---\nb: 2\n"])
     def test_null_or_multi_document_managed_config_raises(self, tmp_path, text):
         from hermes_cli.config import load_config_strict
 

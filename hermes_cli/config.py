@@ -3801,7 +3801,10 @@ def _read_config_mapping_strict(path: Path) -> Dict[str, Any]:
                     return {}
                 if not isinstance(node, yaml.MappingNode):
                     raise TypeError(f"{path}: top-level YAML must be a mapping, got {node.tag}")
-                return loader.construct_document(node)
+                loaded = loader.construct_document(node)
+                if not isinstance(loaded, dict):  # a mapping node can still construct a set (`!!set {}`)
+                    raise TypeError(f"{path}: top-level YAML must construct a mapping, got {type(loaded).__name__}")
+                return loaded
             finally:
                 loader.dispose()
     except FileNotFoundError:
