@@ -124,6 +124,14 @@ def _vault_forget(session_key: str, target_id: str) -> None:
         _VAULT_ARMED.get(session_key, {}).pop(target_id, None)
 
 
+def vault_forget_task(task_id: str) -> None:
+    """The task's last browser session was retired and its browser died with it: every tab it armed is gone."""
+    bare = task_id.removesuffix("::local")
+    with _VAULT_ARMED_LOCK:
+        _VAULT_ARMED.pop(bare, None)
+        _VAULT_ARMED.pop(bare + "::local", None)
+
+
 def _is_dialog_bridge(url: str) -> bool:
     """Exactly the bridge origin ``http://hermes-dialog-bridge.invalid`` (never a lookalike, path or query)."""
     try:

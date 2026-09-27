@@ -281,6 +281,42 @@ def test_mutant_guard_removed_every_row_recovers_the_canary(harso, row):
         assert ROWS[row](d) == EXPECTED[row]
 
 
+@pytest.mark.parametrize("selector", ["env", "config"])
+@pytest.mark.parametrize("reader", ["console", "vision"])
+def test_a_cached_session_on_the_shared_browser_stays_guarded_after_the_override_is_removed(
+        harso, monkeypatch, reader, selector):
+    """Review r2 F1: two conversations attach to one Chrome, one fills, then the CDP override is removed from the env
+    or the config. The other conversation's cached session still drives that Chrome (lead ruling r2, decision 1b)."""
+    from hermes_cli.config import read_raw_config
+    from tools import browser_tool as bt
+
+    d = harso
+    cfg = read_raw_config()
+    if selector == "config":
+        cfg["browser"]["cdp_url"] = bt._get_cdp_override_raw()
+        _write_config(cfg)
+        monkeypatch.delenv("BROWSER_CDP_URL")
+    d.call("browser_navigate", task_id="another-conversation", url=f"{d.pages.origin()}/login")
+    d.fill()
+    assert bt._active_sessions["another-conversation"]["cdp_url"] == bt._active_sessions["default"]["cdp_url"]
+    if selector == "config":
+        cfg["browser"].pop("cdp_url")
+        _write_config(cfg)
+    else:
+        monkeypatch.delenv("BROWSER_CDP_URL")
+    assert not bt._get_cdp_override_raw() and not bt._use_real_profile()  # the config no longer selects it
+    if reader == "console":
+        out = d.call("browser_console", task_id="another-conversation",
+                     expression="btoa(unescape(encodeURIComponent(pw.value)))")
+        raw = out.get("result") if out.get("success") else None
+        assert (base64.b64decode(raw).decode("utf-8") if raw else None) is None
+    else:
+        out = d.call("browser_vision", task_id="another-conversation", question="What does the page show?")
+        assert [p for p in out.get("content") or [] if p.get("type") == "image_url"] == []
+    assert out.get("error_type") == "vault_armed", out
+    assert d.page_eval("pw.value") == CANARY  # refused, not because the value vanished
+
+
 def test_refusal_is_typed_and_never_names_the_value(harso):
     d = harso
     d.fill()

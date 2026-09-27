@@ -100,6 +100,86 @@ def test_a_browser_every_task_shares_is_armed_for_every_task(reg, shared, mode, 
 
 
 @pytest.fixture
+def sessions(monkeypatch):
+    """The browser tool's cached sessions (session key -> session_info), empty by default."""
+    from tools import browser_tool
+
+    cache = {}
+    monkeypatch.setattr(browser_tool, "_active_sessions", cache)
+    return cache
+
+
+def _boom():
+    raise OSError("config unreadable")
+
+
+@pytest.mark.parametrize("session_key", ["t2", "t2::local"])
+@pytest.mark.parametrize("config", ["off", "raises"])
+def test_a_cached_session_on_the_real_profile_browser_stays_shared_whatever_the_config(
+        reg, shared, sessions, monkeypatch, session_key, config):
+    """The config no longer selects the real-profile browser (or cannot be read), but t2's cached session still
+    drives it: t1's armed tab there is reachable from t2 (lead ruling r2, decision 1b)."""
+    from tools import browser_tool
+
+    sessions[session_key] = {"features": {"local": True, "real_profile": True}}
+    if config == "raises":
+        monkeypatch.setattr(browser_tool, "_use_real_profile", _boom)
+    _arm("t1")
+    out = _run(reg, "browser_console", {"expression": "pw.value"}, task_id="t2")
+    assert out.get("error_type") == "vault_armed" and "ran" not in out, out
+    del sessions[session_key]  # a task with no session on a shared browser keeps its own scope
+    if config == "off":
+        assert _run(reg, "browser_console", {"expression": "1"}, task_id="t2").get("ran") is True
+
+
+def test_a_failing_session_lookup_fails_closed(reg, sessions, monkeypatch):
+    from tools import browser_tool
+
+    class Broken:
+        def get(self, key):
+            raise RuntimeError("lookup failed")
+
+    _arm("t1")
+    monkeypatch.setattr(browser_tool, "_active_sessions", Broken())
+    out = _run(reg, "browser_vision", {"question": "?"}, task_id="t2")
+    assert out.get("error_type") == "vault_armed" and "ran" not in out, out
+
+
+def _cleanup(session_key, sessions, monkeypatch):
+    from tools import browser_tool
+
+    monkeypatch.setattr(browser_tool, "_stop_cdp_supervisor", lambda k: None)
+    monkeypatch.setattr(browser_tool, "_maybe_stop_recording", lambda k: None)
+    monkeypatch.setattr(browser_tool, "_run_browser_command", lambda *a, **k: {"success": True})
+    browser_tool._cleanup_single_browser_session(session_key)
+    assert session_key not in sessions
+
+
+def test_retiring_a_session_whose_browser_dies_with_it_disarms_its_tabs(reg, shared, sessions, monkeypatch):
+    sessions["t1"] = {"session_name": "", "bb_session_id": None, "features": {"local": True}}
+    sessions["t1::local"] = {"session_name": "", "bb_session_id": None, "features": {"local": True}}
+    _arm("t1")
+    _arm("t1::local", tab="T2")
+    _cleanup("t1", sessions, monkeypatch)
+    assert bs.vault_armed("t1")  # the sidecar is still alive and may hold the tab
+    _cleanup("t1::local", sessions, monkeypatch)
+    assert not bs.vault_armed("t1") and not bs.vault_armed(None)
+    shared["cdp"] = "ws://127.0.0.1:9222/devtools/browser/x"  # another task on a shared browser is not refused
+    assert _run(reg, "browser_console", {"expression": "1"}, task_id="t2").get("ran") is True
+
+
+@pytest.mark.parametrize("features", [{"cdp_override": True}, {"local": True, "real_profile": True}])
+def test_retiring_a_session_on_a_shared_browser_keeps_its_tabs_armed(reg, shared, sessions, monkeypatch, features):
+    """The shared browser outlives the session, and the filled tab with it (lead ruling r2, decision 2)."""
+    sessions["t1"] = {"session_name": "", "bb_session_id": None, "features": features}
+    _arm("t1")
+    _cleanup("t1", sessions, monkeypatch)
+    shared["cdp"] = "ws://127.0.0.1:9222/devtools/browser/x"
+    out = _run(reg, "browser_console", {"expression": "1"}, task_id="t2")
+    assert out.get("error_type") == "vault_armed" and "ran" not in out, out
+
+
+@pytest.fixture
 def sup(monkeypatch):
     """A real CDPSupervisor on a real loop; only the CDP wire is stubbed (the frame tree the tab shows now)."""
     monkeypatch.setattr(bs, "_VAULT_ARMED", {})

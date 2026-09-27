@@ -6006,6 +6006,17 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         with _cleanup_lock:
             _active_sessions.pop(task_id, None)
             _session_last_activity.pop(task_id, None)
+            # Fork (V-9d): a browser that dies with this session takes its vault-filled tabs with it; a CDP override
+            # or the real-profile browser outlives the session, so its armed tabs stay armed. While another session
+            # of the task is alive it may be the one holding the tab: keep the state until the last one goes.
+            features = session_info.get("features") or {}
+            bare = _bare_task_id_for_session_key(task_id)
+            browser_died = not (features.get("cdp_override") or features.get("real_profile")) and not any(
+                k in _active_sessions for k in (bare, bare + _LOCAL_SUFFIX))
+        if browser_died:
+            from tools.browser_supervisor import vault_forget_task
+
+            vault_forget_task(bare)
 
         # Cloud mode: close the cloud browser session via provider API.
         # Local sidecars have bb_session_id=None so this no-ops for them.
