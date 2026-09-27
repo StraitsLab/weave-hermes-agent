@@ -102,7 +102,10 @@ DIALOG_BRIDGE_URL_PATTERN = f"http://{DIALOG_BRIDGE_HOST}/*"
 # back in a form no redaction recognises. registry.dispatch refuses model-driven eval/screenshot calls on an armed
 # tab (tools.registry._vault_armed_refusal). State per browser session key -> tab target id (= its main frame id)
 # -> [the main frame's current loaderId, the loaderIds whose document received a value, whether the tab lives in a
-# browser that outlives the session (a CDP override or the real profile; unknown counts)]. The tab is armed while its
+# browser that outlives the session (a CDP override or the real profile; unknown counts), the CDP endpoint of the
+# browser that holds it (in memory only, never logged: it can carry a ?token=)]. Only a supervisor on that same
+# endpoint reconciles the record (prune, close, new document); a tab absent from another browser is not closed, so an
+# endpoint that never reattaches keeps its tabs armed for the life of the process. The tab is armed while its
 # current document is one that received a value: a new document disarms it, a same-document (hash/pushState)
 # navigation does not, and a back/forward-cache restore of a filled document re-arms it.
 _VAULT_ARMED: Dict[str, Dict[str, list]] = {}
@@ -119,10 +122,17 @@ def vault_armed(task_id: Optional[str], target_id: Optional[str] = None) -> bool
                    for tid, tab in tabs.items() if target_id is None or tid == target_id)
 
 
-def _vault_forget(session_key: str, target_id: str) -> None:
-    """The tab closed: its vault state goes with it."""
+def _vault_record(session_key: str, target_id: str, endpoint: str) -> Optional[list]:
+    """The tab's record if the browser at ``endpoint`` holds it (call under _VAULT_ARMED_LOCK)."""
+    tab = _VAULT_ARMED.get(session_key, {}).get(target_id)
+    return tab if tab is not None and tab[3] is not None and tab[3] == endpoint else None
+
+
+def _vault_forget(session_key: str, target_id: str, endpoint: str) -> None:
+    """The tab closed in the browser at ``endpoint``: its vault state goes with it."""
     with _VAULT_ARMED_LOCK:
-        _VAULT_ARMED.get(session_key, {}).pop(target_id, None)
+        if _vault_record(session_key, target_id, endpoint) is not None:
+            del _VAULT_ARMED[session_key][target_id]
 
 
 def vault_forget_session(session_key: str) -> None:
@@ -700,7 +710,7 @@ class CDPSupervisor:
         frame = fut.result(timeout=timeout + 1)["result"]["frameTree"]["frame"]
         shared = _browser_outlives_session(self.task_id)
         with _VAULT_ARMED_LOCK:
-            tab = _VAULT_ARMED.setdefault(self.task_id, {}).setdefault(frame["id"], [None, set(), False])
+            tab = _VAULT_ARMED.setdefault(self.task_id, {}).setdefault(frame["id"], [None, set(), False, self.cdp_url])
             tab[0] = frame["loaderId"]
             tab[1].add(frame["loaderId"])
             tab[2] = tab[2] or shared
@@ -953,12 +963,15 @@ class CDPSupervisor:
         await self._cdp("Target.setDiscoverTargets", {"discover": True})  # Target.targetDestroyed = a tab closed
         targets = resp.get("result", {}).get("targetInfos", [])
         # A supervisor stop does not disarm (an external CDP browser outlives it with the value still in the tab);
-        # tabs that are gone by the next attach are forgotten here (fork, V-9d).
+        # tabs of THIS browser that are gone by the next attach are forgotten here (fork, V-9d).
         live = {t.get("targetId") for t in targets}
         with _VAULT_ARMED_LOCK:
             tabs = _VAULT_ARMED.get(self.task_id, {})
-            for gone in [tid for tid in tabs if tid not in live]:
+            for gone in [tid for tid in tabs if tid not in live and _vault_record(self.task_id, tid, self.cdp_url)]:
                 del tabs[gone]
+            foreign = sum(tab[3] != self.cdp_url for tab in tabs.values())
+        if foreign:
+            logger.info("vault: session %s keeps %d armed tab(s) of another browser", self.task_id, foreign)
         page_target = next((t for t in targets if t.get("type") == "page"), None)
         if page_target is None:
             created = await self._cdp("Target.createTarget", {"url": "about:blank"})
@@ -1122,7 +1135,7 @@ class CDPSupervisor:
         elif method == "Target.detachedFromTarget":
             self._on_target_detached(params)
         elif method == "Target.targetDestroyed" and params.get("targetId"):  # a tab closed (fork, V-9d)
-            _vault_forget(self.task_id, params["targetId"])
+            _vault_forget(self.task_id, params["targetId"], self.cdp_url)
         elif method == "Runtime.consoleAPICalled":
             self._on_console(params, level_from="api")
         elif method == "Runtime.exceptionThrown":
@@ -1499,7 +1512,7 @@ class CDPSupervisor:
             )
             self._frames[frame_id] = info
         with _VAULT_ARMED_LOCK:  # an armed tab's main frame committed a document: the tab now shows that one (V-9d)
-            tab = _VAULT_ARMED.get(self.task_id, {}).get(frame_id)  # keyed by main frame id: subframes never match
+            tab = _vault_record(self.task_id, frame_id, self.cdp_url)  # keyed by main frame id: subframes never match
             if tab is not None:
                 tab[0] = frame.get("loaderId")
 

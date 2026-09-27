@@ -417,3 +417,47 @@ def test_retiring_a_local_sidecar_never_disarms_the_shared_browser_tab(harso, mo
     raw = ((out.get("result") or {}).get("result") or {}).get("value")
     assert (base64.b64decode(raw).decode("utf-8") if raw else None) is None
     assert out.get("error_type") == "vault_armed", out
+
+
+@pytest.mark.parametrize("selector", ["env", "config"])
+def test_a_local_refill_under_the_same_key_never_prunes_the_shared_browser_tab(harso, monkeypatch, selector):
+    """Review r4: default fills a tab in the shared Chrome and is retired; the override is removed, and default is
+    reused for a real local agent-browser that fills again. That browser's attach must not prune the shared tab (it is
+    absent from ANOTHER browser's list, not closed), so once the local session is retired too, another conversation
+    naming the shared tab's target id is still refused (lead ruling 3, decisions 1-2)."""
+    from hermes_cli.config import read_raw_config
+    from tools import browser_supervisor as bs
+    from tools import browser_tool as bt
+
+    d = harso
+    cfg = read_raw_config()
+    if selector == "config":
+        cfg["browser"]["cdp_url"] = bt._get_cdp_override_raw()
+        _write_config(cfg)
+        monkeypatch.delenv("BROWSER_CDP_URL")
+    monkeypatch.setattr(bt, "_verify_reapable_browser_daemon", lambda *a, **k: False)  # as in the r3 row above
+    d.fill()
+    target = d.page_target()
+    shared_url = bt._active_sessions["default"]["cdp_url"]
+    bt._cleanup_single_browser_session("default")
+    assert bs.vault_armed("default", target)
+    if selector == "env":
+        monkeypatch.delenv("BROWSER_CDP_URL")
+    else:
+        cfg["browser"].pop("cdp_url")
+        _write_config(cfg)
+    local_origin = d.pages.origin("127.0.0.1")
+    item = d.api.items[HANDLE.removeprefix("wv:")]
+    item["origin"], item["allowed_origins"] = local_origin, [local_origin]
+    assert d.call("browser_navigate", url=local_origin + "/login").get("success")
+    assert bt._active_sessions["default"]["features"].get("local")
+    assert d.call("browser_vault_fill", handle=HANDLE).get("success")
+    assert d.page_eval("pw.value") == CANARY  # the local browser really filled (its attach ran)
+    assert bs.vault_armed("default", target)  # the local attach kept the shared browser's tab
+    bt._cleanup_single_browser_session("default")
+    monkeypatch.setenv("BROWSER_CDP_URL", shared_url)
+    out = d.call("browser_cdp", task_id="another-conversation", method="Runtime.evaluate", target_id=target,
+                 params={"expression": "btoa(unescape(encodeURIComponent(pw.value)))", "returnByValue": True})
+    raw = ((out.get("result") or {}).get("result") or {}).get("value")
+    assert (base64.b64decode(raw).decode("utf-8") if raw else None) is None
+    assert out.get("error_type") == "vault_armed", out

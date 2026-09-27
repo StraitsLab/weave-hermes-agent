@@ -52,8 +52,8 @@ def reg(monkeypatch, shared):
     return r
 
 
-def _arm(session_key, tab="T1", loader="L1", shared=False):
-    bs._VAULT_ARMED.setdefault(session_key, {})[tab] = [loader, {loader}, shared]
+def _arm(session_key, tab="T1", loader="L1", shared=False, endpoint="ws://x"):
+    bs._VAULT_ARMED.setdefault(session_key, {})[tab] = [loader, {loader}, shared, endpoint]
 
 
 def _run(reg, name, args, task_id="t1"):
@@ -80,7 +80,7 @@ def test_a_local_sidecar_tab_arms_the_task_and_other_tasks_are_untouched(reg):
     _arm("t1::local")
     assert _run(reg, "browser_console", {"expression": "1"})["error_type"] == "vault_armed"
     assert _run(reg, "browser_console", {"expression": "1"}, task_id="t2").get("ran") is True
-    bs._vault_forget("t1::local", "T1")  # the tab closed
+    bs._vault_forget("t1::local", "T1", "ws://x")  # the tab closed
     assert _run(reg, "browser_console", {"expression": "1"}).get("ran") is True
 
 
@@ -316,3 +316,51 @@ def test_the_guard_reads_which_browser_is_selected_from_the_env_and_config(monke
     monkeypatch.setenv("BROWSER_CDP_URL", env)
     monkeypatch.setattr(config, "read_raw_config", lambda: {"browser": browser_cfg})
     assert browser_tool._shared_browser_selected() is expected
+
+
+class _AttachStop(Exception):
+    pass
+
+
+def _attach(endpoint, live):
+    """A real supervisor on ``endpoint`` runs its initial attach against a browser whose tabs are ``live``."""
+    s = bs.CDPSupervisor("t1", endpoint)
+
+    async def cdp(method, params=None, session_id=None, **kwargs):
+        if method == "Target.getTargets":
+            return {"result": {"targetInfos": [{"targetId": t, "type": "page"} for t in live]}}
+        if method == "Target.setDiscoverTargets":
+            return {}
+        raise _AttachStop(method)  # the vault reconcile is done; the rest of the attach is not under test
+
+    s._cdp = cdp
+    with pytest.raises(_AttachStop):
+        asyncio.run(s._attach_initial_page())
+
+
+@pytest.mark.parametrize("endpoint,retained", [
+    ("ws://x", False),        # (a) this browser's tab is gone: pruned (so not everything is kept)
+    ("ws://other", True),     # (b) a tab absent from ANOTHER browser is not a closed tab
+    (None, True)])            # (c) unknown provenance: never reconciled
+def test_an_attach_prunes_only_its_own_browsers_gone_tabs(monkeypatch, caplog, endpoint, retained):
+    """Review r4: a session key reused for another browser must not prune the first browser's armed tab (lead
+    ruling 3, decision 2)."""
+    monkeypatch.setattr(bs, "_VAULT_ARMED", {})
+    _arm("t1", shared=True, endpoint=endpoint)
+    with caplog.at_level("INFO", logger=bs.logger.name):
+        _attach("ws://x", live=["T9"])
+    assert bs.vault_armed("t1", "T1") is retained
+    assert ("keeps 1 armed tab(s) of another browser" in caplog.text) is retained
+    assert "ws://other" not in caplog.text  # the endpoint may carry a token: never logged
+
+
+@pytest.mark.parametrize("endpoint", ["ws://x", "ws://other"])
+def test_close_and_new_document_events_act_only_on_their_own_browsers_tabs(monkeypatch, endpoint):
+    """(d) Target.targetDestroyed / Page.frameNavigated from a supervisor on another browser leave the tab armed."""
+    monkeypatch.setattr(bs, "_VAULT_ARMED", {})
+    s = bs.CDPSupervisor("t1", endpoint)
+    for method, params in (("Page.frameNavigated", {"frame": {"id": "T1", "loaderId": "L2"}}),
+                           ("Target.targetDestroyed", {"targetId": "T1"})):
+        _arm("t1")  # armed in the browser at ws://x
+        asyncio.run(s._on_event(method, params, "PAGE"))
+        assert bs.vault_armed("t1", "T1") is (endpoint != "ws://x"), method
