@@ -11,9 +11,13 @@ except in the non-root-owner case, which leaves the production value.
 import hashlib
 import json
 import os
+import sys
 
 import pytest
 import yaml
+
+# uid ownership, mode bits and symlinks are POSIX semantics.
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX ownership checks")
 
 
 @pytest.fixture
@@ -38,24 +42,24 @@ def platform_root(tmp_path, monkeypatch):
     root = tmp_path / "platform-scripts"
     root.mkdir(mode=0o755)
     os.chmod(root, 0o755)
-    monkeypatch.setattr(scheduler, "_PLATFORM_SCRIPT_OWNER_UID", os.getuid())
+    monkeypatch.setattr(scheduler, "_PLATFORM_SCRIPT_OWNER_UID", os.getuid())  # windows-footgun: ok
     return root
 
 
 def _config(home, **cron):
-    (home / "config.yaml").write_text(yaml.safe_dump({"cron": cron}))
+    (home / "config.yaml").write_text(yaml.safe_dump({"cron": cron}), encoding="utf-8")
 
 
 def _platform_script(root, name="tick.py", body='print("platform ran")\n'):
     path = root / name
-    path.write_text(body)
+    path.write_text(body, encoding="utf-8")
     os.chmod(path, 0o555)
     return path
 
 
 def _tenant_script(home, marker):
     path = home / "scripts" / "tenant.py"
-    path.write_text(f"open({str(marker)!r}, 'w').close()\nprint('tenant ran')\n")
+    path.write_text(f"open({str(marker)!r}, 'w').close()\nprint('tenant ran')\n", encoding="utf-8")
     return path
 
 
@@ -112,7 +116,7 @@ def test_no_agent_platform_job_runs_end_to_end(home, platform_root):
 def test_malformed_platform_name_refused(home, platform_root, ref):
     from cron.scheduler import _run_job_script
 
-    (platform_root / "x.py").write_text("print(1)\n")
+    (platform_root / "x.py").write_text("print(1)\n", encoding="utf-8")
     _config(home, platform_script_root=str(platform_root))
 
     ok, out = _run_job_script(ref)
@@ -139,7 +143,7 @@ def test_platform_non_root_owner_refused(home, platform_root, monkeypatch):
     _config(home, platform_script_root=str(platform_root))
     # Production owner uid; this test process is not uid 0.
     monkeypatch.setattr(scheduler, "_PLATFORM_SCRIPT_OWNER_UID", 0)
-    assert os.getuid() != 0
+    assert os.getuid() != 0  # windows-footgun: ok
 
     ok, out = scheduler._run_job_script("platform:tick.py")
     assert ok is False
@@ -289,7 +293,7 @@ def test_stock_defaults_are_declared():
 def test_cronjob_tool_refuses_tenant_script_when_allow_scripts_false(home):
     from tools.cronjob_tools import cronjob
 
-    (home / "scripts" / "tenant.py").write_text("print(1)\n")
+    (home / "scripts" / "tenant.py").write_text("print(1)\n", encoding="utf-8")
     _config(home, allow_scripts=False)
 
     result = json.loads(cronjob(
@@ -304,7 +308,7 @@ def test_cronjob_tool_refuses_tenant_script_update_when_allow_scripts_false(home
     from cron.jobs import create_job
     from tools.cronjob_tools import cronjob
 
-    (home / "scripts" / "tenant.py").write_text("print(1)\n")
+    (home / "scripts" / "tenant.py").write_text("print(1)\n", encoding="utf-8")
     job = create_job(prompt="hello", schedule="every 5m", deliver="local")
     _config(home, allow_scripts=False)
 

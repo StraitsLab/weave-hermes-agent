@@ -12,6 +12,7 @@ Covers:
 
 import asyncio
 import logging
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -975,6 +976,7 @@ class TestCronPromptScanParity:
 # PATCH can never set script or no_agent.
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX ownership checks")
 class TestPlatformScriptJobs:
     @pytest.fixture
     def platform_home(self, tmp_path, monkeypatch):
@@ -986,17 +988,17 @@ class TestPlatformScriptJobs:
 
         home = tmp_path / ".hermes"
         (home / "scripts").mkdir(parents=True)
-        (home / "scripts" / "tenant.py").write_text("print(1)\n")
+        (home / "scripts" / "tenant.py").write_text("print(1)\n", encoding="utf-8")
         root = tmp_path / "platform-scripts"
         root.mkdir()
         os.chmod(root, 0o755)
-        (root / "tick.py").write_text("print('tick')\n")
+        (root / "tick.py").write_text("print('tick')\n", encoding="utf-8")
         os.chmod(root / "tick.py", 0o555)
         (home / "config.yaml").write_text(yaml.safe_dump({"cron": {
             "allow_scripts": False, "platform_script_root": str(root),
         }}))
         monkeypatch.setenv("HERMES_HOME", str(home))
-        monkeypatch.setattr(scheduler, "_PLATFORM_SCRIPT_OWNER_UID", os.getuid())
+        monkeypatch.setattr(scheduler, "_PLATFORM_SCRIPT_OWNER_UID", os.getuid())  # windows-footgun: ok
         return home
 
     async def _post(self, adapter, body):
@@ -1035,7 +1037,7 @@ class TestPlatformScriptJobs:
     async def test_create_refuses_tenant_script_even_when_allow_scripts_true(
         self, adapter, platform_home,
     ):
-        (platform_home / "config.yaml").write_text("cron: {}\n")
+        (platform_home / "config.yaml").write_text("cron: {}\n", encoding="utf-8")
         status, _data, mock_create = await self._post(
             adapter, {"script": "tenant.py", "no_agent": True},
         )
