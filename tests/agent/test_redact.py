@@ -1136,9 +1136,9 @@ class TestVaultValueEncodedForms:
 
 
 _TIMED_SCRUB = """
-import sys, time
+import json, sys, time
 from agent import redact
-values, text = eval(sys.argv[1]), eval(sys.argv[2])
+values, text = json.load(sys.stdin)
 for v in values:
     redact.register_vault_redaction_value(v)
 start = time.monotonic()
@@ -1161,10 +1161,12 @@ class TestVaultValueScrubIsBoundedTime:
         ([f"p{i}\\\\\\x/y" for i in range(8)], ("\\" * 40 + "/") * 2_500),  # 8 registrations, 100KB
     ], ids=["1bs-100k", "2bs-1k", "8bs-40", "8bs-1k", "mixed", "prefix", "8regs-100k"])
     def test_near_miss_output_is_scrubbed_in_bounded_time(self, values, text):
+        import json
         import subprocess
         import sys
 
-        proc = subprocess.run([sys.executable, "-c", _TIMED_SCRUB, repr(values), repr(text)],
+        # The payload goes on stdin: Linux rejects a single argv string over 128KB (E2BIG) before the child starts.
+        proc = subprocess.run([sys.executable, "-c", _TIMED_SCRUB], input=json.dumps([values, text]),
                               capture_output=True, text=True, timeout=10)
         assert proc.returncode == 0, proc.stderr
         assert float(proc.stdout) < 0.5
