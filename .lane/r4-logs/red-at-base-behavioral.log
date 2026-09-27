@@ -1,0 +1,14 @@
+F...F...FFFFFFFFF                                                        [100%]
+=========================== short test summary info ============================
+FAILED tests/plugins/memory/test_harso_copilot_r4_base.py::test_r4_stamped_first_composition_rechecks_live_switch[delivery-True-False]
+FAILED tests/plugins/memory/test_harso_copilot_r4_base.py::test_r4_stamped_first_composition_rechecks_live_switch[items-True-False]
+FAILED tests/plugins/memory/test_harso_copilot_r4_base.py::test_r4_unstamped_first_composition_rechecks_live_switch[delivery-True-False]
+FAILED tests/plugins/memory/test_harso_copilot_r4_base.py::test_r4_unstamped_first_composition_rechecks_live_switch[delivery-True-True]
+FAILED tests/plugins/memory/test_harso_copilot_r4_base.py::test_r4_unstamped_first_composition_rechecks_live_switch[delivery-False-False]
+FAILED tests/plugins/memory/test_harso_copilot_r4_base.py::test_r4_unstamped_first_composition_rechecks_live_switch[delivery-False-True]
+FAILED tests/plugins/memory/test_harso_copilot_r4_base.py::test_r4_unstamped_first_composition_rechecks_live_switch[items-True-False]
+FAILED tests/plugins/memory/test_harso_copilot_r4_base.py::test_r4_unstamped_first_composition_rechecks_live_switch[items-True-True]
+FAILED tests/plugins/memory/test_harso_copilot_r4_base.py::test_r4_unstamped_first_composition_rechecks_live_switch[items-False-False]
+FAILED tests/plugins/memory/test_harso_copilot_r4_base.py::test_r4_unstamped_first_composition_rechecks_live_switch[items-False-True]
+FAILED tests/plugins/memory/test_harso_copilot_r4_base.py::test_r4_origin_is_per_prefetch_and_covers_the_legacy_item_fallback
+11 failed, 6 passed, 7 deselected in 9.26s

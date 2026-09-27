@@ -1,0 +1,16 @@
+
+==================================== ERRORS ====================================
+________ ERROR collecting tests/plugins/memory/test_harso_copilot_r4.py ________
+ImportError while importing test module '/private/var/folders/91/mj7wcwxn5l3_f27z17yxckkw0000gn/T/k-r4/base/tests/plugins/memory/test_harso_copilot_r4.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/Users/abbhinnav/.local/share/uv/python/cpython-3.11-macos-aarch64-none/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/plugins/memory/test_harso_copilot_r4.py:15: in <module>
+    from agent.turn_context import build_turn_context, withhold_off_origin_memory
+E   ImportError: cannot import name 'withhold_off_origin_memory' from 'agent.turn_context' (/private/var/folders/91/mj7wcwxn5l3_f27z17yxckkw0000gn/T/k-r4/base/agent/turn_context.py)
+=========================== short test summary info ============================
+ERROR tests/plugins/memory/test_harso_copilot_r4.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.36s

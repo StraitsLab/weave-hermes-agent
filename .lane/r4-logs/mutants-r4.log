@@ -1,0 +1,19 @@
+control 0 1361 passed, 2 skipped, 1 xfailed in 50.19s
+a_stamped_recheck_removed
+  KILLED
+  2 failed, 1359 passed, 2 skipped, 1 xfailed in 53.97s
+  tests/plugins/memory/test_harso_copilot_r4.py::test_r4_stamped_first_composition_rechecks_live_switch[delivery-True-False]
+  tests/plugins/memory/test_harso_copilot_r4.py::test_r4_stamped_first_composition_rechecks_live_switch[items-True-False]
+b_unstamped_recheck_removed
+  KILLED
+  2 failed, 1359 passed, 2 skipped, 1 xfailed in 53.81s
+  tests/plugins/memory/test_harso_copilot_r4.py::test_r4_unstamped_first_composition_rechecks_live_switch[delivery-True-False]
+  tests/plugins/memory/test_harso_copilot_r4.py::test_r4_unstamped_first_composition_rechecks_live_switch[items-True-False]
+c_origin_from_delivery_marker_only
+  KILLED
+  5 failed, 1356 passed, 2 skipped, 1 xfailed in 54.64s
+  tests/plugins/memory/test_harso_copilot_r4.py::test_r4_stamped_first_composition_rechecks_live_switch[items-True-False]
+  tests/plugins/memory/test_harso_copilot_r4.py::test_r4_unstamped_first_composition_rechecks_live_switch[items-True-False]
+  tests/plugins/memory/test_harso_copilot_r4.py::test_r4_withhold_helper_contract[True-False-False]
+  tests/plugins/memory/test_harso_copilot_r4.py::test_r4_withhold_helper_contract[True-live4-False]
+  tests/plugins/memory/test_harso_copilot_r4.py::test_r4_withhold_helper_contract[origin5-True-False]
