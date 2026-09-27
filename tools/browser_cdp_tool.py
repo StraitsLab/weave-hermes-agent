@@ -565,6 +565,15 @@ def browser_cdp(
     safe_timeout = max(1.0, min(safe_timeout, 300.0))
 
     try:
+        # Web Bot Auth (fork, AB-2): the registry lookup applies browser.web_bot_auth to the task's live
+        # supervisor before this raw call can make the browser send requests.
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
+
+        SUPERVISOR_REGISTRY.get(effective_task_id)
+    except ImportError:  # pragma: no cover - defensive
+        pass
+
+    try:
         result = _run_async(
             _cdp_call(endpoint, method, call_params, target_id, safe_timeout)
         )

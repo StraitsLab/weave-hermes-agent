@@ -8,6 +8,7 @@ hop and a subresource must all arrive signed. It needs ``HERMES_E2E_BROWSER=1`` 
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import http.server
 import json
@@ -274,31 +275,138 @@ def test_only_the_dialog_bridge_origin_is_exempt(url, bridge):
 # ── Live sessions follow the flag ────────────────────────────────────────────
 
 
-def test_a_reused_supervisor_and_vault_reuse_take_the_current_flag(config, hook, monkeypatch):
+class _LiveStub:
+    """A registered supervisor as the registry sees it: records what the flag reconciliation applies, in order
+    with the command the caller then runs on it."""
+
+    cdp_url = "ws://x"
+    _loop = type("L", (), {"is_running": lambda self: True})()
+
+    def __init__(self):
+        self.calls = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._stop.wait, daemon=True)  # the supervisor's own loop thread
+        self._thread.start()
+
+    def set_request_signer(self, signer):
+        self.calls.append(("reconcile", type(signer).__name__))
+
+    def evaluate_runtime(self, expression):
+        self.calls.append(("evaluate", expression))
+        return {"ok": True, "result": 1, "result_type": "number"}
+
+    def respond_to_dialog(self, **kwargs):
+        self.calls.append(("dialog", kwargs["action"]))
+        return {"ok": True}
+
+    def snapshot(self):
+        return type("S", (), {"frame_tree": {"top": {"frame_id": "F1", "session_id": "S1"}}})()
+
+    async def _cdp(self, method, params, **kwargs):
+        self.calls.append(("frame-cdp", method))
+        return {"result": {}}
+
+
+@pytest.fixture
+def live(config, hook, monkeypatch):
     from tools import browser_supervisor as bs
-    from tools import browser_vault_tool
-
-    applied = []
-
-    class Live:
-        cdp_url = "ws://x"
-        _thread = threading.current_thread()
-        _loop = type("L", (), {"is_running": lambda self: True})()
-
-        def set_request_signer(self, signer):
-            applied.append(signer)
 
     registry = bs._SupervisorRegistry()
-    registry._by_task["t"] = live = Live()
+    registry._by_task["t"] = stub = _LiveStub()
     monkeypatch.setattr(bs, "SUPERVISOR_REGISTRY", registry)
     hook.append(lambda: _TestSigner())
+    yield registry, stub
+    stub._stop.set()
+
+
+def test_a_reused_supervisor_and_vault_reuse_take_the_current_flag(config, live):
+    from tools import browser_vault_tool
+
+    registry, stub = live
     config["browser"]["web_bot_auth"] = True
-    assert registry.get_or_start("t", "ws://x") is live
+    assert registry.get_or_start("t", "ws://x") is stub
     config["browser"]["web_bot_auth"] = False
-    assert registry.get_or_start("t", "ws://x") is live
+    assert registry.get_or_start("t", "ws://x") is stub
     config["browser"]["web_bot_auth"] = True
-    assert browser_vault_tool._ensure_supervisor("t") is live
-    assert [type(s) for s in applied] == [wba.RequestSigner, type(None), wba.RequestSigner]
+    assert browser_vault_tool._ensure_supervisor("t") is stub
+    assert stub.calls == [("reconcile", "RequestSigner"), ("reconcile", "NoneType"), ("reconcile", "RequestSigner")]
+
+
+def _console(task):
+    from tools import browser_tool
+
+    browser_tool.browser_console(expression="1", task_id=task)
+
+
+def _cdp_frame(task):
+    from tools import browser_cdp_tool
+
+    browser_cdp_tool.browser_cdp("Runtime.evaluate", {"expression": "1"}, frame_id="F1", task_id=task)
+
+
+def _cdp_raw(task):
+    from tools import browser_cdp_tool
+
+    browser_cdp_tool.browser_cdp("Target.createTarget", {"url": "about:blank"}, task_id=task)
+
+
+def _dialog(task):
+    from tools import browser_dialog_tool
+
+    browser_dialog_tool.browser_dialog("accept", task_id=task)
+
+
+def _vault_eval(task):
+    from tools import browser_vault_tool
+
+    browser_vault_tool._eval_js(task, "1")
+
+
+@pytest.mark.parametrize("command", [_console, _cdp_frame, _cdp_raw, _dialog, _vault_eval],
+                         ids=["console", "cdp-frame", "cdp-raw", "dialog", "vault-eval"])
+def test_every_command_applies_the_current_flag_to_the_live_session_first(config, live, monkeypatch, command):
+    """F2-A: a flag flip takes effect at the next tool command, whichever tool it is, in both directions."""
+    from tools import browser_cdp_tool, browser_dialog_tool, browser_tool
+
+    registry, stub = live
+    monkeypatch.setattr(browser_dialog_tool, "SUPERVISOR_REGISTRY", registry)
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(browser_tool, "_last_session_key", lambda task_id: "t")
+    monkeypatch.setattr(browser_tool, "_eval_ssrf_guard_active", lambda task_id: False)
+    monkeypatch.setattr(browser_cdp_tool, "_resolve_cdp_endpoint", lambda: "ws://x")
+
+    async def raw_call(*args):
+        stub.calls.append(("raw-cdp", args[1]))
+        return {}
+
+    monkeypatch.setattr(browser_cdp_tool, "_cdp_call", raw_call)
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    stub._loop = loop  # the frame route dispatches onto the supervisor loop
+    try:
+        for flag, applied in ((True, "RequestSigner"), (False, "NoneType")):
+            config["browser"]["web_bot_auth"] = flag
+            stub.calls.clear()
+            command("t")
+            assert len(stub.calls) >= 2 and stub.calls[0] == ("reconcile", applied), stub.calls  # then the command
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+def test_a_lookup_on_the_supervisor_loop_thread_does_not_reconcile_or_block(config, live):
+    """``set_request_signer`` waits on the supervisor loop; a lookup from that loop must not (it would deadlock)."""
+    registry, stub = live
+    config["browser"]["web_bot_auth"] = True
+    stub.set_request_signer = lambda signer: stub.calls.append("reconcile") or threading.Event().wait()  # would hang
+    stub._stop.set()
+    stub._thread.join(1)
+    box = []
+    stub._thread = threading.Thread(target=lambda: box.append(registry.get("t")), daemon=True)
+    stub._thread.start()
+    stub._thread.join(2)
+    assert box == [stub] and stub.calls == []
+    stub.set_request_signer = lambda signer: stub.calls.append("reconcile")  # control: another thread reconciles
+    assert registry.get("t") is stub and stub.calls == ["reconcile"]
 
 
 # ── E2E: real Chrome, real supervisor, verifying server ──────────────────────
@@ -359,15 +467,46 @@ def _tls_context():
 
 
 def _verdict(headers, public_key):
-    """From the raw headers the server received: ``absent`` (none of the three), ``signed`` (verifies against the
-    authority this server sees, from Host) or ``invalid`` (anything else, including a partial set)."""
-    if not any(headers.get(name) for name in wba.SIGNED_HEADERS):
+    """From the raw headers the server received: ``absent`` (none of the three present, whatever their values),
+    ``signed`` (verifies against the authority this server sees, from Host) or ``invalid`` (anything else,
+    including an empty value or a partial set)."""
+    present = {name.lower() for name in headers.keys()}
+    if not present & {name.lower() for name in wba.SIGNED_HEADERS}:
         return "absent"
     try:
         _verify(headers, headers["Host"], public_key)
         return "signed"
     except Exception:
         return "invalid"
+
+
+def _message(**headers):
+    from email.message import Message
+
+    message = Message()
+    for name, value in headers.items():
+        message[name.replace("_", "-")] = value
+    return message
+
+
+def test_the_verdict_counts_a_header_as_present_whatever_its_value():
+    """F4: the oracle every negative test shares. ``absent`` means no WBA header by name, not no WBA value."""
+    signer = _TestSigner()
+    key = signer.private.public_key()
+    good = wba.RequestSigner(signer).headers("http://example.com/")
+    empty = dict.fromkeys(wba.SIGNED_HEADERS, "")
+    cases = [
+        (_message(Host="example.com"), "absent"),
+        (_message(Host="example.com", **{k.replace("-", "_"): v for k, v in good.items()}), "signed"),
+        (_message(Host="example.com", **{k.replace("-", "_"): v for k, v in empty.items()}), "invalid"),
+        (_message(Host="example.com", Signature=""), "invalid"),
+        (_message(Host="example.com", Signature_Agent=good["Signature-Agent"]), "invalid"),
+        (_message(Host="example.com", **{"signature_input": good["Signature-Input"]}), "invalid"),
+        (_message(Host="example.com", **{"SIGNATURE": good["Signature"]}), "invalid"),
+        (_message(Host="example.com", Signature="sig1=:AAAA:", Signature_Input=good["Signature-Input"],
+                  Signature_Agent=good["Signature-Agent"]), "invalid"),
+    ]
+    assert [_verdict(headers, key) for headers, _ in cases] == [want for _, want in cases]
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -539,6 +678,171 @@ def test_a_failing_signer_lets_requests_through_unsigned_and_logs(chrome, config
         assert f"signing failed ({name}); request continues unsigned" in caplog.text
     finally:
         release.set()
+        server.shutdown()
+
+
+def _wait_for(server, path, timeout=6.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and path not in dict(server.seen):
+        time.sleep(0.05)
+    return dict(server.seen).get(path)
+
+
+@e2e
+@pytest.mark.integration
+@pytest.mark.parametrize("tool", ["console", "cdp"])
+def test_console_and_raw_cdp_commands_follow_the_flag_in_both_directions(chrome, config, hook, registry, monkeypatch,
+                                                                         tool):
+    """F2-A on the wire: a page fetch from browser_console and a new tab from raw browser_cdp are requests too, so
+    the flag flip applies to them at that command, with no navigation in between."""
+    from tools import browser_cdp_tool, browser_tool
+
+    signer = _TestSigner()
+    config["browser"]["web_bot_auth"] = True
+    hook.append(lambda: signer)
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: True)  # the verifying server is on loopback
+    monkeypatch.setattr(browser_cdp_tool, "_resolve_cdp_endpoint", lambda: chrome)
+    server = _Server(signer.private.public_key())
+    task = f"wba-e2e-{tool}"
+
+    def request(path):
+        server.seen.clear()
+        if tool == "console":
+            out = browser_tool.browser_console(expression=f"fetch({json.dumps(server.url(path))}).then(r => r.status)",
+                                               task_id=task)
+        else:
+            out = browser_cdp_tool.browser_cdp("Target.createTarget", {"url": server.url(path)}, task_id=task)
+        assert json.loads(out).get("success") is True, out
+        return _wait_for(server, path)
+
+    try:
+        supervisor = registry.get_or_start(task_id=task, cdp_url=chrome)
+        assert _load(supervisor, server.url("/page"), ["/page"], server) == {"/page": "signed"}
+        config["browser"]["web_bot_auth"] = False
+        assert request("/after-off") == "absent"
+        config["browser"]["web_bot_auth"] = True
+        assert request("/after-on") == "signed"
+    finally:
+        server.shutdown()
+
+
+@pytest.fixture
+def root_fetch_faults(monkeypatch):
+    """Fail the first browser-level Fetch.<name> once; count every attempt."""
+    from tools.browser_supervisor import CDPSupervisor
+
+    original, attempts, fail = CDPSupervisor._cdp, {"Fetch.enable": 0, "Fetch.disable": 0}, set()
+
+    async def faulty(self, method, params=None, **kwargs):
+        if method in attempts and not kwargs.get("session_id"):
+            attempts[method] += 1
+            if method in fail:
+                fail.discard(method)
+                raise RuntimeError("transient CDP failure")
+        return await original(self, method, params, **kwargs)
+
+    monkeypatch.setattr(CDPSupervisor, "_cdp", faulty)
+    return attempts, fail
+
+
+@e2e
+@pytest.mark.integration
+def test_a_failed_root_fetch_enable_is_retried_by_the_next_command(chrome, config, hook, registry, root_fetch_faults):
+    """F2-B: desired and applied state are separate. A transient enable failure at attach leaves the session unsigned
+    only until the next command, which retries it."""
+    attempts, fail = root_fetch_faults
+    signer = _TestSigner()
+    config["browser"]["web_bot_auth"] = True
+    hook.append(lambda: signer)
+    server = _Server(signer.private.public_key())
+    try:
+        fail.add("Fetch.enable")
+        supervisor = registry.get_or_start(task_id="wba-e2e-enable", cdp_url=chrome)
+        assert attempts["Fetch.enable"] == 1
+        assert _load(supervisor, server.url("/first"), ["/first"], server) == {"/first": "absent"}
+        assert registry.get("wba-e2e-enable") is supervisor  # the next command
+        assert attempts["Fetch.enable"] == 2
+        assert _load(supervisor, server.url("/second"), ["/second"], server) == {"/second": "signed"}
+        assert _dialog_round_trip(supervisor, server)
+    finally:
+        server.shutdown()
+
+
+@e2e
+@pytest.mark.integration
+def test_a_failed_root_fetch_disable_is_retried_by_the_next_command(chrome, config, hook, registry, root_pauses,
+                                                                    root_fetch_faults):
+    attempts, fail = root_fetch_faults
+    signer = _TestSigner()
+    config["browser"]["web_bot_auth"] = True
+    hook.append(lambda: signer)
+    server = _Server(signer.private.public_key())
+    try:
+        supervisor = registry.get_or_start(task_id="wba-e2e-disable", cdp_url=chrome)
+        assert _load(supervisor, server.url("/on"), ["/on"], server) == {"/on": "signed"}
+        config["browser"]["web_bot_auth"] = False
+        fail.add("Fetch.disable")
+        assert registry.get("wba-e2e-disable") is supervisor and attempts["Fetch.disable"] == 1
+        assert registry.get("wba-e2e-disable") is supervisor and attempts["Fetch.disable"] == 2
+        root_pauses.clear()
+        assert _load(supervisor, server.url("/off"), ["/off"], server) == {"/off": "absent"}
+        assert root_pauses == [] and _dialog_round_trip(supervisor, server)
+    finally:
+        server.shutdown()
+
+
+def _reconnect(supervisor):
+    old_ws = supervisor._ws
+    asyncio.run_coroutine_threadsafe(old_ws.close(), supervisor._loop).result(5)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not (supervisor._ws not in (None, old_ws) and supervisor.snapshot().active):
+        time.sleep(0.05)
+    assert supervisor._ws not in (None, old_ws)
+
+
+@e2e
+@pytest.mark.integration
+def test_a_failed_live_enable_keeps_the_desired_signer_for_a_reconnect(chrome, config, hook, registry,
+                                                                        root_fetch_faults):
+    """A failed enable must not forget that signing is wanted: a reconnect before the next command signs."""
+    attempts, fail = root_fetch_faults
+    signer = _TestSigner()
+    hook.append(lambda: signer)
+    server = _Server(signer.private.public_key())
+    try:
+        supervisor = registry.get_or_start(task_id="wba-e2e-keep", cdp_url=chrome)
+        config["browser"]["web_bot_auth"] = True
+        fail.add("Fetch.enable")
+        assert registry.get("wba-e2e-keep") is supervisor and attempts["Fetch.enable"] == 1
+        _reconnect(supervisor)
+        assert attempts["Fetch.enable"] == 2  # the reconnect attach, with no command in between
+        assert _load(supervisor, server.url("/after"), ["/after"], server) == {"/after": "signed"}
+    finally:
+        server.shutdown()
+
+
+@e2e
+@pytest.mark.integration
+def test_a_reconnect_resets_the_applied_state_so_a_failed_reenable_is_retried(chrome, config, hook, registry,
+                                                                              root_fetch_faults):
+    """A new CDP connection starts with no root Fetch: when re-enabling it on reconnect fails, the next command must
+    retry rather than trust the previous connection's state."""
+    attempts, fail = root_fetch_faults
+    signer = _TestSigner()
+    config["browser"]["web_bot_auth"] = True
+    hook.append(lambda: signer)
+    server = _Server(signer.private.public_key())
+    try:
+        supervisor = registry.get_or_start(task_id="wba-e2e-reconnect", cdp_url=chrome)
+        assert _load(supervisor, server.url("/before"), ["/before"], server) == {"/before": "signed"}
+        fail.add("Fetch.enable")
+        _reconnect(supervisor)
+        assert attempts["Fetch.enable"] == 2  # attach + failed re-enable
+        assert _load(supervisor, server.url("/dropped"), ["/dropped"], server) == {"/dropped": "absent"}
+        assert registry.get("wba-e2e-reconnect") is supervisor and attempts["Fetch.enable"] == 3
+        assert _load(supervisor, server.url("/after"), ["/after"], server) == {"/after": "signed"}
+        assert _dialog_round_trip(supervisor, server)
+    finally:
         server.shutdown()
 
 

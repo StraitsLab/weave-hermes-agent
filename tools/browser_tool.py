@@ -3837,15 +3837,12 @@ def _dispatch_browser_command(
         _ensure_cdp_supervisor(task_id)
     elif command != "close" and args != ["cdp-url"]:
         # Web Bot Auth (fork, AB-2): a local session has no CDP URL of its own. A live supervisor takes the current
-        # flag; otherwise, when signing is on, ask the daemon (which launches the browser) for its endpoint so the
-        # supervisor intercepts before this command's first request leaves.
+        # flag in the registry lookup; otherwise, when signing is on, ask the daemon (which launches the browser)
+        # for its endpoint so the supervisor intercepts before this command's first request leaves.
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
 
-        signer = web_bot_auth_request_signer()
         supervisor = SUPERVISOR_REGISTRY.get(task_id)
-        if supervisor is not None and supervisor.snapshot().active:
-            supervisor.set_request_signer(signer)
-        elif signer is not None:
+        if (supervisor is None or not supervisor.snapshot().active) and web_bot_auth_request_signer() is not None:
             res = _dispatch_browser_command(task_id, session_info, browser_cmd, "get", ["cdp-url"], timeout,
                                             _engine_override)
             local_cdp = str((res.get("data") or {}).get("cdpUrl") or "") if res.get("success") else ""
