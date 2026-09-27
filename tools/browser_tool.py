@@ -1517,6 +1517,18 @@ def _auto_local_for_private_urls() -> bool:
     return _cached_auto_local_for_private_urls
 
 
+def _shared_browser_selected() -> bool:
+    """Whether the env or config selects a browser every task shares (a CDP override or the real profile), for the
+    vault-armed guard (fork, V-9d). No try/except: a read failure reaches the guard, which then fails closed.
+    read_raw_config's own parse-failure {} is what the dialers see too, so they cannot reach a browser it hides."""
+    if os.environ.get("BROWSER_CDP_URL", "").strip():
+        return True
+    from hermes_cli.config import read_raw_config
+
+    browser_cfg = read_raw_config().get("browser") or {}
+    return bool(str(browser_cfg.get("cdp_url") or "").strip() or browser_cfg.get("use_real_profile"))
+
+
 def _use_real_profile() -> bool:
     """Return whether the user consented to real-profile local browsing.
 
@@ -6006,17 +6018,14 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         with _cleanup_lock:
             _active_sessions.pop(task_id, None)
             _session_last_activity.pop(task_id, None)
-            # Fork (V-9d): a browser that dies with this session takes its vault-filled tabs with it; a CDP override
-            # or the real-profile browser outlives the session, so its armed tabs stay armed. While another session
-            # of the task is alive it may be the one holding the tab: keep the state until the last one goes.
+            # Fork (V-9d): a browser that dies with this session takes the vault-filled tabs it armed with it; a CDP
+            # override or the real-profile browser outlives the session, so nothing is forgotten here.
             features = session_info.get("features") or {}
-            bare = _bare_task_id_for_session_key(task_id)
-            browser_died = not (features.get("cdp_override") or features.get("real_profile")) and not any(
-                k in _active_sessions for k in (bare, bare + _LOCAL_SUFFIX))
+            browser_died = not (features.get("cdp_override") or features.get("real_profile"))
         if browser_died:
-            from tools.browser_supervisor import vault_forget_task
+            from tools.browser_supervisor import vault_forget_session
 
-            vault_forget_task(bare)
+            vault_forget_session(task_id)
 
         # Cloud mode: close the cloud browser session via provider API.
         # Local sidecars have bb_session_id=None so this no-ops for them.

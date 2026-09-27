@@ -390,3 +390,30 @@ def test_mutant_disarm_on_any_navigation_turns_the_hash_row_red(harso):
         _same_document_navigations(d)
         out = d.call("browser_console", expression="pw.value.length")
     assert out.get("result") == len(CANARY), out  # the mutant let the model read the armed tab again
+
+
+@pytest.mark.parametrize("order", ["shared-first", "local-first"])
+def test_retiring_a_local_sidecar_never_disarms_the_shared_browser_tab(harso, monkeypatch, order):
+    """Review r3 F1a: default fills a tab in the shared Chrome and also runs a real local agent-browser sidecar
+    (default::local). Both sessions are retired, in either order; the shared tab still holds the value, so another
+    conversation naming its target id is refused (lead ruling r3, decisions 1-2)."""
+    from tools import browser_supervisor as bs
+    from tools import browser_tool as bt
+
+    # The real agent-browser close still runs; only the fallback daemon reap (a signal to a reparented pid) is off.
+    monkeypatch.setattr(bt, "_verify_reapable_browser_daemon", lambda *a, **k: False)
+    d = harso
+    d.fill()
+    target = d.page_target()
+    info = bt._get_session_info("default::local")  # a second, independent local browser
+    assert info["features"].get("local") and not (info["features"].get("cdp_override")
+                                                   or info["features"].get("real_profile"))
+    assert bt._run_browser_command("default::local", "open", [d.pages.origin("127.0.0.1") + "/welcome"])["success"]
+    for key in (["default", "default::local"] if order == "shared-first" else ["default::local", "default"]):
+        bt._cleanup_single_browser_session(key)
+    assert bs.vault_armed(None)
+    out = d.call("browser_cdp", task_id="another-conversation", method="Runtime.evaluate", target_id=target,
+                 params={"expression": "btoa(unescape(encodeURIComponent(pw.value)))", "returnByValue": True})
+    raw = ((out.get("result") or {}).get("result") or {}).get("value")
+    assert (base64.b64decode(raw).decode("utf-8") if raw else None) is None
+    assert out.get("error_type") == "vault_armed", out

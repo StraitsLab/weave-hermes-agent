@@ -101,7 +101,8 @@ DIALOG_BRIDGE_URL_PATTERN = f"http://{DIALOG_BRIDGE_HOST}/*"
 # A tab that received a vault value holds it in its DOM, where arbitrary page JS or a screenshot could read it
 # back in a form no redaction recognises. registry.dispatch refuses model-driven eval/screenshot calls on an armed
 # tab (tools.registry._vault_armed_refusal). State per browser session key -> tab target id (= its main frame id)
-# -> [the main frame's current loaderId, the loaderIds whose document received a value]. The tab is armed while its
+# -> [the main frame's current loaderId, the loaderIds whose document received a value, whether the tab lives in a
+# browser that outlives the session (a CDP override or the real profile; unknown counts)]. The tab is armed while its
 # current document is one that received a value: a new document disarms it, a same-document (hash/pushState)
 # navigation does not, and a back/forward-cache restore of a filled document re-arms it.
 _VAULT_ARMED: Dict[str, Dict[str, list]] = {}
@@ -124,12 +125,30 @@ def _vault_forget(session_key: str, target_id: str) -> None:
         _VAULT_ARMED.get(session_key, {}).pop(target_id, None)
 
 
-def vault_forget_task(task_id: str) -> None:
-    """The task's last browser session was retired and its browser died with it: every tab it armed is gone."""
-    bare = task_id.removesuffix("::local")
+def vault_forget_session(session_key: str) -> None:
+    """The session was retired and its browser died with it: forget the tabs it armed there, never a shared-browser
+    tab (that browser is still alive, and so is the value in the tab)."""
     with _VAULT_ARMED_LOCK:
-        _VAULT_ARMED.pop(bare, None)
-        _VAULT_ARMED.pop(bare + "::local", None)
+        tabs = _VAULT_ARMED.get(session_key, {})
+        for tid in [tid for tid, tab in tabs.items() if not tab[2]]:
+            del tabs[tid]
+
+
+def _browser_outlives_session(session_key: str) -> bool:
+    """Whether the session's browser is one that outlives it (a CDP override or the real-profile browser). No
+    session, a failed lookup, or a live bare/::local twin (the supervisor may drive either browser) counts as yes:
+    an entry of unknown ownership is never forgotten on a retire."""
+    try:
+        from tools import browser_tool
+
+        bare = session_key.removesuffix("::local")
+        twin = bare if session_key != bare else bare + "::local"
+        with browser_tool._cleanup_lock:
+            info, twin_alive = browser_tool._active_sessions.get(session_key), twin in browser_tool._active_sessions
+        features = (info or {}).get("features") or {}
+        return info is None or twin_alive or bool(features.get("cdp_override") or features.get("real_profile"))
+    except Exception:
+        return True
 
 
 def _is_dialog_bridge(url: str) -> bool:
@@ -679,10 +698,12 @@ class CDPSupervisor:
         if fut is None:
             raise RuntimeError("Browser supervisor loop unavailable")
         frame = fut.result(timeout=timeout + 1)["result"]["frameTree"]["frame"]
+        shared = _browser_outlives_session(self.task_id)
         with _VAULT_ARMED_LOCK:
-            tab = _VAULT_ARMED.setdefault(self.task_id, {}).setdefault(frame["id"], [None, set()])
+            tab = _VAULT_ARMED.setdefault(self.task_id, {}).setdefault(frame["id"], [None, set(), False])
             tab[0] = frame["loaderId"]
             tab[1].add(frame["loaderId"])
+            tab[2] = tab[2] or shared
 
     def evaluate_runtime(
         self,

@@ -91,8 +91,7 @@ def _vault_armed_refusal(name: str, args: dict, task_id) -> Optional[str]:
     try:
         with bt._cleanup_lock:
             cached = [(bt._active_sessions.get(k) or {}).get("features") or {} for k in (key, key + "::local")]
-        shared = bool(bt._get_cdp_override_raw() or bt._use_real_profile()
-                      or any(f.get("cdp_override") or f.get("real_profile") for f in cached))
+        shared = bool(bt._shared_browser_selected() or any(f.get("cdp_override") or f.get("real_profile") for f in cached))
     except Exception:  # fail closed: an unknown browser may be the shared one
         shared = True
     if not vault_armed(None if shared else key):

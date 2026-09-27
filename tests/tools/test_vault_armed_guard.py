@@ -38,8 +38,7 @@ def shared(monkeypatch):
     from tools import browser_tool
 
     mode = {"cdp": "", "real_profile": False}
-    monkeypatch.setattr(browser_tool, "_get_cdp_override_raw", lambda: mode["cdp"])
-    monkeypatch.setattr(browser_tool, "_use_real_profile", lambda: mode["real_profile"])
+    monkeypatch.setattr(browser_tool, "_shared_browser_selected", lambda: bool(mode["cdp"] or mode["real_profile"]))
     return mode
 
 
@@ -53,8 +52,8 @@ def reg(monkeypatch, shared):
     return r
 
 
-def _arm(session_key, tab="T1", loader="L1"):
-    bs._VAULT_ARMED.setdefault(session_key, {})[tab] = [loader, {loader}]
+def _arm(session_key, tab="T1", loader="L1", shared=False):
+    bs._VAULT_ARMED.setdefault(session_key, {})[tab] = [loader, {loader}, shared]
 
 
 def _run(reg, name, args, task_id="t1"):
@@ -123,7 +122,7 @@ def test_a_cached_session_on_the_real_profile_browser_stays_shared_whatever_the_
 
     sessions[session_key] = {"features": {"local": True, "real_profile": True}}
     if config == "raises":
-        monkeypatch.setattr(browser_tool, "_use_real_profile", _boom)
+        monkeypatch.setattr(browser_tool, "_shared_browser_selected", _boom)
     _arm("t1")
     out = _run(reg, "browser_console", {"expression": "pw.value"}, task_id="t2")
     assert out.get("error_type") == "vault_armed" and "ran" not in out, out
@@ -161,7 +160,7 @@ def test_retiring_a_session_whose_browser_dies_with_it_disarms_its_tabs(reg, sha
     _arm("t1")
     _arm("t1::local", tab="T2")
     _cleanup("t1", sessions, monkeypatch)
-    assert bs.vault_armed("t1")  # the sidecar is still alive and may hold the tab
+    assert bs.vault_armed("t1") and "T1" not in bs._VAULT_ARMED["t1"]  # only the retired session's own tabs go
     _cleanup("t1::local", sessions, monkeypatch)
     assert not bs.vault_armed("t1") and not bs.vault_armed(None)
     shared["cdp"] = "ws://127.0.0.1:9222/devtools/browser/x"  # another task on a shared browser is not refused
@@ -243,3 +242,77 @@ def test_the_fill_is_refused_when_the_tab_cannot_be_armed(monkeypatch):
     monkeypatch.setattr(bvt, "_bot_desktop_browser_session", lambda task_id: False)
     out = bvt._eval_js_secret("t1", "fill('SECRET')")
     assert out["error_type"] == "vault_arm_failed" and wrote == []
+
+
+@pytest.mark.parametrize("feature", ["cdp_override", "real_profile"])
+@pytest.mark.parametrize("shape", ["mixed", "sequential"])
+def test_retiring_a_local_session_never_forgets_a_tab_armed_in_the_shared_browser(
+        reg, shared, sessions, monkeypatch, feature, shape):
+    """Review r3 F1a: t1 fills in the shared browser, and a local sidecar (alive at the same time, or a later session
+    reusing the key) is retired. The shared tab still holds the value (lead ruling r3, decisions 1-2)."""
+    sessions["t1"] = {"session_name": "", "bb_session_id": None, "features": {feature: True}}
+    _arm("t1", shared=True)
+    if shape == "mixed":
+        sessions["t1::local"] = {"session_name": "", "bb_session_id": None, "features": {"local": True}}
+    _cleanup("t1", sessions, monkeypatch)
+    for key in ("t1::local", "t1"):  # sidecar retire, then a later per-task session reusing the bare key
+        sessions[key] = {"session_name": "", "bb_session_id": None, "features": {"local": True}}
+        _cleanup(key, sessions, monkeypatch)
+    shared["cdp"] = "ws://127.0.0.1:9222/devtools/browser/x"
+    out = _run(reg, "browser_console", {"expression": "pw.value"}, task_id="t2")
+    assert out.get("error_type") == "vault_armed" and "ran" not in out, out
+
+
+@pytest.mark.parametrize("env", ["", "ws://127.0.0.1:9222/devtools/browser/x"])
+def test_a_config_read_failure_below_the_helpers_fails_closed(monkeypatch, env):
+    """Review r3 F1b: the config read itself raises (not a patched helper); t2 has no cached session anywhere."""
+    from hermes_cli import config
+    from tools import browser_tool
+
+    monkeypatch.setattr(bs, "_VAULT_ARMED", {})
+    monkeypatch.setattr(browser_tool, "_active_sessions", {})
+    monkeypatch.setenv("BROWSER_CDP_URL", env) if env else monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+    r = ToolRegistry()
+    r.register(name="browser_console", toolset="browser", schema={"name": "browser_console",
+               "parameters": {"type": "object"}}, handler=lambda args, **kw: json.dumps({"success": True, "ran": True}))
+    monkeypatch.setattr(config, "read_raw_config", lambda: {})
+    assert _run(r, "browser_console", {"expression": "1"}, task_id="t2").get("ran") is True  # nothing armed: runs
+    _arm("t1")
+    if not env:  # a readable config selecting no shared browser keeps t1's tab out of t2's scope
+        assert _run(r, "browser_console", {"expression": "1"}, task_id="t2").get("ran") is True
+    monkeypatch.setattr(config, "read_raw_config", _boom)
+    out = _run(r, "browser_console", {"expression": "pw.value"}, task_id="t2")
+    assert out.get("error_type") == "vault_armed" and "ran" not in out, out
+
+
+@pytest.mark.parametrize("session,expected", [
+    (None, True), ({"features": {"local": True}}, False), ({"features": {"cdp_override": True}}, True),
+    ({"features": {"local": True, "real_profile": True}}, True), ("raises", True), ("twin", True)])
+def test_the_armed_tab_records_whether_its_browser_outlives_the_session(sup, monkeypatch, session, expected):
+    """Ownership is stored at arm time; unknown (no session, failed lookup) counts as shared (ruling r3, dec. 1)."""
+    from tools import browser_tool
+
+    class Broken(dict):
+        def get(self, key, default=None):
+            raise RuntimeError("lookup failed")
+
+    local = {"features": {"local": True}}  # "twin": the vault's supervisor may drive the ::local browser instead
+    cache = (Broken() if session == "raises" else {"t1": local, "t1::local": local} if session == "twin"
+             else {"t1": session} if session else {})
+    monkeypatch.setattr(browser_tool, "_active_sessions", cache)
+    sup.arm_vault()
+    assert bs._VAULT_ARMED["t1"]["T1"][2] is expected
+    bs.vault_forget_session("t1")
+    assert bs.vault_armed("t1") is expected  # a retire forgets only a tab whose browser died with the session
+
+
+@pytest.mark.parametrize("env,browser_cfg,expected", [
+    ("ws://127.0.0.1:9222/devtools/browser/x", {}, True), ("", {"cdp_url": "http://127.0.0.1:9222"}, True),
+    ("", {"use_real_profile": True}, True), ("", {"cdp_url": " ", "use_real_profile": False}, False), ("", {}, False)])
+def test_the_guard_reads_which_browser_is_selected_from_the_env_and_config(monkeypatch, env, browser_cfg, expected):
+    from hermes_cli import config
+    from tools import browser_tool
+
+    monkeypatch.setenv("BROWSER_CDP_URL", env)
+    monkeypatch.setattr(config, "read_raw_config", lambda: {"browser": browser_cfg})
+    assert browser_tool._shared_browser_selected() is expected
