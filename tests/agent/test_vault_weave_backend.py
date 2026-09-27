@@ -1141,6 +1141,10 @@ def test_a_turn_the_app_did_not_send_opens_no_card(stripe):
 
 def test_no_handle_lists_only_this_sites_api_keys_as_metadata_and_opens_no_card(stripe, admitted_turn):
     stripe.items[KEY]["allowed_origins"] = ["https://api.example"]  # another site's key: not offered
+    totp = "0199bbbb-0000-7000-8000-00000000000e"
+    stripe.items[totp] = _item(totp, "totp", ["https://api.stripe.com"])
+    for same_site_non_key in (ITEM, ADDR, totp):  # the kind filter, not the origin, must keep these out
+        stripe.items[same_site_non_key]["allowed_origins"] = ["https://api.stripe.com"]
     out = json.loads(_authorize(handle=""))
     assert (out["success"], out["error_type"]) == (False, "handle_required")
     assert out["api_keys"] == [{"handle": STRIPE_HANDLE, "label": "Api_Key", "allowed_origins": ["https://api.stripe.com"]}]
@@ -1180,3 +1184,59 @@ def test_a_harso_cell_selection_offers_the_tool_only_with_the_harso_vault(api):
     assert offered() is False
     _write_config({"vault": {"enabled": True, "backend": "weave", "weave_api_url": api.url}})
     assert offered() is True
+
+
+# Round 2 (F1): every malformed input or authority answer is a typed, content-free result at the tool boundary,
+# through the real registry dispatch: no card, no header, no parser or exception text, never a second request.
+def _dispatch(**changes):
+    import tools.vault_write_tool  # noqa: F401 — registers the tool
+    from tools.registry import registry
+
+    args = {"handle": STRIPE_HANDLE, "method": "POST", "url": WRITE_URL, "body": WRITE_BODY.decode(), **changes}
+    return registry.dispatch("vault_authorize_write", args)
+
+
+@pytest.mark.parametrize("changes", [
+    {"handle": "", "url": "https://[invalid"},                   # unmatched bracket
+    {"handle": "", "url": "https://[::1"},
+    {"handle": "", "url": "https://[invalid]/"},                 # not an IPv6 literal
+    {"handle": "", "url": "https://example.com\uff0fother/"},    # NFKC-invalid authority
+    {"url": "https://[bad/"},                                    # with a handle: never reaches the authority either
+    {"body": "\ud800"}, {"body": "\udfff"},                      # unpaired surrogates: not sendable as UTF-8
+])
+def test_a_request_that_cannot_be_sent_is_request_invalid_and_sends_nothing(stripe, admitted_turn, changes):
+    with _acp_gate("once") as asked:
+        raw = _dispatch(**changes)
+    out = json.loads(raw)
+    assert (out["success"], out["error_type"]) == (False, "request_invalid") and "header" not in out
+    assert "Error" not in raw and "example.com" not in raw and "[" not in out["error"]
+    assert asked == [] and stripe.requests == []
+
+
+@pytest.mark.parametrize("handle,force,resolve", [
+    (STRIPE_HANDLE, None, (503, {"error": "service unavailable"})),
+    (STRIPE_HANDLE, None, (503, {"error": ["service unavailable"]})),
+    (STRIPE_HANDLE, None, (503, {"error": 1})),
+    (STRIPE_HANDLE, None, (503, {"error": {"code": ["CONTENT_INVALID"]}})),
+    (STRIPE_HANDLE, None, (503, {"error": {"code": {"value": "CONTENT_INVALID"}}})),
+    ("", (200, {"items": [_item(STRIPE, "api_key", ["https://api.stripe.com"]) | {"allowed_origins": 1}]}), None),
+    ("", (200, {"items": [_item(STRIPE, "api_key", ["https://api.stripe.com"]) | {"allowed_origins": True}]}), None),
+])
+def test_a_malformed_authority_answer_is_vault_unavailable_and_content_free(stripe, admitted_turn, handle, force,
+                                                                               resolve):
+    stripe.force, stripe.force_resolve = force, resolve
+    with _acp_gate("once") as asked:
+        raw = _dispatch(handle=handle)
+    out = json.loads(raw)
+    assert (out["success"], out["error_type"]) == (False, "vault_unavailable") and "header" not in out
+    assert "Error" not in raw and "service unavailable" not in raw and "CONTENT_INVALID" not in raw
+    assert asked == [] and len(stripe.requests) == 1
+
+
+def test_a_backend_that_cannot_be_selected_is_vault_unavailable(stripe, admitted_turn):
+    from agent.vault_backends import base
+
+    with patch.object(base, "enabled_backends", side_effect=RuntimeError("config text the model must not see")):
+        raw = _dispatch()
+    assert json.loads(raw)["error_type"] == "vault_unavailable" and "must not see" not in raw
+    assert stripe.requests == []

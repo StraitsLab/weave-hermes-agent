@@ -31,21 +31,27 @@ def vault_authorize_write(handle: str, method: str, url: str, body: str = "") ->
     from agent.vault_backends.base import VaultUnavailable, VaultUseRefused, enabled_backends
     from agent.vault_backends.weave import APPROVAL_HEADER, WeaveLoginBackend
 
-    backend = next((b for b in enabled_backends() if isinstance(b, WeaveLoginBackend)), None)
-    if backend is None:
-        return _refused("vault_unavailable", "The Harso vault is not configured in this session.")
+    try:  # the request as it will be sent: a URL that does not parse or a body that is not UTF-8 cannot be sent
+        parts = urlsplit(url)
+        payload = body.encode("utf-8")
+    except ValueError:  # UnicodeEncodeError included; the parser's text names the input, so it stays out
+        return _refused("request_invalid", "The URL or body is not a valid request. Nothing was sent.")
     try:
+        backend = next((b for b in enabled_backends() if isinstance(b, WeaveLoginBackend)), None)
+        if backend is None:
+            return _refused("vault_unavailable", "The Harso vault is not configured in this session.")
         if not handle:  # metadata only: the API key handles saved for this URL's site
-            parts = urlsplit(url or "")
             origin = f"{parts.scheme}://{parts.netloc}"
             return _refused("handle_required", "Name one of these API key handles for this site, then call again.",
                             api_keys=[{"handle": m.id, "label": m.label, "allowed_origins": list(m.allowed_origins)}
                                       for m in backend.list_api_keys() if origin in m.allowed_origins])
-        ref = backend.authorize_write(handle, method, url, body.encode("utf-8"))
+        ref = backend.authorize_write(handle, method, url, payload)
     except VaultUseRefused as refusal:
         return _refused(refusal.error_type, str(refusal))
     except VaultUnavailable as exc:
         return _refused("vault_unavailable", str(exc)[:200])
+    except Exception:  # a malformed authority answer or a backend fault: content-free, never retried
+        return _refused("vault_unavailable", "The Harso vault could not answer. Nothing was sent.")
     return json.dumps({"approval_ref": ref, "header": APPROVAL_HEADER})
 
 
