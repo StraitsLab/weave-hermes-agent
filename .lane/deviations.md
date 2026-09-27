@@ -22,3 +22,21 @@ affected (recorded rows consume a recorded notice exactly as before).
 - Unchanged: a notice at the very end of a legacy row (after its last CLOSE) is still dropped.
   Every steer block ends with CLOSE and the notice contains no CLOSE, so those bytes cannot be
   steer text (`test_trailing_legacy_notice_still_dropped`).
+
+## D3 (r5, ruling-r5): a record-less multi-block region is ATOMIC
+
+On a record-less (legacy) string row, the protected region (earliest steer OPEN to the final
+CLOSE) is returned as ONE piece and is never split at an inner CLOSE/OPEN pair. Only its
+outermost producer OPEN and CLOSE are unwrapped (`steer_texts`); every inner byte, markers
+included, stays verbatim for pruning, re-pruning, both serializers and the deterministic
+fallback. Reason: two genuine successive legacy appends are byte-identical to one user steer
+quoting `CLOSE + OPEN` (reviewer R4.1), and splitting them let the fallback delete user bytes.
+
+- Accepted cost: genuine successive legacy appends (`A1`, `B2`) are no longer split; they
+  come back as one piece whose text is `A1\n<CLOSE>\n\n<OPEN>\nB2`.
+- Rewritten guards (tests/agent/test_durable_tool_append_r3.py):
+  `TestR22LegacyKeepsMore::test_successive_legacy_appends_with_notice` (now asserts one piece,
+  with and without the notice) and `TestR31LegacyNoticeKept::test_quoted_notice_after_earlier_steer`
+  (now asserts one piece).
+- Unchanged: recorded rows split per steer exactly; list-shaped legacy rows (one text block per
+  append) unchanged; D2's notice rule and the trailing-notice drop unchanged.

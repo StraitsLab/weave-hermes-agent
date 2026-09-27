@@ -301,20 +301,23 @@ def _peel_string_by_markers(body: str, steers: List[str]) -> str:
     marker that opened it, and a closing marker between two openings proves
     nothing (the user may have quoted a whole block). So when the content
     ends with a closing marker, everything from the EARLIEST opening marker
-    to the end is protected. That region is split into pieces only where a
-    closing marker is immediately followed by an opening one (the shape
-    successive appends produce); every byte of the region stays protected
-    either way, so the split never moves steer text into the body.
+    to the end is protected.
 
-    A wrap-up notice INSIDE the region (between a closing marker and a later
-    opening one) is kept in place as text: without records it may be a
-    user's quotation of the notice, so it is never stripped and a piece
-    boundary is never placed past its bytes (a notice between two genuine
-    legacy appends is therefore kept too; keeping a possible system notice
-    is allowed, deleting a possible user quotation is not). Only notices at
-    the very end of the row, after its last closing marker, are dropped:
-    every steer block ends with a closing marker and the notice contains
-    none, so those bytes cannot be steer text.
+    That region is ATOMIC: it is returned as ONE piece and never split at an
+    inner closing/opening pair. Two genuine successive legacy appends are
+    byte-identical to one user steer that quotes ``CLOSE`` + ``OPEN``, so an
+    inner marker can never be proven producer-owned; every consumer
+    (pruning, ``steer_texts``, summaries, deterministic fallback) therefore
+    unwraps only the region's outermost producer ``OPEN`` (first) and
+    ``CLOSE`` (last) and keeps every inner byte, markers included, verbatim.
+    Genuine successive legacy appends thus stay together as one piece
+    (over-retention is the safe side; recorded rows split exactly).
+
+    A wrap-up notice INSIDE the region is kept in place as text: without
+    records it may be a user's quotation of the notice. Only notices at the
+    very end of the row, after its last closing marker, are dropped: every
+    steer block ends with a closing marker and the notice contains none, so
+    those bytes cannot be steer text.
     """
     while body.endswith(_NOTICE_PIECE):
         body = body[: -len(_NOTICE_PIECE)]
@@ -323,20 +326,7 @@ def _peel_string_by_markers(body: str, steers: List[str]) -> str:
     start = body.find(_STEER_PIECE_OPEN)
     if start < 0:
         return body
-    region = body[start:]
-    pieces: List[str] = []
-    cut = 0
-    pos = region.find(_STEER_PIECE_OPEN, 1)
-    while pos >= 0:
-        piece = region[cut:pos]
-        # Split only where the piece is EXACTLY a steer block; a notice
-        # between blocks stays inside the piece (kept, never skipped).
-        if _is_steer_piece(piece):
-            pieces.append(piece)
-            cut = pos
-        pos = region.find(_STEER_PIECE_OPEN, pos + 1)
-    pieces.append(region[cut:])
-    steers[:0] = pieces
+    steers.insert(0, body[start:])
     return body[:start]
 
 

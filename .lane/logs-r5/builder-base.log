@@ -1,0 +1,6 @@
+FAILED tests/agent/test_durable_tool_append_r3.py::TestR22LegacyKeepsMore::test_successive_legacy_appends_with_notice
+FAILED tests/agent/test_durable_tool_append_r3.py::TestR31LegacyNoticeKept::test_quoted_notice_after_earlier_steer
+FAILED tests/agent/test_durable_tool_append_r3.py::TestR41LegacyRegionAtomic::test_split_returns_one_piece_and_steer_texts_keeps_inner_markers
+FAILED tests/agent/test_durable_tool_append_r3.py::TestR41LegacyRegionAtomic::test_static_fallback_keeps_quoted_boundary[none]
+FAILED tests/agent/test_durable_tool_append_r3.py::TestR41LegacyRegionAtomic::test_static_fallback_keeps_quoted_boundary[trailing]
+5 failed, 38 passed in 6.01s

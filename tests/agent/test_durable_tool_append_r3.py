@@ -229,20 +229,25 @@ class TestR22LegacyKeepsMore:
         section = summary.split("## Mid-turn User Steers", 1)[1]
         assert "PFX-FALLBACK" in section
 
-    # REWRITTEN in r4 (ruling-r4 item 2, listed in .lane/deviations.md):
-    # genuine successive legacy appends with a notice between them are
-    # byte-identical to one steer quoting CLOSE + notice + OPEN, so the notice
-    # is KEPT (in place, protected) rather than risk deleting user text.
+    # REWRITTEN in r4 (D2) and r5 (D3, ruling-r5; .lane/deviations.md):
+    # genuine successive legacy appends are byte-identical to one steer
+    # quoting CLOSE (+ notice) + OPEN, so the record-less region is ONE atomic
+    # piece: the notice is KEPT in place and the inner markers are not split
+    # on; only the outermost producer OPEN/CLOSE are unwrapped.
     def test_successive_legacy_appends_with_notice(self):
         suffix = format_steer_marker("A1") + "\n\n" + RUN_BUDGET_WRAPUP_NOTICE + format_steer_marker("B2")
         body, steers = split_tool_message(_legacy_row(suffix))
         assert body == BIG_BODY
-        assert "".join(steers) == suffix
+        assert steers == [suffix]
         assert "".join(steers).count(RUN_BUDGET_WRAPUP_NOTICE) == 1
-        # Successive legacy appends WITHOUT a notice still split per append.
+        # Successive legacy appends WITHOUT a notice: also one atomic piece
+        # (D3); the inner CLOSE/OPEN stay verbatim in the unwrapped text.
         plain = format_steer_marker("A1") + format_steer_marker("B2")
         body, steers = split_tool_message(_legacy_row(plain))
-        assert body == BIG_BODY and steer_texts(steers) == ["A1", "B2"]
+        assert body == BIG_BODY and steers == [plain]
+        assert steer_texts(steers) == [
+            "A1\n" + STEER_MARKER_CLOSE + "\n\n" + STEER_MARKER_OPEN + "\nB2"
+        ]
 
     # DESIGN GUARD: legacy tool output quoting the marker earlier keeps more.
     def test_legacy_marker_in_tool_output_keeps_more(self):
@@ -294,12 +299,11 @@ class TestR31LegacyNoticeKept:
         assert steer in text and text.count(RUN_BUDGET_WRAPUP_NOTICE) == 2
 
     def test_quoted_notice_after_earlier_steer(self):
-        """A notice quoted in a later steer: earlier steer still splits, no byte lost."""
+        """A notice quoted in a later steer: whole region one piece (D3), no byte lost."""
         suffix = format_steer_marker("FIRST") + format_steer_marker(_quoting_steer(1))
         body, steers = split_tool_message(_legacy_row(suffix))
         assert body == BIG_BODY
-        assert steers[0] == format_steer_marker("FIRST")
-        assert "".join(steers) == suffix
+        assert steers == [suffix]
 
     # DESIGN GUARD: a trailing notice after the row's last CLOSE cannot be
     # steer text (every steer block ends with CLOSE; the notice has none).
@@ -327,6 +331,57 @@ class TestR31LegacyNoticeKept:
         assert body == _body(shape)
         assert steer_texts(steers) == ["REC-A", "REC-B"]
         assert RUN_BUDGET_WRAPUP_NOTICE not in "".join(steers)
+
+
+# ---------------------------------------------------------------------------
+# R4.1 (round 5) — a record-less multi-block region is ATOMIC for every
+# consumer; only its outermost producer OPEN/CLOSE are unwrapped (D3).
+# ---------------------------------------------------------------------------
+
+
+_R41_USER = "KEEP-PREFIX\n" + STEER_MARKER_CLOSE + "\n\n" + STEER_MARKER_OPEN + "\nKEEP-SUFFIX"
+
+
+class TestR41LegacyRegionAtomic:
+    def test_split_returns_one_piece_and_steer_texts_keeps_inner_markers(self):
+        row = _legacy_row(format_steer_marker(_R41_USER))
+        body, steers = split_tool_message(row)
+        assert body == BIG_BODY
+        assert steers == [format_steer_marker(_R41_USER)]
+        assert steer_texts(steers) == [_R41_USER]
+
+    @pytest.mark.parametrize("notice", ["none", "inner", "trailing"])
+    def test_static_fallback_keeps_quoted_boundary(self, notice):
+        user = _R41_USER
+        if notice == "inner":
+            user = "HEAD\n" + STEER_MARKER_CLOSE + "\n\n" + RUN_BUDGET_WRAPUP_NOTICE + "\n\n" + STEER_MARKER_OPEN + "\nTAIL"
+        suffix = format_steer_marker(user) + ("\n\n" + RUN_BUDGET_WRAPUP_NOTICE if notice == "trailing" else "")
+        summary = _compressor()._build_static_fallback_summary(_turn(BIG_BODY + suffix))
+        assert summary is not None
+        section = summary.split("## Mid-turn User Steers\n", 1)[1]
+        assert user in section
+
+    def test_prune_and_reprune_keep_region_whole(self):
+        suffix = format_steer_marker("A1") + format_steer_marker("B2")
+        row = _legacy_row(suffix)
+        c = _compressor()
+        out, n = c._prune_old_tool_results(_prunable(row), protect_tail_count=4)
+        first = out[2]["content"]
+        assert n >= 1 and len(first) < len(row["content"]) and first.endswith(suffix)
+        again, _ = c._prune_old_tool_results(_prunable(out[2]), protect_tail_count=4)
+        assert again[2]["content"] == first
+
+    # DESIGN GUARD: recorded rows still split per steer exactly.
+    @pytest.mark.parametrize("shape", ["string", "list"])
+    def test_recorded_adjacent_steers_still_split(self, store, shape):
+        agent, db, sid = store
+        messages = _turn(_body(shape))
+        agent._flush_messages_to_session_db(messages)
+        _drain(agent, messages, "REC-ONE", _R41_USER)
+        row = _reloaded_tool_rows(db, sid)[-1]
+        body, steers = split_tool_message(row)
+        assert body == _body(shape)
+        assert steer_texts(steers) == ["REC-ONE", _R41_USER]
 
 
 # ---------------------------------------------------------------------------

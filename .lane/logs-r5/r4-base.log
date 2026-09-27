@@ -1,0 +1,5 @@
+FAILED tests/agent/test_review_r4_fallback.py::test_fallback_preserves_one_user_quoted_boundary[string-False]
+FAILED tests/agent/test_review_r4_hunt.py::test_static_fallback_quoted_adjacent_boundary[before-string]
+FAILED tests/agent/test_review_r4_hunt.py::test_static_fallback_quoted_adjacent_boundary[after-string]
+FAILED tests/agent/test_review_r4_hunt.py::test_static_fallback_quoted_adjacent_boundary[none-string]
+4 failed, 10 passed in 16.86s
