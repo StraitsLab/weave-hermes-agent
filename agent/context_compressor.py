@@ -46,10 +46,11 @@ from agent.model_metadata import (
 from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
 from agent.tool_row_append import (
+    SummaryInput,
     defang_steer_markers,
-    protected_steer_spans,
     split_tool_message,
     steer_texts,
+    summary_input_spans,
     summary_steer_piece,
     with_steers,
 )
@@ -4504,8 +4505,10 @@ class ContextCompressor(ContextEngine):
                 content = "\n".join(text_parts)
             content = _redact_compaction_text(content or "")
             content = _MEDIA_DIRECTIVE_RE.sub("[media attachment]", content)
-            # Only protected steers may carry a live steer marker in the
-            # summarizer input (input budgeting protects them by position).
+            # Ordinary material only: marker lookalikes in tool output or
+            # other messages are visibly quoted. Protected steers are NOT
+            # defanged (verbatim user words) and are budgeted by the
+            # positions recorded below, never re-found in the text.
             content = defang_steer_markers(content)
             # Strip inline reasoning blocks (<think>, <reasoning>, etc.) from
             # assistant content before it reaches the summarizer. Reasoning
@@ -4526,11 +4529,12 @@ class ContextCompressor(ContextEngine):
                 # user's words and must reach the summarizer whole.
                 if len(content) > self._CONTENT_MAX:
                     content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
-                rendered_steers = [
-                    summary_steer_piece(piece, _redact_compaction_text)
-                    for piece in steers
-                ]
-                parts.append(f"[TOOL RESULT {tool_id}]: {with_steers(content, rendered_steers)}")
+                segments: list[tuple[bool, str]] = [(False, f"[TOOL RESULT {tool_id}]: {content}")]
+                for piece in steers:
+                    segments.append(
+                        (True, summary_steer_piece(piece, _redact_compaction_text))
+                    )
+                parts.append(segments)
                 continue
 
             # Assistant messages: include tool call names AND arguments
@@ -4564,7 +4568,21 @@ class ContextCompressor(ContextEngine):
                 content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
             parts.append(f"[{role.upper()}]: {content}")
 
-        return "\n\n".join(parts)
+        # Join, recording where each protected steer landed: input budgeting
+        # reserves exactly these spans (``SummaryInput``).
+        chunks: list[str] = []
+        spans: list[tuple[int, int]] = []
+        pos = 0
+        for n, part in enumerate(parts):
+            if n:
+                chunks.append("\n\n")
+                pos += 2
+            for is_protected, text in (part if isinstance(part, list) else [(False, part)]):
+                if is_protected:
+                    spans.append((pos, pos + len(text)))
+                chunks.append(text)
+                pos += len(text)
+        return SummaryInput("".join(chunks), spans)
 
     def _build_static_fallback_summary(
         self,
@@ -4900,14 +4918,14 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         recent state; explicitly mark the omitted middle so the summarizer knows
         context was intentionally compressed before it saw the prompt.
 
-        Protected mid-turn user steers (see ``protected_steer_spans``) are
-        reserved inside the same bound and never clipped; only ordinary
-        material is head/tail bounded. Returns ``None`` when the protected
-        steers alone exceed the bound.
+        Protected mid-turn user steers (the spans ``_serialize_for_summary``
+        recorded on its ``SummaryInput``) are reserved inside the same bound
+        and never clipped; only ordinary material is head/tail bounded.
+        Returns ``None`` when the protected steers alone exceed the bound.
         """
         if len(content) <= cls._SUMMARY_INPUT_MAX_CHARS:
             return content
-        if protected_steer_spans(content):
+        if summary_input_spans(content):
             return cls._budget_with_protected_steers(content, sampled=False)
 
         marker_template = (
@@ -4952,7 +4970,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         """
         if len(content) <= cls._SUMMARY_INPUT_MAX_CHARS:
             return content
-        if protected_steer_spans(content):
+        if summary_input_spans(content):
             return cls._budget_with_protected_steers(content, sampled=True)
         n = max(2, cls._SAMPLED_INPUT_SLICES)
         gaps = n - 1
@@ -4987,7 +5005,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         same policy as the caller (head+tail, or even sampling). Returns
         ``None`` when the protected spans alone do not fit.
         """
-        spans = protected_steer_spans(content)
+        spans = summary_input_spans(content)
         protected = sum(end - start for start, end in spans)
         if sampled:
             template = "\n\n...[{n:,} chars elided — recover via session_search]...\n\n"

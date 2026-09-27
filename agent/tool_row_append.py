@@ -28,7 +28,6 @@ fall back to the steer marker text, conservatively. See
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any, List, Optional, Tuple
 
 from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
@@ -196,28 +195,28 @@ def requeue_steer(agent: Any, steer_text: str) -> None:
 # or bounds only the tool body, and re-attaches the protected steer pieces
 # unclipped (``with_steers``). The run-budget wrap-up notice is disposable.
 #
-# Identification is unambiguous for every append made through
-# ``append_to_tool_row``: it records a span per append in the row's
-# ``display_metadata["tool_appends"]`` (kind + exact character length),
-# persisted with the content in the same guarded write. Content without
-# records (rows appended before this existed) falls back to the marker text,
-# conservatively: an opening marker quoted inside a steer never becomes the
-# boundary (the protected span grows to the outer marker instead of cutting
-# the user's prefix).
+# Identification: every append made through ``append_to_tool_row`` records
+# a span (kind + exact character length) in the row's
+# ``display_metadata["tool_appends"]``, persisted with the content in the
+# same guarded write. Records are AUTHORITATIVE: once a row has records, the
+# text they do not cover is ordinary tool output and is never marker-parsed
+# (a lookalike steer block printed by a tool stays tool output). Records that
+# no longer describe the content are not second-guessed either: the whole
+# unmatched tail is kept as protected text. Marker parsing runs ONLY for rows
+# without records (appended before records existed), and there ambiguity
+# keeps MORE, never less (see ``_peel_string_by_markers``).
 
 _APPENDS_META_KEY = "tool_appends"
 _STEER_PIECE_OPEN = "\n\n" + _STEER_BLOCK_OPEN
 _NOTICE_PIECE = "\n\n" + RUN_BUDGET_WRAPUP_NOTICE
 
-# Serialized-summary spans: after ``defang_steer_markers`` has neutralized
-# every marker in ordinary material, each OPEN..CLOSE block in a serialized
-# summary input IS a protected steer (see ``protected_steer_spans``).
+# Ordinary summarizer-input material (tool output, other messages, a previous
+# summary) gets its markers rewritten to a visibly-quoted form. Protected
+# steers are NOT defanged: their bytes reach the summarizer verbatim (only
+# secret redaction applies) and their positions travel with the serialized
+# text (``SummaryInput``), never re-found by pattern.
 _QUOTED_OPEN = STEER_MARKER_OPEN.replace("[OUT-OF-BAND", "[quoted OUT-OF-BAND", 1)
 _QUOTED_CLOSE = STEER_MARKER_CLOSE.replace("[/OUT-OF-BAND", "[/quoted OUT-OF-BAND", 1)
-_PROTECTED_SPAN_RE = re.compile(
-    re.escape(STEER_MARKER_OPEN) + r"\n.*?\n" + re.escape(STEER_MARKER_CLOSE),
-    re.S,
-)
 
 
 def _append_kind(suffix: str) -> Optional[str]:
@@ -229,6 +228,13 @@ def _append_kind(suffix: str) -> Optional[str]:
 
 
 def _append_record(existing: Any, suffix: str) -> Optional[dict]:
+    """Span record for one append (kind + exact length of the appended piece).
+
+    Pre-existing content is never re-classified here: a row's text that no
+    record covers is its tool output (a legacy record-less append on a row
+    that later receives its first recorded append is indistinguishable from
+    tool output ending in a lookalike block, so it is left as output).
+    """
     kind = _append_kind(suffix)
     if kind is None:
         return None
@@ -257,46 +263,71 @@ def _is_steer_block_text(text: str) -> bool:
     return _is_steer_piece("\n\n" + text.lstrip())
 
 
-def _append_records(metadata: Any) -> List[Tuple[str, int]]:
+_INVALID_RECORDS = "invalid"
+
+
+def _append_records(metadata: Any):
+    """The row's span records: ``[]`` when it has none, ``"invalid"`` when
+    records exist but are malformed (treated like records that no longer
+    match: keep the tail), else ``[(kind, chars), ...]``."""
     if not isinstance(metadata, dict):
         return []
     raw = metadata.get(_APPENDS_META_KEY)
+    if raw is None or raw == []:
+        return []
+    if not isinstance(raw, list):
+        return _INVALID_RECORDS
+    def _valid(rec: Any) -> bool:
+        return (
+            isinstance(rec, dict)
+            and rec.get("kind") in ("steer", "notice")
+            and isinstance(rec.get("chars"), int)
+            and not isinstance(rec.get("chars"), bool)
+            and rec["chars"] > 0
+        )
+
     out: List[Tuple[str, int]] = []
-    if isinstance(raw, list):
-        for rec in raw:
-            if (
-                isinstance(rec, dict)
-                and rec.get("kind") in ("steer", "notice")
-                and isinstance(rec.get("chars"), int)
-                and rec["chars"] > 0
-            ):
-                out.append((rec["kind"], rec["chars"]))
+    for rec in raw:
+        if not _valid(rec):
+            return _INVALID_RECORDS
+        out.append((rec["kind"], rec["chars"]))
     return out
 
 
 def _peel_string_by_markers(body: str, steers: List[str]) -> str:
-    """Legacy (record-less) peeling; ambiguity keeps MORE, never less."""
-    while True:
-        if body.endswith(_NOTICE_PIECE):
-            body = body[: -len(_NOTICE_PIECE)]
-            continue
-        if body.endswith(_STEER_BLOCK_CLOSE):
-            start = body.rfind(_STEER_PIECE_OPEN)
-            if start >= 0:
-                # An earlier opening marker with no closing marker between it
-                # and ``start`` means ``start`` may be a marker QUOTED inside
-                # the user's steer: grow the protected span to the outer one.
-                while True:
-                    prev = body.rfind(_STEER_PIECE_OPEN, 0, start)
-                    if prev < 0:
-                        break
-                    if body.find(_STEER_BLOCK_CLOSE, prev + len(_STEER_PIECE_OPEN), start) >= 0:
-                        break
-                    start = prev
-                steers.insert(0, body[start:])
-                body = body[:start]
-                continue
+    """Legacy (record-less) peeling; ambiguity keeps MORE, never less.
+
+    A record-less row cannot tell a marker QUOTED inside a steer from the
+    marker that opened it, and a closing marker between two openings proves
+    nothing (the user may have quoted a whole block). So when the content
+    ends with a closing marker, everything from the EARLIEST opening marker
+    to the end is protected. That region is split into pieces only where a
+    closing marker is immediately followed by an opening one (the shape
+    successive appends produce); every byte of the region stays protected
+    either way, so the split never moves steer text into the body.
+    """
+    while body.endswith(_NOTICE_PIECE):
+        body = body[: -len(_NOTICE_PIECE)]
+    if not body.endswith(_STEER_BLOCK_CLOSE):
         return body
+    start = body.find(_STEER_PIECE_OPEN)
+    if start < 0:
+        return body
+    region = body[start:]
+    pieces: List[str] = []
+    cut = 0
+    pos = region.find(_STEER_PIECE_OPEN, 1)
+    while pos >= 0:
+        piece = region[cut:pos]
+        while piece.endswith(_NOTICE_PIECE):  # disposable notice between appends
+            piece = piece[: -len(_NOTICE_PIECE)]
+        if _is_steer_piece(piece):
+            pieces.append(piece)
+            cut = pos
+        pos = region.find(_STEER_PIECE_OPEN, pos + 1)
+    pieces.append(region[cut:])
+    steers[:0] = pieces
+    return body[:start]
 
 
 def split_trailing_appends(content: Any, metadata: Any = None) -> Tuple[Any, List[str]]:
@@ -309,24 +340,37 @@ def split_trailing_appends(content: Any, metadata: Any = None) -> Tuple[Any, Lis
     CLOSE``) so callers re-attach them verbatim with ``with_steers``. The
     wrap-up notice is dropped (disposable). ``metadata`` is the row's
     ``display_metadata``; its ``tool_appends`` records identify each span
-    exactly. Only the tail is examined: a lookalike marker in the middle of
-    a tool output is ordinary output.
+    exactly and are authoritative (text they do not cover is ordinary
+    output). Rows without records fall back to marker parsing, which keeps
+    MORE on ambiguity, never less.
     """
     steers: List[str] = []
     records = _append_records(metadata)
     if isinstance(content, str):
+        if not records:
+            body = _peel_string_by_markers(content, steers)
+            return body, steers
         body = content
-        for kind, n in reversed(records):
+        consumed = records != _INVALID_RECORDS
+        for kind, n in reversed(records if consumed else []):
             piece = body[-n:] if n <= len(body) else None
             if kind == "notice":
                 if piece == _NOTICE_PIECE:
                     body = body[:-n]
                 continue  # a disposable notice already dropped by a rewrite
             if piece is None or not _is_steer_piece(piece):
-                break  # records no longer describe this content: fall back
+                consumed = False
+                break
             steers.insert(0, piece)
             body = body[:-n]
-        return _peel_string_by_markers(body, steers), steers
+        if not consumed and body:
+            # Records no longer describe this content: do not guess where
+            # the tool output ends. Keep the whole unmatched tail protected.
+            steers.insert(0, body)
+            body = ""
+        # Every record consumed: the rest is ordinary tool output (never
+        # marker-parsed).
+        return body, steers
     if isinstance(content, list):
         blocks = list(content)
 
@@ -339,28 +383,43 @@ def split_trailing_appends(content: Any, metadata: Any = None) -> Tuple[Any, Lis
                 return text if isinstance(text, str) else None
             return None
 
-        for kind, n in reversed(records):
+        if not records:
+            # Legacy (record-less) rows: each append was its own trailing
+            # text block, so a quoted marker cannot split a steer here.
+            while True:
+                text = _last_text()
+                if text is None:
+                    break
+                if text == RUN_BUDGET_WRAPUP_NOTICE:
+                    blocks.pop()
+                    continue
+                if _is_steer_block_text(text):
+                    steers.insert(0, "\n\n" + text.lstrip())
+                    blocks.pop()
+                    continue
+                break
+            return blocks, steers
+        consumed = records != _INVALID_RECORDS
+        for kind, n in reversed(records if consumed else []):
             text = _last_text()
             if kind == "notice":
                 if text == RUN_BUDGET_WRAPUP_NOTICE:
                     blocks.pop()
                 continue
             if text is None or len(text) != n or not _is_steer_block_text(text):
+                consumed = False
                 break
             steers.insert(0, "\n\n" + text.lstrip())
             blocks.pop()
-        while True:
-            text = _last_text()
-            if text is None:
-                break
-            if text == RUN_BUDGET_WRAPUP_NOTICE:
+        if not consumed:
+            # Appends are always trailing text blocks: keep the whole
+            # trailing text run protected rather than guess.
+            while True:
+                text = _last_text()
+                if text is None:
+                    break
+                steers.insert(0, "\n\n" + text)
                 blocks.pop()
-                continue
-            if _is_steer_block_text(text):
-                steers.insert(0, "\n\n" + text.lstrip())
-                blocks.pop()
-                continue
-            break
         return blocks, steers
     return content, steers
 
@@ -389,13 +448,11 @@ def with_steers(new_text: str, steers: Optional[List[str]]) -> str:
 
 
 def defang_steer_markers(text: str) -> str:
-    """Neutralize steer markers in ORDINARY summarizer-input material.
+    """Neutralize steer markers in ORDINARY summarizer-input material only.
 
-    A serialized summarizer input must carry exactly one kind of
-    OPEN..CLOSE block: a genuine protected steer (``summary_steer_piece``).
-    Tool output, user/assistant text or a steer that QUOTES the marker is
-    rewritten to a visibly-quoted form, so input budgeting can protect
-    steer spans by position without trusting lookalikes.
+    Tool output, user/assistant text and a previous summary are rewritten to
+    a visibly-quoted form so the summarizer never mistakes them for a live
+    steer. Never applied to protected steer text (``summary_steer_piece``).
     """
     if not text:
         return text
@@ -403,13 +460,37 @@ def defang_steer_markers(text: str) -> str:
 
 
 def summary_steer_piece(piece: str, redact) -> str:
-    """Render one protected steer for summarizer input: redacted, unclipped."""
+    """Render one protected steer for summarizer input.
+
+    The user's words are carried VERBATIM except for secret redaction: no
+    clipping and no marker rewriting (a user may be asking about the exact
+    delimiter text).
+    """
     inner = steer_texts([piece])[0]
-    return _STEER_PIECE_OPEN + defang_steer_markers(redact(inner)) + _STEER_BLOCK_CLOSE
+    return _STEER_PIECE_OPEN + redact(inner) + _STEER_BLOCK_CLOSE
 
 
-def protected_steer_spans(text: str) -> List[Tuple[int, int]]:
-    """``(start, end)`` of every protected steer block in a serialized input."""
-    if not text or STEER_MARKER_OPEN not in text:
+class SummaryInput(str):
+    """Serialized summarizer input carrying its protected steer positions.
+
+    The serializer knows exactly where each rendered steer sits; budgeting
+    reserves those ``(start, end)`` spans instead of searching the text for
+    markers (a quoted closing marker inside a steer must not end its
+    reservation, and lookalikes in ordinary text must get none). Any string
+    operation yields a plain ``str`` (no spans), so positions can never
+    drift from the text they describe.
+    """
+
+    protected_spans: Tuple[Tuple[int, int], ...] = ()
+
+    def __new__(cls, text: str, spans=()):
+        obj = super().__new__(cls, text)
+        obj.protected_spans = tuple((int(a), int(b)) for a, b in spans)
+        return obj
+
+
+def summary_input_spans(text: Any) -> List[Tuple[int, int]]:
+    """Protected spans a serializer attached to ``text`` (``[]`` if none)."""
+    if not isinstance(text, SummaryInput):
         return []
-    return [(m.start(), m.end()) for m in _PROTECTED_SPAN_RE.finditer(text)]
+    return list(text.protected_spans)
