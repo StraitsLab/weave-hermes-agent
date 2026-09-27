@@ -154,10 +154,12 @@ def test_fence_note_survives_the_existing_fence_sanitizer_round_trip():
     from agent.memory_manager import sanitize_context
     from plugins.memory.harso import HARSO_FENCE_NOTE
 
-    # A provider that echoes the note back (pre-wrapped context) gets it stripped like today's notes.
-    assert sanitize_context(HARSO_FENCE_NOTE + "\nbody").strip() == "body"
+    # Enabled copilot fence path: a provider that echoes the note back (pre-wrapped context) gets it stripped.
     fenced = build_memory_context_block(HARSO_FENCE_NOTE + "\nbody", note=HARSO_FENCE_NOTE)
     assert fenced.count(HARSO_FENCE_NOTE) == 1
+    assert fenced.endswith("\n\nbody\n</memory-context>")
+    # The general sanitizer is today's (review r1 F1): switch-off paths never learn the copilot note.
+    assert sanitize_context(HARSO_FENCE_NOTE + "\nbody") == HARSO_FENCE_NOTE + "\nbody"
 
 
 # -- §5.2 acks and T12 ------------------------------------------------------------------------------------------------

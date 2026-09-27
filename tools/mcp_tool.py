@@ -8449,6 +8449,10 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
                 for schema in get_mem_schemas():
                     if isinstance(schema, dict):
                         _add(schema)
+                # A provider tool that replaces a built-in (Harso copilot: harso_memory -> session_search) keeps
+                # replacing it across a rebuild; staged on the same locals, published atomically below.
+                from agent.memory_manager import reconcile_displaced_tools
+                reconcile_displaced_tools(agent, memory_manager, tools_list, name_set)
     except Exception:
         logger.debug("Memory-provider tool re-injection skipped", exc_info=True)
 

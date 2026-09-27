@@ -31,8 +31,11 @@ _ROUTING_HINT = re.compile(
 
 
 # P9 copilot client (design C §4, §5.2, §11). ONE runtime switch, default OFF:
-# ``plugins.harso.copilot_enabled: true``. Read per call (hot-reloadable). Off =
-# every request body, schema list and rendered string is today's, byte for byte.
+# ``plugins.harso.copilot_enabled: true``. Off = every request body, schema list and rendered string is today's, byte
+# for byte. Rendering paths (turn-start delivery, mid-turn late fetch, acks) read the switch per call. The TOOL SURFACE
+# (harso_memory in, session_search out) is latched per provider and re-read only at the one tool-surface refresh
+# boundary, ``inject_memory_provider_tools`` -> ``MemoryManager.refresh_tool_routing`` (agent construction, ACP's
+# explicit surface refresh), so the advertised schemas and the manager's routing index can never disagree.
 _LATE_FETCH_PATH = "/internal/harso/late-deliveries"
 _TOOL_PATH = "/internal/harso/memory-tool"
 _LATE_FETCH_TIMEOUT_SECONDS = 0.3
@@ -117,7 +120,7 @@ def render_wire_delivery(delivery: Any, *, channel: str) -> str:
     lines = delivery.get("lines")
     if not isinstance(lines, list) or not lines or len(lines) > 64:
         return ""
-    from plugins.memory.harso.render import DeliveryLine, render_delivery
+    from plugins.memory.harso.render import DeliveryLine, find_markers, render_delivery
 
     try:
         parsed = []
@@ -128,24 +131,95 @@ def render_wire_delivery(delivery: Any, *, channel: str) -> str:
             if not (isinstance(op, str) and isinstance(handle, str) and isinstance(text, str)):
                 return ""
             parsed.append(DeliveryLine(op, handle, text[:_MAX_CONTEXT_TEXT]))
-        return render_delivery(delivery.get("seq"), parsed, channel=channel)
+        rendered = render_delivery(delivery.get("seq"), parsed, channel=channel)
+        # Final-string check: only the header/close are trusted framing; every body line must be marker-free.
+        if any(find_markers(body) for body in rendered.split("\n")[1:-1]):
+            logger.warning("Harso %s delivery kept control syntax after rendering; dropped", channel)
+            return ""
+        return rendered
     except (ValueError, TypeError):
         logger.warning("Harso %s delivery malformed; dropped", channel)
         return ""
 
 
+def _recall_denied(response: Dict[str, Any]) -> bool:
+    """The existing context-response status gate: an explicit non-ok status, or the legacy degraded flag, denies recall.
+
+    Explicit ``recall_status`` supersedes the legacy boolean. Runs before ANY memory representation is rendered.
+    """
+    if "recall_status" in response:
+        return response["recall_status"] not in ("ok", "degraded")
+    return response.get("degraded") is True
+
+
+def _neutralize(text: str) -> str | None:
+    """Model-visible memory text with every rule-table marker neutralized, verified on the FINAL string.
+
+    Sanitizes to a fixed point and re-checks with the same detector; returns None (fail closed) if a marker survives.
+    """
+    from plugins.memory.harso.render import find_markers, sanitize_memory_text
+
+    for _ in range(4):
+        if not find_markers(text):
+            return text
+        text = sanitize_memory_text(text)
+    return None if find_markers(text) else text
+
+
+class _UnsafeTree(ValueError):
+    pass
+
+
 def _sanitize_tree(value: Any, depth: int = 0) -> Any:
-    from plugins.memory.harso.render import sanitize_memory_text
+    """Sanitize every key and string, then break the markers JSON quoting can form from them.
+
+    Serialization adds quotes and ``": "`` between a key and its value, so a clean key/value can still assemble a
+    marker (``"tool_calls"``, ``"type": "tool_use"``). Inside a JSON string every quote is escaped, so such a marker
+    can only use a string's own opening or closing quote: a key or string whose serialized form carries a marker is
+    wrapped in that rule's neutral text on both ends (the original words stay readable), and a key/value pair that
+    forms one gets the neutral text in front of the value. The caller re-checks the final serialized string.
+    """
+    from plugins.memory.harso.render import find_markers, sanitize_memory_text
+
+    def guard(s: str) -> str:
+        hits = find_markers(json.dumps(s, ensure_ascii=False))
+        return f"{hits[0].replacement} {s} {hits[0].replacement}" if hits else s
 
     if depth > 8:
         return None
     if isinstance(value, str):
-        return sanitize_memory_text(value)
+        return guard(sanitize_memory_text(value))
     if isinstance(value, list):
         return [_sanitize_tree(item, depth + 1) for item in value]
     if isinstance(value, dict):
-        return {sanitize_memory_text(str(k)): _sanitize_tree(v, depth + 1) for k, v in value.items()}
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            key = guard(sanitize_memory_text(str(k)))
+            item = _sanitize_tree(v, depth + 1)
+            if isinstance(item, str):
+                pair = f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(item, ensure_ascii=False)}"
+                hits = find_markers(pair)
+                if hits:
+                    item = f"{hits[0].replacement} {item}"
+            if key in out:
+                raise _UnsafeTree("neutralized keys collide")
+            out[key] = item
+        return out
     return value
+
+
+def _tool_result_json(response: Dict[str, Any]) -> str:
+    """The FINAL model-visible tool string: sanitized tree, serialized, then verified by the same detector."""
+    from plugins.memory.harso.render import find_markers
+
+    try:
+        out = json.dumps(_sanitize_tree(response), ensure_ascii=False)
+    except _UnsafeTree:
+        out = None
+    if out is None or find_markers(out):
+        logger.warning("Harso memory tool result withheld: control syntax survived neutralization")
+        return json.dumps({"error": "Harso memory result withheld"})
+    return out
 
 
 class HarsoWriteError(RuntimeError):
@@ -185,6 +259,8 @@ class HarsoMemoryProvider(MemoryProvider):
     def __init__(self) -> None:
         self._session_id = ""
         self._visible_seqs: List[int] = []
+        # Tool-surface latch (see module note): changed only by refresh_tool_surface().
+        self._tools_on = copilot_enabled()
 
     # Resolved at call time, never snapshotted in __init__: the provider is
     # constructed once at gateway start, but on the shared host Hermes runs in
@@ -232,8 +308,19 @@ class HarsoMemoryProvider(MemoryProvider):
         self._session_id = session_id
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        # C §11: the one read-only memory tool, exposed only with the switch on.
-        return [dict(_TOOL_SCHEMA)] if copilot_enabled() else []
+        # C §11: the one read-only memory tool, exposed only with the (latched) switch on.
+        return [dict(_TOOL_SCHEMA)] if self._tools_on else []
+
+    def refresh_tool_surface(self) -> bool:
+        """Re-read the switch for the tool surface; True when it changed (the manager then re-indexes routing)."""
+        on = copilot_enabled()
+        changed = on != self._tools_on
+        self._tools_on = on
+        return changed
+
+    def displaced_tool_names(self) -> List[str]:
+        """C §11/T24: harso_memory replaces session_search while it is on the surface and routed."""
+        return ["session_search"] if self._tools_on else []
 
     # -- P9 copilot client (all inert unless copilot_enabled()) --------------
 
@@ -259,12 +346,13 @@ class HarsoMemoryProvider(MemoryProvider):
             timeout=_late_fetch_timeout(),
             max_bytes=_PREFETCH_MAX_BYTES,
         )
-        if not response:
+        if not response or _recall_denied(response):
             return ""
         return render_wire_delivery(response.get("delivery"), channel="mid_turn")
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs: Any) -> str:
-        if tool_name != _TOOL_NAME or not copilot_enabled():
+        # The latch, not the live switch: routing and the advertised surface change together at the refresh boundary.
+        if tool_name != _TOOL_NAME or not self._tools_on:
             return json.dumps({"error": f"Harso does not handle tool {tool_name!r}"})
         args = args if isinstance(args, dict) else {}
         action = args.get("action")
@@ -282,10 +370,11 @@ class HarsoMemoryProvider(MemoryProvider):
         if not self._session_id or not self.is_available():
             return json.dumps({"error": "Harso memory is unavailable"})
         response = self._post(_copilot_path("tool_path", _TOOL_PATH), payload, max_bytes=_TOOL_MAX_BYTES)
-        if response is None:
+        if response is None or _recall_denied(response):
+            # An explicit denial status (same gate as turn start) withholds the whole result; absent status = as sent.
             return json.dumps({"error": "Harso memory is unavailable"})
-        # Tool text is memory too: the same sanitizer runs on every string before it reaches the model.
-        return json.dumps(_sanitize_tree(response), ensure_ascii=False)
+        # Tool text is memory too: the same rule table holds on the final serialized string.
+        return _tool_result_json(response)
 
     def _post(
         self,
@@ -362,17 +451,14 @@ class HarsoMemoryProvider(MemoryProvider):
         hint = response.get("routing_hint")
         hint = hint.strip() if isinstance(hint, str) and len(hint.strip()) <= 200 else ""
         hint = hint if _ROUTING_HINT.fullmatch(hint) else ""
+        # The status gate runs before ANY memory representation (delivery or legacy items) is rendered.
+        if _recall_denied(response):
+            return hint
         if copilot:
             # C §3/§4.1: a copilot delivery replaces the item list; any failure falls back to today's recall (§10).
             delivered = render_wire_delivery(response.get("delivery"), channel="turn_start")
             if delivered:
                 return "\n".join([delivered, hint]) if hint else delivered
-        # Explicit recall status supersedes the legacy degraded boolean.
-        if "recall_status" in response:
-            if response["recall_status"] not in ("ok", "degraded"):
-                return hint
-        elif response.get("degraded") is True:
-            return hint
         items = response.get("items")
         if not isinstance(items, list):
             return hint
@@ -400,7 +486,12 @@ class HarsoMemoryProvider(MemoryProvider):
                 context.append("Memory gaps: " + ", ".join(reasons))
         if hint:
             context.append(hint)
-        return "\n".join(context)
+        if not copilot:
+            return "\n".join(context)
+        # Copilot on: the legacy fallback is model-visible memory too; neutralize the ASSEMBLED string (a marker can
+        # span citation/text joins), fail closed to the hint.
+        safe = _neutralize("\n".join(context))
+        return hint if safe is None else safe
 
     def sync_turn(
         self,

@@ -2561,7 +2561,8 @@ class HermesACPAgent(acp.Agent):
                 enabled_toolsets=toolsets,
                 _memory_manager=getattr(state.agent, "_memory_manager", None),
             )
-            inject_memory_provider_tools(tool_view)
+            # A read-only listing: never move the live agent's memory-tool routing (only a real surface refresh may).
+            inject_memory_provider_tools(tool_view, refresh_routing=False)
             tools = tool_view.tools
             if not tools:
                 return "No tools available."
