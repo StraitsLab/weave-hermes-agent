@@ -170,6 +170,40 @@ def compose_user_api_content(
     return content + "\n\n" + "\n\n".join(injections)
 
 
+def withhold_off_origin_memory(agent: Any, ext_prefetch_cache: str) -> str:
+    """F4 (ruling r4): gate the FIRST composition of this turn's fetched memory on the live copilot switch.
+
+    A provider whose result was fetched with its copilot switch ON (``prefetch_copilot_origin()``, which covers the
+    structured delivery and the legacy-item fallback alike) is re-read through the SAME live switch it uses
+    (``copilot_active()``). Switch now OFF, or either probe unreadable: the whole unsent memory cache is withheld
+    (user and plugin text are composed separately and are untouched). OFF-origin content and providers without the
+    probe pass through byte-identical. Callers apply this once, at first composition, never to already-sent bytes.
+    """
+    if not ext_prefetch_cache:
+        return ext_prefetch_cache
+    manager = getattr(agent, "_memory_manager", None)
+    try:
+        providers = list(getattr(manager, "providers", None) or [])
+    except Exception:
+        providers = []
+    for provider in providers:
+        origin = getattr(provider, "prefetch_copilot_origin", None)
+        if not callable(origin):
+            continue
+        try:
+            if origin() is not True:
+                continue
+        except Exception:
+            return ""
+        live = getattr(provider, "copilot_active", None)
+        try:
+            if not (callable(live) and live() is True):
+                return ""
+        except Exception:
+            return ""
+    return ext_prefetch_cache
+
+
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
     """Pop the ``api_content`` sidecar and substitute it into ``content``.
 
@@ -549,6 +583,9 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # True once ``withhold_off_origin_memory`` gated the cache at its first
+    # composition (the stamped path); the loop gates it otherwise.
+    ext_prefetch_gated: bool = False
     # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
 
@@ -1500,6 +1537,7 @@ def build_turn_context(
     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
+    ext_prefetch_gated = False
     if agent._memory_manager:
         try:
             # Runtime refresh: a config.yaml edit reaches the next prefetch on
@@ -1556,6 +1594,10 @@ def build_turn_context(
         and messages[current_turn_user_idx].get("role") == "user"
     ):
         _turn_user_msg = messages[current_turn_user_idx]
+        # F4 (ruling r4): this is the first composition of the fetched cache —
+        # re-read the live switch now, not at provider completion.
+        ext_prefetch_cache = withhold_off_origin_memory(agent, ext_prefetch_cache)
+        ext_prefetch_gated = True
         _api_content = compose_user_api_content(
             _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context,
             memory_note=memory_fence_note(agent),
@@ -1641,5 +1683,6 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        ext_prefetch_gated=ext_prefetch_gated,
         preflight_compression_blocked=_preflight_compression_blocked,
     )

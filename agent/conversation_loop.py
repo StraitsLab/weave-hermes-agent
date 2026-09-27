@@ -47,6 +47,7 @@ from agent.turn_context import (
     _review_fork_first_request_pending,
     build_turn_context,
     compose_user_api_content,
+    withhold_off_origin_memory,
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
@@ -2010,6 +2011,7 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    _ext_prefetch_gated = _ctx.ext_prefetch_gated
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -2381,6 +2383,12 @@ def run_conversation(
                     api_msg["content"] = _api_content
                 else:
                     # Callers that bypass the prologue stamping: compose live.
+                    if not _ext_prefetch_gated:
+                        # F4 (ruling r4): first composition of this turn's
+                        # fetched cache — re-read the live copilot switch once;
+                        # later passes reuse the result so a turn's bytes stay stable.
+                        _ext_prefetch_cache = withhold_off_origin_memory(agent, _ext_prefetch_cache)
+                        _ext_prefetch_gated = True
                     _composed = compose_user_api_content(
                         api_msg.get("content", ""),
                         _ext_prefetch_cache,

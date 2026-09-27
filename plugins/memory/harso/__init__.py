@@ -271,6 +271,8 @@ class HarsoMemoryProvider(MemoryProvider):
     def __init__(self) -> None:
         self._session_id = ""
         self._visible_seqs: List[int] = []
+        # Copilot origin of the latest turn-start prefetch (ON when it was sent); see prefetch_copilot_origin().
+        self._prefetch_origin_on = False
         # Tool-surface latch (see module note): changed only by refresh_tool_surface().
         self._tools_on = copilot_enabled()
 
@@ -338,6 +340,14 @@ class HarsoMemoryProvider(MemoryProvider):
 
     def copilot_active(self) -> bool:
         return copilot_enabled()
+
+    def prefetch_copilot_origin(self) -> bool:
+        """F4 (ruling r4): True when this turn's prefetch result was fetched with the switch ON.
+
+        Covers every representation the result can take (structured delivery AND the legacy-item fallback), so the
+        turn's first composition can withhold it if the live switch is OFF by then. Never inferred from marker text.
+        """
+        return self._prefetch_origin_on is True
 
     def memory_fence_note(self) -> str | None:
         """C §4.1: the turn-start fence note wording when the copilot is on; None keeps today's note."""
@@ -434,6 +444,8 @@ class HarsoMemoryProvider(MemoryProvider):
         }
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        # A new prefetch replaces the previous turn's origin before any early return.
+        self._prefetch_origin_on = False
         # The turn-context caller omits session_id; initialization binds this
         # provider to the agent's session. Explicit per-call scope still wins.
         session_id = session_id or self._session_id
@@ -451,6 +463,7 @@ class HarsoMemoryProvider(MemoryProvider):
         query = query[:4096]
         timeout, max_bytes = _prefetch_limits()
         copilot = copilot_enabled()
+        self._prefetch_origin_on = copilot
         body: Dict[str, Any] = {**self._scope(session_id), "query": query}
         if copilot:
             # C §5.2: visible_seqs on every (non-trivial) prefetch, only with the switch on.
