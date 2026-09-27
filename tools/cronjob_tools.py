@@ -755,7 +755,7 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     from hermes_constants import get_hermes_home
     from cron.scheduler import (
         PLATFORM_SCRIPT_PREFIX,
-        _cron_script_policy,
+        _tenant_scripts_allowed,
         resolve_platform_script,
     )
 
@@ -763,8 +763,8 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
 
     if raw.startswith(PLATFORM_SCRIPT_PREFIX):
         return resolve_platform_script(raw)[1]
-    if not _cron_script_policy()[0]:
-        return f"cron.allow_scripts is false; only platform: scripts are allowed: {raw!r}"
+    if not _tenant_scripts_allowed():
+        return f"cron.allow_scripts is false or invalid; only platform: scripts are allowed: {raw!r}"
 
     # Reject absolute paths and ~ expansion at the API boundary.
     # Only relative paths within ~/.hermes/scripts/ are allowed.

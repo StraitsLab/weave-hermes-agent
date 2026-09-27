@@ -136,12 +136,78 @@ def test_platform_symlink_refused(home, platform_root, tmp_path):
     assert "not a regular file" in out
 
 
-def test_platform_non_root_owner_refused(home, platform_root, monkeypatch):
+@pytest.mark.parametrize("kind", ["fifo", "directory"])
+def test_platform_non_regular_file_refused(home, platform_root, kind):
+    from cron.scheduler import _run_job_script
+
+    target = platform_root / "tick.py"
+    if kind == "fifo":
+        os.mkfifo(target)
+    else:
+        target.mkdir()
+    _config(home, platform_script_root=str(platform_root))
+
+    ok, out = _run_job_script("platform:tick.py")
+    assert ok is False
+    assert "not a regular file" in out
+
+
+def test_root_that_is_a_file_refused(home, tmp_path):
+    from cron.scheduler import _run_job_script
+
+    root = tmp_path / "root-file"
+    root.write_text("", encoding="utf-8")
+    os.chmod(root, 0o555)
+    _config(home, platform_script_root=str(root))
+
+    ok, out = _run_job_script("platform:tick.py")
+    assert ok is False and out.startswith("Blocked:")
+
+
+def _fake_owner(monkeypatch, target, uid):
+    """Report ``uid`` as the owner of exactly one object (matched by inode),
+    whichever stat call the resolver uses, so one owner guard is tested alone."""
+    import cron.scheduler as scheduler
+
+    ident = (os.stat(target).st_dev, os.stat(target).st_ino)
+
+    def wrap(real):
+        def fake(*args, **kwargs):
+            st = real(*args, **kwargs)
+            if (st.st_dev, st.st_ino) == ident:
+                values = list(st)
+                values[4] = uid
+                return os.stat_result(values)
+            return st
+        return fake
+
+    monkeypatch.setattr(scheduler.os, "lstat", wrap(os.lstat))
+    monkeypatch.setattr(scheduler.os, "fstat", wrap(os.fstat))
+
+
+@pytest.mark.parametrize("which", ["file", "root", "ancestor"])
+def test_platform_single_wrong_owner_refused(home, platform_root, monkeypatch, which):
+    import cron.scheduler as scheduler
+
+    path = _platform_script(platform_root)
+    _config(home, platform_script_root=str(platform_root))
+    target = {"file": path, "root": platform_root, "ancestor": platform_root.parent}[which]
+    _fake_owner(monkeypatch, target, os.getuid() + 1)  # windows-footgun: ok
+
+    ok, out = scheduler._run_job_script("platform:tick.py")
+    assert ok is False
+    assert {
+        "file": "platform script is not platform-owned",
+        "root": "root is not platform-owned",
+        "ancestor": "untrusted ancestor",
+    }[which] in out
+
+
+def test_platform_production_owner_uid_refuses_test_owned_tree(home, platform_root, monkeypatch):
     import cron.scheduler as scheduler
 
     _platform_script(platform_root)
     _config(home, platform_script_root=str(platform_root))
-    # Production owner uid; this test process is not uid 0.
     monkeypatch.setattr(scheduler, "_PLATFORM_SCRIPT_OWNER_UID", 0)
     assert os.getuid() != 0  # windows-footgun: ok
 
@@ -328,3 +394,375 @@ def test_cronjob_tool_admits_platform_ref(home, platform_root):
         no_agent=True, deliver="local",
     ))
     assert result.get("success") is True, result
+
+
+# --- F2: the script policy is positively valid or nothing runs -------------
+
+
+def _both_refused(home, platform_root, marker):
+    from cron.scheduler import _run_job_script
+    from tools.cronjob_tools import _validate_cron_script_path
+
+    tenant = _run_job_script("tenant.py")
+    platform = _run_job_script("platform:tick.py")
+    assert tenant[0] is False and platform[0] is False, (tenant, platform)
+    assert not marker.exists()
+    assert _validate_cron_script_path("tenant.py")
+    assert _validate_cron_script_path("platform:tick.py")
+
+
+def test_cold_malformed_config_refuses_every_script(home, platform_root, tmp_path):
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+    _platform_script(platform_root)
+    (home / "config.yaml").write_text("cron: [broken\n", encoding="utf-8")
+
+    _both_refused(home, platform_root, marker)
+
+
+def test_warm_malformed_config_refuses_every_script(home, platform_root, tmp_path):
+    from cron.scheduler import _run_job_script
+
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+    _platform_script(platform_root)
+    _config(home, allow_scripts=False, platform_script_root=str(platform_root))
+    assert _run_job_script("platform:tick.py") == (True, "platform ran")  # warms last-known-good
+    (home / "config.yaml").write_text(
+        f"cron: {{platform_script_root: {platform_root}, allow_scripts: [\n", encoding="utf-8",
+    )
+
+    _both_refused(home, platform_root, marker)
+
+
+def test_unreadable_config_refuses_every_script(home, platform_root, tmp_path):
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+    _platform_script(platform_root)
+    _config(home, platform_script_root=str(platform_root))
+    os.chmod(home / "config.yaml", 0)
+    try:
+        _both_refused(home, platform_root, marker)
+    finally:
+        os.chmod(home / "config.yaml", 0o600)
+
+
+def test_malformed_managed_config_refuses_every_script(home, platform_root, tmp_path, monkeypatch):
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+    _platform_script(platform_root)
+    _config(home, platform_script_root=str(platform_root))
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text("cron: {allow_scripts: [\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+
+    _both_refused(home, platform_root, marker)
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
+def test_non_bool_allow_scripts_refuses_tenant_script(home, tmp_path, value):
+    from cron.scheduler import _run_job_script
+    from tools.cronjob_tools import _validate_cron_script_path
+
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+    _config(home, allow_scripts=value)
+
+    ok, out = _run_job_script("tenant.py")
+    assert ok is False and "cron.allow_scripts is false or invalid" in out
+    assert not marker.exists()
+    assert _validate_cron_script_path("tenant.py")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"platform_script_digests": ["malformed"]},
+        {"platform_script_digests": {"tick.py": 7}},
+        {"platform_script_digests": "tick.py"},
+        {"platform_script_root": 7},
+    ],
+    ids=["digests-list", "digest-int", "digests-str", "root-int"],
+)
+def test_malformed_platform_policy_refuses_platform_script(home, platform_root, bad):
+    from cron.scheduler import _run_job_script
+
+    _platform_script(platform_root)
+    _config(home, allow_scripts=False, **{"platform_script_root": str(platform_root), **bad})
+
+    ok, out = _run_job_script("platform:tick.py")
+    assert ok is False
+    assert "policy is invalid" in out
+
+
+def test_cron_section_not_a_mapping_refuses_tenant_script(home, tmp_path):
+    from cron.scheduler import _run_job_script
+
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+    (home / "config.yaml").write_text("cron: [1, 2]\n", encoding="utf-8")
+
+    assert _run_job_script("tenant.py")[0] is False
+    assert not marker.exists()
+
+
+# --- F3: the executed bytes are the verified bytes, from a trusted path ---
+
+
+def _swap_at_popen(monkeypatch, action):
+    import cron.scheduler as scheduler
+
+    real = scheduler.subprocess.Popen
+
+    def swapping(*args, **kwargs):
+        action()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler.subprocess, "Popen", swapping)
+
+
+def test_root_rename_after_verification_runs_verified_bytes(home, platform_root, monkeypatch, tmp_path):
+    from cron.scheduler import _run_job_script
+
+    path = _platform_script(platform_root)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    _config(
+        home, allow_scripts=False, platform_script_root=str(platform_root),
+        platform_script_digests={"tick.py": digest},
+    )
+
+    def swap():
+        platform_root.rename(tmp_path / "moved")
+        platform_root.mkdir()
+        (platform_root / "tick.py").write_text('print("SWAPPED")\n', encoding="utf-8")
+
+    _swap_at_popen(monkeypatch, swap)
+    assert _run_job_script("platform:tick.py") == (True, "platform ran")
+
+
+def test_file_replaced_after_verification_runs_verified_bytes(home, platform_root, monkeypatch):
+    from cron.scheduler import _run_job_script
+
+    path = _platform_script(platform_root)
+    _config(home, allow_scripts=False, platform_script_root=str(platform_root))
+
+    def swap():
+        path.unlink()
+        path.write_text('print("SWAPPED")\n', encoding="utf-8")
+
+    _swap_at_popen(monkeypatch, swap)
+    assert _run_job_script("platform:tick.py") == (True, "platform ran")
+
+
+@pytest.mark.parametrize("spelling", ["alias", "alias/", "alias/.", "slash/", "dot", "dotdot", "double"])
+def test_non_canonical_root_spelling_refused(home, platform_root, tmp_path, spelling):
+    from cron.scheduler import _run_job_script
+
+    _platform_script(platform_root)
+    alias = tmp_path / "alias"
+    alias.symlink_to(platform_root, target_is_directory=True)
+    root = {
+        "alias": str(alias),
+        "alias/": f"{alias}/",
+        "alias/.": f"{alias}/.",
+        "slash/": f"{platform_root}/",
+        "dot": f"{platform_root}/.",
+        "dotdot": f"{platform_root}/../{platform_root.name}",
+        "double": f"/{platform_root}",
+    }[spelling]
+    _config(home, allow_scripts=False, platform_script_root=root)
+
+    ok, out = _run_job_script("platform:tick.py")
+    assert ok is False
+    assert "not a canonical absolute path" in out
+
+
+def test_symlinked_ancestor_refused(home, platform_root, tmp_path):
+    from cron.scheduler import _run_job_script
+
+    _platform_script(platform_root)
+    link = tmp_path / "link-parent"
+    link.symlink_to(tmp_path, target_is_directory=True)
+    _config(home, allow_scripts=False, platform_script_root=str(link / platform_root.name))
+
+    ok, out = _run_job_script("platform:tick.py")
+    assert ok is False
+    assert "not a canonical absolute path" in out
+
+
+def test_writable_ancestor_refused_sticky_allowed(home, platform_root):
+    from cron.scheduler import _run_job_script
+
+    _platform_script(platform_root)
+    _config(home, allow_scripts=False, platform_script_root=str(platform_root))
+    parent = platform_root.parent
+    mode = os.stat(parent).st_mode & 0o7777
+    try:
+        os.chmod(parent, 0o777)
+        ok, out = _run_job_script("platform:tick.py")
+        assert ok is False and "untrusted ancestor" in out
+        os.chmod(parent, 0o1777)
+        assert _run_job_script("platform:tick.py") == (True, "platform ran")
+    finally:
+        os.chmod(parent, mode)
+
+
+# --- F1: nothing but the verified bytes starts in the platform interpreter -
+
+
+_ENV_PROBE = (
+    "import os, sys\n"
+    "leaked = sorted(k for k in os.environ if k.startswith(('PYTHON', 'LD_', 'DYLD_')))\n"
+    "print(sys.flags.isolated, ','.join(leaked) or '-')\n"
+)
+
+
+def _startup_hook(tmp_path):
+    hook = tmp_path / "evil-site"
+    hook.mkdir()
+    marker = tmp_path / "startup-ran"
+    (hook / "sitecustomize.py").write_text(
+        f"open({str(marker)!r}, 'w').close()\n", encoding="utf-8",
+    )
+    return hook, marker
+
+
+def test_inherited_python_and_loader_env_do_not_reach_platform_script(
+    home, platform_root, tmp_path, monkeypatch,
+):
+    from cron.scheduler import _run_job_script
+
+    hook, marker = _startup_hook(tmp_path)
+    _platform_script(platform_root, body=_ENV_PROBE)
+    _config(home, allow_scripts=False, platform_script_root=str(platform_root))
+    monkeypatch.setenv("PYTHONPATH", str(hook))
+    monkeypatch.setenv("PYTHONSTARTUP", str(hook / "sitecustomize.py"))
+    monkeypatch.setenv("PYTHONINSPECT", "1")
+    monkeypatch.setenv("LD_PRELOAD", str(tmp_path / "missing.so"))
+    monkeypatch.setenv("DYLD_INSERT_LIBRARIES", str(tmp_path / "missing.dylib"))
+
+    assert _run_job_script("platform:tick.py") == (True, "1 -")
+    assert not marker.exists()
+
+
+def test_profile_env_pythonpath_does_not_run_on_no_agent_platform_job(
+    home, platform_root, tmp_path, monkeypatch,
+):
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    hook, marker = _startup_hook(tmp_path)
+    _platform_script(platform_root, body='print("watch tick")\n')
+    _config(home, allow_scripts=False, platform_script_root=str(platform_root))
+    (home / ".env").write_text(f"PYTHONPATH={hook}\n", encoding="utf-8")
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    job = create_job(
+        prompt=None, schedule="every 5m", script="platform:tick.py", no_agent=True, deliver="local",
+    )
+
+    try:
+        success, _doc, final, error = run_job(job)
+    finally:
+        os.environ.pop("PYTHONPATH", None)
+    assert (success, error) == (True, None)
+    assert "watch tick" in final
+    assert not marker.exists()
+
+
+def test_monitor_platform_script_ignores_pythonpath(home, platform_root, tmp_path, monkeypatch):
+    from cron.monitor import check_monitor
+
+    hook, marker = _startup_hook(tmp_path)
+    _platform_script(platform_root, body='print("snapshot")\n')
+    _config(home, allow_scripts=False, platform_script_root=str(platform_root))
+    monkeypatch.setenv("PYTHONPATH", str(hook))
+
+    outcome = check_monitor({"id": "m1", "monitor_script": "platform:tick.py"})
+    assert outcome.ok is True, outcome
+    assert not marker.exists()
+
+
+def test_stock_tenant_script_keeps_user_pythonpath(home, tmp_path, monkeypatch):
+    from cron.scheduler import _run_job_script
+
+    lib = tmp_path / "userlib"
+    lib.mkdir()
+    (lib / "userhelper.py").write_text("VALUE = 'from user path'\n", encoding="utf-8")
+    (home / "scripts" / "uses_lib.py").write_text(
+        "import userhelper\nprint(userhelper.VALUE)\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("PYTHONPATH", str(lib))
+
+    assert _run_job_script("uses_lib.py") == (True, "from user path")
+
+
+# --- F5: every resolver I/O failure is a Blocked result, never a raise -----
+
+
+@pytest.fixture
+def unreadable_pinned(home, platform_root):
+    path = _platform_script(platform_root)
+    _config(
+        home, allow_scripts=False, platform_script_root=str(platform_root),
+        platform_script_digests={"tick.py": hashlib.sha256(path.read_bytes()).hexdigest()},
+    )
+    os.chmod(path, 0)
+    yield path
+    os.chmod(path, 0o555)
+
+
+def test_unreadable_pinned_script_blocked_at_fire(unreadable_pinned):
+    from cron.scheduler import _run_job_script
+
+    ok, out = _run_job_script("platform:tick.py")
+    assert ok is False
+    assert out.startswith("Blocked: platform script cannot be read")
+
+
+def test_unreadable_pinned_script_blocked_on_prerun(unreadable_pinned):
+    from unittest.mock import MagicMock, patch
+
+    import cron.scheduler as scheduler
+
+    agent = MagicMock()
+    agent.run_conversation = MagicMock(return_value={"final_response": "ok", "messages": []})
+    runtime = {
+        "provider": "openrouter", "api_mode": "chat_completions",
+        "base_url": "https://openrouter.ai/api/v1", "api_key": "test-key",
+        "source": "stub", "requested_provider": None,
+    }
+    job = {"id": "job_prerun", "name": "prerun", "prompt": "summarize",
+           "schedule": "*/5 * * * *", "script": "platform:tick.py"}
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime), \
+         patch("run_agent.AIAgent", return_value=agent):
+        scheduler.run_job(job)
+
+    prompt = agent.run_conversation.call_args.args[0]
+    assert "Blocked: platform script cannot be read" in prompt
+
+
+def test_unreadable_pinned_script_blocked_on_monitor(unreadable_pinned):
+    from cron.monitor import check_monitor
+
+    outcome = check_monitor({"id": "m1", "monitor_script": "platform:tick.py"})
+    assert outcome.ok is False
+    assert "Blocked: platform script cannot be read" in outcome.error
+
+
+def test_unreadable_pinned_script_refused_by_tool_validator(unreadable_pinned):
+    from tools.cronjob_tools import _validate_cron_script_path
+
+    assert _validate_cron_script_path("platform:tick.py").startswith(
+        "Blocked: platform script cannot be read"
+    )
+
+
+def test_nul_in_configured_root_is_blocked(home):
+    from cron.scheduler import _run_job_script
+
+    _config(home, allow_scripts=False, platform_script_root="/opt/x\x00y")
+
+    ok, out = _run_job_script("platform:tick.py")
+    assert ok is False
+    assert out.startswith("Blocked:")

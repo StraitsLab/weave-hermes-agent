@@ -1155,6 +1155,24 @@ class TestPlatformScriptJobs:
         mock_create.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_create_refuses_unreadable_platform_script_with_400(
+        self, adapter, platform_home, tmp_path,
+    ):
+        import os
+
+        script = tmp_path / "platform-scripts" / "tick.py"
+        os.chmod(script, 0)
+        try:
+            status, data, mock_create = await self._post(
+                adapter, {"script": "platform:tick.py", "no_agent": True},
+            )
+        finally:
+            os.chmod(script, 0o555)
+        assert status == 400
+        assert data["error"].startswith("Blocked: platform script cannot be read")
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_create_refuses_no_agent_without_script(self, adapter, platform_home):
         status, data, mock_create = await self._post(adapter, {"no_agent": True})
         assert status == 400
