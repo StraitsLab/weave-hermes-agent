@@ -294,7 +294,8 @@ def test_snapshot_supervisor_merge_is_inside_the_fence(monkeypatch, takeover):
     monkeypatch.setattr(bt, "get_browser_snapshot_threshold", between_cli_and_merge)
     snap = SupervisorSnapshot(pending_dialogs=(), recent_dialogs=(), frame_tree={"top": {"name": "HUMAN-FRAME"}},
                               console_errors=(), active=True, cdp_url="ws://x", task_id="t")
-    monkeypatch.setattr(SUPERVISOR_REGISTRY, "get", lambda tid: SimpleNamespace(snapshot=lambda: snap))
+    monkeypatch.setattr(SUPERVISOR_REGISTRY, "get", lambda tid: SimpleNamespace(
+        snapshot=lambda: snap, set_request_signer=lambda signer: None))  # AB-2: dispatch applies the WBA flag
     raw = bt.browser_snapshot(task_id="t")
     if takeover:
         assert "HUMAN-FRAME" not in raw and _SECRET not in raw
