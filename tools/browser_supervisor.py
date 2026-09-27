@@ -335,6 +335,7 @@ class CDPSupervisor:
         # Web Bot Auth (fork, AB-2): a ``tools.browser_web_bot_auth.RequestSigner``, or None (no interception).
         self.request_signer = request_signer  # desired
         self._root_interception_applied = False  # confirmed root Fetch state on the current connection
+        self._bridge_rebind_pending = False  # a session's required bridge re-enable after a live root enable failed
         self._signing_tasks: set = set()
 
         # State protected by ``_state_lock`` for cross-thread reads.
@@ -445,9 +446,10 @@ class CDPSupervisor:
 
         The registry calls it on every lookup, so ``browser.web_bot_auth`` governs existing sessions in both
         directions. Only the browser-level interceptor changes; the page sessions' dialog bridge is untouched.
-        A failed enable/disable keeps the desired signer and leaves the applied state as it was, so the next
-        call retries."""
-        if signer is self.request_signer and self._root_interception_applied == (signer is not None):
+        A failed enable/disable or session re-enable keeps the desired signer and leaves the applied state as it
+        was, so the next call retries."""
+        if (signer is self.request_signer and self._root_interception_applied == (signer is not None)
+                and not self._bridge_rebind_pending):
             return
         self.request_signer = signer
         loop = self._loop
@@ -465,14 +467,25 @@ class CDPSupervisor:
         wanted = self.request_signer is not None
         if wanted:
             await self._cdp("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+            self._root_interception_applied = True
             # Chrome only routes an already-loaded document's requests through a root interceptor enabled after it
             # once its session's own Fetch is (re)enabled: re-apply the unchanged bridge interceptor to each session.
+            # Every session is tried; any failure leaves the rebind pending for the next command to retry.
+            failed = []
             for sid in [self._page_session_id, *self._child_sessions]:
                 if sid:
-                    await self._enable_bridge_fetch(sid)
+                    try:
+                        await self._enable_bridge_fetch(sid, strict=True)
+                    except Exception as e:
+                        failed.append(type(e).__name__)
+            self._bridge_rebind_pending = bool(failed)
+            if failed:
+                logger.warning("web bot auth: request interception rebind failed on %d session(s) (%s); "
+                               "retried at the next command", len(failed), ", ".join(sorted(set(failed))))
         else:
             await self._cdp("Fetch.disable")
-        self._root_interception_applied = wanted
+            self._root_interception_applied = False
+            self._bridge_rebind_pending = False
 
     def snapshot(self) -> SupervisorSnapshot:
         """Return an immutable snapshot of current state."""
@@ -795,6 +808,7 @@ class CDPSupervisor:
                 self._page_session_id = None
                 self._child_sessions.clear()
                 self._root_interception_applied = False  # a new connection starts with no root Fetch
+                self._bridge_rebind_pending = False
                 # We deliberately keep `_pending_dialogs` and `_frames` —
                 # they're reconciled as the supervisor resubscribes and
                 # receives fresh events.  Worst case: an agent sees a stale
@@ -887,8 +901,8 @@ class CDPSupervisor:
         # real native dialogs before we can call handleJavaScriptDialog).
         await self._install_dialog_bridge(self._page_session_id)
 
-    async def _enable_bridge_fetch(self, session_id: str) -> None:
-        """``Fetch.enable`` scoped to the bridge URL on one session (best-effort)."""
+    async def _enable_bridge_fetch(self, session_id: str, strict: bool = False) -> None:
+        """``Fetch.enable`` scoped to the bridge URL on one session (best-effort unless ``strict``: then it raises)."""
         try:
             await self._cdp(
                 "Fetch.enable",
@@ -905,6 +919,8 @@ class CDPSupervisor:
                 timeout=5.0,
             )
         except Exception as e:
+            if strict:
+                raise
             logger.debug(
                 "dialog bridge: Fetch.enable failed on sid=%s: %s",
                 (session_id or "")[:16], e,

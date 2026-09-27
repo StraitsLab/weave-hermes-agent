@@ -409,6 +409,47 @@ def test_a_lookup_on_the_supervisor_loop_thread_does_not_reconcile_or_block(conf
     assert registry.get("t") is stub and stub.calls == ["reconcile"]
 
 
+def test_a_failed_session_rebind_is_retried_on_every_session_with_a_sanitized_warning(caplog):
+    """F2-B: after a live root enable, each page/child session's bridge Fetch is re-enabled. One failing session
+    (here a child) leaves the rebind pending, so the next reconciliation retries; the warning names no session."""
+    from tools.browser_supervisor import CDPSupervisor
+
+    supervisor = CDPSupervisor("t", "ws://x")
+    supervisor._page_session_id = "PAGE-SESSION-0123456789"
+    supervisor._child_sessions = {"CHILD-SESSION-A-0123456789": {}, "CHILD-SESSION-B-0123456789": {}}
+    calls, fail = [], {"CHILD-SESSION-A-0123456789"}
+
+    async def cdp(method, params=None, session_id=None, **kwargs):
+        calls.append((method, session_id))
+        if session_id in fail:
+            fail.discard(session_id)
+            raise RuntimeError("transient failure at http://example.com/ on CHILD-SESSION-A-0123456789")
+        return {"result": {}}
+
+    supervisor._cdp = cdp
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    supervisor._loop = loop
+    caplog.set_level(logging.WARNING, logger="tools.browser_supervisor")
+    signer = object()
+    sessions = [("Fetch.enable", None), ("Fetch.enable", "PAGE-SESSION-0123456789"),
+                ("Fetch.enable", "CHILD-SESSION-A-0123456789"), ("Fetch.enable", "CHILD-SESSION-B-0123456789")]
+    try:
+        supervisor.set_request_signer(signer)
+        assert calls == sessions  # every session tried despite the child failing
+        warning = caplog.text
+        assert "rebind failed on 1 session(s) (RuntimeError)" in warning
+        assert "SESSION" not in warning and "example.com" not in warning
+        calls.clear()
+        supervisor.set_request_signer(signer)  # the next command: same signer, retried because pending
+        assert calls == sessions
+        calls.clear()
+        supervisor.set_request_signer(signer)  # applied and nothing pending: no CDP traffic
+        assert calls == []
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
 # ── E2E: real Chrome, real supervisor, verifying server ──────────────────────
 
 
@@ -688,6 +729,20 @@ def _wait_for(server, path, timeout=6.0):
     return dict(server.seen).get(path)
 
 
+def _command_request(tool, server, task, path):
+    """One tool command that makes the browser request ``path``; returns that request's verdict."""
+    from tools import browser_cdp_tool, browser_tool
+
+    server.seen.clear()
+    if tool == "console":
+        out = browser_tool.browser_console(expression=f"fetch({json.dumps(server.url(path))}).then(r => r.status)",
+                                           task_id=task)
+    else:
+        out = browser_cdp_tool.browser_cdp("Target.createTarget", {"url": server.url(path)}, task_id=task)
+    assert json.loads(out).get("success") is True, out
+    return _wait_for(server, path)
+
+
 @e2e
 @pytest.mark.integration
 @pytest.mark.parametrize("tool", ["console", "cdp"])
@@ -706,14 +761,7 @@ def test_console_and_raw_cdp_commands_follow_the_flag_in_both_directions(chrome,
     task = f"wba-e2e-{tool}"
 
     def request(path):
-        server.seen.clear()
-        if tool == "console":
-            out = browser_tool.browser_console(expression=f"fetch({json.dumps(server.url(path))}).then(r => r.status)",
-                                               task_id=task)
-        else:
-            out = browser_cdp_tool.browser_cdp("Target.createTarget", {"url": server.url(path)}, task_id=task)
-        assert json.loads(out).get("success") is True, out
-        return _wait_for(server, path)
+        return _command_request(tool, server, task, path)
 
     try:
         supervisor = registry.get_or_start(task_id=task, cdp_url=chrome)
@@ -841,6 +889,75 @@ def test_a_reconnect_resets_the_applied_state_so_a_failed_reenable_is_retried(ch
         assert _load(supervisor, server.url("/dropped"), ["/dropped"], server) == {"/dropped": "absent"}
         assert registry.get("wba-e2e-reconnect") is supervisor and attempts["Fetch.enable"] == 3
         assert _load(supervisor, server.url("/after"), ["/after"], server) == {"/after": "signed"}
+        assert _dialog_round_trip(supervisor, server)
+    finally:
+        server.shutdown()
+
+
+@pytest.fixture
+def page_fetch_faults(monkeypatch):
+    """Record every Fetch.enable/disable as (method, session_id); when armed, fail the next session-scoped (bridge)
+    Fetch.enable once."""
+    from tools.browser_supervisor import CDPSupervisor
+
+    original, calls, armed = CDPSupervisor._cdp, [], []
+
+    async def faulty(self, method, params=None, **kwargs):
+        if method in ("Fetch.enable", "Fetch.disable"):
+            calls.append((method, kwargs.get("session_id")))
+            if armed and kwargs.get("session_id"):
+                armed.clear()
+                raise RuntimeError("transient CDP failure")
+        return await original(self, method, params, **kwargs)
+
+    monkeypatch.setattr(CDPSupervisor, "_cdp", faulty)
+    return calls, armed
+
+
+@e2e
+@pytest.mark.integration
+@pytest.mark.parametrize("then", ["retry", "off", "reconnect"])
+def test_a_failed_page_rebind_is_retried_by_the_next_command(chrome, config, hook, registry, root_pauses, caplog,
+                                                              monkeypatch, page_fetch_faults, then):
+    """F2-B: OFF->ON on a loaded page needs the page session's bridge Fetch re-enabled. One transient failure of that
+    step may leave the command that hit it unsigned, but it stays pending: the next command retries it and signs,
+    turning the flag OFF still disables root interception, and a reconnect starts clean. Once settled, a command
+    sends no Fetch calls."""
+    from tools import browser_tool
+
+    calls, armed = page_fetch_faults
+    signer = _TestSigner()
+    hook.append(lambda: signer)
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: True)  # the verifying server is on loopback
+    server = _Server(signer.private.public_key())
+    task = f"wba-e2e-rebind-{then}"
+    caplog.set_level(logging.WARNING, logger="tools.browser_supervisor")
+    try:
+        supervisor = registry.get_or_start(task_id=task, cdp_url=chrome)
+        page = supervisor._page_session_id
+        assert _load(supervisor, server.url("/page"), ["/page"], server) == {"/page": "absent"}
+        config["browser"]["web_bot_auth"] = True
+        calls.clear()
+        armed.append(True)
+        assert _command_request("console", server, task, "/first") != "invalid"  # the allowed one-command fail-open
+        assert calls == [("Fetch.enable", None), ("Fetch.enable", page)]
+        calls.clear()
+        if then == "retry":
+            assert _command_request("console", server, task, "/second") == "signed"
+            assert calls == [("Fetch.enable", None), ("Fetch.enable", page)]  # the whole enable, retried
+        elif then == "off":
+            config["browser"]["web_bot_auth"] = False
+            root_pauses.clear()
+            assert _command_request("console", server, task, "/off") == "absent" and root_pauses == []
+            assert calls == [("Fetch.disable", None)]
+        else:
+            _reconnect(supervisor)
+            calls.clear()
+            assert _command_request("console", server, task, "/after") == "signed"
+        calls.clear()
+        assert registry.get(task) is supervisor and calls == []  # settled: nothing left to retry
+        assert "rebind failed on 1 session(s) (RuntimeError)" in caplog.text
+        assert page not in caplog.text and "127.0.0.1" not in caplog.text
         assert _dialog_round_trip(supervisor, server)
     finally:
         server.shutdown()
