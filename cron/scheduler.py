@@ -3316,18 +3316,37 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             from gateway.mirror import mirror_to_session
             from hermes_state import SessionDB
 
+            # Take the conversation's turn lease first: an append inside a
+            # live turn would split its tool-call block, and replay repair
+            # then drops the later tool results.
+            holder = f"pid={os.getpid()}:cron={job['id']}:{uuid.uuid4().hex}"
+            appended = False
             try:
                 with SessionDB() as db:
-                    target_sid = db.resolve_resume_session_id(str(chat_id))
+                    if not db.acquire_session_turn_lease(
+                        str(chat_id), holder, ttl_seconds=60.0,
+                        wait_seconds=_TRANSCRIPT_LEASE_WAIT_SECONDS,
+                    ):
+                        delivery_errors.append(
+                            f"transcript append to {platform_name}:{chat_id} failed: "
+                            f"conversation busy for {_TRANSCRIPT_LEASE_WAIT_SECONDS:g}s"
+                        )
+                        continue
+                    try:
+                        appended = mirror_to_session(
+                            platform_name, str(chat_id),
+                            cleaned_delivery_content.strip(), source_label="cron",
+                            session_id=db.resolve_resume_session_id(str(chat_id)),
+                            role="assistant",
+                        )
+                    finally:
+                        db.release_session_turn_lease(str(chat_id), holder)
             except Exception as e:
                 delivery_errors.append(
                     f"transcript append to {platform_name}:{chat_id} failed: {e}"
                 )
                 continue
-            if not mirror_to_session(
-                platform_name, str(chat_id), cleaned_delivery_content.strip(),
-                source_label="cron", session_id=target_sid, role="assistant",
-            ):
+            if not appended:
                 delivery_errors.append(
                     f"transcript append to {platform_name}:{chat_id} failed"
                 )
@@ -3993,6 +4012,11 @@ def _get_script_timeout() -> int:
 
 
 _DEFAULT_MEDIA_SEND_TIMEOUT = 300
+# How long a brief for a non-push conversation waits for a live turn there to
+# finish before recording a delivery error. Delivery runs inside the job's
+# fire fence, and the fire-claim heartbeat gives up on that fence after
+# _JOBS_LOCK_TIMEOUT_SECONDS (30s), so this must stay below it.
+_TRANSCRIPT_LEASE_WAIT_SECONDS = 20.0
 
 
 def _get_media_send_timeout() -> int:
