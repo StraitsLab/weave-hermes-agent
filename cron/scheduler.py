@@ -3337,7 +3337,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             platform_name, str(chat_id),
                             cleaned_delivery_content.strip(), source_label="cron",
                             session_id=db.resolve_resume_session_id(str(chat_id)),
-                            role="assistant",
+                            role="assistant", turn_lease_holder=holder,
                         )
                     finally:
                         db.release_session_turn_lease(str(chat_id), holder)

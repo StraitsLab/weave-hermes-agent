@@ -311,3 +311,72 @@ def test_turn_that_outlasts_the_wait_is_a_delivery_error(adapter, gateway_loop):
     assert error is not None and "conversation busy" in error
     assert len(_rows(db)) == 2
     assert db.try_acquire_session_turn_lease(SID, "long-turn")  # still ours, not stolen
+
+
+# The cron lease can expire while delivery is paused (GC, suspension) and be
+# reclaimed by a new turn. The append must then be refused at insertion, in
+# the same transaction, rather than split the new turn's tool block.
+
+
+def _deliver_paused_past_lease_expiry(adapter, gateway_loop, successor_turn):
+    """Expire cron's real DB lease just before its append; run successor_turn there."""
+    import time
+
+    from gateway import mirror
+
+    real_append = mirror._append_to_sqlite
+    now = time.time()
+    offset = [0.0]
+
+    def paused_append(sid, message, **kwargs):
+        offset[0] = 61.0  # past the 60s cron lease; lease row untouched
+        successor_turn()
+        return real_append(sid, message, **kwargs)
+
+    with patch("hermes_state.time.time", side_effect=lambda: now + offset[0]), \
+         patch.object(mirror, "_append_to_sqlite", paused_append):
+        return _deliver(adapter, gateway_loop)
+
+
+def _tool_call_turn(db, codex_interim):
+    owned = {"turn_lease_holder": "successor"}
+    db.append_message(SID, role="user", content="Read both", **owned)
+    db.append_message(SID, role="assistant", content="Reading", tool_calls=[
+        {"id": c, "type": "function", "function": {"name": "web_extract", "arguments": "{}"}}
+        for c in ("c1", "c2")
+    ], finish_reason="incomplete" if codex_interim else None, **owned)
+
+
+@pytest.mark.parametrize("codex_interim,fires", [
+    (False, "between_results"),
+    (True, "before_first_result"),
+])
+def test_reclaimed_lease_refuses_the_append(codex_interim, fires, adapter, gateway_loop):
+    db = adapter._session_db
+    _seed_scheduling_turn(db)
+    owned = {"turn_lease_holder": "successor"}
+
+    def successor_takes_over():
+        assert db.try_acquire_session_turn_lease(SID, "successor", ttl_seconds=300)
+        _tool_call_turn(db, codex_interim)
+        if fires == "between_results":
+            db.append_message(SID, role="tool", tool_call_id="c1", content="ONE", **owned)
+
+    error = _deliver_paused_past_lease_expiry(adapter, gateway_loop, successor_takes_over)
+    if fires == "before_first_result":
+        db.append_message(SID, role="tool", tool_call_id="c1", content="ONE", **owned)
+    db.append_message(SID, role="tool", tool_call_id="c2", content="TWO", **owned)
+    db.append_message(SID, role="assistant", content="Done", **owned)
+    db.release_session_turn_lease(SID, "successor")
+
+    assert error is not None and "transcript append to api_server:" in error
+    assert DIGEST not in [content for _, content in _rows(db)]
+    assert _replayed_tool_ids(db, SID) == ["c1", "c2"]
+
+
+def test_expired_but_unclaimed_lease_still_delivers(adapter, gateway_loop):
+    db = adapter._session_db
+    _seed_scheduling_turn(db)
+
+    assert _deliver_paused_past_lease_expiry(adapter, gateway_loop, lambda: None) is None
+    assert _rows(db)[-1] == ("assistant", DIGEST)
