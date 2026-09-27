@@ -36,7 +36,7 @@ def vault_authorize_write(handle: str, method: str, url: str, body: str = "") ->
         method.encode("utf-8"), url.encode("utf-8")  # they go into the authority's JSON; a lone surrogate cannot
         payload = body.encode("utf-8")
     except ValueError:  # UnicodeEncodeError included; the parser's text names the input, so it stays out
-        return _refused("request_invalid", "The URL or body is not a valid request. Nothing was sent.")
+        return _refused("request_invalid", "The method, URL or body is not a valid request. Nothing was sent.")
     try:
         backend = next((b for b in enabled_backends() if isinstance(b, WeaveLoginBackend)), None)
         if backend is None:
