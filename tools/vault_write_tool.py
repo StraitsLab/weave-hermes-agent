@@ -12,11 +12,8 @@ Offered only where the Harso vault is the backend (``vault.enabled: true`` and `
 from __future__ import annotations
 
 import json
-import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from urllib.parse import urlsplit
-
-logger = logging.getLogger(__name__)
 
 
 def _check_available() -> bool:
