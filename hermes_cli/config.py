@@ -3774,6 +3774,35 @@ def load_config_readonly() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=False)
 
 
+def load_config_strict() -> Tuple[Dict[str, Any], Tuple[Dict[str, Any], ...]]:
+    """Fail-closed ``load_config()`` for security policy reads.
+
+    Returns ``(effective, (user_raw, managed_raw))``, where all three come from a
+    single read of the user config.yaml and of the managed config.yaml (a missing
+    file is ``{}``). It uses the same merge, env expansion and managed overlay as
+    ``load_config()``, but it raises instead of falling back to defaults or
+    last-known-good, and it never reads or writes the load caches.
+    """
+    layers: List[Dict[str, Any]] = []
+    effective = _load_config_impl(want_deepcopy=True, strict_layers=layers)
+    return effective, tuple(layers)
+
+
+def _read_config_mapping_strict(path: Path) -> Dict[str, Any]:
+    """Read one config file for ``load_config_strict``. A missing file or an
+    empty document is ``{}``. Any other non-mapping root raises."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            loaded = fast_safe_load(f)
+    except FileNotFoundError:
+        return {}
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise TypeError(f"{path}: top-level YAML must be a mapping, got {type(loaded).__name__}")
+    return loaded
+
+
 def write_platform_config_field(
     platform_key: str,
     field_key: str,
@@ -3947,7 +3976,13 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(
+    *, want_deepcopy: bool, strict_layers: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    # strict_layers is not None -> strict mode (see load_config_strict): it
+    # raises on every read/parse/normalise failure, it skips the caches, and it
+    # appends the raw user and managed mappings to strict_layers.
+    strict = strict_layers is not None
     with _CONFIG_LOCK:
         ensure_hermes_home()
         config_path = get_config_path()
@@ -3986,7 +4021,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         else:
             cache_sig = None
 
-        cached = _LOAD_CONFIG_CACHE.get(path_key)
+        cached = None if strict else _LOAD_CONFIG_CACHE.get(path_key)
         if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
@@ -3998,11 +4033,16 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        user_layer: Dict[str, Any] = {}
 
         if user_sig is not None:
             try:
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = fast_safe_load(f) or {}
+                if strict:
+                    user_config = _read_config_mapping_strict(config_path)
+                    user_layer = copy.deepcopy(user_config)
+                else:
+                    with open(config_path, encoding="utf-8") as f:
+                        user_config = fast_safe_load(f) or {}
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -4013,6 +4053,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
                 config = _deep_merge(config, user_config)
             except Exception as e:
+                if strict:
+                    raise
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
                 # silently replace the effective policy with an empty/default
@@ -4060,7 +4102,13 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         # against the process environment, never against user-config-defined refs.
         # This deliberately inverts the usual env-over-config precedence for the
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
-        managed_config = managed_scope.load_managed_config()
+        if strict:
+            managed_config = (
+                _read_config_mapping_strict(managed_cfg_path) if managed_cfg_path else {}
+            )
+            strict_layers.extend((user_layer, copy.deepcopy(managed_config)))
+        else:
+            managed_config = managed_scope.load_managed_config()
         if managed_config:
             # Normalize the managed overlay through the same canonicalization as
             # the user config BEFORE merging (parity with
@@ -4075,6 +4123,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 managed_normalized["model"] = {"default": managed_normalized["model"]}
             managed_expanded = _expand_env_vars(managed_normalized)
             expanded = _deep_merge(expanded, managed_expanded)
+        if strict:
+            return expanded
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``

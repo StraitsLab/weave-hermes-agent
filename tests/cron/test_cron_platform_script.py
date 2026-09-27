@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -152,16 +153,19 @@ def test_platform_non_regular_file_refused(home, platform_root, kind):
     assert "not a regular file" in out
 
 
-def test_root_that_is_a_file_refused(home, tmp_path):
+def test_root_that_is_a_file_refused(home, platform_root, tmp_path):
     from cron.scheduler import _run_job_script
 
+    # platform_root patches the owner uid, so owner and ancestor custody pass
+    # and ENOTDIR on the open is the only reason left to refuse.
     root = tmp_path / "root-file"
     root.write_text("", encoding="utf-8")
     os.chmod(root, 0o555)
     _config(home, platform_script_root=str(root))
 
     ok, out = _run_job_script("platform:tick.py")
-    assert ok is False and out.startswith("Blocked:")
+    assert ok is False
+    assert out.startswith("Blocked: platform script cannot be read") and "Not a directory" in out
 
 
 def _fake_owner(monkeypatch, target, uid):
@@ -505,6 +509,158 @@ def test_cron_section_not_a_mapping_refuses_tenant_script(home, tmp_path):
 
     assert _run_job_script("tenant.py")[0] is False
     assert not marker.exists()
+
+
+# --- F2 round 3: the policy comes from one strict read of each file --------
+
+
+def _write_yaml(path, data):
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+
+def _tenant_refused(marker):
+    from cron.scheduler import _run_job_script
+    from tools.cronjob_tools import _validate_cron_script_path
+
+    ok, out = _run_job_script("tenant.py")
+    assert ok is False and out.startswith("Blocked:"), out
+    assert not marker.exists()
+    assert _validate_cron_script_path("tenant.py")
+
+
+@pytest.mark.parametrize("agent", [1, "x", ["x"]], ids=["int", "str", "list"])
+def test_normalisation_failure_does_not_drop_explicit_false(home, tmp_path, agent):
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+    _write_yaml(home / "config.yaml", {"cron": {"allow_scripts": False}, "max_turns": 5, "agent": agent})
+
+    _tenant_refused(marker)
+
+
+def test_warm_normalisation_failure_does_not_serve_permissive_lkg(home, tmp_path):
+    from cron.scheduler import _cron_script_policy, _run_job_script
+    from hermes_cli.config import load_config
+
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+    _write_yaml(home / "config.yaml", {"cron": {"allow_scripts": True}})
+    assert _cron_script_policy() == (True, "", {})
+    load_config()  # warm the last-known-good cache with the permissive config
+    assert _run_job_script("tenant.py")[0] is True
+    marker.unlink()
+    _write_yaml(home / "config.yaml", {"cron": {"allow_scripts": False}, "max_turns": 5, "agent": 1})
+
+    _tenant_refused(marker)
+
+
+@pytest.mark.parametrize("managed_text", ["cron: {allow_scripts: [\n", "[1, 2]\n", "[]\n", None],
+                         ids=["malformed", "non-mapping", "empty-list", "unreadable"])
+def test_cold_bad_managed_config_refuses_tenant(home, tmp_path, monkeypatch, managed_text):
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    managed_cfg = managed / "config.yaml"
+    managed_cfg.write_text(managed_text or "cron: {allow_scripts: true}\n", encoding="utf-8")
+    if managed_text is None:
+        os.chmod(managed_cfg, 0)
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    try:
+        _tenant_refused(marker)
+    finally:
+        os.chmod(managed_cfg, 0o600)
+
+
+@pytest.mark.parametrize(
+    "layer, cron",
+    [
+        ("user", None),
+        ("user", {"allow_scripts": None}),
+        ("user", {"platform_script_root": None}),
+        ("user", {"platform_script_digests": None}),
+        ("managed", None),
+        ("managed", {"platform_script_digests": None}),
+    ],
+    ids=["cron", "allow", "root", "digests", "managed-cron", "managed-digests"],
+)
+def test_explicit_null_policy_refuses_every_script(home, platform_root, tmp_path, monkeypatch, layer, cron):
+    from cron.scheduler import _cron_script_policy, _run_job_script
+
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+    _platform_script(platform_root)
+    user = {"cron": {"platform_script_root": str(platform_root)}}
+    if layer == "user":
+        user["cron"] = None if cron is None else {**user["cron"], **cron}
+    else:
+        managed = tmp_path / "managed"
+        managed.mkdir()
+        _write_yaml(managed / "config.yaml", {"cron": cron})
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    _write_yaml(home / "config.yaml", user)
+
+    assert _cron_script_policy() is None
+    assert _run_job_script("platform:tick.py")[0] is False  # never unpinned
+    _tenant_refused(marker)
+
+
+def test_policy_reads_each_config_file_once_and_ignores_later_replacement(
+    home, tmp_path, monkeypatch,
+):
+    import hermes_cli.config as config_mod
+    from cron.scheduler import _cron_script_policy
+
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    _write_yaml(managed / "config.yaml", {"cron": {"platform_script_root": "/opt/weave"}})
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    _write_yaml(home / "config.yaml", {"cron": {"allow_scripts": False}})
+    targets = {str(home / "config.yaml"), str(managed / "config.yaml")}
+    opened = []
+    real_open, real_load = open, config_mod.fast_safe_load
+
+    def spy_open(path, *args, **kwargs):
+        if str(path) in targets:
+            opened.append(str(path))
+        return real_open(path, *args, **kwargs)
+
+    def load_then_replace(stream):
+        parsed = real_load(stream)
+        # Held replacement: the file just read turns permissive.
+        _write_yaml(Path(stream.name), {"cron": {"allow_scripts": True, "platform_script_root": ""}})
+        return parsed
+
+    monkeypatch.setattr(config_mod, "open", spy_open, raising=False)
+    monkeypatch.setattr(config_mod, "fast_safe_load", load_then_replace)
+
+    assert _cron_script_policy() == (False, "/opt/weave", {})
+    assert sorted(opened) == sorted(targets)
+
+
+@pytest.mark.parametrize("text", [None, "{}\n", "cron: {}\n", "cron: {script_timeout_seconds: 5}\n"],
+                         ids=["no-file", "empty-mapping", "empty-cron", "unrelated-cron-key"])
+def test_absent_policy_keeps_stock_defaults(home, tmp_path, text):
+    from cron.scheduler import _cron_script_policy, _run_job_script
+
+    if text is not None:
+        (home / "config.yaml").write_text(text, encoding="utf-8")
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+
+    assert _cron_script_policy() == (True, "", {})
+    assert _run_job_script("tenant.py")[0] is True and marker.exists()
+
+
+def test_valid_managed_false_overrides_user_true(home, tmp_path, monkeypatch):
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    _write_yaml(managed / "config.yaml", {"cron": {"allow_scripts": False}})
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    _write_yaml(home / "config.yaml", {"cron": {"allow_scripts": True}})
+
+    _tenant_refused(marker)
 
 
 # --- F3: the executed bytes are the verified bytes, from a trusted path ---

@@ -4289,36 +4289,39 @@ def _cron_script_policy() -> Optional[tuple[bool, str, dict]]:
 
     Stock defaults: tenant scripts allowed, no platform root, no digests.
     Returns None (callers refuse every script) unless the policy is positively
-    valid: the user and managed config files parse (``load_config`` itself
-    falls back to defaults / last-known-good on a parse error) and every key
-    has its declared type.
+    valid. ``load_config_strict`` raises on any read/parse/normalise failure
+    (never defaults or last-known-good). Every raw layer and the merged result
+    must also carry the declared types. An explicit null counts as invalid,
+    because the merge would otherwise drop it back to the default.
     """
     try:
-        from hermes_cli import managed_scope
-        from hermes_cli.config import get_config_path, require_readable_config_before_write
+        from hermes_cli.config import load_config_strict
 
-        require_readable_config_before_write(get_config_path())
-        managed_dir = managed_scope.get_managed_dir()
-        if managed_dir is not None:
-            require_readable_config_before_write(managed_dir / "config.yaml")
-        cron_cfg = (load_config() or {}).get("cron")
+        effective, layers = load_config_strict()
     except Exception:
         logger.warning("cron: config unreadable; refusing all cron scripts", exc_info=True)
         return None
-    if not isinstance(cron_cfg, dict):
-        return None
-    allow = cron_cfg.get("allow_scripts", True)
-    root = cron_cfg.get("platform_script_root", "")
+    for cron_cfg in [layer["cron"] for layer in layers if "cron" in layer] + [effective.get("cron")]:
+        if not isinstance(cron_cfg, dict) or not _cron_script_policy_types_ok(cron_cfg):
+            logger.warning("cron: invalid script policy types; refusing all cron scripts")
+            return None
+    cron_cfg = effective["cron"]
+    return (
+        cron_cfg.get("allow_scripts", True),
+        cron_cfg.get("platform_script_root", ""),
+        cron_cfg.get("platform_script_digests", {}),
+    )
+
+
+def _cron_script_policy_types_ok(cron_cfg: dict) -> bool:
+    """True when every script-policy key present in ``cron_cfg`` has its type."""
     digests = cron_cfg.get("platform_script_digests", {})
-    if (
-        not isinstance(allow, bool)
-        or not isinstance(root, str)
-        or not isinstance(digests, dict)
-        or not all(isinstance(k, str) and isinstance(v, str) for k, v in digests.items())
-    ):
-        logger.warning("cron: invalid script policy types; refusing all cron scripts")
-        return None
-    return allow, root, digests
+    return (
+        isinstance(cron_cfg.get("allow_scripts", True), bool)
+        and isinstance(cron_cfg.get("platform_script_root", ""), str)
+        and isinstance(digests, dict)
+        and all(isinstance(k, str) and isinstance(v, str) for k, v in digests.items())
+    )
 
 
 def _tenant_scripts_allowed() -> bool:
