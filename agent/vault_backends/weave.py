@@ -198,8 +198,9 @@ class WeaveLoginBackend(LoginBackend):
             payload = None
         if response.status_code == 200 and isinstance(payload, dict):
             return payload
-        code = ((payload or {}).get("error") or {}).get("code") if isinstance(payload, dict) else None
-        if code in refusals:
+        error = payload.get("error") if isinstance(payload, dict) else None  # any other shape is just unavailable
+        code = error.get("code") if isinstance(error, dict) else None
+        if isinstance(code, str) and code in refusals:
             raise VaultUseRefused(*refusals[code])
         raise VaultUnavailable(f"the Harso vault answered HTTP {response.status_code}")
 

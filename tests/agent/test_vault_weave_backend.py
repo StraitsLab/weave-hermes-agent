@@ -1203,6 +1203,8 @@ def _dispatch(**changes):
     {"handle": "", "url": "https://example.com\uff0fother/"},    # NFKC-invalid authority
     {"url": "https://[bad/"},                                    # with a handle: never reaches the authority either
     {"body": "\ud800"}, {"body": "\udfff"},                      # unpaired surrogates: not sendable as UTF-8
+    {"url": "https://api.stripe.com/v1/\ud800"},                 # ...nor in the URL or method sent to the authority
+    {"method": "PO\udfffST"}, {"handle": "", "url": "https://api.stripe.com/\udfff"},
 ])
 def test_a_request_that_cannot_be_sent_is_request_invalid_and_sends_nothing(stripe, admitted_turn, changes):
     with _acp_gate("once") as asked:
@@ -1240,3 +1242,17 @@ def test_a_backend_that_cannot_be_selected_is_vault_unavailable(stripe, admitted
         raw = _dispatch()
     assert json.loads(raw)["error_type"] == "vault_unavailable" and "must not see" not in raw
     assert stripe.requests == []
+
+
+@pytest.mark.parametrize("error", ["down", ["down"], 1, {"code": ["VAULT_ITEM_UNAVAILABLE"]}, {"code": {"x": 1}}])
+def test_a_malformed_error_envelope_is_unavailable_on_every_backend_path(api, monkeypatch, error):
+    """The shared ``_call`` parser: fill's get_meta and list_items see the same typed failure as the write tool."""
+    from agent.vault_backends.base import VaultUnavailable
+    from agent.vault_backends.weave import WeaveLoginBackend
+
+    monkeypatch.setenv("WEAVE_API_MCP_BEARER", ATTEMPT_BEARER)
+    api.force = (503, {"error": error})
+    backend = WeaveLoginBackend(api.url)
+    for call in (lambda: backend.get_meta(HANDLE), backend.list_items):
+        with pytest.raises(VaultUnavailable, match=r"^the Harso vault answered HTTP 503$"):
+            call()

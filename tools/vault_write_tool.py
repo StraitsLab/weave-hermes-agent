@@ -33,6 +33,7 @@ def vault_authorize_write(handle: str, method: str, url: str, body: str = "") ->
 
     try:  # the request as it will be sent: a URL that does not parse or a body that is not UTF-8 cannot be sent
         parts = urlsplit(url)
+        method.encode("utf-8"), url.encode("utf-8")  # they go into the authority's JSON; a lone surrogate cannot
         payload = body.encode("utf-8")
     except ValueError:  # UnicodeEncodeError included; the parser's text names the input, so it stays out
         return _refused("request_invalid", "The URL or body is not a valid request. Nothing was sent.")
