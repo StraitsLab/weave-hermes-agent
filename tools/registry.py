@@ -75,15 +75,19 @@ def _vault_armed_refusal(name: str, args: dict, task_id) -> Optional[str]:
     """Fork (V-9d): a tab that received a vault value holds it in its DOM until it loads a new document. Redaction
     cannot hide a value the model transforms in-page (btoa, reversal, char codes) or reads as pixels, so model-driven
     page JS, raw CDP beyond the page-blind methods, browser-use code (js/cdp/capture_screenshot) and screenshots are
-    refused here, the one point every model tool call crosses, while any tab of the task is armed (the target tab of
-    an eval is not known here, and a same-origin tab can reach the armed one through window.opener). The vault's own
-    fill runs over the supervisor, not here."""
+    refused here, the one point every model tool call crosses, while any tab the call can reach is armed (the target
+    tab of an eval is not known here, and a same-origin tab can reach the armed one through window.opener). A CDP
+    override (the one browser browser_cdp reaches, target ids included) or the real-profile browser is one browser
+    every task drives, so there an armed tab of any task counts, whatever task id the call names. The vault's own fill
+    runs over the supervisor."""
     if not (name in ("browser_vision", "browser_cdp", "browser_exec")
             or (name == "browser_console" and args.get("expression") is not None)):
         return None
     from tools.browser_supervisor import vault_armed
+    from tools.browser_tool import _get_cdp_override_raw, _use_real_profile
 
-    if not vault_armed(task_id):
+    shared = _get_cdp_override_raw() or _use_real_profile()
+    if not vault_armed(None if shared else (task_id or "default")):
         return None
     if name == "browser_cdp":
         from tools.browser_cdp_tool import _CDP_PRIVATE_PAGE_ALLOWED_METHODS

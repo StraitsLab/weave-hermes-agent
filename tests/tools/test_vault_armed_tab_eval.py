@@ -117,10 +117,10 @@ class Driver:
     def __init__(self, api, pages):
         self.api, self.pages = api, pages
 
-    def call(self, name, **args):
+    def call(self, name, task_id="default", **args):
         from tools.registry import registry
 
-        out = registry.dispatch(name, args, task_id="default")
+        out = registry.dispatch(name, args, task_id=task_id)
         return out if isinstance(out, dict) else json.loads(out)
 
     def page_eval(self, expression):
@@ -208,12 +208,17 @@ def _full_percent(d):
     return unquote(raw, encoding="latin-1") if isinstance(raw, str) else None
 
 
-def _cdp_runtime_evaluate(d):
-    out = d.call("browser_cdp", method="Runtime.evaluate", target_id=d.page_target(),
+def _cdp_runtime_evaluate(d, task_id="default"):
+    out = d.call("browser_cdp", task_id=task_id, method="Runtime.evaluate", target_id=d.page_target(),
                  params={"expression": "Array.from(document.querySelector('#pw').value, c => c.charCodeAt(0))",
                          "returnByValue": True})
     codes = ((out.get("result") or {}).get("result") or {}).get("value")
     return "".join(map(chr, codes)) if isinstance(codes, list) else None
+
+
+def _cdp_other_task(d):
+    """Another conversation on the same CDP browser names the armed tab's target id (review r1 F1)."""
+    return _cdp_runtime_evaluate(d, task_id="another-conversation")
 
 
 def _vision(d):
@@ -221,13 +226,13 @@ def _vision(d):
     image = next((p["image_url"]["url"] for p in (out.get("content") or []) if p.get("type") == "image_url"), None)
     if not image:
         return None
-    with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as fh:
-        fh.write(base64.b64decode(image.split(",", 1)[1]))
-    try:
-        text = subprocess.run([_require(shutil.which("tesseract")), fh.name, "-", "--psm", "6"],
-                              capture_output=True, text=True, timeout=60).stdout
-    finally:
-        os.unlink(fh.name)
+    media, data = image.split(",", 1)
+    assert media == "data:image/png;base64", media
+    # The PNG goes over stdin: no temp file, suffix or cwd-relative path for Leptonica to misread (review r1 F2).
+    ocr = subprocess.run([_require(shutil.which("tesseract")), "stdin", "-", "--psm", "6"],
+                         input=base64.b64decode(data), capture_output=True, timeout=60)
+    assert ocr.returncode == 0, ocr.stderr.decode("utf-8", "replace")  # an OCR failure is not "nothing recovered"
+    text = ocr.stdout.decode("utf-8", "replace")
     return FRAGMENT if FRAGMENT in text.replace(" ", "") else None  # the pixels carry the value's core
 
 
@@ -251,7 +256,7 @@ def _stolen(d):
 
 
 ROWS = {"btoa": _btoa, "reversed": _reversed, "char_codes": _char_codes, "full_percent": _full_percent,
-        "cdp_runtime_evaluate": _cdp_runtime_evaluate, "vision": _vision, "location_href_egress": _egress,
+        "cdp_runtime_evaluate": _cdp_runtime_evaluate, "cdp_other_task": _cdp_other_task, "vision": _vision, "location_href_egress": _egress,
         "cdp_javascript_url": _cdp_javascript_url}
 EXPECTED = {name: (FRAGMENT if name == "vision" else CANARY) for name in ROWS}
 

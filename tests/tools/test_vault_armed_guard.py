@@ -33,7 +33,18 @@ ALLOWED = [
 
 
 @pytest.fixture
-def reg(monkeypatch):
+def shared(monkeypatch):
+    """Which browser the tools drive: none shared by default (a per-task agent-browser session)."""
+    from tools import browser_tool
+
+    mode = {"cdp": "", "real_profile": False}
+    monkeypatch.setattr(browser_tool, "_get_cdp_override_raw", lambda: mode["cdp"])
+    monkeypatch.setattr(browser_tool, "_use_real_profile", lambda: mode["real_profile"])
+    return mode
+
+
+@pytest.fixture
+def reg(monkeypatch, shared):
     monkeypatch.setattr(bs, "_VAULT_ARMED", {})
     r = ToolRegistry()
     for name in {n for n, _ in READERS + ALLOWED}:
@@ -72,6 +83,20 @@ def test_a_local_sidecar_tab_arms_the_task_and_other_tasks_are_untouched(reg):
     assert _run(reg, "browser_console", {"expression": "1"}, task_id="t2").get("ran") is True
     bs._vault_forget("t1::local", "T1")  # the tab closed
     assert _run(reg, "browser_console", {"expression": "1"}).get("ran") is True
+
+
+@pytest.mark.parametrize("mode", [{"cdp": "ws://127.0.0.1:9222/devtools/browser/x"}, {"real_profile": True}])
+@pytest.mark.parametrize("name,args", READERS + [
+    ("browser_cdp", {"method": "Runtime.evaluate", "target_id": "T1", "params": {"expression": "1"}})])
+def test_a_browser_every_task_shares_is_armed_for_every_task(reg, shared, mode, name, args):
+    """A CDP override or the real-profile browser is one browser: another task id reaches the armed tab too."""
+    shared.update(mode)
+    _arm("t1")
+    for task_id in ("t2", None):
+        out = _run(reg, name, args, task_id=task_id)
+        assert out.get("error_type") == "vault_armed" and "ran" not in out, (task_id, out)
+    bs._VAULT_ARMED["t1"]["T1"][0] = "L2"  # the tab loaded a new document
+    assert _run(reg, name, args, task_id="t2").get("ran") is True
 
 
 @pytest.fixture

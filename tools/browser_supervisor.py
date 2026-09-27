@@ -110,10 +110,11 @@ _VAULT_ARMED_LOCK = threading.Lock()
 
 def vault_armed(task_id: Optional[str], target_id: Optional[str] = None) -> bool:
     """Whether ``target_id`` (None: any tab) of any browser session of ``task_id`` (its bare id or a ``::local``
-    sidecar) shows a document that received a vault value."""
-    bare = (task_id or "default").removesuffix("::local")
+    sidecar; None: every session, for a browser all tasks share) shows a document that received a vault value."""
+    bare = task_id and task_id.removesuffix("::local")
     with _VAULT_ARMED_LOCK:
-        return any(tab[0] in tab[1] for key, tabs in _VAULT_ARMED.items() if key.removesuffix("::local") == bare
+        return any(tab[0] in tab[1] for key, tabs in _VAULT_ARMED.items()
+                   if bare is None or key.removesuffix("::local") == bare
                    for tid, tab in tabs.items() if target_id is None or tid == target_id)
 
 
