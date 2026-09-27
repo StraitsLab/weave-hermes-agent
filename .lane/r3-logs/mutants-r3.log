@@ -1,0 +1,10 @@
+F4a-tool-pre-post-gate-removed: control rc=0 [754 passed, 1 xfailed in 13.69s] | mutant rc=1 [3 failed, 751 passed, 1 xfailed in 13.64s] -> KILLED
+    FAILED tests/plugins/memory/test_harso_copilot_r2.py::test_f4_hot_disable_before_refresh_keeps_harso_memory_routable[brief-args0]
+    FAILED tests/plugins/memory/test_harso_copilot_r2.py::test_f4_hot_disable_before_refresh_keeps_harso_memory_routable[search-args1]
+    FAILED tests/plugins/memory/test_harso_copilot_r2.py::test_f4_hot_disable_before_refresh_keeps_harso_memory_routable[open-args2]
+F4b-tool-post-fetch-recheck-removed: control rc=0 [754 passed, 1 xfailed in 14.12s] | mutant rc=1 [1 failed, 753 passed, 1 xfailed in 13.95s] -> KILLED
+    FAILED tests/plugins/memory/test_harso_copilot_r2.py::test_f4_tool_switch_off_during_fetch_returns_content_free_result
+F4c-late-fetch-recheck-removed: control rc=0 [754 passed, 1 xfailed in 13.49s] | mutant rc=1 [1 failed, 753 passed, 1 xfailed in 13.54s] -> KILLED
+    FAILED tests/plugins/memory/test_harso_copilot_r2.py::test_f4_late_fetch_switch_off_during_fetch_renders_nothing
+F4d-turn-start-recheck-removed: control rc=0 [754 passed, 1 xfailed in 14.07s] | mutant rc=1 [1 failed, 753 passed, 1 xfailed in 14.15s] -> KILLED
+    FAILED tests/plugins/memory/test_harso_copilot_r2.py::test_f4_turn_start_switch_off_during_fetch_withholds_memory

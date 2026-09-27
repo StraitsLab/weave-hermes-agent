@@ -1,0 +1,84 @@
+{
+ "tree": "/Volumes/MainData/Runtime/Hermes/cache/scratch/k-r3-probe",
+ "head": "dff21e9d60f339e86d977d1a42f8d3609bbe7e3c",
+ "import_check": [
+  "/Volumes/MainData/Runtime/Hermes/cache/scratch/k-r3-probe/agent/memory_manager.py",
+  "/Volumes/MainData/Runtime/Hermes/cache/scratch/k-r3-probe/plugins/memory/harso/__init__.py"
+ ],
+ "mutants": [
+  {
+   "name": "F4a-tool-pre-post-gate-removed",
+   "file": "plugins/memory/harso/__init__.py",
+   "control": [
+    0,
+    "754 passed, 1 xfailed in 13.69s"
+   ],
+   "mutant": [
+    1,
+    "3 failed, 751 passed, 1 xfailed in 13.64s"
+   ],
+   "failed": [
+    "FAILED tests/plugins/memory/test_harso_copilot_r2.py::test_f4_hot_disable_before_refresh_keeps_harso_memory_routable[brief-args0]",
+    "FAILED tests/plugins/memory/test_harso_copilot_r2.py::test_f4_hot_disable_before_refresh_keeps_harso_memory_routable[search-args1]",
+    "FAILED tests/plugins/memory/test_harso_copilot_r2.py::test_f4_hot_disable_before_refresh_keeps_harso_memory_routable[open-args2]"
+   ],
+   "diff": "plugins/memory/harso/__init__.py | 3 ---\n 1 file changed, 3 deletions(-)",
+   "restored_clean": true,
+   "verdict": "KILLED"
+  },
+  {
+   "name": "F4b-tool-post-fetch-recheck-removed",
+   "file": "plugins/memory/harso/__init__.py",
+   "control": [
+    0,
+    "754 passed, 1 xfailed in 14.12s"
+   ],
+   "mutant": [
+    1,
+    "1 failed, 753 passed, 1 xfailed in 13.95s"
+   ],
+   "failed": [
+    "FAILED tests/plugins/memory/test_harso_copilot_r2.py::test_f4_tool_switch_off_during_fetch_returns_content_free_result"
+   ],
+   "diff": "plugins/memory/harso/__init__.py | 2 --\n 1 file changed, 2 deletions(-)",
+   "restored_clean": true,
+   "verdict": "KILLED"
+  },
+  {
+   "name": "F4c-late-fetch-recheck-removed",
+   "file": "plugins/memory/harso/__init__.py",
+   "control": [
+    0,
+    "754 passed, 1 xfailed in 13.49s"
+   ],
+   "mutant": [
+    1,
+    "1 failed, 753 passed, 1 xfailed in 13.54s"
+   ],
+   "failed": [
+    "FAILED tests/plugins/memory/test_harso_copilot_r2.py::test_f4_late_fetch_switch_off_during_fetch_renders_nothing"
+   ],
+   "diff": "plugins/memory/harso/__init__.py | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)",
+   "restored_clean": true,
+   "verdict": "KILLED"
+  },
+  {
+   "name": "F4d-turn-start-recheck-removed",
+   "file": "plugins/memory/harso/__init__.py",
+   "control": [
+    0,
+    "754 passed, 1 xfailed in 14.07s"
+   ],
+   "mutant": [
+    1,
+    "1 failed, 753 passed, 1 xfailed in 14.15s"
+   ],
+   "failed": [
+    "FAILED tests/plugins/memory/test_harso_copilot_r2.py::test_f4_turn_start_switch_off_during_fetch_withholds_memory"
+   ],
+   "diff": "plugins/memory/harso/__init__.py | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)",
+   "restored_clean": true,
+   "verdict": "KILLED"
+  }
+ ]
+}

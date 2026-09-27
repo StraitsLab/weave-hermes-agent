@@ -47,3 +47,5 @@
    advertised-but-unroutable. On disable at a boundary `harso_memory` leaves surface and routing together and
    `session_search` is restored at its original position. ACP `/tools` (a read-only listing) passes
    `refresh_routing=False` so listing can never move the live agent's routing.
+
+9. r3 turn-start in-flight OFF: returns the hint only (withholds legacy items too), not "legacy items + hint" as ruling-r3 item 2 says. Reason: the reviewer r2 probe, which must pass unchanged, asserts the in-flight item sentinel is not rendered; the request was sent copilot-shaped. Start-OFF turns are unchanged (byte-identical, sha 697069a5…). See rework-r3.md.
