@@ -29,3 +29,21 @@
 7. Wording: brief says fenced `<system-memory>` block; design C §4.1 and source use the existing `<memory-context>`
    fence. Kept `<memory-context>` (code at source wins; the sanitizer table and StreamingContextScrubber already
    know that tag) with the §3 header wording in the note line and in the delivery header.
+8. (review r1 F4, lead ruling) **Hot switch vs tool surface: the switch reaches the TOOL SURFACE at the next
+   tool-surface refresh boundary, not per call.** Rendering (turn-start delivery, fence note, visible_seqs,
+   late fetch, acks, compaction strip) still reads `plugins.harso.copilot_enabled` per call. The tool surface
+   (`harso_memory` advertised + routed, `session_search` displaced) is latched per provider instance
+   (`HarsoMemoryProvider._tools_on`, set at construction) and re-read ONLY in `inject_memory_provider_tools`,
+   which first calls `MemoryManager.refresh_tool_routing()` (re-indexes the existing `_tool_to_provider` table for
+   a provider whose latch changed; no second dispatcher), then reconciles the agent's `tools`/`valid_tool_names`
+   against that same index. Boundaries that call it: agent construction (`agent_init.py:1990`; the gateway builds a
+   fresh agent per message, so there it takes effect on the next message) and ACP's explicit tool-surface rebuild
+   (`acp_adapter/server.py:1255`, which already invalidates the system prompt). `refresh_agent_mcp_tools` keeps the
+   CURRENT latch (it does not re-read the switch) and preserves the displacement (`reconcile_displaced_tools`).
+   Why not per call: AGENTS.md "Prompt Caching Must Not Break — do not change toolsets mid-conversation"; flipping
+   the advertised tools inside a live conversation breaks the cached prefix. Between boundaries the surface AND
+   routing both stay as they were: OFF-latched -> no `harso_memory`, `session_search` present; ON-latched ->
+   `harso_memory` advertised AND routed (the provider honours its latch, not the live switch), so it is never
+   advertised-but-unroutable. On disable at a boundary `harso_memory` leaves surface and routing together and
+   `session_search` is restored at its original position. ACP `/tools` (a read-only listing) passes
+   `refresh_routing=False` so listing can never move the live agent's routing.
