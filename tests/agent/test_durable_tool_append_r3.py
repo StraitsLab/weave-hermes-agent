@@ -176,9 +176,11 @@ class TestR21RecordsAuthoritative:
         body, steers = split_tool_message(row)
         assert body == "" and "".join(steers) == content
 
-    # DESIGN GUARD (documents the r3 deviation, see .lane/rework-r3.md): a
-    # record-less row's first recorded append does not reclassify the
-    # pre-existing content; it stays in the transcript as tool output.
+    # DEVIATION PIN (not a RED variant; see .lane/rework-r3.md "Deviation"):
+    # a record-less row's first recorded append does not reclassify the
+    # pre-existing content. It is byte-identical to the reviewer's r2 probe
+    # row (new tool output ending in a complete lookalike block), which must
+    # stay tool output, so it cannot be told apart without flush provenance.
     def test_legacy_row_upgraded_by_first_recorded_append(self, store):
         agent, db, sid = store
         legacy = BIG_BODY + format_steer_marker("LEGACY-STEER")
@@ -300,7 +302,8 @@ class TestR23VerbatimSteers:
         assert out is not None and len(out) <= c._SUMMARY_INPUT_MAX_CHARS
         assert STEER_MARKER_OPEN not in out and STEER_MARKER_CLOSE not in out
 
-    # DESIGN GUARD: derived strings carry no stale positions.
+    # DESIGN GUARD (fails on r2 only by ImportError, so not RED evidence):
+    # derived strings carry no stale positions.
     def test_string_operations_drop_positions(self):
         from agent.tool_row_append import summary_input_spans
 
