@@ -8240,11 +8240,17 @@ class APIServerAdapter(BasePlatformAdapter):
         # `hermes cron run` / cronjob(action='run', prompt=...) — same length
         # cap and strict injection scan as a stored job prompt.
         extra_prompt = None
+        respect_pause = False
         try:
             body = await request.json()
         except Exception:
             body = None
         if isinstance(body, dict):
+            # Opt-in non-forcing admission (arrival links): a paused job is
+            # refused atomically under the claim lock instead of resumed.
+            respect_pause = body.get("respect_pause", False)
+            if not isinstance(respect_pause, bool):
+                return web.json_response({"error": "respect_pause must be a boolean"}, status=400)
             raw_prompt = body.get("prompt")
             if raw_prompt is not None:
                 extra_prompt = str(raw_prompt)
@@ -8270,7 +8276,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 provider_source = str(getattr(provider, "name", "provider"))
                 if not provider_supports_split_fire(provider): return web.json_response({"error": "cron provider does not support typed run identity", "job_id": job_id}, status=409)
                 previous_execution = latest_execution(job_id)
-                claim_kwargs = {"force": True} if provider_supports_claim_force(provider) else {}
+                claim_kwargs = {"force": True} if provider_supports_claim_force(provider) and not respect_pause else {}
                 try:
                     claimed_job = await asyncio.to_thread(provider.claim_fire, job_id, **claim_kwargs)
                 except Exception as admission_error:
