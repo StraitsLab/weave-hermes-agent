@@ -689,6 +689,106 @@ class TestRunJob:
         assert response.status == 503
         assert calls == [VALID_JOB_ID]
 
+    @staticmethod
+    async def _run_real(adapter, job_id, **post_kwargs):
+        """POST /run against the real cron store and built-in provider; only
+        the dispatch rail is stubbed so no agent turn starts."""
+        dispatched = []
+
+        def _dispatch(provider, claimed_job, *args, **kwargs):
+            dispatched.append(claimed_job["execution_id"])
+            return True
+
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._dispatch_claimed_api_fire", side_effect=_dispatch
+        ):
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                response = await cli.post(f"/api/jobs/{job_id}/run", **post_kwargs)
+                return response.status, await response.json(), dispatched
+
+    @pytest.mark.asyncio
+    async def test_run_job_respect_pause_refuses_paused_job(self, adapter):
+        from cron.executions import latest_execution
+        from cron.jobs import create_job, get_job, pause_job
+
+        job = create_job(prompt="x", schedule="every 1h")
+        pause_job(job["id"], reason="user paused")
+        before = get_job(job["id"])
+
+        status, data, dispatched = await self._run_real(
+            adapter, job["id"], json={"respect_pause": True})
+
+        # The built-in claim_fire records its own refused attempt before the
+        # handler re-reads, so the existing claim-loss path reports it as
+        # "duplicate" with that failed execution (no new status).
+        assert (status, data.get("status")) == (200, "duplicate")
+        after = get_job(job["id"])
+        assert after == before
+        assert after["enabled"] is False and after["state"] == "paused"
+        assert after["paused_at"] == before["paused_at"]
+        assert dispatched == []
+        latest = latest_execution(job["id"])
+        assert (latest["status"], latest["error"]) == ("failed", "Fire claim was not acquired")
+        assert data["execution"]["id"] == latest["id"]
+
+    @pytest.mark.asyncio
+    async def test_run_job_respect_pause_refuses_half_paused_job(self, adapter):
+        from cron.jobs import create_job, get_job, update_job
+
+        job = create_job(prompt="x", schedule="every 1h")
+        update_job(job["id"], {"paused_at": "2026-09-27T00:00:00+00:00"})
+        before = get_job(job["id"])
+        assert before["enabled"] is True
+
+        status, data, dispatched = await self._run_real(
+            adapter, job["id"], json={"respect_pause": True})
+
+        assert (status, data.get("status")) == (200, "duplicate")
+        assert data["execution"]["status"] == "failed"
+        assert get_job(job["id"]) == before
+        assert dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_run_job_respect_pause_admits_runnable_job_before_due(self, adapter):
+        from cron.jobs import create_job
+
+        job = create_job(prompt="x", schedule="2099-12-31T23:59:00+00:00")
+        assert job["next_run_at"].startswith("2099-12-31")
+
+        status, data, dispatched = await self._run_real(
+            adapter, job["id"], json={"respect_pause": True})
+
+        assert status == 202
+        assert data["execution"]["id"] and dispatched == [data["execution"]["id"]]
+
+    @pytest.mark.asyncio
+    async def test_run_job_without_flag_still_force_resumes_paused_job(self, adapter):
+        from cron.jobs import create_job, get_job, pause_job
+
+        job = create_job(prompt="x", schedule="every 1h")
+        pause_job(job["id"])
+
+        status, data, dispatched = await self._run_real(adapter, job["id"])
+
+        assert status == 202 and dispatched == [data["execution"]["id"]]
+        after = get_job(job["id"])
+        assert after["enabled"] is True and after["state"] == "scheduled"
+        assert after["paused_at"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", ["true", 1, None, 0, {}])
+    async def test_run_job_rejects_non_boolean_respect_pause(self, adapter, value):
+        from cron.executions import latest_execution
+        from cron.jobs import create_job
+
+        job = create_job(prompt="x", schedule="every 1h")
+
+        status, data, dispatched = await self._run_real(
+            adapter, job["id"], json={"respect_pause": value})
+
+        assert (status, data) == (400, {"error": "respect_pause must be a boolean"})
+        assert latest_execution(job["id"]) is None and dispatched == []
+
     @pytest.mark.asyncio
     async def test_list_job_runs_uses_exact_id_and_cursor(self, adapter):
         app = _create_app(adapter)
