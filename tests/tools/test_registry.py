@@ -889,3 +889,57 @@ class TestVaultScrubCoversEveryDispatchExit:
         reg.register(name="shot", toolset="t", schema=_make_schema("shot"), handler=lambda args, **kw: envelope)
         out = reg.dispatch("shot", {})
         assert "Zq7f3eK9x" not in json.dumps(out)
+
+
+class TestVaultScrubRound2Residuals:
+    """F3/F4 (#58 r2): the wire document is parsed before any raw-form precheck, string leaves and keys are
+    scrubbed as text (never re-parsed as new documents), and an inline image exempts only its data URL."""
+
+    @pytest.fixture(autouse=True)
+    def clean(self):
+        from agent import redact
+
+        redact.clear_vault_redaction_values()
+        yield
+        redact.clear_vault_redaction_values()
+
+    @staticmethod
+    def send(secret, value):
+        from agent import redact
+
+        redact.register_vault_redaction_value(secret)
+        reg = ToolRegistry()
+        reg.register(name="probe", toolset="review", schema={}, handler=lambda args, **kw: value)
+        return reg.dispatch("probe", {})
+
+    @pytest.mark.parametrize("wire", ['{"value":"\\u0053ensitive42"}', '{"\\u0053ensitive42":"ok"}'])
+    def test_json_representation_cannot_hide_registered_text(self, wire):
+        out = json.loads(self.send("Sensitive42", wire))
+        assert "Sensitive42" not in json.dumps(out)
+
+    @pytest.mark.parametrize("secret,payload", [
+        ("123456", {"body": '{"pin":123456}'}),
+        ("123456", {"body": "[123456]"}),
+        ('{"a":1}', {"body": '{"a":1}'}),
+        ("123456", {"[123456]": "text"}),
+    ])
+    def test_string_leaves_and_keys_are_text_not_new_wire_documents(self, secret, payload):
+        out = json.loads(self.send(secret, json.dumps(payload)))
+        assert all(secret not in key and (not isinstance(value, str) or secret not in value)
+                   for key, value in out.items())
+
+    @pytest.mark.parametrize("detail", ["Sensitive42", {"value": "Sensitive42"}])
+    def test_inline_image_only_bytes_are_exempt(self, detail):
+        out = self.send("Sensitive42", {"_multimodal": True, "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD", "detail": detail}}]})
+        assert "Sensitive42" not in json.dumps(out)
+        assert out["content"][0]["image_url"]["url"] == "data:image/png;base64,QUJD"
+
+    def test_real_numeric_values_remain_numbers(self):
+        out = json.loads(self.send("123456", json.dumps({"pin": 123456, "note": "123456"})))
+        assert out["pin"] == 123456
+        assert out["note"] == "«redacted-vault-secret»"
+
+    def test_a_json_result_without_the_value_is_byte_identical(self):
+        wire = '{ "a" : "\\u0041", "n": 1.50, "b": true }'  # spacing, escape and number spelling kept
+        assert self.send("Sensitive42", wire) == wire

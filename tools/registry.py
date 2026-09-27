@@ -75,34 +75,36 @@ def _bound_json_error_result(result: str) -> str:
 _INLINE_IMAGE_URL = re.compile(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/]*={0,2}")
 
 
-def _is_inline_image_part(part) -> bool:
-    """A multimodal content part that is exactly an inline base64 image (opaque bytes, nothing else)."""
-    image = part.get("image_url") if isinstance(part, dict) else None
-    return (set(part or ()) == {"type", "image_url"} and part["type"] == "image_url" and isinstance(image, dict)
-            and set(image) <= {"url", "detail"} and isinstance(image.get("url"), str)
-            and _INLINE_IMAGE_URL.fullmatch(image["url"]) is not None)
+def _inline_image_url_path(part) -> tuple:
+    """The one opaque path of an inline base64 image part: ``image_url.url`` when it is exactly a data URL."""
+    image = part.get("image_url") if isinstance(part, dict) and part.get("type") == "image_url" else None
+    if isinstance(image, dict) and isinstance(image.get("url"), str) and _INLINE_IMAGE_URL.fullmatch(image["url"]):
+        return (("image_url", "url"),)
+    return ()
 
 
 def _scrub_vault_values(result, *, tool: str = ""):
     """Vault secrets are a hard model-egress boundary: every tool result, whatever tool or field produced it
     (a page title, a URL after a form GET, an exception), is scrubbed of registered fill values. Opaque bytes
-    stay byte-identical only where their owner declares them: an inline ``data:image/...;base64`` part of the
-    handler's own multimodal envelope, and the protocol-defined binary paths of a ``browser_cdp`` result."""
+    stay byte-identical only where their owner declares them: the data URL of an inline ``data:image/...;base64``
+    part of the handler's own multimodal envelope, and the protocol-defined binary paths of a ``browser_cdp``
+    result."""
     if isinstance(result, dict) and result.get("_multimodal") is True and isinstance(result.get("content"), list):
-        return {_scrub_json(k): [p if _is_inline_image_part(p) else _scrub_json(p) for p in v] if k == "content"
+        return {_scrub_json(k): [_scrub_json(p, _inline_image_url_path(p)) for p in v] if k == "content"
                 else _scrub_json(v) for k, v in result.items()}
     if isinstance(result, str):
-        return _scrub_text(result, tool)
+        return _scrub_wire(result, tool)
     return _scrub_json(result)
 
 
-def _scrub_text(text: str, tool: str = "") -> str:
-    """Semantic: a JSON text is parsed and only its string keys and values are scrubbed, so a value that
+def _scrub_wire(text: str, tool: str = "") -> str:
+    """The handler's top-level string result. A JSON document is parsed first (before any raw-form check, so
+    an escaped spelling cannot hide a value) and only its string keys and values are scrubbed, so a value that
     collides with JSON syntax (``true``, ``123456``, a backslash) never rewrites framing. Unchanged text is
     returned byte-identical."""
-    from agent.redact import redact_registered_vault_values, vault_value_in
+    from agent.redact import _VAULT_REDACTION_VALUES, _vault_scope, redact_registered_vault_values
 
-    if not vault_value_in(text):  # the common case: one pass, the text returned byte-identical
+    if not _VAULT_REDACTION_VALUES.get(_vault_scope()):  # nothing registered: byte-identical, no parse
         return text
     if text.lstrip()[:1] in ("{", "["):
         try:
@@ -124,19 +126,23 @@ def _scrub_text(text: str, tool: str = "") -> str:
 
 
 def _scrub_json(value, always: tuple = (), flagged: tuple = ()):
+    """String leaves and keys are scrubbed as TEXT, never re-parsed as new JSON documents; numbers, booleans
+    and null are never touched."""
+    from agent.redact import redact_registered_vault_values
+
     if isinstance(value, str):
-        return _scrub_text(value)
+        return redact_registered_vault_values(value)
     if isinstance(value, list):
         return [_scrub_json(v) for v in value]
     if not isinstance(value, dict):
-        return value  # numbers, booleans, null: never touched
+        return value
     base64_flagged = value.get("base64Encoded") is True
     out = {}
     for key, item in value.items():
         if isinstance(item, str) and ((key,) in always or (base64_flagged and (key,) in flagged)):
             out[key] = item
         else:
-            out[_scrub_text(key)] = _scrub_json(item, tuple(p[1:] for p in always if len(p) > 1 and p[0] == key),
+            out[_scrub_json(key)] = _scrub_json(item, tuple(p[1:] for p in always if len(p) > 1 and p[0] == key),
                                                 tuple(p[1:] for p in flagged if len(p) > 1 and p[0] == key))
     return out
 
