@@ -647,6 +647,9 @@ DEFAULT_CONFIG = {
         # website/docs/developer-guide/browser-supervisor.md.
         "dialog_policy": "must_respond",  # must_respond | auto_dismiss | auto_accept
         "dialog_timeout_s": 300,  # Safety auto-dismiss after N seconds under must_respond
+        # Web Bot Auth (fork, AB-2): sign every browser request through the
+        # browser_request_signer plugin hook. Failures leave requests unsigned.
+        "web_bot_auth": False,
         "camofox": {
             # When true, Hermes sends a stable profile-scoped userId to Camofox
             # so the server maps it to a persistent Firefox profile automatically.
