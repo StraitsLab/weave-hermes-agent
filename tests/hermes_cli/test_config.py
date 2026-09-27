@@ -231,6 +231,9 @@ class TestLoadConfigParseFailure:
 
 
 
+_NULL_ROOTS = ["null\n", "~\n", "!!null null\n", "---\nnull\n...\n"]
+
+
 class TestLoadConfigStrict:
     """load_config_strict raises where load_config falls back, and never
     touches the load caches, so plain load_config keeps its fallbacks."""
@@ -264,7 +267,10 @@ class TestLoadConfigStrict:
             # Cold plain load: defaults, not a value the strict read left behind.
             assert load_config()["cron"]["allow_scripts"] is True
 
-    @pytest.mark.parametrize("text", ["cron: [unclosed\n", "[1, 2]\n", "just a string\n"])
+    @pytest.mark.parametrize("text", [
+        "cron: [unclosed\n", "[1, 2]\n", "just a string\n",
+        *_NULL_ROOTS, "---\n", "a: 1\n---\nb: 2\n",
+    ])
     def test_malformed_or_non_mapping_user_config_raises(self, tmp_path, text):
         from hermes_cli.config import load_config_strict
 
@@ -272,6 +278,41 @@ class TestLoadConfigStrict:
             (tmp_path / "config.yaml").write_text(text, encoding="utf-8")
             with pytest.raises(Exception):
                 load_config_strict()
+            assert isinstance(load_config(), dict)  # plain loader still fails open
+
+    @pytest.mark.parametrize("text", [*_NULL_ROOTS, "---\n", "a: 1\n---\nb: 2\n"])
+    def test_null_or_multi_document_managed_config_raises(self, tmp_path, text):
+        from hermes_cli.config import load_config_strict
+
+        managed = tmp_path / "managed"
+        managed.mkdir()
+        (managed / "config.yaml").write_text(text, encoding="utf-8")
+        home = tmp_path / "home"
+        home.mkdir()
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "HERMES_MANAGED_DIR": str(managed)}):
+            with pytest.raises(Exception):
+                load_config_strict()
+            assert isinstance(load_config(), dict)
+
+    @pytest.mark.parametrize("text", ["", "  \n\n", "# comment only\n"], ids=["empty", "blank", "comment"])
+    def test_documentless_config_is_an_empty_layer(self, tmp_path, text):
+        from hermes_cli.config import load_config_strict
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(text, encoding="utf-8")
+            effective, layers = load_config_strict()
+        assert layers == ({}, {})
+        assert effective["cron"]["allow_scripts"] is True
+
+    def test_strict_mapping_keeps_anchors_and_aliases(self, tmp_path):
+        from hermes_cli.config import load_config_strict
+
+        text = "base: &b {allow_scripts: false}\ncron: *b\n"
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(text, encoding="utf-8")
+            effective, (user, _) = load_config_strict()
+        assert user["cron"] == {"allow_scripts": False}
+        assert effective["cron"]["allow_scripts"] is False
 
     def test_malformed_managed_config_raises_but_load_config_fails_open(self, tmp_path):
         from hermes_cli.config import load_config_strict

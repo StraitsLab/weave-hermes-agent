@@ -765,7 +765,7 @@ def get_container_exec_info() -> Optional[dict]:
 
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F811,E402
-from utils import atomic_replace, fast_safe_load
+from utils import _get_fast_yaml_loader, atomic_replace, fast_safe_load
 
 def get_config_path() -> Path:
     """Get the main config file path."""
@@ -3790,17 +3790,22 @@ def load_config_strict() -> Tuple[Dict[str, Any], Tuple[Dict[str, Any], ...]]:
 
 def _read_config_mapping_strict(path: Path) -> Dict[str, Any]:
     """Read one config file for ``load_config_strict``. A missing file or an
-    empty document is ``{}``. Any other non-mapping root raises."""
+    stream with no document (empty, whitespace, comments) is ``{}``. Any other
+    root, explicit null and a bare ``---`` included, or a second document raises."""
     try:
         with open(path, encoding="utf-8") as f:
-            loaded = fast_safe_load(f)
+            loader = _get_fast_yaml_loader()(f)
+            try:
+                node = loader.get_single_node()
+                if node is None:
+                    return {}
+                if not isinstance(node, yaml.MappingNode):
+                    raise TypeError(f"{path}: top-level YAML must be a mapping, got {node.tag}")
+                return loader.construct_document(node)
+            finally:
+                loader.dispose()
     except FileNotFoundError:
         return {}
-    if loaded is None:
-        return {}
-    if not isinstance(loaded, dict):
-        raise TypeError(f"{path}: top-level YAML must be a mapping, got {type(loaded).__name__}")
-    return loaded
 
 
 def write_platform_config_field(

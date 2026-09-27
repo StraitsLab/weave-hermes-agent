@@ -663,6 +663,67 @@ def test_valid_managed_false_overrides_user_true(home, tmp_path, monkeypatch):
     _tenant_refused(marker)
 
 
+# --- F2 round 4: an explicit null root is not an absent file ---------------
+
+_NULL_ROOTS = ["null\n", "~\n", "!!null null\n", "---\nnull\n...\n", "---\n"]
+
+
+@pytest.mark.parametrize("layer", ["user", "managed"])
+@pytest.mark.parametrize("text", _NULL_ROOTS, ids=["null", "tilde", "tagged", "delimited", "bare-doc"])
+def test_null_config_root_refuses_every_script(home, tmp_path, monkeypatch, layer, text):
+    from cron.scheduler import _cron_script_policy
+
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    ((home if layer == "user" else managed) / "config.yaml").write_text(text, encoding="utf-8")
+
+    assert _cron_script_policy() is None
+    _tenant_refused(marker)
+
+
+@pytest.mark.parametrize("layer", ["user", "managed"])
+def test_warm_config_turning_null_refuses_tenant_and_platform(home, platform_root, tmp_path, monkeypatch, layer):
+    from cron.scheduler import _cron_script_policy, _run_job_script
+    from hermes_cli.config import load_config
+
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+    platform_marker = tmp_path / "platform-ran"
+    _platform_script(platform_root, body=f"open({str(platform_marker)!r}, 'w').close()\n")
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    restrictive, other = (home, managed) if layer == "user" else (managed, home)
+    _write_yaml(restrictive / "config.yaml", {"cron": {"allow_scripts": False}})
+    _write_yaml(other / "config.yaml", {"cron": {"platform_script_root": str(platform_root)}})
+    assert load_config()["cron"]["allow_scripts"] is False  # warm the caches
+    # Control: before the null write the platform script runs, the tenant does not.
+    assert _run_job_script("platform:tick.py")[0] is True and platform_marker.exists()
+    platform_marker.unlink()
+    _tenant_refused(marker)
+    (restrictive / "config.yaml").write_text("null\n", encoding="utf-8")
+
+    assert _cron_script_policy() is None
+    assert _run_job_script("platform:tick.py")[0] is False
+    assert not platform_marker.exists()
+    _tenant_refused(marker)
+
+
+@pytest.mark.parametrize("text", ["", "# comment only\n"], ids=["empty", "comment"])
+def test_documentless_config_keeps_stock_defaults(home, tmp_path, text):
+    from cron.scheduler import _cron_script_policy, _run_job_script
+
+    (home / "config.yaml").write_text(text, encoding="utf-8")
+    marker = tmp_path / "tenant-ran"
+    _tenant_script(home, marker)
+
+    assert _cron_script_policy() == (True, "", {})
+    assert _run_job_script("tenant.py")[0] is True and marker.exists()
+
+
 # --- F3: the executed bytes are the verified bytes, from a trusted path ---
 
 
