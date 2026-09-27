@@ -46,8 +46,11 @@ from agent.model_metadata import (
 from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
 from agent.tool_row_append import (
-    split_trailing_appends,
+    defang_steer_markers,
+    protected_steer_spans,
+    split_tool_message,
     steer_texts,
+    summary_steer_piece,
     with_steers,
 )
 from tools.todo_tool import TODO_INJECTION_HEADER
@@ -617,9 +620,12 @@ def salvage_grown_transcript(
             for key in salvage_reasoning_keys:
                 msg.pop(key, None)
         if msg.get("role") == "tool" and index not in keep_tools:
-            content = msg.get("content")
-            if isinstance(content, str) and len(content) > _PRUNE_MIN_CHARS:
-                msg["content"] = _PRUNED_TOOL_PLACEHOLDER
+            # Clear the tool BODY only; a user /steer appended to the row is
+            # carried verbatim after the placeholder (shared split/reattach
+            # authority). The under-budget check below still decides.
+            body, steers = split_tool_message(msg)
+            if isinstance(body, str) and len(body) > _PRUNE_MIN_CHARS:
+                msg["content"] = with_steers(_PRUNED_TOOL_PLACEHOLDER, steers)
         content = msg.get("content")
         if (
             isinstance(content, str)
@@ -4101,7 +4107,10 @@ class ContextCompressor(ContextEngine):
             msg = result[i]
             if msg.get("role") != "tool":
                 continue
-            content = msg.get("content") or ""
+            # Dedupe the tool BODY only; appended /steer parts are carried on
+            # the back-reference (shared split/reattach authority).
+            content, steers = split_tool_message(msg)
+            content = content or ""
             # Multimodal content — dedupe by the text summary if available.
             if isinstance(content, list):
                 continue
@@ -4114,7 +4123,9 @@ class ContextCompressor(ContextEngine):
             h = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()[:12]
             if h in content_hashes:
                 # This is an older duplicate — replace with back-reference
-                result[i] = {**msg, "content": "[Duplicate tool output — same content as a more recent call]"}
+                result[i] = {**msg, "content": with_steers(
+                    "[Duplicate tool output — same content as a more recent call]", steers,
+                )}
                 pruned += 1
             else:
                 content_hashes[h] = (i, msg.get("tool_call_id", "?"))
@@ -4155,9 +4166,8 @@ class ContextCompressor(ContextEngine):
             # END of a tool result. Judge and summarize the tool body only;
             # the steer markers are carried verbatim after the summary (the
             # wrap-up notice is dropped with the body).
-            full_content = content
-            content, steers = split_trailing_appends(full_content)
-            if not content or content == _PRUNED_TOOL_PLACEHOLDER:
+            content, steers = split_tool_message(msg)
+            if not isinstance(content, str) or not content or content == _PRUNED_TOOL_PLACEHOLDER:
                 return False
             if content.startswith("[Duplicate tool output"):
                 return False
@@ -4469,6 +4479,13 @@ class ContextCompressor(ContextEngine):
         for msg in turns:
             role = msg.get("role", "unknown")
             content = msg.get("content")
+            steers: list[str] = []
+            if role == "tool":
+                # Split appended /steer parts off the ORIGINAL (possibly
+                # structured) content before any join/redact/clip: only the
+                # tool body is rendered and bounded; each steer is re-attached
+                # redacted but unclipped (``summary_steer_piece``).
+                content, steers = split_tool_message(msg)
             if isinstance(content, list):
                 text_parts: list[str] = []
                 for part in content:
@@ -4487,6 +4504,9 @@ class ContextCompressor(ContextEngine):
                 content = "\n".join(text_parts)
             content = _redact_compaction_text(content or "")
             content = _MEDIA_DIRECTIVE_RE.sub("[media attachment]", content)
+            # Only protected steers may carry a live steer marker in the
+            # summarizer input (input budgeting protects them by position).
+            content = defang_steer_markers(content)
             # Strip inline reasoning blocks (<think>, <reasoning>, etc.) from
             # assistant content before it reaches the summarizer. Reasoning
             # traces are transient scratch work — feeding them to the aux
@@ -4504,10 +4524,13 @@ class ContextCompressor(ContextEngine):
                 tool_id = msg.get("tool_call_id", "")
                 # Truncate the tool body only; a trailing user /steer is the
                 # user's words and must reach the summarizer whole.
-                content, steers = split_trailing_appends(content)
                 if len(content) > self._CONTENT_MAX:
                     content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
-                parts.append(f"[TOOL RESULT {tool_id}]: {with_steers(content, steers)}")
+                rendered_steers = [
+                    summary_steer_piece(piece, _redact_compaction_text)
+                    for piece in steers
+                ]
+                parts.append(f"[TOOL RESULT {tool_id}]: {with_steers(content, rendered_steers)}")
                 continue
 
             # Assistant messages: include tool call names AND arguments
@@ -4521,7 +4544,9 @@ class ContextCompressor(ContextEngine):
                         if isinstance(tc, dict):
                             fn = tc.get("function", {})
                             name = fn.get("name", "?")
-                            args = _redact_compaction_text(fn.get("arguments", ""))
+                            args = defang_steer_markers(
+                                _redact_compaction_text(fn.get("arguments", ""))
+                            )
                             # Truncate long arguments but keep enough for context
                             if len(args) > self._TOOL_ARGS_MAX:
                                 args = args[:self._TOOL_ARGS_HEAD] + "..."
@@ -4545,7 +4570,7 @@ class ContextCompressor(ContextEngine):
         self,
         turns_to_summarize: List[Dict[str, Any]],
         reason: str | None = None,
-    ) -> str:
+    ) -> Optional[str]:
         """Build a deterministic handoff when the LLM summarizer is unavailable.
 
         This is intentionally much less rich than an LLM-written summary, but it
@@ -4555,6 +4580,9 @@ class ContextCompressor(ContextEngine):
         tool calls, and any error text.  The result uses the normal summary
         structure so downstream prompts can recover gracefully after a provider
         outage or summary-model failure.
+
+        Returns ``None`` only when the protected mid-turn user steers alone
+        cannot fit the fallback bound (the caller then keeps the transcript).
         """
         user_asks: list[str] = []
         assistant_actions: list[str] = []
@@ -4608,9 +4636,24 @@ class ContextCompressor(ContextEngine):
                             parsed = args
                         _collect_paths_from_jsonish(parsed)
 
+        def _redact_steer(value: str) -> str:
+            # Established redaction only: a user steer is never clipped,
+            # whitespace-folded or count-limited (it is protected text).
+            text = _redact_compaction_text(value).strip()
+            return re.sub(r"\bgh[pousr]_[A-Za-z0-9_.-]+", "[REDACTED]", text)
+
         for msg in turns_to_summarize:
             role = msg.get("role", "unknown")
-            text = _compact_fallback_turn(msg.get("content"))
+            raw_content = msg.get("content")
+            if role == "tool":
+                # Shared split: disposable tool body feeds the ordinary
+                # (bounded) sections; every appended /steer is protected.
+                raw_content, _steers = split_tool_message(msg)
+                for _steer in steer_texts(_steers):
+                    _steer = _redact_steer(_steer)
+                    if _steer:
+                        user_steers.append(_steer)
+            text = _compact_fallback_turn(raw_content)
             _collect_path_mentions(text, relevant_files)
             synthetic_user = (
                 role == "user" and self._is_synthetic_compression_user_turn(msg)
@@ -4650,13 +4693,6 @@ class ContextCompressor(ContextEngine):
                 tool_actions.append(
                     _summarize_tool_result(tool_name, tool_args, text or "")
                 )
-                # A /steer riding on this tool result is a real user message:
-                # keep it verbatim-ish (redacted, whitespace-folded).
-                _body, _steers = split_trailing_appends(msg.get("content"))
-                for _steer in steer_texts(_steers):
-                    _steer = _compact_fallback_turn(_steer)
-                    if _steer:
-                        user_steers.append(_steer)
                 if re.search(
                     r"\b(error|failed|exception|traceback|timeout|timed out|fatal)\b",
                     text,
@@ -4702,10 +4738,6 @@ class ContextCompressor(ContextEngine):
             )
 
         reason_text = f" Summary failure reason: {reason}." if reason else ""
-        if user_steers:
-            active_task += (
-                "\n\n## Mid-turn User Steers\n" + _bullets(user_steers, limit=8)
-            )
         body = f"""{HISTORICAL_TASK_HEADING}
 {active_task}
 
@@ -4748,8 +4780,25 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         _pruned_names = _collect_ghosted_skill_names(turns_to_summarize)
         del _pruned_names[_MAX_PRUNED_SKILL_MARKERS:]
         summary = self._with_summary_prefix(_redact_compaction_text(body.strip()))
-        if len(summary) > _FALLBACK_SUMMARY_MAX_CHARS:
-            summary = summary[: _FALLBACK_SUMMARY_MAX_CHARS - 42].rstrip() + "\n...[fallback summary truncated]"
+        # Mid-turn user steers are protected: every one (oldest to newest)
+        # is kept whole inside the SAME fallback bound, and the disposable
+        # sections above absorb the truncation. If the steers alone cannot
+        # fit, there is no fallback (the caller keeps the transcript) rather
+        # than a lossy one.
+        steer_section = ""
+        if user_steers:
+            steer_section = (
+                "\n\n## Mid-turn User Steers\n"
+                + "\n".join(f"- {item}" for item in user_steers)
+            )
+        available = _FALLBACK_SUMMARY_MAX_CHARS - len(steer_section)
+        if steer_section and available < len(
+            self._with_summary_prefix(HISTORICAL_TASK_HEADING)
+        ) + 42:
+            return None
+        if len(summary) > available:
+            summary = summary[: available - 42].rstrip() + "\n...[fallback summary truncated]"
+        summary += steer_section
         # Re-inject AFTER the size cap: the markers live at the end of the
         # body, exactly where the truncation above cuts.
         summary = _reinject_pruned_skill_markers(summary, _pruned_names)
@@ -4794,7 +4843,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             if not isinstance(content, str):
                 continue
             # Keep trailing /steer markers verbatim (see _demote_tool_result_at).
-            content, steers = split_trailing_appends(content)
+            content, steers = split_tool_message(msg)
+            if not isinstance(content, str):
+                continue
             if len(content) < _LEAN_TAIL_DEMOTE_MIN_CHARS:
                 continue
             if SKILL_PRUNED_MARKER_PREFIX in content:
@@ -4839,7 +4890,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         return summary
 
     @classmethod
-    def _bound_summary_input(cls, content: str) -> str:
+    def _bound_summary_input(cls, content: str) -> Optional[str]:
         """Cap total summarizer input while preserving beginning and recent tail.
 
         Per-message truncation alone is not enough for very long sessions: a
@@ -4848,9 +4899,16 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         because the beginning often has task setup and the tail has the most
         recent state; explicitly mark the omitted middle so the summarizer knows
         context was intentionally compressed before it saw the prompt.
+
+        Protected mid-turn user steers (see ``protected_steer_spans``) are
+        reserved inside the same bound and never clipped; only ordinary
+        material is head/tail bounded. Returns ``None`` when the protected
+        steers alone exceed the bound.
         """
         if len(content) <= cls._SUMMARY_INPUT_MAX_CHARS:
             return content
+        if protected_steer_spans(content):
+            return cls._budget_with_protected_steers(content, sampled=False)
 
         marker_template = (
             "\n\n...[summary input truncated: omitted "
@@ -4878,7 +4936,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
     _SAMPLED_INPUT_SLICES = 8
 
     @classmethod
-    def _sample_summary_input(cls, content: str) -> str:
+    def _sample_summary_input(cls, content: str) -> Optional[str]:
         """Cap summarizer input by EVEN SAMPLING across the whole region.
 
         Lean mode's single request also produces the detailed session log,
@@ -4888,9 +4946,14 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         ``_SAMPLED_INPUT_SLICES`` proportionally spaced slices in
         oldest-to-newest order, with explicit elision markers between them,
         so the one auxiliary call sees the whole session's shape.
+
+        Protected mid-turn user steers are reserved inside the same bound and
+        never sampled away (``None`` when they alone exceed it).
         """
         if len(content) <= cls._SUMMARY_INPUT_MAX_CHARS:
             return content
+        if protected_steer_spans(content):
+            return cls._budget_with_protected_steers(content, sampled=True)
         n = max(2, cls._SAMPLED_INPUT_SLICES)
         gaps = n - 1
         marker_template = "\n\n...[{elided:,} chars elided — recover via session_search]...\n\n"
@@ -4913,6 +4976,89 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             parts.append(content[start:end])
             prev_end = end
         return "".join(parts)
+
+    @classmethod
+    def _budget_with_protected_steers(cls, content: str, *, sampled: bool) -> Optional[str]:
+        """Bound summarizer input, keeping every protected steer span whole.
+
+        One budget (``_SUMMARY_INPUT_MAX_CHARS``): the protected spans and the
+        worst-case elision markers are reserved first; the remainder is spent
+        on ORDINARY material, selected in ordinary-only coordinates with the
+        same policy as the caller (head+tail, or even sampling). Returns
+        ``None`` when the protected spans alone do not fit.
+        """
+        spans = protected_steer_spans(content)
+        protected = sum(end - start for start, end in spans)
+        if sampled:
+            template = "\n\n...[{n:,} chars elided — recover via session_search]...\n\n"
+        else:
+            template = (
+                "\n\n...[summary input truncated: omitted "
+                "{n:,} chars from the middle to keep compression prompt bounded]...\n\n"
+            )
+        # Omission runs <= kept pieces + 1; kept pieces <= spans + (keep
+        # ranges, each split at most once per span).
+        keep_ranges = max(2, cls._SAMPLED_INPUT_SLICES) if sampled else 2
+        max_runs = 2 * len(spans) + keep_ranges + 2
+        reserve = len(template.format(n=len(content))) * max_runs
+        budget = cls._SUMMARY_INPUT_MAX_CHARS - protected - reserve
+        if budget < 0:
+            return None
+        segments: list[tuple[bool, str]] = []
+        pos = 0
+        for start, end in spans:
+            if start > pos:
+                segments.append((False, content[pos:start]))
+            segments.append((True, content[start:end]))
+            pos = end
+        if pos < len(content):
+            segments.append((False, content[pos:]))
+        total = sum(len(text) for is_p, text in segments if not is_p)
+        # Ordinary ranges to keep, in ordinary-only coordinates.
+        if total <= budget:
+            keep = [(0, total)]
+        elif sampled:
+            n = max(2, cls._SAMPLED_INPUT_SLICES)
+            slice_len = budget // n
+            stride = total / n
+            keep = []
+            for i in range(n):
+                start = int(i * stride)
+                if i == n - 1:
+                    start = max(start, total - slice_len)
+                keep.append((start, min(start + slice_len, total)))
+        else:
+            head = int(budget * 0.45)
+            keep = [(0, head), (total - (budget - head), total)]
+        out: list[str] = []
+        omitted = 0
+
+        def _flush_omitted() -> None:
+            nonlocal omitted
+            if omitted:
+                out.append(template.format(n=omitted))
+                omitted = 0
+
+        base = 0
+        for is_protected, text in segments:
+            if is_protected:
+                _flush_omitted()
+                out.append(text)
+                continue
+            cursor = base
+            end_seg = base + len(text)
+            for k_start, k_end in keep:
+                a, b = max(k_start, cursor), min(k_end, end_seg)
+                if a >= b:
+                    continue
+                omitted += a - cursor
+                _flush_omitted()
+                out.append(text[a - base:b - base])
+                cursor = b
+            omitted += end_seg - cursor
+            base = end_seg
+        _flush_omitted()
+        return "".join(out)
 
     def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> None:
         """Switch from a separate ``summary_model`` back to the main model.
@@ -5014,6 +5160,13 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             content_to_summarize = self._sample_summary_input(content_to_summarize)
         else:
             content_to_summarize = self._bound_summary_input(content_to_summarize)
+        if content_to_summarize is None:
+            # Protected mid-turn user steers alone exceed the one bounded
+            # request: no summary (the static fallback applies the same
+            # rule, and the transcript is kept rather than lose them).
+            self._last_summary_error = "protected user steers exceed the summary input bound"
+            logger.warning("Context summary skipped: %s", self._last_summary_error)
+            return None
         _sanitized_memory_context = sanitize_memory_context(memory_context)
         _serialized_memory_context = json.dumps(
             _sanitized_memory_context,
@@ -5242,8 +5395,10 @@ Write only the summary body. Do not include any preamble or prefix."""
             # pathological handoff rehydrated from a persisted session can be
             # arbitrarily large — the iterative prompt (previous summary +
             # new turns) must stay bounded too.
+            # Defanged: only this window's protected steers carry live
+            # markers, so the bound below never reserves for lookalikes.
             _bounded_previous_summary = self._bound_summary_input(
-                self._previous_summary
+                defang_steer_markers(self._previous_summary)
             )
             prompt = f"""{_summarizer_preamble}
 
@@ -8203,6 +8358,20 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # embedded into a deliberate feasibility skip's fallback.
                 reason=None if feasibility_skip else self._last_summary_error,
             )
+            if summary is None:
+                # Protected user steers cannot fit any bounded handoff:
+                # dropping the window would delete them. Keep it unchanged.
+                self._last_summary_dropped_count = 0
+                self._last_summary_fallback_used = False
+                self._last_compress_aborted = True
+                telemetry["failure_class"] = "protected_steer_overflow"
+                self._previous_summary = _previous_summary_before_scan
+                logger.warning(
+                    "Compression aborted: mid-turn user steers in the window "
+                    "exceed the summary bound; %d message(s) preserved unchanged.",
+                    n_dropped,
+                )
+                return messages
 
         tail_messages: List[Dict[str, Any]] = []
         # Start at tail_start (not compress_end): the restart-decay scan may

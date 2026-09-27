@@ -13111,6 +13111,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         tool_call_id: Optional[str],
         expected_content: Any,
         new_content: Any,
+        append_record: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Durably rewrite one already-saved ACTIVE tool row's ``content``.
 
@@ -13123,6 +13124,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (``id``/``session_id``/``role``/``tool_call_id``) AND still hold
         ``expected_content`` (encoded exactly as the flush encoded it). Any
         mismatch writes nothing. Returns the number of rows updated (0 or 1).
+
+        ``append_record`` (kind + exact length of the appended span) is added
+        to the row's ``display_metadata["tool_appends"]`` in the SAME
+        transaction, so pruning/compaction can identify the appended span
+        unambiguously after reload. Other metadata keys are preserved.
         """
         expected = self._encode_content(expected_content)
         encoded = self._encode_content(new_content)
@@ -13134,7 +13140,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "AND active = 1 AND tool_call_id IS ? AND content IS ?",
                 (encoded, row_id, session_id, tool_call_id, expected),
             )
-            return cursor.rowcount
+            updated = cursor.rowcount
+            if updated == 1 and append_record:
+                row = conn.execute(
+                    "SELECT display_metadata FROM messages WHERE id = ?", (row_id,)
+                ).fetchone()
+                meta = self._decode_display_metadata(row[0] if row else None) or {}
+                records = meta.get("tool_appends")
+                meta["tool_appends"] = (
+                    list(records) if isinstance(records, list) else []
+                ) + [dict(append_record)]
+                conn.execute(
+                    "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                    (self._encode_display_metadata(meta), row_id),
+                )
+            return updated
 
         return self._execute_write(_do)
 
