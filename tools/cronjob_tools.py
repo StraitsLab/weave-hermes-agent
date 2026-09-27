@@ -753,8 +753,18 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
         return None  # empty/None = clearing the field, always OK
 
     from hermes_constants import get_hermes_home
+    from cron.scheduler import (
+        PLATFORM_SCRIPT_PREFIX,
+        _cron_script_policy,
+        resolve_platform_script,
+    )
 
     raw = script.strip()
+
+    if raw.startswith(PLATFORM_SCRIPT_PREFIX):
+        return resolve_platform_script(raw)[1]
+    if not _cron_script_policy()[0]:
+        return f"cron.allow_scripts is false; only platform: scripts are allowed: {raw!r}"
 
     # Reject absolute paths and ~ expansion at the API boundary.
     # Only relative paths within ~/.hermes/scripts/ are allowed.

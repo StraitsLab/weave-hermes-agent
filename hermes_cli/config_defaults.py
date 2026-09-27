@@ -2831,6 +2831,14 @@ DEFAULT_CONFIG = {
         # cron.scheduler._DEFAULT_SCRIPT_TIMEOUT so config set recognizes the
         # same setting the scheduler reads.
         "script_timeout_seconds": 3600,
+        # Weave platform script seam (cron.scheduler.resolve_platform_script):
+        # ``platform:<name>.py`` runs only from platform_script_root (uid-0,
+        # not group/other-writable, no symlinks; digest-pinned when
+        # platform_script_digests is non-empty). allow_scripts: false refuses
+        # every other script at create and fire. Defaults = stock behaviour.
+        "allow_scripts": True,
+        "platform_script_root": "",
+        "platform_script_digests": {},
         # Timeout (seconds) for SessionDB() init inside cron jobs.
         # SessionDB opens/migrates state.db synchronously and has no timeout
         # of its own against a wedged sqlite3.connect. An unbounded hang here

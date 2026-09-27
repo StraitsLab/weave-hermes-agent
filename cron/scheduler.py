@@ -14,12 +14,14 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
 import signal
+import stat as _stat
 import subprocess
 import sys
 import threading
@@ -4263,6 +4265,76 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+PLATFORM_SCRIPT_PREFIX = "platform:"
+_PLATFORM_SCRIPT_NAME_RE = re.compile(r"[a-z0-9_]{1,64}\.py")
+# Owner the platform script root and its files must have. Tests patch this
+# where uid 0 is unavailable; production never changes it.
+_PLATFORM_SCRIPT_OWNER_UID = 0
+
+
+def _cron_script_policy() -> tuple[bool, str, dict]:
+    """Return (allow_scripts, platform_script_root, platform_script_digests).
+
+    Stock defaults: tenant scripts allowed, no platform root, no digests.
+    An unreadable config fails closed (no scripts of either kind).
+    """
+    try:
+        cfg = load_config() or {}
+    except Exception:
+        logger.warning("cron: config unreadable; refusing all cron scripts", exc_info=True)
+        return False, "", {}
+    cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+    if not isinstance(cron_cfg, dict):
+        cron_cfg = {}
+    root = cron_cfg.get("platform_script_root")
+    digests = cron_cfg.get("platform_script_digests")
+    return (
+        cron_cfg.get("allow_scripts", True) is not False,
+        root.strip() if isinstance(root, str) else "",
+        digests if isinstance(digests, dict) else {},
+    )
+
+
+def _platform_owned(st: os.stat_result) -> bool:
+    return st.st_uid == _PLATFORM_SCRIPT_OWNER_UID and not st.st_mode & 0o022
+
+
+def resolve_platform_script(ref: str) -> tuple[Optional[Path], Optional[str]]:
+    """Resolve a ``platform:<name>`` ref under ``cron.platform_script_root``.
+
+    Returns (path, None) or (None, "Blocked: ..."). The root and the file must
+    be owner-``_PLATFORM_SCRIPT_OWNER_UID`` and not group/other-writable, the
+    file must be regular (lstat: never a symlink), and when
+    ``cron.platform_script_digests`` is non-empty the file's sha256 must be
+    pinned there under its name.
+    """
+    name = str(ref)[len(PLATFORM_SCRIPT_PREFIX):]
+    if not _PLATFORM_SCRIPT_NAME_RE.fullmatch(name):
+        return None, f"Blocked: invalid platform script name: {ref!r}"
+    _, root, digests = _cron_script_policy()
+    if not root or not os.path.isabs(root):
+        return None, f"Blocked: cron.platform_script_root is not configured: {ref!r}"
+    try:
+        root_st = os.lstat(root)
+        path = Path(root) / name
+        st = os.lstat(path)
+    except OSError:
+        return None, f"Blocked: platform script not found: {ref!r}"
+    if not _stat.S_ISDIR(root_st.st_mode) or not _platform_owned(root_st):
+        return None, f"Blocked: platform script root is not platform-owned: {root}"
+    if not _stat.S_ISREG(st.st_mode):
+        return None, f"Blocked: platform script is not a regular file: {ref!r}"
+    if not _platform_owned(st):
+        return None, f"Blocked: platform script is not platform-owned: {ref!r}"
+    if digests:
+        pinned = digests.get(name)
+        with open(path, "rb") as fh:
+            actual = hashlib.sha256(fh.read()).hexdigest()
+        if not isinstance(pinned, str) or pinned.strip().lower() != actual:
+            return None, f"Blocked: platform script digest is not pinned: {ref!r}"
+    return path, None
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -4273,7 +4345,9 @@ def _run_job_script(
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
     absolute paths are resolved and validated against this directory to
     prevent arbitrary script execution via path traversal or absolute
-    path injection.
+    path injection.  A ``platform:<name>`` ref instead runs only from the
+    platform-owned ``cron.platform_script_root`` (``resolve_platform_script``);
+    with ``cron.allow_scripts: false`` every other ref is refused.
 
     Supported interpreters (chosen by file extension):
 
@@ -4304,10 +4378,6 @@ def _run_job_script(
         (success, output) — on failure *output* contains the error message so the
         LLM can report the problem to the user.
     """
-    scripts_dir = _get_hermes_home() / "scripts"
-    _ensure_cron_dir(scripts_dir)
-    scripts_dir_resolved = scripts_dir.resolve()
-
     # Same ingestion contract as cron.lifecycle_guard._expand_candidate_path:
     # a NUL-bearing value can never name a real script, and on Windows the
     # Path operations raise ValueError *after* expanduser (expanduser never
@@ -4320,35 +4390,51 @@ def _run_job_script(
     if "\x00" in str(script_path):
         return False, f"Blocked: script path contains a NUL byte: {script_path!r}"
 
-    try:
-        raw = Path(script_path).expanduser()
-    except (ValueError, RuntimeError, OSError):
-        # Same ingestion contract as cron.lifecycle_guard: a NUL-bearing
-        # value (ValueError) or an unexpandable ``~`` (RuntimeError with no
-        # resolvable HOME) can never name a real script. The creation-time
-        # guard tolerates such values as "nothing to scan", so they can
-        # reach fire time — fail the run with a report instead of crashing
-        # the scheduler with an unhandled exception.
-        return False, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
-    if raw.is_absolute():
-        path = raw.resolve()
-    else:
-        path = (scripts_dir / raw).resolve()
-
-    # Guard against path traversal, absolute path injection, and symlink
-    # escape — scripts MUST reside within HERMES_HOME/scripts/.
-    try:
-        path.relative_to(scripts_dir_resolved)
-    except ValueError:
+    # Weave platform seam: a ``platform:<name>`` ref runs only from the
+    # platform-owned root; with cron.allow_scripts false nothing else runs.
+    if str(script_path).startswith(PLATFORM_SCRIPT_PREFIX):
+        path, platform_error = resolve_platform_script(str(script_path))
+        if platform_error:
+            return False, platform_error
+    elif not _cron_script_policy()[0]:
         return False, (
-            f"Blocked: script path resolves outside the scripts directory "
-            f"({scripts_dir_resolved}): {script_path!r}"
+            f"Blocked: cron.allow_scripts is false; only platform: scripts "
+            f"may run: {script_path!r}"
         )
+    else:
+        scripts_dir = _get_hermes_home() / "scripts"
+        _ensure_cron_dir(scripts_dir)
+        scripts_dir_resolved = scripts_dir.resolve()
 
-    if not path.exists():
-        return False, f"Script not found: {path}"
-    if not path.is_file():
-        return False, f"Script path is not a file: {path}"
+        try:
+            raw = Path(script_path).expanduser()
+        except (ValueError, RuntimeError, OSError):
+            # Same ingestion contract as cron.lifecycle_guard: a NUL-bearing
+            # value (ValueError) or an unexpandable ``~`` (RuntimeError with no
+            # resolvable HOME) can never name a real script. The creation-time
+            # guard tolerates such values as "nothing to scan", so they can
+            # reach fire time — fail the run with a report instead of crashing
+            # the scheduler with an unhandled exception.
+            return False, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
+        if raw.is_absolute():
+            path = raw.resolve()
+        else:
+            path = (scripts_dir / raw).resolve()
+
+        # Guard against path traversal, absolute path injection, and symlink
+        # escape — scripts MUST reside within HERMES_HOME/scripts/.
+        try:
+            path.relative_to(scripts_dir_resolved)
+        except ValueError:
+            return False, (
+                f"Blocked: script path resolves outside the scripts directory "
+                f"({scripts_dir_resolved}): {script_path!r}"
+            )
+
+        if not path.exists():
+            return False, f"Script not found: {path}"
+        if not path.is_file():
+            return False, f"Script path is not a file: {path}"
 
     script_timeout = _get_script_timeout()
 
