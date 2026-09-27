@@ -71,6 +71,34 @@ def _bound_json_error_result(result: str) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _vault_armed_refusal(name: str, args: dict, task_id) -> Optional[str]:
+    """Fork (V-9d): a tab that received a vault value holds it in its DOM until it loads a new document. Redaction
+    cannot hide a value the model transforms in-page (btoa, reversal, char codes) or reads as pixels, so model-driven
+    page JS, raw CDP beyond the page-blind methods, browser-use code (js/cdp/capture_screenshot) and screenshots are
+    refused here, the one point every model tool call crosses, while any tab of the task is armed (the target tab of
+    an eval is not known here, and a same-origin tab can reach the armed one through window.opener). The vault's own
+    fill runs over the supervisor, not here."""
+    if not (name in ("browser_vision", "browser_cdp", "browser_exec")
+            or (name == "browser_console" and args.get("expression") is not None)):
+        return None
+    from tools.browser_supervisor import vault_armed
+
+    if not vault_armed(task_id):
+        return None
+    if name == "browser_cdp":
+        from tools.browser_cdp_tool import _CDP_PRIVATE_PAGE_ALLOWED_METHODS
+
+        url = str((args.get("params") or {}).get("url") or "http:").lower()
+        # Tab listing / navigation read no page content; a javascript: URL is page JS, not a navigation.
+        if args.get("method") in _CDP_PRIVATE_PAGE_ALLOWED_METHODS and url.startswith(("http:", "https:")):
+            return None
+    return tool_error(
+        "Refused: a tab holds a value filled from the vault. Reading the page with JavaScript, raw CDP, browser code "
+        "or a screenshot is blocked until that tab loads a new page (submit the form or navigate). Click, type, "
+        "press, scroll, snapshot and navigate still work.",
+        error_type="vault_armed", success=False)
+
+
 def _is_registry_register_call(node: ast.AST) -> bool:
     """Return True when *node* is a ``registry.register(...)`` call expression."""
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
@@ -1144,6 +1172,9 @@ class ToolRegistry:
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        refusal = _vault_armed_refusal(name, args, kwargs.get("task_id"))
+        if refusal is not None:
+            return refusal
         try:
             if entry.is_async:
                 from model_tools import _run_async
