@@ -71,6 +71,21 @@ def _bound_json_error_result(result: str) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _scrub_vault_values(result):
+    """Vault secrets are a hard model-egress boundary: every tool result, whatever tool or field produced it
+    (a page title, a URL after a form GET), is scrubbed of registered fill values. A multimodal envelope's text
+    parts are scrubbed too; its image parts are left as they are (pixels cannot be scrubbed)."""
+    from agent.redact import redact_registered_vault_values
+
+    if isinstance(result, str):
+        return redact_registered_vault_values(result)
+    if isinstance(result, dict):
+        return {k: v if k == "image_url" else _scrub_vault_values(v) for k, v in result.items()}
+    if isinstance(result, list):
+        return [_scrub_vault_values(v) for v in result]
+    return result
+
+
 def _is_registry_register_call(node: ast.AST) -> bool:
     """Return True when *node* is a ``registry.register(...)`` call expression."""
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
@@ -1150,7 +1165,7 @@ class ToolRegistry:
                 result = _run_async(entry.handler(args, **kwargs))
             else:
                 result = entry.handler(args, **kwargs)
-            return self._normalize_handler_result(name, result)
+            return _scrub_vault_values(self._normalize_handler_result(name, result))
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.
             logger.exception(

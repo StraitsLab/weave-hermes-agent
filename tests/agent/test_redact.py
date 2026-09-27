@@ -1081,3 +1081,48 @@ class TestMaskSecretControlStripping:
     def test_all_control_value_returns_empty_fallback(self):
         assert mask_secret("\n\x85\u200b") == ""
         assert mask_secret("\n\x85\u200b", empty="(not set)") == "(not set)"
+
+
+class TestVaultValueEncodedForms:
+    """V9: a filled vault value reaches browser output escaped or encoded, not only as raw bytes. Every form
+    observed against a real Chrome + agent-browser (tests/tools/test_vault_adversarial_eval.py) is scrubbed."""
+
+    CANARY = 'Pa ss"w\\o+rd&\u00fc/Zq7f3eK9x<b>'
+
+    @pytest.fixture(autouse=True)
+    def _registered(self):
+        from agent import redact
+
+        redact.register_vault_redaction_value(self.CANARY)
+        yield
+        redact.clear_vault_redaction_values()
+
+    @pytest.mark.parametrize("encode", [
+        lambda v: v,
+        lambda v: __import__("json").dumps(v)[1:-1],                                  # snapshot line / tool JSON
+        lambda v: __import__("json").dumps(__import__("json").dumps(v))[1:-1],        # nested JSON
+        lambda v: __import__("json").dumps(v, ensure_ascii=True)[1:-1],               # \\u00fc
+        lambda v: __import__("urllib.parse").parse.quote(v, safe=""),                 # encodeURIComponent
+        lambda v: __import__("re").sub(r"%[0-9A-F]{2}", lambda m: m.group(0).lower(),
+                                       __import__("urllib.parse").parse.quote(v, safe="")),  # lowercase hex
+        lambda v: __import__("urllib.parse").parse.quote_plus(v),                     # form GET, utf-8 page
+        lambda v: __import__("urllib.parse").parse.quote_plus(v, encoding="cp1252"),  # form GET, no charset
+        lambda v: __import__("html").escape(v, quote=True),                           # serialized DOM
+    ], ids=["raw", "json", "json2", "json-ascii", "uri", "uri-lower", "form", "form-1252", "html"])
+    def test_every_encoding_of_a_registered_value_is_scrubbed(self, encode):
+        from agent.redact import redact_registered_vault_values
+
+        out = redact_registered_vault_values(f"page said: {encode(self.CANARY)} (end)")
+        assert "Zq7f3eK9x" not in out and "«redacted-vault-secret»" in out
+
+    def test_text_that_only_shares_characters_with_the_value_is_untouched(self):
+        from agent.redact import redact_registered_vault_values
+
+        text = "STATUS Pa ss other & Zq7f3eK9 %20 \\\" plain"
+        assert redact_registered_vault_values(text) == text
+
+    def test_whole_token_values_keep_exact_token_matching(self):
+        from agent import redact
+
+        redact.register_vault_redaction_value("US", whole_token=True)
+        assert redact.redact_registered_vault_values("STATUS US") == "STATUS «redacted-vault-secret»"

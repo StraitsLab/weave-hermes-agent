@@ -7,6 +7,7 @@ Short tokens (< 18 chars) are fully masked. Longer tokens preserve
 the first 6 and last 4 characters for debuggability.
 """
 
+import functools
 import logging
 import os
 import re
@@ -77,10 +78,49 @@ def clear_vault_redaction_values() -> None:
     """Drop the current profile's registered values (profile teardown / explicit lock)."""
     with _VAULT_REDACTION_LOCK:
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
+    _encoded_value_pattern.cache_clear()  # the compiled patterns embed the values
+
+
+def _hex_either_case(digits: str) -> str:
+    return "".join(f"[{d.upper()}{d.lower()}]" if d.isalpha() else d for d in digits)
+
+
+@functools.lru_cache(maxsize=256)
+def _encoded_value_pattern(value: str):
+    """A regex matching ``value`` with any of its non-alphanumeric characters in the encodings browser
+    output carries: JSON string escapes at any nesting depth (a snapshot line, a serialized tool result),
+    percent-encoding in UTF-8 or windows-1252 (encodeURIComponent, a form GET to a page without a charset),
+    ``+`` for space, and the HTML entities a DOM serializer emits. None when the value has no such character
+    (the exact scrub already covers it)."""
+    parts, encodable = [], False
+    for ch in value:
+        if ch.isascii() and ch.isalnum():
+            parts.append(ch)
+            continue
+        encodable = True
+        alts = {re.escape(ch)}
+        if ch in "\"/":
+            alts.add(r"\\*" + re.escape(ch))
+        if ch == "\\":
+            alts.add(r"\\+")
+        if ch == " ":
+            alts.add(r"\+")
+        for enc in ("utf-8", "cp1252"):
+            try:
+                alts.add("".join("%" + _hex_either_case(f"{b:02X}") for b in ch.encode(enc)))
+            except UnicodeEncodeError:
+                pass
+        utf16 = ch.encode("utf-16-be")
+        alts.add("".join(r"\\+u" + _hex_either_case(utf16[i:i + 2].hex()) for i in range(0, len(utf16), 2)))
+        alts.update(re.escape(e) for e in {"&": ("&amp;",), "<": ("&lt;",), ">": ("&gt;",),
+                                           '"': ("&quot;",), "'": ("&#39;", "&#x27;")}.get(ch, ()))
+        parts.append("(?:" + "|".join(sorted(alts)) + ")")
+    return re.compile("".join(parts)) if encodable else None
 
 
 def redact_registered_vault_values(text: str) -> str:
-    """Exact-substring scrub of every vault secret value registered for the current profile."""
+    """Scrub every vault secret value registered for the current profile: exact bytes, and (for exact
+    registrations) the escaped/percent-encoded forms a page, a URL or a serialized result carries it in."""
     if not isinstance(text, str) or not text:
         return text
     with _VAULT_REDACTION_LOCK:
@@ -88,14 +128,17 @@ def redact_registered_vault_values(text: str) -> str:
         # longest first: a substring never shadows its superstring
         values = sorted(bucket.items(), key=lambda kv: len(kv[0]), reverse=True) if bucket else ()
     for value, whole_token in values:
-        if value not in text:
-            continue
         if whole_token:
+            if value not in text:
+                continue
             left = _TOKEN_LEFT_BOUNDARY if re.match(r"\w", value[0]) else ""
             right = r"(?!\w)" if re.match(r"\w", value[-1]) else ""
             text = re.sub(f"{left}{re.escape(value)}{right}", "«redacted-vault-secret»", text)
-        else:
-            text = text.replace(value, "«redacted-vault-secret»")
+            continue
+        text = text.replace(value, "«redacted-vault-secret»")
+        encoded = _encoded_value_pattern(value)
+        if encoded is not None:
+            text = encoded.sub("«redacted-vault-secret»", text)
     return text
 
 

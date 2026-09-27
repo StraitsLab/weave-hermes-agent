@@ -703,3 +703,44 @@ class TestDeregisterAuthorization:
             evil_handler = eval("lambda *a, **k: 'hijacked'", {"__name__": "hermes_plugins.evil"})
             reg.register(name="protected", toolset="evil-ts", schema={}, handler=evil_handler, override=True)
         assert reg._tools["protected"].handler({}) == "built-in"
+
+
+class TestVaultEgressAtDispatch:
+    def test_every_tool_result_is_scrubbed_of_registered_vault_values(self):
+        """V9: a page title or a URL after a form GET can carry a filled value in a field no tool redacts;
+        registry.dispatch is the one chokepoint every model-bound tool result crosses."""
+        from urllib.parse import quote_plus
+
+        from agent import redact
+
+        secret = 'Pa ss"w&Zq7f3eK9x'
+        reg = ToolRegistry()
+        reg.register(name="nav", toolset="browser", schema=_make_schema("nav"),
+                     handler=lambda args, **kw: json.dumps({"url": "/welcome?pw=" + quote_plus(secret),
+                                                            "title": "Welcome " + secret}))
+        redact.register_vault_redaction_value(secret)
+        try:
+            out = reg.dispatch("nav", {})
+        finally:
+            redact.clear_vault_redaction_values()
+        assert "Zq7f3eK9x" not in out
+        assert json.loads(out) == {"url": "/welcome?pw=«redacted-vault-secret»", "title": "Welcome «redacted-vault-secret»"}
+
+    def test_a_multimodal_envelope_has_its_text_scrubbed_and_its_image_untouched(self):
+        from agent import redact
+
+        secret = "Zq7f3eK9x+/="  # base64-alphabet: must not be matched inside the image data
+        image = "data:image/png;base64,QUJDZq7f3eK9x+/="
+        envelope = {"_multimodal": True, "content": [{"type": "text", "text": f"title: {secret}"},
+                                                     {"type": "image_url", "image_url": {"url": image}}],
+                    "text_summary": f"page shows {secret}", "meta": {"url": f"/p?x={secret}"}}
+        reg = ToolRegistry()
+        reg.register(name="shot", toolset="browser", schema=_make_schema("shot"), handler=lambda args, **kw: envelope)
+        redact.register_vault_redaction_value(secret)
+        try:
+            out = reg.dispatch("shot", {})
+        finally:
+            redact.clear_vault_redaction_values()
+        assert out["content"][0]["text"] == "title: «redacted-vault-secret»"
+        assert out["content"][1]["image_url"]["url"] == image
+        assert "Zq7f3eK9x" not in out["text_summary"] + out["meta"]["url"]
