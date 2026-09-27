@@ -219,18 +219,78 @@ def test_f4_between_boundaries_surface_and_routing_hold_still(monkeypatch):
     assert "error" in json.loads(m.handle_tool_call("harso_memory", {"action": "brief"}))
 
 
-def test_f4_hot_disable_before_refresh_keeps_harso_memory_routable(monkeypatch):
-    """ON surface, switch flipped OFF, no refresh yet: the advertised tool still routes (never advertised-but-dead)."""
+@pytest.mark.parametrize("action,args", [("brief", {}), ("search", {"query": "tea"}), ("open", {"ref": "m7"})])
+def test_f4_hot_disable_before_refresh_keeps_harso_memory_routable(monkeypatch, action, args):
+    """ON surface, switch flipped OFF, no refresh yet: the advertised tool still routes (never advertised-but-dead),
+    but the live switch gates content: the dispatch succeeds with a content-free result and makes ZERO requests."""
     _switch(True)
     p = _provider(monkeypatch)
     m = _manager(p)
     a = _tool_agent(m)
     inject_memory_provider_tools(a)
     _switch(False)
-    seen = _capture(monkeypatch, {"/memory-tool": {"items": []}})
-    assert json.loads(m.handle_tool_call("harso_memory", {"action": "brief"})) == {"items": []}
-    assert len(seen) == 1
+    seen = _capture(monkeypatch, {"/memory-tool": {"items": [{"text": "OFF_SENTINEL"}]}})
+    assert m.has_tool("harso_memory")
+    out = m.handle_tool_call("harso_memory", {"action": action, **args})
+    assert json.loads(out) == {"error": "Harso memory is off"}
+    assert seen == []
     _assert_consistent(a, m)
+
+
+def _flip_off_in_flight(monkeypatch, p, response):
+    calls = []
+
+    def post(*_args, **_kwargs):
+        calls.append(1)
+        _switch(False)
+        return response
+
+    monkeypatch.setattr(p, "_post", post)
+    return calls
+
+
+_INFLIGHT = {"recall_status": "ok", "delivery": _DELIVERY,
+             "items": [{"text": "INFLIGHT_SENTINEL", "citation": "[harso: e1]"}],
+             "routing_hint": "Consider the calendar tool."}
+
+
+def test_f4_tool_switch_off_during_fetch_returns_content_free_result(monkeypatch):
+    _switch(True)
+    p = _provider(monkeypatch)
+    m = _manager(p)
+    inject_memory_provider_tools(_tool_agent(m))
+    calls = _flip_off_in_flight(monkeypatch, p, {"items": [{"text": "INFLIGHT_SENTINEL"}]})
+    out = m.handle_tool_call("harso_memory", {"action": "brief"})
+    assert calls == [1] and json.loads(out) == {"error": "Harso memory is off"}
+
+
+def test_f4_late_fetch_switch_off_during_fetch_renders_nothing(monkeypatch):
+    _switch(True)
+    p = _provider(monkeypatch)
+    calls = _flip_off_in_flight(monkeypatch, p, _INFLIGHT)
+    assert p.fetch_mid_turn_delivery(visible_seqs=[]) == "" and calls == [1]
+
+
+def test_f4_turn_start_switch_off_during_fetch_withholds_memory(monkeypatch):
+    """A copilot-shaped request that completes after OFF renders no delivery and no items (fail closed)."""
+    _switch(True)
+    p = _provider(monkeypatch)
+    calls = _flip_off_in_flight(monkeypatch, p, _INFLIGHT)
+    out = p.prefetch("What do you remember?")
+    assert calls == [1]
+    assert "Harso memory delivery" not in out and "INFLIGHT_SENTINEL" not in out
+
+
+def test_f4_live_on_positive_controls_still_render(monkeypatch):
+    """The re-checks are not dead-ending ON: the same responses render when the switch stays on."""
+    _switch(True)
+    p = _provider(monkeypatch)
+    m = _manager(p)
+    inject_memory_provider_tools(_tool_agent(m))
+    monkeypatch.setattr(p, "_post", lambda *a, **k: dict(_INFLIGHT))
+    assert "INFLIGHT_SENTINEL" in m.handle_tool_call("harso_memory", {"action": "brief"})
+    assert "Harso memory delivery" in p.fetch_mid_turn_delivery(visible_seqs=[])
+    assert "Harso memory delivery" in p.prefetch("What do you remember?")
 
 
 def test_f4_off_on_off_round_trip_restores_todays_surface_in_order(monkeypatch):

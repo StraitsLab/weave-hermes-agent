@@ -82,6 +82,18 @@ def copilot_enabled() -> bool:
     return _harso_section().get("copilot_enabled") is True
 
 
+def _copilot_off() -> bool:
+    """F4 content gate: the tool latch decides ROUTING; the live switch alone decides CONTENT.
+
+    Checked before a tool request and again after every blocking fetch returns, before anything is rendered, so a
+    response that completes after the switch went OFF never reaches the model.
+    """
+    return not copilot_enabled()
+
+
+_COPILOT_OFF_RESULT = json.dumps({"error": "Harso memory is off"})
+
+
 def _copilot_path(key: str, default: str) -> str:
     raw = _harso_section().get(key)
     if raw is None:
@@ -346,7 +358,7 @@ class HarsoMemoryProvider(MemoryProvider):
             timeout=_late_fetch_timeout(),
             max_bytes=_PREFETCH_MAX_BYTES,
         )
-        if not response or _recall_denied(response):
+        if _copilot_off() or not response or _recall_denied(response):
             return ""
         return render_wire_delivery(response.get("delivery"), channel="mid_turn")
 
@@ -367,9 +379,14 @@ class HarsoMemoryProvider(MemoryProvider):
             return json.dumps({"error": "search needs a query"})
         if action == "open" and "ref" not in payload:
             return json.dumps({"error": "open needs a ref"})
+        if _copilot_off():
+            # Still routed (the latch), but the live switch is OFF: a content-free result and zero requests.
+            return _COPILOT_OFF_RESULT
         if not self._session_id or not self.is_available():
             return json.dumps({"error": "Harso memory is unavailable"})
         response = self._post(_copilot_path("tool_path", _TOOL_PATH), payload, max_bytes=_TOOL_MAX_BYTES)
+        if _copilot_off():
+            return _COPILOT_OFF_RESULT
         if response is None or _recall_denied(response):
             # An explicit denial status (same gate as turn start) withholds the whole result; absent status = as sent.
             return json.dumps({"error": "Harso memory is unavailable"})
@@ -451,6 +468,11 @@ class HarsoMemoryProvider(MemoryProvider):
         hint = response.get("routing_hint")
         hint = hint.strip() if isinstance(hint, str) and len(hint.strip()) <= 200 else ""
         hint = hint if _ROUTING_HINT.fullmatch(hint) else ""
+        if copilot and _copilot_off():
+            # Switched OFF while this copilot request was in flight: withhold every memory representation it
+            # returned (delivery and items); only the recall-independent hint remains. A turn that STARTS off never
+            # reaches here, so the OFF path stays byte-identical to base.
+            return hint
         # The status gate runs before ANY memory representation (delivery or legacy items) is rendered.
         if _recall_denied(response):
             return hint
