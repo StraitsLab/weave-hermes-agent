@@ -1,0 +1,23 @@
+...............⚠ Auxiliary title generation failed: No LLM provider configured for task=title_generation provider=auto. Run: hermes setup
+.⚠ Auxiliary title generation failed: No LLM provider configured for task=title_generation provider=auto. Run: hermes setup
+⚠ Auxiliary title generation failed: No LLM provider configured for task=title_generation provider=auto. Run: hermes setup
+......................................🗜️ Compacting context — summarizing earlier conversation so I can continue...
+🗜️ Compacting context — summarizing earlier conversation so I can continue...
+...................⚠ Auxiliary title generation failed: No LLM provider configured for task=title_generation provider=auto. Run: hermes setup
+..⚠ Auxiliary title generation failed: No LLM provider configured for task=title_generation provider=auto. Run: hermes setup
+..⚠ Auxiliary title generation failed: No LLM provider configured for task=title_generation provider=auto. Run: hermes setup
+..........⚠ Auxiliary title generation failed: No LLM provider configured for task=title_generation provider=auto. Run: hermes setup
+....⚠ Auxiliary title generation failed: No LLM provider configured for task=title_generation provider=auto. Run: hermes setup
+.......  ┊ 📖 read        0.1s [File not found:]
+.⚠ Auxiliary title generation failed: No LLM provider configured for task=title_generation provider=auto. Run: hermes setup
+.⚠ Auxiliary title generation failed: No LLM provider configured for task=title_generation provider=auto. Run: hermes setup
+...........⚠️  Reached maximum iterations (9223372036854775807). Requesting summary...
+.<MagicMock name='mock.get_automatic_compaction_status_message()' id='4634387600'>
+<MagicMock name='mock.get_automatic_compaction_status_message()' id='4634387600'>
+.<MagicMock name='mock.get_automatic_compaction_status_message()' id='4671668560'>
+<MagicMock name='mock.get_automatic_compaction_status_message()' id='4671668560'>
+..⚠ Auxiliary title generation failed: No LLM provider configured for task=title_generation provider=auto. Run: hermes setup
+
+115 passed in 15.80s
+⚠ Auxiliary title generation failed: No LLM provider configured for task=title_generation provider=auto. Run: hermes setup
+EXIT=0

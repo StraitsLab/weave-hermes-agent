@@ -1,0 +1,11 @@
+start_on=True end_on=False representation=delivery requests=1 first_sidecar_contains_memory=False plain_text_kept=True
+.start_on=True end_on=True representation=delivery requests=1 first_sidecar_contains_memory=True plain_text_kept=True
+.start_on=False end_on=False representation=delivery requests=1 first_sidecar_contains_memory=True plain_text_kept=True
+.start_on=False end_on=True representation=delivery requests=1 first_sidecar_contains_memory=True plain_text_kept=True
+.start_on=True end_on=False representation=items requests=1 first_sidecar_contains_memory=False plain_text_kept=True
+.start_on=True end_on=True representation=items requests=1 first_sidecar_contains_memory=True plain_text_kept=True
+.start_on=False end_on=False representation=items requests=1 first_sidecar_contains_memory=True plain_text_kept=True
+.start_on=False end_on=True representation=items requests=1 first_sidecar_contains_memory=True plain_text_kept=True
+.
+8 passed in 0.67s
+EXIT=0

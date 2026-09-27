@@ -2012,6 +2012,7 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
     _ext_prefetch_gated = _ctx.ext_prefetch_gated
+    _ext_prefetch_note = _ctx.ext_prefetch_note
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -2388,12 +2389,16 @@ def run_conversation(
                         # fetched cache — re-read the live copilot switch once;
                         # later passes reuse the result so a turn's bytes stay stable.
                         _ext_prefetch_cache = withhold_off_origin_memory(agent, _ext_prefetch_cache)
+                        # Ruling r5: freeze the fence-note choice with the gate
+                        # so later passes (and a compression/rebuild that drops
+                        # the stamped sidecar) resend the same memory bytes.
+                        _ext_prefetch_note = memory_fence_note(agent)
                         _ext_prefetch_gated = True
                     _composed = compose_user_api_content(
                         api_msg.get("content", ""),
                         _ext_prefetch_cache,
                         _plugin_user_context,
-                        memory_note=memory_fence_note(agent),
+                        memory_note=_ext_prefetch_note,
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed

@@ -1,0 +1,16 @@
+action=brief live_on=True advertised=True routed=True posts=1 rendered=True
+.action=search live_on=True advertised=True routed=True posts=1 rendered=True
+.action=open live_on=True advertised=True routed=True posts=1 rendered=True
+.action=brief live_on=False advertised=True routed=True posts=0 rendered=False
+.action=search live_on=False advertised=True routed=True posts=0 rendered=False
+.action=open live_on=False advertised=True routed=True posts=0 rendered=False
+.path=tool live_on=False rendered_after_off=False
+.path=late live_on=False rendered_after_off=False
+.path=prefetch live_on=False rendered_after_off=False
+.acp_listing_start_on=False live_surface_and_routing_unchanged=True
+.acp_listing_start_on=True live_surface_and_routing_unchanged=True
+.mcp_refresh_start_on=False surface_routing_consistent=True
+.mcp_refresh_start_on=True surface_routing_consistent=True
+.
+13 passed in 0.87s
+EXIT=0

@@ -586,6 +586,9 @@ class TurnContext:
     # True once ``withhold_off_origin_memory`` gated the cache at its first
     # composition (the stamped path); the loop gates it otherwise.
     ext_prefetch_gated: bool = False
+    # Fence-note choice frozen with that gate (ruling r5): valid once
+    # ``ext_prefetch_gated`` is True; every later composition this turn reuses it.
+    ext_prefetch_note: Optional[str] = None
     # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
 
@@ -1538,6 +1541,7 @@ def build_turn_context(
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
     ext_prefetch_gated = False
+    ext_prefetch_note = None
     if agent._memory_manager:
         try:
             # Runtime refresh: a config.yaml edit reaches the next prefetch on
@@ -1598,9 +1602,11 @@ def build_turn_context(
         # re-read the live switch now, not at provider completion.
         ext_prefetch_cache = withhold_off_origin_memory(agent, ext_prefetch_cache)
         ext_prefetch_gated = True
+        # Ruling r5: the fence-note choice is decided once, with the gate.
+        ext_prefetch_note = memory_fence_note(agent)
         _api_content = compose_user_api_content(
             _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context,
-            memory_note=memory_fence_note(agent),
+            memory_note=ext_prefetch_note,
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content
@@ -1684,5 +1690,6 @@ def build_turn_context(
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
         ext_prefetch_gated=ext_prefetch_gated,
+        ext_prefetch_note=ext_prefetch_note,
         preflight_compression_blocked=_preflight_compression_blocked,
     )

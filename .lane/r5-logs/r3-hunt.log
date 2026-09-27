@@ -1,0 +1,13 @@
+timeout=False late_completion_reused=False next_off_request_legacy=True
+.timeout=True late_completion_reused=False next_off_request_legacy=True
+.background_enabled=False requests=0
+.background_enabled=True requests=0
+.stable_on=False representation=delivery r2_head_output_and_requests_equal=True
+.stable_on=True representation=delivery r2_head_output_and_requests_equal=True
+.stable_on=False representation=items r2_head_output_and_requests_equal=True
+.stable_on=True representation=items r2_head_output_and_requests_equal=True
+.stable_on=False representation=denied r2_head_output_and_requests_equal=True
+.stable_on=True representation=denied r2_head_output_and_requests_equal=True
+.
+10 passed in 0.36s
+EXIT=0
