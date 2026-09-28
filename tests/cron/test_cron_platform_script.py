@@ -684,8 +684,9 @@ def test_null_config_root_refuses_every_script(home, tmp_path, monkeypatch, laye
     _tenant_refused(marker)
 
 
+@pytest.mark.parametrize("bad_root", ["null\n", "!!set {}\n"], ids=["null", "set"])
 @pytest.mark.parametrize("layer", ["user", "managed"])
-def test_warm_config_turning_null_refuses_tenant_and_platform(home, platform_root, tmp_path, monkeypatch, layer):
+def test_warm_config_turning_null_refuses_tenant_and_platform(home, platform_root, tmp_path, monkeypatch, layer, bad_root):
     from cron.scheduler import _cron_script_policy, _run_job_script
     from hermes_cli.config import load_config
 
@@ -704,7 +705,7 @@ def test_warm_config_turning_null_refuses_tenant_and_platform(home, platform_roo
     assert _run_job_script("platform:tick.py")[0] is True and platform_marker.exists()
     platform_marker.unlink()
     _tenant_refused(marker)
-    (restrictive / "config.yaml").write_text("null\n", encoding="utf-8")
+    (restrictive / "config.yaml").write_text(bad_root, encoding="utf-8")
 
     assert _cron_script_policy() is None
     assert _run_job_script("platform:tick.py")[0] is False

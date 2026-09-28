@@ -234,7 +234,7 @@ class TestLoadConfigParseFailure:
 _NULL_ROOTS = ["null\n", "~\n", "!!null null\n", "---\nnull\n...\n"]
 # A mapping NODE that constructs a set: passes a node-kind check, must still refuse.
 _SET_ROOTS = ["!!set {}\n", "!<tag:yaml.org,2002:set> {}\n", "%TAG !e! tag:yaml.org,2002:\n--- !e!set {}\n",
-              "\ufeff--- !!set\n{}\n...\n", "!!set {a: null}\n"]
+              "\ufeff--- !!set\n{}\n...\n", "!!set {a: null}\n", "!!omap []\n", "!!pairs []\n"]
 
 
 class TestLoadConfigStrict:
