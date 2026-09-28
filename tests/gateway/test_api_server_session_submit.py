@@ -439,11 +439,16 @@ async def test_steer_joins_the_running_turn_and_settles_when_that_turn_ends(adap
     assert agent.steered == ["make it Saturday"] and queued == [] and agent.interrupted == []
     assert "native-steered" not in adapter._native_submit_terminals
 
+    closed = []
+    original = adapter._native_submit_close
+    adapter._native_submit_close = lambda ref, kind, **fields: (closed.append((ref, kind, fields.get("steered_into"))),
+                                                                original(ref, kind, **fields))
     running = SimpleNamespace(metadata={"native_request_ref": "native-running"})
     await adapter._on_native_submit_finished(running, "native-key")
 
-    assert "native-steered" in adapter._native_submit_terminals
-    assert "native-running" in adapter._native_submit_terminals
+    assert ("native-steered", "turn.completed", "native-running") in closed
+    assert ("native-running", "turn.completed", None) in closed
+    assert not any(kind == "turn.failed" for _ref, kind, _into in closed)
 
 
 @pytest.mark.asyncio
@@ -555,4 +560,118 @@ async def test_interrupt_is_demoted_to_queue_while_the_gateway_would_demote_it(a
                                                            busy_mode="interrupt")
 
     assert admission == "queued" and queued == ["book the dentist"]
+    assert agent.interrupted == []
+
+
+async def _post_submit(adapter, request_id, busy_mode, message="hello"):
+    adapter.gateway_runner.session_credential_available = lambda *_args: True
+    client = await _client(adapter)
+    try:
+        response = await client.post(f"/api/sessions/{SESSION_ID}/submit",
+                                     headers={"Authorization": f"Bearer {adapter.config.extra['key']}"},
+                                     json={**_request(request_id, message), "busy_mode": busy_mode})
+        return response.status, await response.json()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_through_the_http_route_reaches_the_running_agent(adapter):
+    """F4(a): the real route carries busy_mode=interrupt to the running agent, and the submit still queues."""
+    agent = _Agent()
+    queued = _busy_adapter(adapter, agent)
+
+    status, body = await _post_submit(adapter, "interrupt-wire", "interrupt")
+
+    assert status == 202 and body["admission"] == "queued"
+    assert agent.interrupted == ["hello"] and queued == ["hello"] and agent.steered == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first,second", [(a, b) for a in ("queue", "steer", "interrupt")
+                                          for b in ("queue", "steer", "interrupt") if a != b])
+async def test_a_retry_that_changes_busy_mode_is_changed_input(adapter, first, second):
+    """F3: busy_mode is part of the request identity. A changed mode is a 409, never a replay."""
+    agent = _Agent()
+    _busy_adapter(adapter, agent)
+
+    first_status, _ = await _post_submit(adapter, "mode-change", first)
+    retry_status, retry = await _post_submit(adapter, "mode-change", second)
+
+    assert first_status == 202
+    assert retry_status == 409 and retry["error"]["code"] == "native_submit_idempotency_conflict"
+
+
+@pytest.mark.asyncio
+async def test_a_queue_record_from_before_busy_modes_still_replays(adapter):
+    """F3: records written before busy modes keep the message-only hash, so their identical retry replays."""
+    adapter._session_db.register_native_session_submit(
+        SESSION_ID, external_request_id="legacy", native_request_ref="legacy-ref",
+        message_sha256=hashlib.sha256(b"hello").hexdigest())
+    adapter._session_db.set_native_session_submit_admission(native_request_ref="legacy-ref", admission="queued")
+    _busy_adapter(adapter, _Agent())
+
+    status, body = await _post_submit(adapter, "legacy", "queue")
+
+    assert status == 202 and body["native_request_ref"] == "legacy-ref"
+
+
+def _real_agent():
+    """The real AIAgent steer/drain/window owners, without a model."""
+    import threading
+    from run_agent import AIAgent
+
+    agent = object.__new__(AIAgent)
+    agent._pending_steer_lock, agent._pending_steer, agent._execution_thread_id = threading.Lock(), None, None
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_a_steer_after_the_turn_took_its_last_leftover_is_queued_not_lost(adapter):
+    """F1(b): once the finalizer has taken the leftover, a steer would never be read. The agent refuses it,
+    so the submit queues as its own turn instead of being reported steered and dropped."""
+    agent = _real_agent()
+    queued = _busy_adapter(adapter, agent)
+
+    leftover = agent._close_steer_window()  # turn_finalizer's single take
+    admission = await adapter._admit_native_session_submit(SESSION_ID, "do not book it", "late-steer",
+                                                           busy_mode="steer")
+
+    assert leftover is None
+    assert admission == "queued" and queued == ["do not book it"] and agent._pending_steer is None
+    agent._open_steer_window()  # the next turn accepts steers again
+    assert agent.steer("make it Saturday") is True and agent._drain_pending_steer() == "make it Saturday"
+
+
+def test_a_steer_accepted_before_the_window_closes_is_the_leftover():
+    agent = _real_agent()
+    assert agent.steer("make it Saturday") is True
+    assert agent._close_steer_window() == "make it Saturday"
+    assert agent.steer("too late") is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["turn-ended", "agent-replaced", "subagent-started"])
+async def test_an_interrupt_is_dropped_if_its_target_changed_during_the_compression_check(adapter, change):
+    """F2: the interrupt is fenced to the turn it was aimed at, re-checked after the compression await,
+    so it can never stop its own queued turn, a different agent, or a turn now driving subagents."""
+    agent = _Agent()
+    agent._active_children = []
+    queued = _busy_adapter(adapter, agent)
+    runner = adapter.gateway_runner
+
+    async def compression_check(key):
+        await asyncio.sleep(0)
+        if change == "turn-ended":
+            adapter._native_submit_active_refs[key] = "native-new"  # this very submit is now running
+        elif change == "agent-replaced":
+            runner._peek_session_state = lambda _k: SimpleNamespace(turn=SimpleNamespace(agent=_Agent()))
+        else:
+            agent._active_children = [object()]
+        return False
+
+    runner._session_has_compression_in_flight = compression_check
+    admission = await adapter._admit_native_session_submit(SESSION_ID, "new task", "native-new", busy_mode="interrupt")
+
+    assert admission == "queued" and queued == ["new task"]
     assert agent.interrupted == []

@@ -5306,9 +5306,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
             compressing = getattr(runner, "_session_has_compression_in_flight", None)
             if (
-                busy_mode == "interrupt" and agent is not None and hasattr(agent, "interrupt")
+                busy_mode == "interrupt" and agent is not None and active_ref and hasattr(agent, "interrupt")
                 and not GatewayRunner._agent_has_active_subagents(agent)
                 and not (callable(compressing) and await compressing(entry.session_key))
+                # Fence after the await: the same turn must still be running on the same agent, and
+                # the guards must still hold, or this request could interrupt itself or a subagent.
+                and self._native_submit_active_ref(entry.session_key) == active_ref
+                and self._native_submit_running_agent(runner, entry.session_key) is agent
+                and not GatewayRunner._agent_has_active_subagents(agent)
             ):
                 try:
                     agent.interrupt(message)
@@ -5324,6 +5329,14 @@ class APIServerAdapter(BasePlatformAdapter):
             if not started.done():
                 started.cancel()
             raise
+
+    @staticmethod
+    def _native_submit_fingerprint(message: str, busy_mode: str) -> str:
+        """Weave (WEV-2108): the idempotency identity of one submit. A retry that changes busy_mode is
+        changed input (409), not a replay. queue keeps the message-only hash that records written
+        before busy modes existed carry, so their identical retries still replay across a deploy."""
+        body = message if busy_mode == "queue" else f"{message}\0busy_mode={busy_mode}"
+        return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _native_submit_running_agent(runner: Any, session_key: str) -> Any:
@@ -5373,7 +5386,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 db.register_native_session_submit,
                 session_id,
                 external_request_id=external_request_id,
-                message_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                message_sha256=self._native_submit_fingerprint(message, busy_mode),
                 native_request_ref=native_request_ref,
             )
             outcome = result["outcome"]

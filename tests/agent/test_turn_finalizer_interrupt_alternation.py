@@ -180,3 +180,21 @@ def test_interrupt_without_tool_tail_adds_nothing():
     _finalize(agent, messages, interrupted=True, final_response="partial reply")
     assert len(messages) == before
     assert messages[-1]["role"] == "assistant"
+
+
+def test_finalize_closes_the_steer_window_and_hands_back_the_leftover():
+    """WEV-2108: the finalizer takes the last leftover steer and closes the window in one step, so a
+    steer arriving after it is refused (and queued by the caller) instead of accepted and never read."""
+    import threading
+    from run_agent import AIAgent
+
+    agent = _StubAgent()
+    agent._pending_steer_lock, agent._pending_steer = threading.Lock(), "make it Saturday"
+    for name in ("steer", "_close_steer_window", "_open_steer_window", "_drain_pending_steer"):
+        setattr(agent, name, getattr(AIAgent, name).__get__(agent))
+
+    result = _finalize(agent, [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}],
+                       interrupted=False, final_response="ok")
+
+    assert result["pending_steer"] == "make it Saturday"
+    assert agent.steer("too late") is False and agent._pending_steer is None
