@@ -14,3 +14,8 @@ Evidence at this head:
 - submit + finalizer tests: 39 passed. Related gateway/agent suites (21 files): 221 passed (207 at b62cc65).
 - Reviewer's own probe.py + integration.py: 12 passed (9 failed + 1 failed at b62cc65). Two probe assertions were adapted to the new contract: the probe drains via `_close_steer_window` (the finalizer's real call), and the sibling case accepts the steer text leading the queued message.
 - Mutants (9, one at a time, source restored): all killed.
+
+Round 2 (Fly delta review, GPT-6 Astra, BLOCK at 1b0dbfdc3) and what changed:
+- R2-F1: closing the window inside steer() broke the CLI / gateway / TUI /steer callers, which read False as "empty". steer() keeps its old contract; a new AIAgent.steer_if_open() refuses after the finalizer closes the window, and only native submit uses it (and queues on refusal). Reviewer's CLI and gateway reproductions now pass.
+- R2-F3: the fingerprint was ambiguous (a queue message could spell the steer/interrupt encoding). Now queue = bare sha256 hex (legacy replay kept), other modes = "<mode>:<sha256 hex>", which no bare digest can equal.
+Evidence: reviewer test_delta_regressions.py 6/6 pass; related suites + round-1 probes 216 passed; 10 mutants, all killed.

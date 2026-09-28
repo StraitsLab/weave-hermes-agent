@@ -190,11 +190,11 @@ def test_finalize_closes_the_steer_window_and_hands_back_the_leftover():
 
     agent = _StubAgent()
     agent._pending_steer_lock, agent._pending_steer = threading.Lock(), "make it Saturday"
-    for name in ("steer", "_close_steer_window", "_open_steer_window", "_drain_pending_steer"):
+    for name in ("steer", "steer_if_open", "_close_steer_window", "_open_steer_window", "_drain_pending_steer"):
         setattr(agent, name, getattr(AIAgent, name).__get__(agent))
 
     result = _finalize(agent, [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}],
                        interrupted=False, final_response="ok")
 
     assert result["pending_steer"] == "make it Saturday"
-    assert agent.steer("too late") is False and agent._pending_steer is None
+    assert agent.steer_if_open("too late") is False and agent._pending_steer is None

@@ -640,14 +640,46 @@ async def test_a_steer_after_the_turn_took_its_last_leftover_is_queued_not_lost(
     assert leftover is None
     assert admission == "queued" and queued == ["do not book it"] and agent._pending_steer is None
     agent._open_steer_window()  # the next turn accepts steers again
-    assert agent.steer("make it Saturday") is True and agent._drain_pending_steer() == "make it Saturday"
+    assert agent.steer_if_open("make it Saturday") is True and agent._drain_pending_steer() == "make it Saturday"
 
 
 def test_a_steer_accepted_before_the_window_closes_is_the_leftover():
     agent = _real_agent()
-    assert agent.steer("make it Saturday") is True
+    assert agent.steer_if_open("make it Saturday") is True
     assert agent._close_steer_window() == "make it Saturday"
-    assert agent.steer("too late") is False
+    assert agent.steer_if_open("too late") is False
+
+
+def test_plain_steer_keeps_its_contract_for_other_callers_after_the_window_closes():
+    """R2-F1: CLI, TUI, ACP and gateway /steer treat False as empty input, so steer() itself never refuses
+    non-empty text; only native submit (which queues on refusal) uses steer_if_open."""
+    agent = _real_agent()
+    agent._close_steer_window()
+    assert agent.steer("do not book it") is True and agent._pending_steer == "do not book it"
+    assert agent.steer("   ") is False
+
+
+@pytest.mark.asyncio
+async def test_changed_mode_and_text_cannot_alias_a_queue_identity(adapter):
+    """R2-F3: a queue message that spells another mode's encoding is still a different request."""
+    agent = _Agent()
+    _busy_adapter(adapter, agent)
+
+    first, _ = await _post_submit(adapter, "alias", "queue", message="hello\u0000busy_mode=interrupt")
+    for crafted in ("interrupt:" + hashlib.sha256(b"hello").hexdigest(), "hello"):
+        status, body = await _post_submit(adapter, "alias", "interrupt", message=crafted)
+        assert status == 409 and body["error"]["code"] == "native_submit_idempotency_conflict"
+    assert first == 202 and agent.interrupted == []
+
+
+@pytest.mark.asyncio
+async def test_an_identical_steer_or_interrupt_retry_replays(adapter):
+    agent = _Agent()
+    _busy_adapter(adapter, agent)
+    for mode in ("steer", "interrupt"):
+        first, one = await _post_submit(adapter, f"same-{mode}", mode)
+        retry, two = await _post_submit(adapter, f"same-{mode}", mode)
+        assert first == retry == 202 and one["native_request_ref"] == two["native_request_ref"]
 
 
 @pytest.mark.asyncio

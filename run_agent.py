@@ -3567,16 +3567,10 @@ class AIAgent:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
             # Fall back to direct attribute set; no concurrent callers expected
             # in those stubs.
-            if getattr(self, "_steer_window_closed", False):
-                return False
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
         with _lock:
-            # Weave (WEV-2108): once the turn's finalizer has taken the last leftover, nothing
-            # would ever read this slot again; refuse so the caller queues instead of losing it.
-            if getattr(self, "_steer_window_closed", False):
-                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
@@ -3694,6 +3688,25 @@ class AIAgent:
             text = self._pending_redirect
             self._pending_redirect = None
         return text
+
+    def steer_if_open(self, text: str) -> bool:
+        """Weave (WEV-2108): steer() for callers that can queue on refusal (native submit).
+
+        Refuses once this turn's finalizer has taken its last leftover (the window is closed), because
+        nothing in the finishing turn would read the text. steer() itself keeps its old contract for
+        the CLI, TUI, ACP and gateway /steer callers, which treat False as empty input.
+        """
+        if not text or not text.strip():
+            return False
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            return False if getattr(self, "_steer_window_closed", False) else self.steer(text)
+        with _lock:
+            if getattr(self, "_steer_window_closed", False):
+                return False
+            cleaned = text.strip()
+            self._pending_steer = f"{self._pending_steer}\n{cleaned}" if self._pending_steer else cleaned
+        return True
 
     def _close_steer_window(self) -> Optional[str]:
         """Weave (WEV-2108): take the turn's last leftover steer and refuse later ones, atomically.

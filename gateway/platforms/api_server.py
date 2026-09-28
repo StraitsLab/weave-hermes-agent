@@ -5290,7 +5290,8 @@ class APIServerAdapter(BasePlatformAdapter):
             active_ref = self._native_submit_active_ref(entry.session_key)
             if busy_mode == "steer" and active_ref and agent is not None and hasattr(agent, "steer"):
                 try:
-                    steered = bool(agent.steer(message))
+                    _steer = getattr(agent, "steer_if_open", None)
+                    steered = bool(_steer(message) if callable(_steer) else agent.steer(message))
                 except Exception:
                     logger.warning("[api_server] native submit steer failed", exc_info=True)
                     steered = False
@@ -5335,8 +5336,8 @@ class APIServerAdapter(BasePlatformAdapter):
         """Weave (WEV-2108): the idempotency identity of one submit. A retry that changes busy_mode is
         changed input (409), not a replay. queue keeps the message-only hash that records written
         before busy modes existed carry, so their identical retries still replay across a deploy."""
-        body = message if busy_mode == "queue" else f"{message}\0busy_mode={busy_mode}"
-        return hashlib.sha256(body.encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        return digest if busy_mode == "queue" else f"{busy_mode}:{digest}"
 
     @staticmethod
     def _native_submit_running_agent(runner: Any, session_key: str) -> Any:
