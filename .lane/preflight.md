@@ -19,3 +19,8 @@ Round 2 (Fly delta review, GPT-6 Astra, BLOCK at 1b0dbfdc3) and what changed:
 - R2-F1: closing the window inside steer() broke the CLI / gateway / TUI /steer callers, which read False as "empty". steer() keeps its old contract; a new AIAgent.steer_if_open() refuses after the finalizer closes the window, and only native submit uses it (and queues on refusal). Reviewer's CLI and gateway reproductions now pass.
 - R2-F3: the fingerprint was ambiguous (a queue message could spell the steer/interrupt encoding). Now queue = bare sha256 hex (legacy replay kept), other modes = "<mode>:<sha256 hex>", which no bare digest can equal.
 Evidence: reviewer test_delta_regressions.py 6/6 pass; related suites + round-1 probes 216 passed; 10 mutants, all killed.
+
+Round 3 (Fly delta review, BLOCK at 3b1fb5138) and what changed:
+- R3-F1: an accepted native steer whose queued sibling was refused during preparation (next_message None) was returned undelivered. The leftover steer now runs as its own turn in that case, and still leads a prepared sibling otherwise.
+- Note: round-2 preflight wrongly said the reviewer's test_delta_regressions.py passed 6/6; two of its assertions required the old refusing steer() contract, which R2-F1 deliberately restored. test_restored_contract.py (reviewer's) passes.
+Evidence: tests/gateway/test_native_steer_refused_sibling.py (reviewer reproduction, both sibling cases) passes; 12 mutants, all killed.

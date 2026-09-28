@@ -31900,12 +31900,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         history=updated_history,
                         session_key=next_session_key,
                     )
-                    if next_message is None:
-                        return result
                     # Weave (WEV-2108): an accepted steer this turn could not inject must not vanish
-                    # because a queued message is next. It leads that message's turn instead.
+                    # because a queued message is next. It leads that message's turn instead, or runs
+                    # alone when the queued message itself is refused during preparation.
                     _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
-                    if _leftover_steer and isinstance(next_message, str):
+                    if next_message is None:
+                        if not _leftover_steer:
+                            return result
+                        next_message = _leftover_steer
+                        logger.debug("Leftover /steer runs alone; its queued follow-up was refused (%s)", session_key or "?")
+                    elif _leftover_steer and isinstance(next_message, str):
                         next_message = f"{_leftover_steer}\n\n{next_message}"
                         logger.debug("Leftover /steer leads the queued follow-up for session %s", session_key or "?")
                     next_message_id = self._reply_anchor_for_event(pending_event)
