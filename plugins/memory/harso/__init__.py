@@ -7,6 +7,7 @@ import logging
 import re
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from agent.message_content import flatten_message_text
@@ -20,8 +21,9 @@ _TIMEOUT_SECONDS = 5
 # the prefetch thread soon after the turn stops waiting; writes keep 5s.
 _PREFETCH_TIMEOUT_SECONDS = 0.8
 _PREFETCH_MAX_BYTES = 262144
-_MAX_CONTEXT_ITEMS = 5
-_MAX_CONTEXT_TEXT = 1200
+# The server packs items to its own token budget; this is only a total safety
+# bound on the rendered block (~16k tokens), applied at whole-item boundaries.
+_CONTEXT_MAX_CHARS = 65536
 _P = r"(?:0\.[0-9]{2}|1\.00)"
 _ACTION = rf"external action: (?:likely|unlikely|unsure) \({_P}\)"
 # WEV-1850: the fixed vocabulary weave-api's RoutingHint.line() generates. No
@@ -34,9 +36,11 @@ class HarsoWriteError(RuntimeError):
     """Content-free failure that lets D4 record an unacknowledged mirror."""
 
 
-def _prefetch_limits() -> tuple[float, int]:
-    """Read ``plugins.harso.prefetch_timeout`` / ``prefetch_max_bytes`` per call."""
+def _prefetch_limits() -> tuple[float, int, int]:
+    """Read ``plugins.harso.prefetch_timeout`` / ``prefetch_max_bytes`` /
+    ``context_max_chars`` per call."""
     timeout, max_bytes = _PREFETCH_TIMEOUT_SECONDS, _PREFETCH_MAX_BYTES
+    max_chars = _CONTEXT_MAX_CHARS
     try:
         from hermes_cli.config import cfg_get, load_config_readonly
 
@@ -44,7 +48,7 @@ def _prefetch_limits() -> tuple[float, int]:
     except Exception:
         section = {}
     if not isinstance(section, dict):
-        return timeout, max_bytes
+        return timeout, max_bytes, max_chars
     raw = section.get("prefetch_timeout")
     if raw is not None:
         if (not isinstance(raw, bool) and isinstance(raw, (int, float))
@@ -58,7 +62,29 @@ def _prefetch_limits() -> tuple[float, int]:
             max_bytes = raw
         else:
             logger.warning("plugins.harso.prefetch_max_bytes invalid; using %d", max_bytes)
-    return timeout, max_bytes
+    raw = section.get("context_max_chars")
+    if raw is not None:
+        if type(raw) is int and 1024 <= raw <= 16 * 1024 * 1024:
+            max_chars = raw
+        else:
+            logger.warning("plugins.harso.context_max_chars invalid; using %d", max_chars)
+    return timeout, max_bytes, max_chars
+
+
+def _date_prefix(occurred_at: Any) -> str:
+    """``[YYYY-MM-DD HH:MM] `` in UTC for an ISO-8601 string, else ``""``.
+
+    Only a parsed datetime is rendered, never the raw string. The wire is UTC,
+    so a zone-less value is read as UTC."""
+    if not isinstance(occurred_at, str):
+        return ""
+    try:
+        parsed = datetime.fromisoformat(occurred_at)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).strftime("[%Y-%m-%d %H:%M] ")
+    except (ValueError, OverflowError):
+        return ""
 
 
 class HarsoMemoryProvider(MemoryProvider):
@@ -171,7 +197,7 @@ class HarsoMemoryProvider(MemoryProvider):
         # HarsoContextInput's wire-contract ceiling, not a recall tuning knob.
         # Keep the head: user intent normally precedes pasted supporting text.
         query = query[:4096]
-        timeout, max_bytes = _prefetch_limits()
+        timeout, max_bytes, max_chars = _prefetch_limits()
         response = self._post(
             "/internal/harso/context",
             {
@@ -198,7 +224,8 @@ class HarsoMemoryProvider(MemoryProvider):
         if not isinstance(items, list):
             return hint
         context = []
-        for item in items[:_MAX_CONTEXT_ITEMS]:
+        used, budget_hit = 0, False
+        for item in items:
             if not isinstance(item, dict):
                 continue
             citation, text = item.get("citation"), item.get("text")
@@ -208,15 +235,25 @@ class HarsoMemoryProvider(MemoryProvider):
                     and all(isinstance(ref, str) and ref.strip() for ref in citations)):
                 citation = " ".join(citations[:64])
             if (isinstance(citation, str) and citation.strip()
-                    and isinstance(text, str) and text[:_MAX_CONTEXT_TEXT].strip()):
-                context.append(f"{citation} {text[:_MAX_CONTEXT_TEXT]}")
+                    and isinstance(text, str) and text.strip()):
+                line = f"{_date_prefix(item.get('occurred_at'))}{citation} {text}"
+                # Whole items only: never cut recalled evidence mid-item.
+                if used + len(line) + 1 > max_chars:
+                    budget_hit = True
+                    break
+                used += len(line) + 1
+                context.append(line)
         # Gaps may annotate admitted evidence, never create context by themselves.
         gaps = response.get("gaps")
-        if context and isinstance(gaps, list):
-            reasons = [gap["reason"] for gap in gaps
-                       if isinstance(gap, dict) and gap.get("reason") in (
-                           "missing", "stale", "contradictory", "privacy-excluded", "budget-excluded"
-                       )][:5]
+        if context:
+            reasons = []
+            if isinstance(gaps, list):
+                reasons = [gap["reason"] for gap in gaps
+                           if isinstance(gap, dict) and gap.get("reason") in (
+                               "missing", "stale", "contradictory", "privacy-excluded", "budget-excluded"
+                           )][:5]
+            if budget_hit and "budget-excluded" not in reasons:
+                reasons.append("budget-excluded")
             if reasons:
                 context.append("Memory gaps: " + ", ".join(reasons))
         if hint:
