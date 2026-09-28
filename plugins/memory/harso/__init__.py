@@ -7,6 +7,7 @@ import logging
 import re
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from agent.message_content import flatten_message_text
@@ -19,9 +20,34 @@ _TIMEOUT_SECONDS = 5
 # timeout stays below MemoryManager's caller-wait bound so a slow server frees
 # the prefetch thread soon after the turn stops waiting; writes keep 5s.
 _PREFETCH_TIMEOUT_SECONDS = 0.8
-_PREFETCH_MAX_BYTES = 262144
-_MAX_CONTEXT_ITEMS = 5
-_MAX_CONTEXT_TEXT = 1200
+# Both finite bounds below admit the LARGEST response the server guarantees,
+# so they never cut valid recall; the server's pack decides recall. Maxima,
+# each enforced by weave-cloud on this path (not merely schema-declared):
+#   entries  <= 256: harso-memory context.py _cap_entries caps the final pack
+#               (main + Jev extras + pack-check) at CONTEXT_ENTRIES_MAX and
+#               reports the rest as budget-excluded.
+#   content  <= 4 * 32768 = 131072 UTF-8 bytes in total: TOTAL_TOKENS_MAX
+#               counts ceil(content bytes / 4) per entry; a str has no more
+#               chars than UTF-8 bytes.
+#   per item (weave-api memory_service._recall_item, else recall fails closed
+#               or the field is omitted): evidence_id <= 54 chars
+#               ("memory-projection:" + UUID); <= 64 citations, each exactly
+#               45 ("evidence:" + UUIDv7); occurred_at exactly 27
+#               ("YYYY-MM-DDTHH:MM:SS.ffffffZ"); session_id exactly 42
+#               ("weave-" + UUID); kind "projection"/"evidence".
+#   envelope: <= 5 allowlisted gap reasons; routing hint <= 200 chars.
+# Transport (JSON bytes; json.dumps default ", "/": " separators, above
+# Starlette's compact ones): content worst escape is 6 bytes per content byte
+# (a control char -> \u00XX) = 786432; per item, all fields but "text" =
+# 3425, plus 255 ", " item separators; envelope with 5 gaps and a 200-char
+# hint of worst-escaped chars = 1458.
+# 786432 + 256 * 3425 + 255 * 2 + 1458 = 1665200, so 2 MiB.
+_PREFETCH_MAX_BYTES = 2 * 1024 * 1024
+# Rendered chars, whole output: per item the date prefix "[YYYY-MM-DD HH:MM] "
+# 19 + 64 refs * 45 + 63 separators + 1 space before text + 1 newline = 2964;
+# 131072 + 256 * 2964 + gaps line 77 + 1 + hint 200 = 890134, so 1 MiB.
+_CONTEXT_MAX_CHARS = 1024 * 1024
+_GAP_REASONS = ("missing", "stale", "contradictory", "privacy-excluded", "budget-excluded")
 _P = r"(?:0\.[0-9]{2}|1\.00)"
 _ACTION = rf"external action: (?:likely|unlikely|unsure) \({_P}\)"
 # WEV-1850: the fixed vocabulary weave-api's RoutingHint.line() generates. No
@@ -34,31 +60,69 @@ class HarsoWriteError(RuntimeError):
     """Content-free failure that lets D4 record an unacknowledged mirror."""
 
 
-def _prefetch_limits() -> tuple[float, int]:
-    """Read ``plugins.harso.prefetch_timeout`` / ``prefetch_max_bytes`` per call."""
-    timeout, max_bytes = _PREFETCH_TIMEOUT_SECONDS, _PREFETCH_MAX_BYTES
-    try:
-        from hermes_cli.config import cfg_get, load_config_readonly
+def _prefetch_limits() -> tuple[float, int, int]:
+    """Read ``plugins.harso.prefetch_timeout`` / ``prefetch_max_bytes`` /
+    ``context_max_chars`` per call.
 
-        section = cfg_get(load_config_readonly(), "plugins", "harso", default={})
+    An absent section or key is silent; a present but invalid one (including
+    an explicit null) and an unreadable config warn, content-free, and use the
+    defaults."""
+    timeout, max_bytes = _PREFETCH_TIMEOUT_SECONDS, _PREFETCH_MAX_BYTES
+    max_chars = _CONTEXT_MAX_CHARS
+    defaults = timeout, max_bytes, max_chars
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
     except Exception:
-        section = {}
+        logger.warning("plugins.harso config unreadable; using defaults")
+        return defaults
+    if not isinstance(config, dict):
+        logger.warning("plugins.harso config unreadable; using defaults")
+        return defaults
+    plugins = config.get("plugins")
+    if not isinstance(plugins, dict) or "harso" not in plugins:
+        return defaults
+    section = plugins["harso"]
     if not isinstance(section, dict):
-        return timeout, max_bytes
-    raw = section.get("prefetch_timeout")
-    if raw is not None:
+        logger.warning("plugins.harso invalid; using defaults")
+        return defaults
+    if "prefetch_timeout" in section:
+        raw = section["prefetch_timeout"]
         if (not isinstance(raw, bool) and isinstance(raw, (int, float))
                 and 0 < raw <= _TIMEOUT_SECONDS):
             timeout = float(raw)
         else:
             logger.warning("plugins.harso.prefetch_timeout invalid; using %.1fs", timeout)
-    raw = section.get("prefetch_max_bytes")
-    if raw is not None:
+    if "prefetch_max_bytes" in section:
+        raw = section["prefetch_max_bytes"]
         if type(raw) is int and 1024 <= raw <= 16 * 1024 * 1024:
             max_bytes = raw
         else:
             logger.warning("plugins.harso.prefetch_max_bytes invalid; using %d", max_bytes)
-    return timeout, max_bytes
+    if "context_max_chars" in section:
+        raw = section["context_max_chars"]
+        if type(raw) is int and 1024 <= raw <= 16 * 1024 * 1024:
+            max_chars = raw
+        else:
+            logger.warning("plugins.harso.context_max_chars invalid; using %d", max_chars)
+    return timeout, max_bytes, max_chars
+
+
+def _date_prefix(occurred_at: Any) -> str:
+    """``[YYYY-MM-DD HH:MM] `` in UTC for an ISO-8601 string, else ``""``.
+
+    Only a parsed datetime is rendered, never the raw string. The wire is UTC,
+    so a zone-less value is read as UTC."""
+    if not isinstance(occurred_at, str):
+        return ""
+    try:
+        parsed = datetime.fromisoformat(occurred_at)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).strftime("[%Y-%m-%d %H:%M] ")
+    except (ValueError, OverflowError):
+        return ""
 
 
 class HarsoMemoryProvider(MemoryProvider):
@@ -171,7 +235,7 @@ class HarsoMemoryProvider(MemoryProvider):
         # HarsoContextInput's wire-contract ceiling, not a recall tuning knob.
         # Keep the head: user intent normally precedes pasted supporting text.
         query = query[:4096]
-        timeout, max_bytes = _prefetch_limits()
+        timeout, max_bytes, max_chars = _prefetch_limits()
         response = self._post(
             "/internal/harso/context",
             {
@@ -197,8 +261,8 @@ class HarsoMemoryProvider(MemoryProvider):
         items = response.get("items")
         if not isinstance(items, list):
             return hint
-        context = []
-        for item in items[:_MAX_CONTEXT_ITEMS]:
+        lines = []
+        for item in items:
             if not isinstance(item, dict):
                 continue
             citation, text = item.get("citation"), item.get("text")
@@ -208,20 +272,42 @@ class HarsoMemoryProvider(MemoryProvider):
                     and all(isinstance(ref, str) and ref.strip() for ref in citations)):
                 citation = " ".join(citations[:64])
             if (isinstance(citation, str) and citation.strip()
-                    and isinstance(text, str) and text[:_MAX_CONTEXT_TEXT].strip()):
-                context.append(f"{citation} {text[:_MAX_CONTEXT_TEXT]}")
-        # Gaps may annotate admitted evidence, never create context by themselves.
+                    and isinstance(text, str) and text.strip()):
+                lines.append(f"{_date_prefix(item.get('occurred_at'))}{citation} {text}")
         gaps = response.get("gaps")
-        if context and isinstance(gaps, list):
-            reasons = [gap["reason"] for gap in gaps
-                       if isinstance(gap, dict) and gap.get("reason") in (
-                           "missing", "stale", "contradictory", "privacy-excluded", "budget-excluded"
-                       )][:5]
-            if reasons:
-                context.append("Memory gaps: " + ", ".join(reasons))
-        if hint:
-            context.append(hint)
-        return "\n".join(context)
+        reasons = list(dict.fromkeys(
+            gap["reason"] for gap in gaps
+            if isinstance(gap, dict) and gap.get("reason") in _GAP_REASONS
+        ))[:5] if isinstance(gaps, list) else []
+
+        def render(kept: List[str], excluded: bool) -> str:
+            parts = list(kept)
+            # Gaps may annotate admitted evidence, never create context by
+            # themselves; the hint is independent of memory admission.
+            if lines:
+                shown = reasons + ["budget-excluded"] if (
+                    excluded and "budget-excluded" not in reasons) else reasons
+                if shown:
+                    parts.append("Memory gaps: " + ", ".join(shown))
+            if hint:
+                parts.append(hint)
+            return "\n".join(parts)
+
+        # context_max_chars bounds the COMPLETE output, gaps line and hint
+        # included. Over it, keep a whole-item prefix in server order under the
+        # room left by the final suffix; never cut an item. The suffix is at
+        # most 278 chars, under the 1024 minimum, so an admitted item excluded
+        # by the bound is always reported as budget-excluded, even if none fit.
+        output = render(lines, False)
+        if len(output) <= max_chars:
+            return output
+        used, kept = len(render([], True)), []
+        for line in lines:
+            if used + len(line) + 1 > max_chars:
+                break
+            used += len(line) + 1
+            kept.append(line)
+        return render(kept, True)
 
     def sync_turn(
         self,
