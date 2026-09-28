@@ -54,6 +54,9 @@ class LoginBackend(ABC):
     # Fork (V5): every value this backend resolves is protected (the model never sees it), addresses included.
     # The local vault keeps upstream's rule that an address is not a secret; a Harso item is (VAULT-design §4).
     protects_all_values: bool = False
+    # Fork (V-otp): the backend can supply a login's code without a stored authenticator key (Harso reads the
+    # sign-in code the site mailed its owner), so the tool asks it for every login, not only a seeded one.
+    otp_without_seed: bool = False
 
     def owns(self, handle: str) -> bool:
         return handle.startswith(self.prefix)
