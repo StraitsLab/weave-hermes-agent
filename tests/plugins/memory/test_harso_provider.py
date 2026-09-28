@@ -230,11 +230,15 @@ def test_default_context_bound_is_finite_and_bounds_the_complete_output(monkeypa
 
 
 # -- F1: the client bounds admit the largest pack the server can send --------
-# weave-cloud harso-memory: main + Jev extra <= TOTAL_TOKENS_MAX 32768 tokens,
-# counted as ceil(UTF-8 content bytes / 4) per entry; <= 256 entries; <= 64
-# citation refs per entry, each "evidence:" + UUIDv7 (45 chars); occurred_at is
-# a UTC timestamp; session_id is at most 256 chars.
+# Server guarantees (weave-cloud), each enforced on the producing path:
+# harso-memory context._cap_entries caps the final pack (main + Jev extras +
+# pack-check) at 256 entries; TOTAL_TOKENS_MAX 32768 tokens, counted as
+# ceil(UTF-8 content bytes / 4) per entry; weave-api memory_service._recall_item
+# emits <= 64 citations of exactly 45 chars ("evidence:" + UUIDv7), evidence_id
+# <= 54, occurred_at exactly 27 ("YYYY-MM-DDTHH:MM:SS.ffffffZ") and session_id
+# exactly 42 ("weave-" + UUID), or fails closed / omits the field.
 _MAX_TOKENS, _MAX_ENTRIES, _MAX_REFS = 32768, 256, 64
+_SESSION_REF = "weave-01990000-0000-7000-8000-00000000abcd"
 
 
 def _server_pack(entries, fill):
@@ -250,8 +254,10 @@ def _server_pack(entries, fill):
         assert len(text.encode()) == content_bytes and len(refs[0]) == 45
         items.append({"evidence_id": f"memory-projection:01990000-0000-7000-8000-{i:012x}",
                       "citation": refs[0], "citations": refs, "text": text,
-                      "kind": "evidence", "session_id": "s" * 256,
+                      "kind": "projection", "session_id": _SESSION_REF,
                       "occurred_at": "2026-09-28T10:15:40.791197Z"})
+        assert len(items[-1]["evidence_id"]) == 54 and len(_SESSION_REF) == 42
+        assert len(items[-1]["occurred_at"]) == 27
     assert sum(-(-len(item["text"].encode()) // 4) for item in items) == _MAX_TOKENS
     return {"recall_status": "ok", "degraded": False, "degradation": "none", "items": items}
 
@@ -285,6 +291,51 @@ def test_default_transport_cap_admits_a_max_pack_with_max_suffix_fields(monkeypa
     lines = recalled.splitlines()
     assert len(lines) == _MAX_ENTRIES + 2 and lines[-1] == body["routing_hint"]
     assert lines[-2] == "Memory gaps: missing, stale, contradictory, privacy-excluded, budget-excluded"
+
+
+def test_derived_worst_case_response_is_exactly_admitted(monkeypatch):
+    # Every server-guaranteed maximum at once: 256 items, 131072 content bytes
+    # of worst-escaped control chars, 64 x 45-char citations, 54-char
+    # evidence_id, 27-char occurred_at, 42-char session_id, longest kind and
+    # envelope values, 5 gaps and a 200-char hint of worst-escaped chars. This
+    # is the 1665200-byte / 890134-char worst case the defaults are derived from.
+    body = _server_pack(_MAX_ENTRIES, "\x01")
+    for item in body["items"]:  # every content byte a worst-escaped control char
+        item["text"] = "\x01" * len(item["text"].encode())
+    body.update(degraded=False, recall_status="degraded", degradation="lexical_only",
+                gaps=[{"reason": reason} for reason in (
+                    "missing", "stale", "contradictory", "privacy-excluded", "budget-excluded")],
+                routing_hint="\x00" * 200)
+    assert len(json.dumps(body).encode()) == 1665200
+    recalled, final = _recall_context(monkeypatch, body)
+    assert final is not None and recalled in final
+    lines = recalled.splitlines()
+    assert lines[:-1] == [f"[2026-09-28 10:15] {' '.join(item['citations'])} {item['text']}"
+                          for item in body["items"]]
+    assert lines[-1] == "Memory gaps: missing, stale, contradictory, privacy-excluded, budget-excluded"
+    rendered = 131072 + _MAX_ENTRIES * (19 + 64 * 45 + 63 + 1 + 1) + 77 + 1 + 200
+    assert rendered == 890134 and len(recalled) == rendered - 1 - 200  # this hint is not admitted
+    assert len(recalled) <= 1024 * 1024
+
+
+@pytest.mark.parametrize("reply", ["", "x"], ids=["no-reply", "reply"])
+def test_capped_jev_producer_pack_renders_every_item(monkeypatch, reply):
+    # The reviewer's producer shape (64 sessions x 200 one-token Jev renders) as
+    # the server now sends it: capped at 256 entries, budget-excluded reported.
+    text = f"user: x\nassistant: {reply}" if reply else "x"
+    items = [{"evidence_id": f"evidence:01990000-0000-7000-8000-{i:012x}",
+              "citation": f"evidence:01990000-0000-7000-8000-{i:012x}",
+              "citations": [f"evidence:01990000-0000-7000-8000-{i:012x}"],
+              "text": text, "kind": "evidence", "session_id": _SESSION_REF,
+              "occurred_at": "2026-09-28T10:15:00.000000Z"} for i in range(_MAX_ENTRIES)]
+    body = {"recall_status": "ok", "degraded": False, "degradation": "none",
+            "items": items, "gaps": [{"reason": "budget-excluded"}]}
+    assert len(json.dumps(body).encode()) <= 2 * 1024 * 1024
+    recalled, final = _recall_context(monkeypatch, body)
+    assert final is not None and recalled in final
+    assert recalled == "\n".join(
+        [f"[2026-09-28 10:15] {item['citation']} {text}" for item in items]
+        + ["Memory gaps: budget-excluded"])  # every item, in server order; the last survives
 
 
 # -- F2: context_max_chars bounds the complete output ------------------------

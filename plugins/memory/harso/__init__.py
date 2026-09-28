@@ -20,23 +20,30 @@ _TIMEOUT_SECONDS = 5
 # timeout stays below MemoryManager's caller-wait bound so a slow server frees
 # the prefetch thread soon after the turn stops waiting; writes keep 5s.
 _PREFETCH_TIMEOUT_SECONDS = 0.8
-# Both finite bounds below admit the LARGEST pack the server can send, so they
-# never cut valid recall; the server's token budget is what decides recall.
-# Worst case, from weave-cloud harso-memory (context.py, harso-memory.v1):
-#   content  <= 4 * 32768 = 131072 UTF-8 bytes: jev_turns.TOTAL_TOKENS_MAX
-#               (main + Jev extra) counts ceil(content bytes / 4) per entry;
-#               a str has no more chars than UTF-8 bytes.
-#   entries  <= 256 (context_assembly_result.entries maxItems).
-#   refs     <= 64 per entry (citation_refs maxItems, DTO [:64]), each 45
-#               chars: every server citation is "evidence:" + UUIDv7.
+# Both finite bounds below admit the LARGEST response the server guarantees,
+# so they never cut valid recall; the server's pack decides recall. Maxima,
+# each enforced by weave-cloud on this path (not merely schema-declared):
+#   entries  <= 256: harso-memory context.py _cap_entries caps the final pack
+#               (main + Jev extras + pack-check) at CONTEXT_ENTRIES_MAX and
+#               reports the rest as budget-excluded.
+#   content  <= 4 * 32768 = 131072 UTF-8 bytes in total: TOTAL_TOKENS_MAX
+#               counts ceil(content bytes / 4) per entry; a str has no more
+#               chars than UTF-8 bytes.
+#   per item (weave-api memory_service._recall_item, else recall fails closed
+#               or the field is omitted): evidence_id <= 54 chars
+#               ("memory-projection:" + UUID); <= 64 citations, each exactly
+#               45 ("evidence:" + UUIDv7); occurred_at exactly 27
+#               ("YYYY-MM-DDTHH:MM:SS.ffffffZ"); session_id exactly 42
+#               ("weave-" + UUID); kind "projection"/"evidence".
+#   envelope: <= 5 allowlisted gap reasons; routing hint <= 200 chars.
 # Transport (JSON bytes; json.dumps default ", "/": " separators, above
 # Starlette's compact ones): content worst escape is 6 bytes per content byte
-# (a control char -> \u00XX) = 786432; per entry, fields besides "text"
-# (evidence_id 54, citation 45, 64 citations, kind, session_id at its
-# 256-char contract max, occurred_at 27) = 3641; envelope (degradation,
-# 5 gaps, 200-char hint) = 457. 786432 + 256 * 3641 + 457 = 1718985, so 2 MiB.
+# (a control char -> \u00XX) = 786432; per item, all fields but "text" =
+# 3425, plus 255 ", " item separators; envelope with 5 gaps and a 200-char
+# hint of worst-escaped chars = 1458.
+# 786432 + 256 * 3425 + 255 * 2 + 1458 = 1665200, so 2 MiB.
 _PREFETCH_MAX_BYTES = 2 * 1024 * 1024
-# Rendered chars, whole output: per entry the date prefix "[YYYY-MM-DD HH:MM] "
+# Rendered chars, whole output: per item the date prefix "[YYYY-MM-DD HH:MM] "
 # 19 + 64 refs * 45 + 63 separators + 1 space before text + 1 newline = 2964;
 # 131072 + 256 * 2964 + gaps line 77 + 1 + hint 200 = 890134, so 1 MiB.
 _CONTEXT_MAX_CHARS = 1024 * 1024
