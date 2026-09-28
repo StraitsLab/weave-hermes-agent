@@ -523,3 +523,36 @@ async def test_submit_route_passes_busy_mode_and_replays_a_steered_admission(ada
     assert first.status == retry.status == 202
     assert first_body["admission"] == retry_body["admission"] == "steered"
     assert first_body["native_request_ref"] == retry_body["native_request_ref"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy_mode", [["steer"], {"steer": True}])
+async def test_a_non_string_busy_mode_is_a_schema_error_not_a_crash(adapter, busy_mode):
+    """WEV-2108: a JSON list/object busy_mode is rejected as 400, not a 500 from an unhashable set lookup."""
+    client = await _client(adapter)
+    try:
+        response = await client.post(f"/api/sessions/{SESSION_ID}/submit", headers={"Authorization": f"Bearer {adapter.config.extra['key']}"},
+                                     json={**_request("bad-mode"), "busy_mode": busy_mode})
+        body = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 400
+    assert body["error"]["code"] == "invalid_native_submit_schema"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard", ["subagents", "compression"])
+async def test_interrupt_is_demoted_to_queue_while_the_gateway_would_demote_it(adapter, guard):
+    """WEV-2108: like the gateway's own interrupt paths (#30170, #56391), a native interrupt never stops a turn
+    driving subagents or mid-compression; the submit still runs next as its own queued turn."""
+    agent = _Agent()
+    agent._active_children = [object()] if guard == "subagents" else []
+    queued = _busy_adapter(adapter, agent)
+    adapter.gateway_runner._session_has_compression_in_flight = AsyncMock(return_value=guard == "compression")
+
+    admission = await adapter._admit_native_session_submit(SESSION_ID, "book the dentist", "native-new",
+                                                           busy_mode="interrupt")
+
+    assert admission == "queued" and queued == ["book the dentist"]
+    assert agent.interrupted == []

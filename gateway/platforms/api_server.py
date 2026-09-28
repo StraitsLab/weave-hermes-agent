@@ -5198,7 +5198,8 @@ class APIServerAdapter(BasePlatformAdapter):
         message = body.get("message")
         if (
             body.get("kind") != "hermes.session.submit"
-            or body.get("busy_mode") not in _NATIVE_SUBMIT_BUSY_MODES
+            or not isinstance(body.get("busy_mode"), str)
+            or body["busy_mode"] not in _NATIVE_SUBMIT_BUSY_MODES
             or not isinstance(request_id, str)
             or not re.fullmatch(r"[\x21-\x7e]{1,128}", request_id)
             or not isinstance(message, str)
@@ -5299,7 +5300,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._native_submit_event(native_request_ref, "turn.started", steered_into=active_ref)
                     return "steered"
             runner._enqueue_fifo(entry.session_key, event, self)
-            if busy_mode == "interrupt" and agent is not None and hasattr(agent, "interrupt"):
+            # The gateway's own interrupt paths demote to queue while subagents run (#30170) or
+            # compression is in flight (#56391); this path keeps both guards.
+            from gateway.run import GatewayRunner
+
+            compressing = getattr(runner, "_session_has_compression_in_flight", None)
+            if (
+                busy_mode == "interrupt" and agent is not None and hasattr(agent, "interrupt")
+                and not GatewayRunner._agent_has_active_subagents(agent)
+                and not (callable(compressing) and await compressing(entry.session_key))
+            ):
                 try:
                     agent.interrupt(message)
                 except Exception:
