@@ -8037,6 +8037,8 @@ class APIServerAdapter(BasePlatformAdapter):
             skills = body.get("skills")
             repeat = body.get("repeat")
             dedup_key = body.get("dedup_key")
+            script = body.get("script")
+            no_agent = body.get("no_agent", False)
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -8056,6 +8058,26 @@ class APIServerAdapter(BasePlatformAdapter):
                     return web.json_response({"error": scan_error}, status=400)
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
+            if not isinstance(no_agent, bool):
+                return web.json_response({"error": "no_agent must be a boolean"}, status=400)
+            if no_agent and script is None:
+                from cron.jobs import NO_AGENT_WITHOUT_SCRIPT_ERROR
+
+                return web.json_response({"error": NO_AGENT_WITHOUT_SCRIPT_ERROR}, status=400)
+            # Only platform-owned scripts come in over the API; tenant
+            # HERMES_HOME/scripts refs never do. Job payloads are immutable
+            # here (_UPDATE_ALLOWED_FIELDS has no script/no_agent).
+            if script is not None:
+                from cron.scheduler import PLATFORM_SCRIPT_PREFIX
+                from tools.cronjob_tools import _validate_cron_script_path
+
+                if not isinstance(script, str) or not script.startswith(PLATFORM_SCRIPT_PREFIX):
+                    return web.json_response(
+                        {"error": "script must be a platform: reference"}, status=400,
+                    )
+                script_error = _validate_cron_script_path(script)
+                if script_error:
+                    return web.json_response({"error": script_error}, status=400)
             kwargs = {
                 "prompt": prompt,
                 "schedule": schedule,
@@ -8069,6 +8091,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["repeat"] = repeat
             if dedup_key is not None:
                 kwargs["dedup_key"] = dedup_key
+            if script is not None:
+                kwargs["script"] = script
+            if no_agent:
+                kwargs["no_agent"] = True
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})

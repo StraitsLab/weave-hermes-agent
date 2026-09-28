@@ -12,6 +12,7 @@ Covers:
 
 import asyncio
 import logging
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1068,3 +1069,140 @@ class TestCronPromptScanParity:
                 data = await resp.json()
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Weave platform script seam: POST accepts platform: script + no_agent only;
+# PATCH can never set script or no_agent.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX ownership checks")
+class TestPlatformScriptJobs:
+    @pytest.fixture
+    def platform_home(self, tmp_path, monkeypatch):
+        import os
+
+        import yaml
+
+        import cron.scheduler as scheduler
+
+        home = tmp_path / ".hermes"
+        (home / "scripts").mkdir(parents=True)
+        (home / "scripts" / "tenant.py").write_text("print(1)\n", encoding="utf-8")
+        root = tmp_path / "platform-scripts"
+        root.mkdir()
+        os.chmod(root, 0o755)
+        (root / "tick.py").write_text("print('tick')\n", encoding="utf-8")
+        os.chmod(root / "tick.py", 0o555)
+        (home / "config.yaml").write_text(yaml.safe_dump({"cron": {
+            "allow_scripts": False, "platform_script_root": str(root),
+        }}))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(scheduler, "_PLATFORM_SCRIPT_OWNER_UID", os.getuid())  # windows-footgun: ok
+        return home
+
+    async def _post(self, adapter, body):
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "watch", "schedule": "every 5m", **body,
+                })
+                return resp.status, await resp.json(), mock_create
+
+    @pytest.mark.asyncio
+    async def test_create_admits_platform_no_agent_job(self, adapter, platform_home):
+        status, _data, mock_create = await self._post(
+            adapter, {"script": "platform:tick.py", "no_agent": True},
+        )
+        assert status == 200
+        kwargs = mock_create.call_args[1]
+        assert kwargs["script"] == "platform:tick.py"
+        assert kwargs["no_agent"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("script", ["tenant.py", "scripts/tenant.py", 7])
+    async def test_create_refuses_non_platform_script(self, adapter, platform_home, script):
+        status, data, mock_create = await self._post(
+            adapter, {"script": script, "no_agent": True},
+        )
+        assert status == 400
+        assert "platform: reference" in data["error"]
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_refuses_tenant_script_even_when_allow_scripts_true(
+        self, adapter, platform_home,
+    ):
+        (platform_home / "config.yaml").write_text("cron: {}\n", encoding="utf-8")
+        status, _data, mock_create = await self._post(
+            adapter, {"script": "tenant.py", "no_agent": True},
+        )
+        assert status == 400
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("script", ["platform:../x.py", "platform:a/b.py", "platform:missing.py"])
+    async def test_create_refuses_unresolvable_platform_ref(self, adapter, platform_home, script):
+        status, data, mock_create = await self._post(
+            adapter, {"script": script, "no_agent": True},
+        )
+        assert status == 400
+        assert data["error"].startswith("Blocked:")
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_refuses_unreadable_platform_script_with_400(
+        self, adapter, platform_home, tmp_path,
+    ):
+        import os
+
+        script = tmp_path / "platform-scripts" / "tick.py"
+        os.chmod(script, 0)
+        try:
+            status, data, mock_create = await self._post(
+                adapter, {"script": "platform:tick.py", "no_agent": True},
+            )
+        finally:
+            os.chmod(script, 0o555)
+        assert status == 400
+        assert data["error"].startswith("Blocked: platform script cannot be read")
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_refuses_no_agent_without_script(self, adapter, platform_home):
+        status, data, mock_create = await self._post(adapter, {"no_agent": True})
+        assert status == 400
+        assert "no_agent=True requires a script" in data["error"]
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_refuses_non_boolean_no_agent(self, adapter, platform_home):
+        status, _data, mock_create = await self._post(
+            adapter, {"script": "platform:tick.py", "no_agent": "yes"},
+        )
+        assert status == 400
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_patch_cannot_set_script_or_no_agent(self, adapter):
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(f"/api/jobs/{VALID_JOB_ID}", json={
+                    "script": "platform:tick.py", "no_agent": True,
+                })
+                assert resp.status == 400
+                mock_update.assert_not_called()
+
+                resp = await cli.patch(f"/api/jobs/{VALID_JOB_ID}", json={
+                    "name": "renamed", "script": "tenant.py", "no_agent": True,
+                })
+                assert resp.status == 200
+                assert mock_update.call_args[0][1] == {"name": "renamed"}
