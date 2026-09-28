@@ -25,9 +25,11 @@ tool sends the user to the Harso app instead of asking for a password (§5).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from agent.vault_backends.base import LoginBackend, VaultUnavailable, VaultUseRefused
 from agent.vault_store import VaultItemMeta
@@ -39,7 +41,8 @@ _MAX_TIMEOUT_S = 120.0
 # weave-api's own presenter shapes (ledger_mcp.CONNECTOR_BEARER / ATTEMPT_CONNECTOR_BEARER). A bearer that does not
 # match is refused before HTTPX sees it: a malformed header value is echoed by httpcore's DEBUG logging.
 _BEARER = re.compile(r"^(?:wvc1|wva1)_[A-Za-z0-9_-]{43}$")
-_HANDLE = re.compile(r"^wv:[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+_REF = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+_HANDLE = re.compile(r"^wv:" + _REF.pattern[1:])
 _SESSION = re.compile(r"^weave-([0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$")
 _FILLABLE = ("login", "address", "totp")  # api_key is injected by the egress proxy (V7), never resolved here
 
@@ -55,6 +58,24 @@ _REFUSALS = {
 }
 _APPROVAL = ("The user has not allowed this use yet. A request is waiting in their Harso app; tell them, "
              "and call this tool again after they allow it. Do not ask for the password in chat.")
+_DENIED = ("The user did not allow this use of the vault item. Nothing was filled. Do not retry it, and do not ask "
+           "for the password in chat.")
+# V-7b-3: an api_key write. weave-api opens a new once/deny card for exactly one request and never returns a key;
+# the egress proxy injects the key only into the request that carries the allowed card's ref in this header.
+APPROVAL_HEADER = "X-Weave-Vault-Approval"
+_WRITE_REFUSALS = {
+    **_REFUSALS,
+    "VAULT_ORIGIN_REFUSED": ("origin_mismatch", "This vault key is not saved for this site. Nothing was sent."),
+    "VAULT_WRITE_UNAVAILABLE": ("write_unavailable", "Writes with a Harso vault key are not available yet. "
+                                                     "Nothing was sent."),
+    "VAULT_WORK_APPROVAL_UNSUPPORTED": ("work_unsupported", "A Work task cannot ask to use a vault key for a write "
+                                                            "yet. Nothing was sent."),
+    "CONTENT_INVALID": ("request_invalid", "Only an https write (not GET or HEAD) with an API key item, to the "
+                                           "item's exact site written as https://host/path, can use a vault key."),
+}
+_WRITE_DENIED = "The user did not allow this request. Nothing was sent. Do not retry it."
+# The same verbs as weave-api's card copy (vault.card_description).
+_VERB = {"fill_login": "sign in", "fill_address": "fill in the address", "enter_otp": "enter the 2FA code"}
 
 
 def _bearer() -> str:
@@ -109,6 +130,33 @@ def _run_context(bearer: str) -> tuple[Optional[str], Optional[str]]:
     return match.group(1), run["native_request_ref"]
 
 
+def _card_gate(approval_ref: Any, tool: str, description: str, denied: str) -> str:
+    """Ask this runtime's approval gate about one Ledger card, keyed by its ref; return the ref on an explicit allow.
+
+    The gate's pattern key ``plugin_rule:<approval_ref>`` is what the relay (a cell's native stream) or the attempt
+    host (Work's ACP permission) reads the card by; the Ledger binds that exact card, and the user's decision settles
+    it. The gate runs regardless of ``approvals.mode`` (Work runs ``off``); only an explicit allow returns here. An
+    allow here grants nothing by itself: only the Ledger's settled card releases a value or admits a write.
+    """
+    from tools.approval import request_tool_approval
+
+    if not isinstance(approval_ref, str) or not _REF.fullmatch(approval_ref):
+        raise VaultUnavailable("the Harso vault returned an invalid answer")
+    try:
+        result = request_tool_approval(tool, description, rule_key=approval_ref)
+    except Exception:  # content-free: the gate's own error text is not the model's to see
+        raise VaultUnavailable("the approval request for this vault use could not be raised") from None
+    if not isinstance(result, dict) or result.get("approved") is not True:
+        raise VaultUseRefused("denied", denied)
+    return approval_ref
+
+
+def _work_gate(approval_ref: Any, handle: str, action: str, origin: str) -> None:
+    """A Work attempt has no chat to wait in: ask the attempt's own gate; the caller re-resolves exactly once."""
+    tool = "browser_vault_enter_code" if action == "enter_otp" else "browser_vault_fill"
+    _card_gate(approval_ref, tool, f"Use Harso vault item {handle} to {_VERB[action]} on {origin}", _DENIED)
+
+
 def _meta(raw: Any) -> VaultItemMeta:
     if not isinstance(raw, dict) or not _HANDLE.fullmatch(str(raw.get("id") or "")):
         raise VaultUnavailable("weave vault returned an invalid item")
@@ -131,7 +179,8 @@ class WeaveLoginBackend(LoginBackend):
         self._base = base_url.rstrip("/")
         self._timeout_s = timeout_s
 
-    def _call(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _call(self, method: str, path: str, body: Optional[Dict[str, Any]] = None,
+              refusals: Dict[str, tuple] = _REFUSALS) -> Dict[str, Any]:
         import httpx
 
         bearer = _bearer()
@@ -150,18 +199,26 @@ class WeaveLoginBackend(LoginBackend):
             payload = None
         if response.status_code == 200 and isinstance(payload, dict):
             return payload
-        code = ((payload or {}).get("error") or {}).get("code") if isinstance(payload, dict) else None
-        if code in _REFUSALS:
-            raise VaultUseRefused(*_REFUSALS[code])
+        error = payload.get("error") if isinstance(payload, dict) else None  # any other shape is just unavailable
+        code = error.get("code") if isinstance(error, dict) else None
+        if isinstance(code, str) and code in refusals:
+            raise VaultUseRefused(*refusals[code])
         raise VaultUnavailable(f"the Harso vault answered HTTP {response.status_code}")
 
     # -- metadata --------------------------------------------------------------------------------------------
 
     def list_items(self) -> List[VaultItemMeta]:
+        return [meta for meta in self._items() if meta.kind in _FILLABLE]
+
+    def list_api_keys(self) -> List[VaultItemMeta]:
+        """V-7b-3: api_key metadata (handle, label, origins) so a write can name its key. Never a value."""
+        return [meta for meta in self._items() if meta.kind == "api_key"]
+
+    def _items(self) -> List[VaultItemMeta]:
         items = self._call("GET", "/v1/vault/runtime/items").get("items")
         if not isinstance(items, list):
             raise VaultUnavailable("weave vault returned an invalid item list")
-        return [meta for meta in map(_meta, items) if meta.kind in _FILLABLE]
+        return list(map(_meta, items))
 
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
         if not _HANDLE.fullmatch(handle or ""):
@@ -186,7 +243,10 @@ class WeaveLoginBackend(LoginBackend):
             body.update(conversation_id=conversation_id, run_id=run_id)
         answer = self._call("POST", "/v1/vault/resolve", body)
         if answer.get("decision") == "approval_required":
-            raise VaultUseRefused("approval_required", _APPROVAL)
+            if not bearer.startswith("wva1_"):  # a cell turn waits for the chat card
+                raise VaultUseRefused("approval_required", _APPROVAL)
+            _work_gate(answer.get("approval_ref"), handle, action, origin)
+            answer = self._call("POST", "/v1/vault/resolve", body)  # exactly once: the card is decided now
         value = answer.get(field)
         if answer.get("decision") not in ("once", "always") or answer.get("action") != action or not value:
             raise VaultUnavailable("the Harso vault returned an invalid answer")
@@ -199,10 +259,43 @@ class WeaveLoginBackend(LoginBackend):
         return value
 
     def resolve_otp(self, handle: str, *, origin: Optional[str] = None) -> Optional[str]:
-        value = self._resolve(handle, "enter_otp", origin, "otp")
-        if not isinstance(value, str) or not value.isdigit():
-            raise VaultUnavailable("the Harso vault returned an invalid answer")
+        """Only called for an item that stores an authenticator key, so every failure here is the answer: it is
+        raised as a typed refusal, which the code tool returns as is. Anything else would be read as "no key" and
+        the user asked for a code instead (only ``otp_unavailable``, from the authority, means that)."""
+        try:
+            value = self._resolve(handle, "enter_otp", origin, "otp")
+            if not isinstance(value, str) or not value.isdigit():
+                raise VaultUnavailable("the Harso vault returned an invalid answer")
+        except VaultUseRefused:
+            raise
+        except VaultUnavailable as exc:
+            raise VaultUseRefused("vault_unavailable", str(exc)[:200]) from None
+        except Exception:
+            raise VaultUseRefused("vault_unavailable", "the Harso vault could not answer") from None
         return value
+
+    def authorize_write(self, handle: str, method: str, url: str, body: bytes) -> str:
+        """V-7b-3: open the once/deny card for ONE api_key write and wait for the user; return the allowed card's ref.
+
+        weave-api binds the card to sha256(METHOD "\\n" origin target "\\n" sha256(body)), so the request must later go
+        out with these exact bytes. No key exists on this path: weave-api only authorizes, egress injects. Asked once:
+        a refusal or a deny is the answer, never retried.
+        """
+        if not _HANDLE.fullmatch(handle or ""):
+            raise VaultUseRefused(*_REFUSALS["VAULT_ITEM_UNAVAILABLE"])
+        bearer = _bearer()
+        conversation_id, run_id = _run_context(bearer)
+        request: Dict[str, Any] = {"handle": handle, "action": "inject", "method": method, "url": url,
+                                   "body_sha256": hashlib.sha256(body).hexdigest()}
+        if conversation_id is not None:
+            request.update(conversation_id=conversation_id, run_id=run_id)
+        answer = self._call("POST", "/v1/vault/resolve", request, _WRITE_REFUSALS)
+        if answer.get("decision") != "approval_required":
+            raise VaultUnavailable("the Harso vault returned an invalid answer")
+        parts = urlsplit(url)  # the card copy names the request line, never the query or the body
+        return _card_gate(answer.get("approval_ref"), "vault_authorize_write",
+                          f"Use Harso vault item {handle} to send {method} {parts.path} to "
+                          f"{parts.scheme}://{parts.netloc}", _WRITE_DENIED)
 
     def resolve_secret(self, handle: str, *, origin: Optional[str] = None) -> Dict[str, str]:
         """Address fields only: Harso stores no payment cards (founder ruling), and a login fills by password."""

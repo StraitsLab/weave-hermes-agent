@@ -168,6 +168,11 @@ VALID_HOOKS: Set[str] = {
     # SessionCredential) replaces the run's api_key; a raising callback fails
     # the run closed. Invoked by cron.scheduler, not through invoke_hook.
     "cron_run_credential",
+    # Weave (fork, AB-2): Web Bot Auth signer for the agent's browser. No
+    # kwargs. The first non-None answer has public_key(), sign(message) and
+    # signature_agent; see tools/browser_web_bot_auth.py. Consulted only when
+    # browser.web_bot_auth is true. Invoked by tools.browser_web_bot_auth.
+    "browser_request_signer",
     "transform_terminal_output",
     "transform_tool_result",
     # Transform LLM output before it's returned to the user.

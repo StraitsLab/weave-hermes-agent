@@ -31,6 +31,7 @@ def mirror_to_session(
     user_id: Optional[str] = None,
     role: str = "assistant",
     session_id: Optional[str] = None,
+    turn_lease_holder: Optional[str] = None,
 ) -> bool:
     """
     Append a delivery-mirror message to the target session's transcript.
@@ -90,7 +91,7 @@ def mirror_to_session(
             "mirror_source": source_label,
         }
 
-        _append_to_sqlite(session_id, mirror_msg)
+        _append_to_sqlite(session_id, mirror_msg, turn_lease_holder=turn_lease_holder)
 
         logger.debug("Mirror: wrote to session %s (from %s)", session_id, source_label)
         return True
@@ -207,8 +208,13 @@ def _find_session_id(
 
 
 
-def _append_to_sqlite(session_id: str, message: dict) -> None:
-    """Append a message to the SQLite session database."""
+def _append_to_sqlite(
+    session_id: str, message: dict, turn_lease_holder: Optional[str] = None,
+) -> None:
+    """Append a message to the SQLite session database.
+
+    Raises on failure so ``mirror_to_session`` reports False, not success.
+    """
     db = None
     try:
         from hermes_state import SessionDB
@@ -217,9 +223,8 @@ def _append_to_sqlite(session_id: str, message: dict) -> None:
             session_id=session_id,
             role=message.get("role", "assistant"),
             content=message.get("content"),
+            turn_lease_holder=turn_lease_holder,
         )
-    except Exception as e:
-        logger.debug("Mirror SQLite write failed: %s", e)
     finally:
         if db is not None:
             db.close()

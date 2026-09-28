@@ -68,7 +68,7 @@ def stub_cdp_supervisor(monkeypatch):
     created: list[SimpleNamespace] = []
 
     class _StubSupervisor:
-        def __init__(self, *, task_id, cdp_url, dialog_policy, dialog_timeout_s):
+        def __init__(self, *, task_id, cdp_url, dialog_policy, dialog_timeout_s, request_signer=None):
             self.task_id = task_id
             self.cdp_url = cdp_url
             self.dialog_policy = dialog_policy
@@ -85,6 +85,9 @@ def stub_cdp_supervisor(monkeypatch):
 
         def start(self, timeout: float = 15.0) -> None:
             self.start_called = True
+
+        def set_request_signer(self, signer) -> None:
+            self.request_signer = signer
 
         def stop(self) -> None:
             self.stop_called = True

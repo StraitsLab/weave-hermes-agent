@@ -429,7 +429,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                 return json.dumps({"success": False, "error_type": refusal.error_type, "error": str(refusal)})
             code = None
         except Exception:
-            code = None
+            return json.dumps({"success": False, "error_type": "vault_unavailable",
+                               "error": f"{backend.display_name} could not answer for a code."})
         if code:
             source = backend.name
     if not code:
