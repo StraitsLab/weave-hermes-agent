@@ -219,22 +219,140 @@ def test_context_max_chars_stops_at_a_whole_item_and_flags_budget_once(monkeypat
     assert "[harso: e2]" not in recalled
 
 
-def test_default_context_bound_is_generous_and_under_it_adds_no_gap(monkeypatch):
-    body = {**_recall_body(), "gaps": []}
-    body["items"] = [{"citation": f"[harso: e{i}]", "text": "y" * 1000} for i in range(60)]
-    recalled, _ = _recall_context(monkeypatch, body)
-    assert len(recalled.splitlines()) == 60 and "Memory gaps" not in recalled
-    body["items"] = [{"citation": f"[harso: e{i}]", "text": "y" * 1000} for i in range(80)]
+def test_default_context_bound_is_finite_and_bounds_the_complete_output(monkeypatch):
+    body = {**_recall_body(), "gaps": [], "routing_hint": _HINTS[0]}
+    body["items"] = [{"citation": f"[harso: e{i}]", "text": "y" * 1000} for i in range(1100)]
     recalled, _ = _recall_context(monkeypatch, body)
     lines = recalled.splitlines()
-    assert lines[-1] == "Memory gaps: budget-excluded"
-    assert len("\n".join(lines[:-1])) <= 65536 < len("\n".join(lines[:-1])) + 1015
+    assert lines[-2:] == ["Memory gaps: budget-excluded", _HINTS[0]]
+    assert len(recalled) <= 1024 * 1024 < len(recalled) + len(lines[0]) + 1
+    assert lines[:-2] == [f"[harso: e{i}] " + "y" * 1000 for i in range(len(lines) - 2)]
+
+
+# -- F1: the client bounds admit the largest pack the server can send --------
+# weave-cloud harso-memory: main + Jev extra <= TOTAL_TOKENS_MAX 32768 tokens,
+# counted as ceil(UTF-8 content bytes / 4) per entry; <= 256 entries; <= 64
+# citation refs per entry, each "evidence:" + UUIDv7 (45 chars); occurred_at is
+# a UTC timestamp; session_id is at most 256 chars.
+_MAX_TOKENS, _MAX_ENTRIES, _MAX_REFS = 32768, 256, 64
+
+
+def _server_pack(entries, fill):
+    """A pack whose content is exactly the 32768-token server maximum."""
+    items = []
+    for i in range(entries):
+        refs = [f"evidence:01990000-0000-7000-8000-{i * _MAX_REFS + j:012x}"
+                for j in range(_MAX_REFS)]
+        # Split the tokens as evenly as whole tokens allow; 4 bytes per token.
+        content_bytes = 4 * (_MAX_TOKENS // entries + (i < _MAX_TOKENS % entries))
+        text = f"{i:06d}" + fill * ((content_bytes - 6) // len(fill.encode()))
+        text += "x" * (content_bytes - len(text.encode()))
+        assert len(text.encode()) == content_bytes and len(refs[0]) == 45
+        items.append({"evidence_id": f"memory-projection:01990000-0000-7000-8000-{i:012x}",
+                      "citation": refs[0], "citations": refs, "text": text,
+                      "kind": "evidence", "session_id": "s" * 256,
+                      "occurred_at": "2026-09-28T10:15:40.791197Z"})
+    assert sum(-(-len(item["text"].encode()) // 4) for item in items) == _MAX_TOKENS
+    return {"recall_status": "ok", "degraded": False, "degradation": "none", "items": items}
+
+
+@pytest.mark.parametrize("entries, fill", [
+    (_MAX_ENTRIES, "x"), (_MAX_ENTRIES, "\x01"), (_MAX_ENTRIES, "\u00e9"),
+    (64, "x"), (109, "x"), (1, "\x01"),
+], ids=["256-ascii", "256-json-escape-worst", "256-multibyte", "64-citation-heavy",
+        "109-evidence", "1-escape-worst"])
+def test_full_server_pack_with_64_citations_renders_every_item(monkeypatch, entries, fill):
+    body = _server_pack(entries, fill)
+    wire = len(json.dumps(body).encode())
+    recalled, final = _recall_context(monkeypatch, body)
+    assert final is not None and recalled in final
+    lines = recalled.splitlines()
+    assert lines == [f"[2026-09-28 10:15] {' '.join(item['citations'])} {item['text']}"
+                     for item in body["items"]]
+    assert "Memory gaps" not in recalled
+    assert wire <= 2 * 1024 * 1024 and len(recalled) <= 1024 * 1024
+    if entries > 1:  # the old 262144-byte / 65536-char defaults dropped these
+        assert wire > 262144 and len(recalled) > 65536
+
+
+def test_default_transport_cap_admits_a_max_pack_with_max_suffix_fields(monkeypatch):
+    body = _server_pack(_MAX_ENTRIES, "\x01")
+    body["gaps"] = [{"reason": reason} for reason in (
+        "missing", "stale", "contradictory", "privacy-excluded", "budget-excluded")]
+    body["routing_hint"] = "Routing hint: inline (0.93); external action: unlikely (0.05)"
+    recalled, final = _recall_context(monkeypatch, body)
+    assert final is not None and recalled in final
+    lines = recalled.splitlines()
+    assert len(lines) == _MAX_ENTRIES + 2 and lines[-1] == body["routing_hint"]
+    assert lines[-2] == "Memory gaps: missing, stale, contradictory, privacy-excluded, budget-excluded"
+
+
+# -- F2: context_max_chars bounds the complete output ------------------------
+
+def _limit_prefetch(monkeypatch, body, max_chars):
+    provider, _ = _context_provider(monkeypatch)
+    module = importlib.import_module("plugins.memory.harso")
+    monkeypatch.setattr(module, "_prefetch_limits", lambda: (0.8, 2 * 1024 * 1024, max_chars))
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: _Response(body))
+    return provider.prefetch("What database does the orchid project use?")
+
+
+def test_output_exactly_at_the_bound_keeps_every_item_and_no_exclusion(monkeypatch):
+    hint = "Routing hint: inline (1.00)"
+    body = {"recall_status": "ok", "gaps": [{"reason": "stale"}], "routing_hint": hint,
+            "items": [{"citation": "c", "text": "x" * 500}, {"citation": "d", "text": ""}]}
+    suffix = "\nMemory gaps: stale\n" + hint
+    body["items"][1]["text"] = "y" * (1024 - len("c ") - 500 - 1 - len("d ") - len(suffix))
+    result = _limit_prefetch(monkeypatch, body, 1024)
+    assert len(result) == 1024 and "budget-excluded" not in result
+    assert result.splitlines()[:2] == ["c " + "x" * 500, "d " + body["items"][1]["text"]]
+    body["items"][1]["text"] += "y"  # one char over: the whole second item goes
+    result = _limit_prefetch(monkeypatch, body, 1024)
+    assert result.splitlines() == ["c " + "x" * 500, "Memory gaps: stale, budget-excluded", hint]
+
+
+@pytest.mark.parametrize("hint", ["", "Routing hint: inline (1.00)"])
+def test_first_item_overflow_is_reported_as_budget_excluded(monkeypatch, hint):
+    body = {"recall_status": "ok", "routing_hint": hint,
+            "items": [{"citation": "c", "text": "x" * 1023}]}
+    result = _limit_prefetch(monkeypatch, body, 1024)
+    # Exactly the exclusion marker (and hint): no item text is invented or cut.
+    assert result == "\n".join(filter(None, ["Memory gaps: budget-excluded", hint]))
+
+
+@pytest.mark.parametrize("gaps", [None, [{"reason": "stale"}], [
+    {"reason": r} for r in ("missing", "stale", "contradictory", "privacy-excluded", "budget-excluded")]])
+@pytest.mark.parametrize("hint", ["", "Routing hint: inline (0.93); external action: unlikely (0.05)"])
+def test_suffixes_are_counted_inside_the_bound_at_every_limit(monkeypatch, gaps, hint):
+    items = [{"citation": f"[harso: e{i}]", "occurred_at": "2026-09-28T10:15:00Z",
+              "text": str(i) * (97 + 131 * i)} for i in range(8)]
+    body = {"recall_status": "ok", "gaps": gaps, "routing_hint": hint, "items": items}
+    full = [f"[2026-09-28 10:15] [harso: e{i}] " + str(i) * (97 + 131 * i) for i in range(8)]
+    for limit in range(1024, len("\n".join(full)) + 400, 7):
+        result = _limit_prefetch(monkeypatch, body, limit)
+        lines = result.splitlines()
+        assert len(result) <= limit, limit
+        kept = [line for line in lines if line.startswith("[2026-")]
+        assert kept == full[:len(kept)]  # a whole-item prefix in server order
+        assert (hint in lines) == bool(hint)
+        excluded = len(kept) < len(full)
+        assert any(line.startswith("Memory gaps:") and "budget-excluded" in line
+                   for line in lines) == (excluded or "budget-excluded" in str(gaps))
+        if excluded:  # the next whole item could not fit beside the suffix
+            assert len(result) + len(full[len(kept)]) + 1 > limit
+
+
+def test_repeated_gap_reasons_are_deduplicated(monkeypatch):
+    body = {**_recall_body(), "gaps": [{"reason": "stale"}] * 5 + [
+        {"reason": "missing"}, {"reason": "missing"}, {"reason": "budget-excluded"}]}
+    recalled, _ = _recall_context(monkeypatch, body)
+    assert recalled.splitlines()[-1] == "Memory gaps: stale, missing, budget-excluded"
 
 
 def test_context_max_chars_is_read_per_call(monkeypatch):
     body = {**_recall_body(), "gaps": []}
     body["items"] = [{"citation": f"[harso: e{i}]", "text": "z" * 1000} for i in range(4)]
-    _write_config("plugins:\n  harso:\n    context_max_chars: 1024\n")
+    _write_config("plugins:\n  harso:\n    context_max_chars: 1100\n")
     assert len(_recall_context(monkeypatch, body)[0].splitlines()) == 1 + 1
     _write_config("plugins:\n  harso:\n    context_max_chars: 3100\n")
     assert len(_recall_context(monkeypatch, body)[0].splitlines()) == 3 + 1
@@ -245,16 +363,18 @@ def test_context_max_chars_is_read_per_call(monkeypatch):
 @pytest.mark.parametrize("setting", [
     "context_max_chars: 0", "context_max_chars: 100", "context_max_chars: -5",
     "context_max_chars: 99999999", "context_max_chars: true", "context_max_chars: 4096.0",
-    "context_max_chars: lots",
+    "context_max_chars: lots", "context_max_chars: null", "context_max_chars: ~",
+    "context_max_chars:", "context_max_chars: []", "context_max_chars: {n: 4096}",
 ])
 def test_invalid_context_max_chars_falls_back_to_default(monkeypatch, caplog, setting):
     body = {**_recall_body(), "gaps": []}
-    body["items"] = [{"citation": f"[harso: e{i}]", "text": "w" * 1000} for i in range(60)]
+    body["items"] = [{"citation": f"[harso: e{i}]", "text": "w" * 1000} for i in range(80)]
     _write_config(f"plugins:\n  harso:\n    {setting}\n")
     with caplog.at_level(logging.WARNING, logger="plugins.memory.harso"):
         recalled, _ = _recall_context(monkeypatch, body)
-    assert len(recalled.splitlines()) == 60  # default 65536 fits all 60
-    assert "context_max_chars invalid; using 65536" in caplog.text
+    assert len(recalled.splitlines()) == 80  # the default fits all 80
+    assert "context_max_chars invalid; using 1048576" in caplog.text
+    assert "lots" not in caplog.text and "4096" not in caplog.text
 
 
 def test_no_recalled_content_is_logged(monkeypatch, caplog):
@@ -978,13 +1098,57 @@ def test_prefetch_limits_are_runtime_config_read_per_call(monkeypatch):
 @pytest.mark.parametrize("setting", [
     "prefetch_timeout: 0", "prefetch_timeout: 6", "prefetch_timeout: true",
     "prefetch_timeout: fast", "prefetch_max_bytes: 10", "prefetch_max_bytes: 1.5",
+    "prefetch_timeout: null", "prefetch_timeout:", "prefetch_max_bytes: null",
+    "prefetch_max_bytes: ~", "prefetch_max_bytes: [4096]",
 ])
-def test_invalid_prefetch_limits_fall_back_to_defaults(monkeypatch, setting):
+def test_invalid_prefetch_limits_fall_back_to_defaults(monkeypatch, caplog, setting):
     provider = _provider(monkeypatch)
     seen = _capture_turn(monkeypatch, {"items": [{"citation": "[harso: e1]", "text": "ok"}]})
     _write_config(f"plugins:\n  harso:\n    {setting}\n")
-    assert provider.prefetch("q", session_id=_SESSION) == "[harso: e1] ok"
+    with caplog.at_level(logging.WARNING, logger="plugins.memory.harso"):
+        assert provider.prefetch("q", session_id=_SESSION) == "[harso: e1] ok"
     assert seen[0]["timeout"] == 0.8
+    key = setting.split(":")[0]
+    assert f"plugins.harso.{key} invalid; using" in caplog.text
+    assert "fast" not in caplog.text and "4096" not in caplog.text
+
+
+@pytest.mark.parametrize("config, warning", [
+    ("", None), ("plugins: {}\n", None), ("plugins:\n  harso: {}\n", None),
+    ("plugins:\n  other: 1\n", None),
+    ("plugins:\n  harso: []\n", "plugins.harso invalid; using defaults"),
+    ("plugins:\n  harso: [context_max_chars]\n", "plugins.harso invalid; using defaults"),
+    ("plugins:\n  harso: secret-looking-value\n", "plugins.harso invalid; using defaults"),
+    ("plugins:\n  harso: 4096\n", "plugins.harso invalid; using defaults"),
+    ("plugins:\n  harso:\n", "plugins.harso invalid; using defaults"),  # explicit null
+], ids=["no-config", "no-harso", "empty-section", "sibling-plugin", "section-list",
+        "section-list-of-keys", "section-string", "section-int", "section-null"])
+def test_absent_config_is_silent_and_malformed_section_warns(monkeypatch, caplog, config, warning):
+    module = importlib.import_module("plugins.memory.harso")
+    _write_config(config)
+    with caplog.at_level(logging.WARNING, logger="plugins.memory.harso"):
+        assert module._prefetch_limits() == (0.8, 2 * 1024 * 1024, 1024 * 1024)
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == ([warning] if warning else [])
+    assert "secret-looking-value" not in caplog.text
+
+
+@pytest.mark.parametrize("loaded", [OSError("/private/secret/config.yaml"), ["not", "a", "dict"]],
+                         ids=["loader-raises", "loader-non-dict"])
+def test_failed_config_read_warns_without_echo_and_uses_defaults(monkeypatch, caplog, loaded):
+    module = importlib.import_module("plugins.memory.harso")
+
+    def load():
+        if isinstance(loaded, Exception):
+            raise loaded
+        return loaded
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", load)
+    with caplog.at_level(logging.WARNING, logger="plugins.memory.harso"):
+        assert module._prefetch_limits() == (0.8, 2 * 1024 * 1024, 1024 * 1024)
+    assert [r.getMessage() for r in caplog.records] == [
+        "plugins.harso config unreadable; using defaults"]
+    assert "secret" not in caplog.text
 
 
 def test_valid_body_one_byte_over_the_cap_is_dropped(monkeypatch, caplog):
@@ -1012,7 +1176,7 @@ def test_oversized_prefetch_body_is_dropped_without_reading_it_all(monkeypatch):
 
     monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: Huge({}))
     assert provider.prefetch("q", session_id=_SESSION) == ""
-    assert reads == [262145]
+    assert reads == [2 * 1024 * 1024 + 1]
 
 
 @pytest.fixture

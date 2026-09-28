@@ -20,10 +20,27 @@ _TIMEOUT_SECONDS = 5
 # timeout stays below MemoryManager's caller-wait bound so a slow server frees
 # the prefetch thread soon after the turn stops waiting; writes keep 5s.
 _PREFETCH_TIMEOUT_SECONDS = 0.8
-_PREFETCH_MAX_BYTES = 262144
-# The server packs items to its own token budget; this is only a total safety
-# bound on the rendered block (~16k tokens), applied at whole-item boundaries.
-_CONTEXT_MAX_CHARS = 65536
+# Both finite bounds below admit the LARGEST pack the server can send, so they
+# never cut valid recall; the server's token budget is what decides recall.
+# Worst case, from weave-cloud harso-memory (context.py, harso-memory.v1):
+#   content  <= 4 * 32768 = 131072 UTF-8 bytes: jev_turns.TOTAL_TOKENS_MAX
+#               (main + Jev extra) counts ceil(content bytes / 4) per entry;
+#               a str has no more chars than UTF-8 bytes.
+#   entries  <= 256 (context_assembly_result.entries maxItems).
+#   refs     <= 64 per entry (citation_refs maxItems, DTO [:64]), each 45
+#               chars: every server citation is "evidence:" + UUIDv7.
+# Transport (JSON bytes; json.dumps default ", "/": " separators, above
+# Starlette's compact ones): content worst escape is 6 bytes per content byte
+# (a control char -> \u00XX) = 786432; per entry, fields besides "text"
+# (evidence_id 54, citation 45, 64 citations, kind, session_id at its
+# 256-char contract max, occurred_at 27) = 3641; envelope (degradation,
+# 5 gaps, 200-char hint) = 457. 786432 + 256 * 3641 + 457 = 1718985, so 2 MiB.
+_PREFETCH_MAX_BYTES = 2 * 1024 * 1024
+# Rendered chars, whole output: per entry the date prefix "[YYYY-MM-DD HH:MM] "
+# 19 + 64 refs * 45 + 63 separators + 1 space before text + 1 newline = 2964;
+# 131072 + 256 * 2964 + gaps line 77 + 1 + hint 200 = 890134, so 1 MiB.
+_CONTEXT_MAX_CHARS = 1024 * 1024
+_GAP_REASONS = ("missing", "stale", "contradictory", "privacy-excluded", "budget-excluded")
 _P = r"(?:0\.[0-9]{2}|1\.00)"
 _ACTION = rf"external action: (?:likely|unlikely|unsure) \({_P}\)"
 # WEV-1850: the fixed vocabulary weave-api's RoutingHint.line() generates. No
@@ -38,32 +55,46 @@ class HarsoWriteError(RuntimeError):
 
 def _prefetch_limits() -> tuple[float, int, int]:
     """Read ``plugins.harso.prefetch_timeout`` / ``prefetch_max_bytes`` /
-    ``context_max_chars`` per call."""
+    ``context_max_chars`` per call.
+
+    An absent section or key is silent; a present but invalid one (including
+    an explicit null) and an unreadable config warn, content-free, and use the
+    defaults."""
     timeout, max_bytes = _PREFETCH_TIMEOUT_SECONDS, _PREFETCH_MAX_BYTES
     max_chars = _CONTEXT_MAX_CHARS
+    defaults = timeout, max_bytes, max_chars
     try:
-        from hermes_cli.config import cfg_get, load_config_readonly
+        from hermes_cli.config import load_config_readonly
 
-        section = cfg_get(load_config_readonly(), "plugins", "harso", default={})
+        config = load_config_readonly()
     except Exception:
-        section = {}
+        logger.warning("plugins.harso config unreadable; using defaults")
+        return defaults
+    if not isinstance(config, dict):
+        logger.warning("plugins.harso config unreadable; using defaults")
+        return defaults
+    plugins = config.get("plugins")
+    if not isinstance(plugins, dict) or "harso" not in plugins:
+        return defaults
+    section = plugins["harso"]
     if not isinstance(section, dict):
-        return timeout, max_bytes, max_chars
-    raw = section.get("prefetch_timeout")
-    if raw is not None:
+        logger.warning("plugins.harso invalid; using defaults")
+        return defaults
+    if "prefetch_timeout" in section:
+        raw = section["prefetch_timeout"]
         if (not isinstance(raw, bool) and isinstance(raw, (int, float))
                 and 0 < raw <= _TIMEOUT_SECONDS):
             timeout = float(raw)
         else:
             logger.warning("plugins.harso.prefetch_timeout invalid; using %.1fs", timeout)
-    raw = section.get("prefetch_max_bytes")
-    if raw is not None:
+    if "prefetch_max_bytes" in section:
+        raw = section["prefetch_max_bytes"]
         if type(raw) is int and 1024 <= raw <= 16 * 1024 * 1024:
             max_bytes = raw
         else:
             logger.warning("plugins.harso.prefetch_max_bytes invalid; using %d", max_bytes)
-    raw = section.get("context_max_chars")
-    if raw is not None:
+    if "context_max_chars" in section:
+        raw = section["context_max_chars"]
         if type(raw) is int and 1024 <= raw <= 16 * 1024 * 1024:
             max_chars = raw
         else:
@@ -223,8 +254,7 @@ class HarsoMemoryProvider(MemoryProvider):
         items = response.get("items")
         if not isinstance(items, list):
             return hint
-        context = []
-        used, budget_hit = 0, False
+        lines = []
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -236,29 +266,41 @@ class HarsoMemoryProvider(MemoryProvider):
                 citation = " ".join(citations[:64])
             if (isinstance(citation, str) and citation.strip()
                     and isinstance(text, str) and text.strip()):
-                line = f"{_date_prefix(item.get('occurred_at'))}{citation} {text}"
-                # Whole items only: never cut recalled evidence mid-item.
-                if used + len(line) + 1 > max_chars:
-                    budget_hit = True
-                    break
-                used += len(line) + 1
-                context.append(line)
-        # Gaps may annotate admitted evidence, never create context by themselves.
+                lines.append(f"{_date_prefix(item.get('occurred_at'))}{citation} {text}")
         gaps = response.get("gaps")
-        if context:
-            reasons = []
-            if isinstance(gaps, list):
-                reasons = [gap["reason"] for gap in gaps
-                           if isinstance(gap, dict) and gap.get("reason") in (
-                               "missing", "stale", "contradictory", "privacy-excluded", "budget-excluded"
-                           )][:5]
-            if budget_hit and "budget-excluded" not in reasons:
-                reasons.append("budget-excluded")
-            if reasons:
-                context.append("Memory gaps: " + ", ".join(reasons))
-        if hint:
-            context.append(hint)
-        return "\n".join(context)
+        reasons = list(dict.fromkeys(
+            gap["reason"] for gap in gaps
+            if isinstance(gap, dict) and gap.get("reason") in _GAP_REASONS
+        ))[:5] if isinstance(gaps, list) else []
+
+        def render(kept: List[str], excluded: bool) -> str:
+            parts = list(kept)
+            # Gaps may annotate admitted evidence, never create context by
+            # themselves; the hint is independent of memory admission.
+            if lines:
+                shown = reasons + ["budget-excluded"] if (
+                    excluded and "budget-excluded" not in reasons) else reasons
+                if shown:
+                    parts.append("Memory gaps: " + ", ".join(shown))
+            if hint:
+                parts.append(hint)
+            return "\n".join(parts)
+
+        # context_max_chars bounds the COMPLETE output, gaps line and hint
+        # included. Over it, keep a whole-item prefix in server order under the
+        # room left by the final suffix; never cut an item. The suffix is at
+        # most 278 chars, under the 1024 minimum, so an admitted item excluded
+        # by the bound is always reported as budget-excluded, even if none fit.
+        output = render(lines, False)
+        if len(output) <= max_chars:
+            return output
+        used, kept = len(render([], True)), []
+        for line in lines:
+            if used + len(line) + 1 > max_chars:
+                break
+            used += len(line) + 1
+            kept.append(line)
+        return render(kept, True)
 
     def sync_turn(
         self,
