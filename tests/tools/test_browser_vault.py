@@ -955,6 +955,34 @@ class TestTwoFactor:
         assert out["success"] is False and code not in raw
         assert "«redacted-vault-secret»" in out["error"]
 
+    @pytest.mark.parametrize("can_prompt", [True, False])
+    @pytest.mark.parametrize("raised", [Exception("backend exploded"), VaultError("backend exploded")])
+    def test_an_untyped_backend_code_failure_is_never_read_as_no_key(self, store, raised, can_prompt):
+        """V-4b residual: only a None code or the typed otp_unavailable means "no key". A backend raising anything
+        else (a bare Exception, a store error) is vault_unavailable: nobody is asked, nothing is injected, and no
+        advice to save an authenticator key is given."""
+        from agent.vault_backends import unlock as unlock_mod
+        from tools import browser_vault_tool
+
+        meta = store.add_item("login", "gh", {"identifier_type": "username", "identifier": "tek", "password": "pw",
+                                              "otp_secret": "JBSWY3DPEHPK3PXP"}, origin="https://trusted.example")
+        controls = [{"index": 0, "type": "text", "name": "otp", "autocomplete": "one-time-code"}]
+        asked, injected = [], []
+        unlock_mod.set_code_prompt_callback(lambda site, hint: asked.append(site) or "123456")
+        try:
+            with patch("agent.vault_store.get_vault_store", return_value=store), \
+                 patch("agent.vault_backends.local.LocalLoginBackend.resolve_otp", side_effect=raised), \
+                 patch("agent.vault_backends.unlock.can_prompt_here", return_value=can_prompt), \
+                 patch.object(browser_vault_tool, "_focus_bound_origin", lambda t, o, k: o or None), \
+                 patch.object(browser_vault_tool, "_eval_js", return_value={"success": True, "result": json.dumps(controls)}), \
+                 patch.object(browser_vault_tool, "_eval_js_secret", side_effect=lambda t, e: injected.append(e)):
+                out = json.loads(browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t"))
+        finally:
+            unlock_mod.set_code_prompt_callback(None)
+        assert (out["success"], out["error_type"]) == (False, "vault_unavailable"), out
+        assert asked == [] and injected == [] and "authenticator" not in out["error"]
+        assert "backend exploded" not in out["error"]  # an untyped error's text is not echoed
+
     def test_unknown_handle_resolves_and_prompts_nothing(self, store):
         from agent.vault_backends import unlock as unlock_mod
         from tools import browser_vault_tool
