@@ -1957,6 +1957,10 @@ def run_conversation(
     # per-turn: carrying a prior in-place boundary forward would make a later
     # uncompressed result look like a compacted transcript to gateway writers.
     agent._last_compaction_in_place = False
+    # Weave (WEV-2108): a new turn accepts steers again (the last finalizer closed the window).
+    _open_steer = getattr(agent, "_open_steer_window", None)
+    if callable(_open_steer):
+        _open_steer()
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
 

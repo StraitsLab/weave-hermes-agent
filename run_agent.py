@@ -3689,6 +3689,49 @@ class AIAgent:
             self._pending_redirect = None
         return text
 
+    def steer_if_open(self, text: str) -> bool:
+        """Weave (WEV-2108): steer() for callers that can queue on refusal (native submit).
+
+        Refuses once this turn's finalizer has taken its last leftover (the window is closed), because
+        nothing in the finishing turn would read the text. steer() itself keeps its old contract for
+        the CLI, TUI, ACP and gateway /steer callers, which treat False as empty input.
+        """
+        if not text or not text.strip():
+            return False
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            return False if getattr(self, "_steer_window_closed", False) else self.steer(text)
+        with _lock:
+            if getattr(self, "_steer_window_closed", False):
+                return False
+            cleaned = text.strip()
+            self._pending_steer = f"{self._pending_steer}\n{cleaned}" if self._pending_steer else cleaned
+        return True
+
+    def _close_steer_window(self) -> Optional[str]:
+        """Weave (WEV-2108): take the turn's last leftover steer and refuse later ones, atomically.
+
+        Called once by the turn finalizer. A steer accepted before this returns in the leftover;
+        one attempted after it is refused (steer() returns False) until the next turn reopens.
+        """
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            text = getattr(self, "_pending_steer", None)
+            self._pending_steer, self._steer_window_closed = None, True
+            return text
+        with _lock:
+            text = self._pending_steer
+            self._pending_steer, self._steer_window_closed = None, True
+        return text
+
+    def _open_steer_window(self) -> None:
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._steer_window_closed = False
+            return
+        with _lock:
+            self._steer_window_closed = False
+
     def _drain_pending_steer(self) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot.
 
