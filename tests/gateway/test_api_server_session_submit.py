@@ -139,7 +139,7 @@ async def test_submit_rejects_changed_retry_and_non_queue_busy_modes(adapter, mo
         changed_body = await changed.json()
         invalid = await client.post(
             f"/api/sessions/{SESSION_ID}/submit", headers=headers,
-            json={**_request("request-2"), "busy_mode": "steer"},
+            json={**_request("request-2"), "busy_mode": "stop"},
         )
         invalid_body = await invalid.json()
     finally:
@@ -395,3 +395,131 @@ async def test_submit_passes_the_external_request_id_into_native_admission(adapt
     finally:
         await client.close()
     assert [item[3] for item in admitted] == ["cmd-01a0-7f00"]
+
+
+def _busy_adapter(adapter, agent):
+    """A busy native session whose running turn is ``native-running`` and whose live agent is ``agent``."""
+    entry = SimpleNamespace(session_key="native-key", session_id=SESSION_ID)
+    queued = []
+    runner = SimpleNamespace(
+        _running=True,
+        async_session_store=SimpleNamespace(bind_existing_session=AsyncMock(return_value=entry)),
+        _is_session_running=lambda key: True,
+        _enqueue_fifo=lambda key, event, adapter: queued.append(event.text),
+        _peek_session_state=lambda key: SimpleNamespace(turn=SimpleNamespace(agent=agent)),
+    )
+    adapter.gateway_runner = runner
+    adapter._native_submit_active_refs["native-key"] = "native-running"
+    return queued
+
+
+class _Agent:
+    def __init__(self, steer_accepts=True):
+        self.steered, self.interrupted, self._accepts = [], [], steer_accepts
+
+    def steer(self, text):
+        self.steered.append(text)
+        return self._accepts
+
+    def interrupt(self, message=None, **_kwargs):
+        self.interrupted.append(message)
+
+
+@pytest.mark.asyncio
+async def test_steer_joins_the_running_turn_and_settles_when_that_turn_ends(adapter):
+    """WEV-2108: steer reaches the running agent, not the FIFO, and the steered ref stays open
+    (observable through its events) until the turn it joined finishes, then ends with it."""
+    agent = _Agent()
+    queued = _busy_adapter(adapter, agent)
+
+    admission = await adapter._admit_native_session_submit(
+        SESSION_ID, "make it Saturday", "native-steered", external_request_id="steer-request", busy_mode="steer")
+
+    assert admission == "steered"
+    assert agent.steered == ["make it Saturday"] and queued == [] and agent.interrupted == []
+    assert "native-steered" not in adapter._native_submit_terminals
+
+    running = SimpleNamespace(metadata={"native_request_ref": "native-running"})
+    await adapter._on_native_submit_finished(running, "native-key")
+
+    assert "native-steered" in adapter._native_submit_terminals
+    assert "native-running" in adapter._native_submit_terminals
+
+
+@pytest.mark.asyncio
+async def test_a_steered_ref_fails_with_the_turn_it_joined(adapter):
+    queued = _busy_adapter(adapter, _Agent())
+    closed = []
+    original = adapter._native_submit_close
+    adapter._native_submit_close = lambda ref, kind, **fields: (closed.append((ref, kind)), original(ref, kind, **fields))
+
+    await adapter._admit_native_session_submit(SESSION_ID, "also add Priya", "native-steered", busy_mode="steer")
+    running = SimpleNamespace(metadata={"native_request_ref": "native-running", "native_submit_failed": True})
+    await adapter._on_native_submit_finished(running, "native-key")
+
+    assert ("native-steered", "turn.failed") in closed and queued == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["absent", "still-starting", "steer-rejected"])
+async def test_steer_the_agent_cannot_take_is_queued_not_lost(adapter, state):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    agent = {"absent": None, "still-starting": _AGENT_PENDING_SENTINEL,
+             "steer-rejected": _Agent(steer_accepts=False)}[state]
+    queued = _busy_adapter(adapter, agent)
+
+    admission = await adapter._admit_native_session_submit(SESSION_ID, "make it Saturday", "native-steered",
+                                                           busy_mode="steer")
+
+    assert admission == "queued" and queued == ["make it Saturday"]
+    assert "native-steered" not in adapter._native_submit_steered.get("native-running", [])
+
+
+@pytest.mark.asyncio
+async def test_interrupt_stops_the_running_turn_and_runs_this_submit_next(adapter):
+    """WEV-2108: interrupt queues the submit as its own turn (own ref, own events) and stops the running one."""
+    agent = _Agent()
+    queued = _busy_adapter(adapter, agent)
+
+    admission = await adapter._admit_native_session_submit(SESSION_ID, "forget that, book the dentist",
+                                                           "native-new", busy_mode="interrupt")
+
+    assert admission == "queued"
+    assert queued == ["forget that, book the dentist"]
+    assert agent.interrupted == ["forget that, book the dentist"] and agent.steered == []
+
+
+@pytest.mark.asyncio
+async def test_queue_mode_never_touches_the_running_agent(adapter):
+    agent = _Agent()
+    queued = _busy_adapter(adapter, agent)
+
+    assert await adapter._admit_native_session_submit(SESSION_ID, "later", "native-q", busy_mode="queue") == "queued"
+    assert queued == ["later"] and agent.steered == [] and agent.interrupted == []
+
+
+@pytest.mark.asyncio
+async def test_submit_route_passes_busy_mode_and_replays_a_steered_admission(adapter, monkeypatch):
+    admitted = []
+
+    async def admit(session_id, message, native_request_ref, external_request_id="", busy_mode="queue"):
+        admitted.append(busy_mode)
+        return "steered"
+
+    monkeypatch.setattr(adapter, "_admit_native_session_submit", admit)
+    client = await _client(adapter)
+    headers = {"Authorization": "Bearer sk-native-submit-test"}
+    try:
+        first = await client.post(f"/api/sessions/{SESSION_ID}/submit", headers=headers,
+                                  json={**_request("steer-1"), "busy_mode": "steer"})
+        retry = await client.post(f"/api/sessions/{SESSION_ID}/submit", headers=headers,
+                                  json={**_request("steer-1"), "busy_mode": "steer"})
+        first_body, retry_body = await first.json(), await retry.json()
+    finally:
+        await client.close()
+
+    assert admitted == ["steer"]
+    assert first.status == retry.status == 202
+    assert first_body["admission"] == retry_body["admission"] == "steered"
+    assert first_body["native_request_ref"] == retry_body["native_request_ref"]

@@ -1552,6 +1552,10 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
+# Weave (WEV-2108): what a native submit may ask of a busy session. "queue" waits its turn;
+# "steer" joins the running turn; "interrupt" stops it and runs next.
+_NATIVE_SUBMIT_BUSY_MODES = frozenset({"queue", "steer", "interrupt"})
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -1690,6 +1694,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._native_submit_sequences: Dict[str, int] = {}
         self._native_submit_event_lock = threading.Lock()
         self._native_submit_terminals: Dict[str, None] = {}
+        # Weave (WEV-2108): running native_request_ref -> refs steered into that turn.
+        self._native_submit_steered: Dict[str, List[str]] = {}
         # Weave: native_request_ref -> approval session key while the turn is
         # attended, and the approval request_ids already published per ref.
         # The pending approvals themselves live only in tools.approval's queue.
@@ -5182,7 +5188,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({"status": "ready", "credential_slot": "GATE_B_API_KEY"})
 
     @staticmethod
-    def _native_submit_request(body: Dict[str, Any]) -> tuple[Optional[tuple[str, str]], Optional["web.Response"]]:
+    def _native_submit_request(body: Dict[str, Any]) -> tuple[Optional[tuple[str, str, str]], Optional["web.Response"]]:
         """Validate the deliberately narrow native-admission request shape."""
         if set(body) != {"kind", "external_request_id", "message", "busy_mode"}:
             return None, web.json_response(
@@ -5192,7 +5198,7 @@ class APIServerAdapter(BasePlatformAdapter):
         message = body.get("message")
         if (
             body.get("kind") != "hermes.session.submit"
-            or body.get("busy_mode") != "queue"
+            or body.get("busy_mode") not in _NATIVE_SUBMIT_BUSY_MODES
             or not isinstance(request_id, str)
             or not re.fullmatch(r"[\x21-\x7e]{1,128}", request_id)
             or not isinstance(message, str)
@@ -5208,11 +5214,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return None, web.json_response(
                 _openai_error("Invalid native submit schema", code="invalid_native_submit_schema"), status=400
             )
-        return (request_id, message), None
+        return (request_id, message, body["busy_mode"]), None
 
     async def _admit_native_session_submit(
         self, session_id: str, message: str, native_request_ref: str,
-        external_request_id: str = "",
+        external_request_id: str = "", busy_mode: str = "queue",
     ) -> str:
         """Submit one ordinary turn through the running gateway's writer lease."""
         runner = self.gateway_runner
@@ -5276,7 +5282,28 @@ class APIServerAdapter(BasePlatformAdapter):
         if not busy and callable(is_session_running):
             busy = bool(is_session_running(entry.session_key))
         if busy:
+            # Weave (WEV-2108): the caller's busy_mode, never the ambient policy. steer folds the
+            # text into the running turn; interrupt stops it and runs this submit next. Either
+            # falls back to the FIFO when the running agent cannot take it, so nothing is lost.
+            agent = self._native_submit_running_agent(runner, entry.session_key)
+            active_ref = self._native_submit_active_ref(entry.session_key)
+            if busy_mode == "steer" and active_ref and agent is not None and hasattr(agent, "steer"):
+                try:
+                    steered = bool(agent.steer(message))
+                except Exception:
+                    logger.warning("[api_server] native submit steer failed", exc_info=True)
+                    steered = False
+                if steered:
+                    # Open until the turn it joined ends: that turn's finish closes it (below).
+                    self._native_submit_steered.setdefault(active_ref, []).append(native_request_ref)
+                    self._native_submit_event(native_request_ref, "turn.started", steered_into=active_ref)
+                    return "steered"
             runner._enqueue_fifo(entry.session_key, event, self)
+            if busy_mode == "interrupt" and agent is not None and hasattr(agent, "interrupt"):
+                try:
+                    agent.interrupt(message)
+                except Exception:
+                    logger.warning("[api_server] native submit interrupt failed", exc_info=True)
             return "queued"
         started = asyncio.get_running_loop().create_future()
         self._native_submit_started[native_request_ref] = started
@@ -5287,6 +5314,16 @@ class APIServerAdapter(BasePlatformAdapter):
             if not started.done():
                 started.cancel()
             raise
+
+    @staticmethod
+    def _native_submit_running_agent(runner: Any, session_key: str) -> Any:
+        """The session's live agent, or None while it is still starting (sentinel) or absent."""
+        peek = getattr(runner, "_peek_session_state", None)
+        state = peek(session_key) if callable(peek) else None
+        agent = getattr(getattr(state, "turn", None), "agent", None)
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        return None if agent is None or agent is _AGENT_PENDING_SENTINEL else agent
 
     async def _handle_session_submit(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{id}/submit — native gateway admission receipt."""
@@ -5301,7 +5338,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         assert parsed is not None
-        external_request_id, message = parsed
+        external_request_id, message, busy_mode = parsed
         db = await self._ensure_session_db_async()
         if db is None:
             return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
@@ -5337,13 +5374,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     _openai_error("external_request_id was reused with different input", code="native_submit_idempotency_conflict"), status=409
                 )
             native_request_ref = result["native_request_ref"]
-            if outcome == "identical_retry" and result.get("admission") in {"streaming", "queued"}:
+            if outcome == "identical_retry" and result.get("admission") in {"streaming", "queued", "steered"}:
                 admission = result["admission"]
             else:
                 try:
                     admission = await self._admit_native_session_submit(
                         session_id, message, native_request_ref,
                         external_request_id=external_request_id,
+                        **({} if busy_mode == "queue" else {"busy_mode": busy_mode}),
                     )
                 except Exception:
                     await asyncio.to_thread(
@@ -5831,6 +5869,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # A survivor that never reached its successful start still owns its folded siblings:
         # settle them with the survivor's outcome. Already-closed siblings are skipped.
         self._native_submit_close_merged(event, native_request_ref, failed=failed)
+        for steered in self._native_submit_steered.pop(native_request_ref, ()):
+            if steered not in self._native_submit_terminals:
+                self._native_submit_close(
+                    steered, "turn.failed" if failed else "turn.completed", steered_into=native_request_ref,
+                )
         self._native_submit_close(
             native_request_ref, "turn.failed" if failed else "turn.completed",
         )
