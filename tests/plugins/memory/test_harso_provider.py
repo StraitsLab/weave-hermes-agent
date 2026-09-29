@@ -16,6 +16,43 @@ from agent.memory_manager import MemoryManager
 from agent.turn_context import compose_user_api_content
 
 
+# -- HARSO-PLUGIN-TOOLS: legacy tests run with both new features OFF --------
+# The pre-existing tests pin the base behaviour. They run with
+# plugins.harso.tools_enabled / profile_enabled false, injected through the
+# real config read path (not by patching the provider), which proves "flags
+# off == base" for every one of them. Tests that request ``features_on``
+# see the config exactly as written (defaults: both on).
+@pytest.fixture
+def features_on():
+    return True
+
+
+@pytest.fixture(autouse=True)
+def _legacy_features_off(request, monkeypatch):
+    if "features_on" in request.fixturenames:
+        return
+    import hermes_cli.config as config_module
+
+    real = config_module.load_config_readonly
+
+    def load():
+        config = real()
+        if not isinstance(config, dict):
+            return config
+        plugins = config.get("plugins")
+        if plugins is None:
+            plugins = {}
+        if not isinstance(plugins, dict):
+            return config
+        section = plugins.get("harso", {}) if "harso" in plugins else {}
+        if not isinstance(section, dict):
+            return config
+        section = {"tools_enabled": False, "profile_enabled": False, **section}
+        return {**config, "plugins": {**plugins, "harso": section}}
+
+    monkeypatch.setattr(config_module, "load_config_readonly", load)
+
+
 # Fixed MemoryService.context DTO from weave-cloud c3d41e9f9e258102e4d9422efcaff39f417dbc23.
 def _recall_body():
     return {
