@@ -178,6 +178,13 @@ TOOLSETS = {
         "tools": ["skills_list", "skill_view", "skill_manage"],
         "includes": []
     },
+
+    # Read-only skills for sandboxed workers (Weave WEM): list and view, never skill_manage.
+    "skills-read": {
+        "description": "List and read skill documents (no create/edit/delete)",
+        "tools": ["skills_list", "skill_view"],
+        "includes": []
+    },
     
     "browser": {
         "description": "Browser automation for web interaction (navigate, click, type, scroll, iframes, hold-click) with web search for finding URLs",
