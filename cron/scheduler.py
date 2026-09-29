@@ -3314,7 +3314,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # turn and rewrite the brief.
         from gateway.wake import adapter_supports_push
 
-        if runtime_adapter is not None and not adapter_supports_push(runtime_adapter):
+        # A multiplex secondary profile ticks with its own adapter map, which never holds api_server (the one API
+        # listener is the default profile's, and it serves every profile from that profile's own state.db). The
+        # append below needs only this profile's SessionDB, which the tick's HERMES_HOME override already selects,
+        # so an api_server target takes it with or without a live adapter; send() can never deliver there.
+        if platform == Platform.API_SERVER or (
+            runtime_adapter is not None and not adapter_supports_push(runtime_adapter)
+        ):
             from gateway.mirror import mirror_to_session
             from hermes_state import SessionDB
 
