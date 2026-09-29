@@ -380,3 +380,61 @@ def test_expired_but_unclaimed_lease_still_delivers(adapter, gateway_loop):
 
     assert _deliver_paused_past_lease_expiry(adapter, gateway_loop, lambda: None) is None
     assert _rows(db)[-1] == ("assistant", DIGEST)
+
+
+def test_secondary_profile_job_lands_without_a_live_adapter(adapter, gateway_loop):
+    """Multiplex: a secondary profile's cron ticks with its OWN adapter map, which never holds api_server (the one
+    API listener belongs to the default profile). The brief must still land in the conversation's transcript: the
+    api_server target is a session id in this profile's SessionDB, so no live adapter is needed, and send() (which
+    cannot push) must never be tried. Harso W0 Q2, 2026-09-29: every digest failed with the send() stub error."""
+    db = adapter._session_db
+    _seed_scheduling_turn(db)
+    job = {"id": "076f2d35c776", "name": "digest", "deliver": "origin",
+           "origin": {"platform": "api_server", "chat_id": SID}}
+    cfg = GatewayConfig(platforms={Platform.API_SERVER: PlatformConfig(enabled=True)})
+    with patch("gateway.config.load_gateway_config", return_value=cfg), \
+         patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+         patch.object(APIServerAdapter, "send", side_effect=AssertionError("send() called")):
+        error = _deliver_result(job, DIGEST, adapters={}, loop=gateway_loop)
+
+    assert error is None
+    assert _rows(db)[-1] == ("assistant", DIGEST)
+    assert len(_rows(db)) == 3
+    assert db.try_acquire_session_turn_lease(SID, "next-turn")  # cron released it
+
+
+def test_secondary_profile_brief_lands_in_that_profiles_state_db(tmp_path, gateway_loop, monkeypatch):
+    """The append must land in the SECONDARY profile's state.db (where the default profile's API listener reads that
+    profile's conversations), never in the default profile's DB. The multiplex tick selects the profile with a
+    context-local HERMES_HOME override; no adapter map is passed."""
+    import hermes_state
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    # conftest re-points DEFAULT_DB_PATH (which outranks HERMES_HOME); production leaves it at the import-time
+    # value, so SessionDB() follows the per-profile override. Restore that production resolution here.
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
+    default_home, general_home = tmp_path / "default", tmp_path / "profiles" / "general"
+    for home in (default_home, general_home):
+        home.mkdir(parents=True)
+    with SessionDB(db_path=general_home / "state.db") as db:
+        _seed_scheduling_turn(db)
+    with SessionDB(db_path=default_home / "state.db") as db:
+        db.create_session("default-conversation", "api_server")
+
+    job = {"id": "076f2d35c776", "name": "digest", "deliver": "origin",
+           "origin": {"platform": "api_server", "chat_id": SID}}
+    cfg = GatewayConfig(platforms={Platform.API_SERVER: PlatformConfig(enabled=True)})
+    token = set_hermes_home_override(str(general_home))
+    try:
+        with patch("gateway.config.load_gateway_config", return_value=cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch.object(APIServerAdapter, "send", side_effect=AssertionError("send() called")):
+            error = _deliver_result(job, DIGEST, adapters={}, loop=gateway_loop)
+    finally:
+        reset_hermes_home_override(token)
+
+    assert error is None
+    with SessionDB(db_path=general_home / "state.db") as db:
+        assert _rows(db)[-1] == ("assistant", DIGEST)
+    with SessionDB(db_path=default_home / "state.db") as db:
+        assert db.get_messages(SID) == []
