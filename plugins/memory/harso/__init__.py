@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import contextvars
+from collections import OrderedDict
+import hashlib
 import json
 import logging
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from agent.message_content import flatten_message_text
 from agent.memory_provider import MemoryProvider
@@ -54,6 +59,182 @@ _ACTION = rf"external action: (?:likely|unlikely|unsure) \({_P}\)"
 # free text can match, so nothing instruction-shaped reaches the chat model.
 _ROUTING_HINT = re.compile(
     rf"Routing hint: (?:(?:inline|work) \({_P}\)(?:; {_ACTION})?|none; {_ACTION})")
+# Always-on profile + memory tools (config.yaml ``plugins.harso``).
+_PROFILE_WAIT_SECONDS = 1.0
+_PROFILE_TIMEOUT_SECONDS = 3
+_TOOL_TIMEOUT_SECONDS = 8
+_PROFILE_HEADER = "Profile (always-on memory):"
+# Bound on per-session profile cache entries held by one (cached) agent.
+_PROFILE_CACHE_SESSIONS = 64
+# Process-wide warm-up fetch pool: at most this many worker threads for ALL
+# providers and sessions (a trickling server cannot pile up daemons). Waiting
+# jobs run newest first, so the chat that just opened is never starved.
+_PROFILE_FETCH_MAX = 8
+_PROFILE_PENDING_MAX = 64
+_FETCH_LOCK = threading.Lock()
+_FETCH_PENDING: "OrderedDict[Tuple[str, ...], Any]" = OrderedDict()
+_FETCH_WORKERS = 0
+
+
+def _fetch_worker() -> None:
+    global _FETCH_WORKERS
+    while True:
+        with _FETCH_LOCK:
+            if not _FETCH_PENDING:
+                _FETCH_WORKERS -= 1
+                return
+            _key, job = _FETCH_PENDING.popitem(last=True)
+        try:
+            job(False)
+        except Exception:  # a job never raises; the pool must outlive one that does
+            pass
+
+
+def _schedule_fetch(key: Tuple[str, ...], job: Any) -> None:
+    """Queue ``job(skip)``; start a worker if under the process-wide cap.
+    Every job leaves the queue by exactly one path: a worker runs it, or it
+    is displaced (same key, or oldest past the pending cap) and run with
+    skip=True (cleanup only), so no waiter hangs."""
+    global _FETCH_WORKERS
+    dropped = []
+    with _FETCH_LOCK:
+        replaced = _FETCH_PENDING.pop(key, None)
+        if replaced is not None:
+            dropped.append(replaced)
+        _FETCH_PENDING[key] = job
+        if len(_FETCH_PENDING) > _PROFILE_PENDING_MAX:
+            dropped.append(_FETCH_PENDING.popitem(last=False)[1])
+        start = _FETCH_WORKERS < _PROFILE_FETCH_MAX
+        if start:
+            _FETCH_WORKERS += 1
+    for stale in dropped:
+        stale(True)
+    if start:
+        try:
+            threading.Thread(target=_fetch_worker, daemon=True, name="harso-profile").start()
+        except Exception:
+            with _FETCH_LOCK:
+                _FETCH_WORKERS -= 1
+                orphan = _FETCH_PENDING.pop(key, None)
+            if orphan is not None:
+                orphan(True)
+            raise
+# Readiness answers are tiny; bound the read so a trickling body cannot pin a thread.
+_READINESS_MAX_BYTES = 4096
+_FENCE_OPEN, _FENCE_CLOSE = "<memory-data untrusted>", "</memory-data>"
+
+
+def _fenced(text: str) -> bool:
+    """Exactly one server fence around the whole text (weave-api memory_delivery.face_envelope)."""
+    return (text.startswith(_FENCE_OPEN) and text.endswith(_FENCE_CLOSE)
+            and text.count(_FENCE_OPEN) == 1 and text.count(_FENCE_CLOSE) == 1)
+_TOOL_UNAVAILABLE = json.dumps({"error": "memory unavailable"})
+# tool name -> (wire action, argument key or None)
+_TOOL_ACTIONS = {
+    "memory_profile": ("profile", None),
+    "memory_search": ("search", "query"),
+    "memory_open": ("open", "ref"),
+}
+_TOOL_SCHEMAS = [
+    {
+        "name": "memory_profile",
+        "description": "The user's current always-on profile.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "memory_search",
+        "description": (
+            "Search the user's long-term memory (facts, preferences, past "
+            "conversations). Use before saying you don't know something about "
+            "the user."),
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "What to look for."}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "memory_open",
+        "description": "Open one memory ref from memory_search to see its full text and sources.",
+        "parameters": {
+            "type": "object",
+            "properties": {"ref": {"type": "string", "description": "A ref from memory_search."}},
+            "required": ["ref"],
+        },
+    },
+]
+
+
+def _render_recall(response: Any, max_chars: int, profile: str = "") -> str:
+    """Render a /internal/harso/context response within ``max_chars``.
+
+    A recall item whose text already appears verbatim in ``profile`` is
+    skipped; with no profile this is exactly the base prefetch rendering."""
+    if not response:
+        return ""
+    # Jev's advisory hint is independent of recall: it renders with or
+    # without admitted memory, after items and gaps. Anything else drops.
+    hint = response.get("routing_hint")
+    hint = hint.strip() if isinstance(hint, str) and len(hint.strip()) <= 200 else ""
+    hint = hint if _ROUTING_HINT.fullmatch(hint) else ""
+    # Explicit recall status supersedes the legacy degraded boolean.
+    if "recall_status" in response:
+        if response["recall_status"] not in ("ok", "degraded"):
+            return hint
+    elif response.get("degraded") is True:
+        return hint
+    items = response.get("items")
+    if not isinstance(items, list):
+        return hint
+    lines = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        citation, text = item.get("citation"), item.get("text")
+        citations = item.get("citations")
+        # Wire-contract ceiling per entry, not a recall-breadth tuning knob.
+        if (isinstance(citations, list) and citations
+                and all(isinstance(ref, str) and ref.strip() for ref in citations)):
+            citation = " ".join(citations[:64])
+        if (isinstance(citation, str) and citation.strip()
+                and isinstance(text, str) and text.strip()):
+            if profile and text.strip() in profile:
+                continue  # already shown verbatim in the always-on profile
+            lines.append(f"{_date_prefix(item.get('occurred_at'))}{citation} {text}")
+    gaps = response.get("gaps")
+    reasons = list(dict.fromkeys(
+        gap["reason"] for gap in gaps
+        if isinstance(gap, dict) and gap.get("reason") in _GAP_REASONS
+    ))[:5] if isinstance(gaps, list) else []
+
+    def render(kept: List[str], excluded: bool) -> str:
+        parts = list(kept)
+        # Gaps may annotate admitted evidence, never create context by
+        # themselves; the hint is independent of memory admission.
+        if lines:
+            shown = reasons + ["budget-excluded"] if (
+                excluded and "budget-excluded" not in reasons) else reasons
+            if shown:
+                parts.append("Memory gaps: " + ", ".join(shown))
+        if hint:
+            parts.append(hint)
+        return "\n".join(parts)
+
+    # context_max_chars bounds the COMPLETE output, gaps line and hint
+    # included. Over it, keep a whole-item prefix in server order under the
+    # room left by the final suffix; never cut an item. The suffix is at
+    # most 278 chars, under the 1024 minimum, so an admitted item excluded
+    # by the bound is always reported as budget-excluded, even if none fit.
+    output = render(lines, False)
+    if len(output) <= max_chars:
+        return output
+    used, kept = len(render([], True)), []
+    for line in lines:
+        if used + len(line) + 1 > max_chars:
+            break
+        used += len(line) + 1
+        kept.append(line)
+    return render(kept, True)
 
 
 class HarsoWriteError(RuntimeError):
@@ -109,6 +290,43 @@ def _prefetch_limits() -> tuple[float, int, int]:
     return timeout, max_bytes, max_chars
 
 
+def _feature_settings() -> Tuple[bool, bool, float]:
+    """Read ``plugins.harso.tools_enabled`` / ``profile_enabled`` /
+    ``profile_wait`` per call.
+
+    Absent keys are silent; an invalid key warns content-free and uses its
+    default. An unreadable config or malformed section silently uses the
+    defaults here: ``_prefetch_limits`` already reports those."""
+    tools, profile, wait = True, True, _PROFILE_WAIT_SECONDS
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        return tools, profile, wait
+    plugins = config.get("plugins") if isinstance(config, dict) else None
+    section = plugins.get("harso") if isinstance(plugins, dict) else None
+    if not isinstance(section, dict):
+        return tools, profile, wait
+    for key in ("tools_enabled", "profile_enabled"):
+        if key in section:
+            if isinstance(section[key], bool):
+                if key == "tools_enabled":
+                    tools = section[key]
+                else:
+                    profile = section[key]
+            else:
+                logger.warning("plugins.harso.%s invalid; using true", key)
+    if "profile_wait" in section:
+        raw = section["profile_wait"]
+        if (not isinstance(raw, bool) and isinstance(raw, (int, float))
+                and 0 <= raw <= _TIMEOUT_SECONDS):
+            wait = float(raw)
+        else:
+            logger.warning("plugins.harso.profile_wait invalid; using %.1fs", wait)
+    return tools, profile, wait
+
+
 def _date_prefix(occurred_at: Any) -> str:
     """``[YYYY-MM-DD HH:MM] `` in UTC for an ISO-8601 string, else ``""``.
 
@@ -130,6 +348,11 @@ class HarsoMemoryProvider(MemoryProvider):
 
     def __init__(self) -> None:
         self._session_id = ""
+        # session id -> profile text ("" once a fetch completed without one).
+        self._profile: Dict[str, str] = {}
+        # session id -> Event set when the in-flight profile fetch finishes.
+        self._profile_inflight: Dict[str, threading.Event] = {}
+        self._profile_lock = threading.Lock()
 
     # Resolved at call time, never snapshotted in __init__: the provider is
     # constructed once at gateway start, but on the shared host Hermes runs in
@@ -175,15 +398,139 @@ class HarsoMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **_kwargs: Any) -> None:
         self._session_id = session_id
+        self._start_profile_fetch(session_id)
 
     def on_session_switch(self, new_session_id: str, **_kwargs: Any) -> None:
         # A cached gateway agent serves a new conversation: calls that fall
         # back to the bound session must name the current one, not the first.
         if new_session_id:
             self._session_id = new_session_id
+            self._start_profile_fetch(new_session_id)
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        # After each turn: refresh the always-on profile for the next one.
+        self._start_profile_fetch(session_id or self._session_id)
+
+    # -- Always-on profile ----------------------------------------------------
+
+    def _profile_key(self, session_id: str) -> Tuple[str, ...]:
+        """Cache key bound to the CURRENT secret scope: a cached agent reused
+        under another profile (multiplex) or revision never sees this entry."""
+        route = hashlib.sha256(self._route_key.encode("utf-8")).hexdigest()
+        return (self._endpoint, self._profile_id, self._profile_revision_id, route, session_id)
+
+    def _start_profile_fetch(self, session_id: str) -> None:
+        """Warm admission and refresh the profile on a daemon thread.
+
+        Never raises into the caller; at most one fetch per session in flight."""
+        try:
+            if not session_id or not _feature_settings()[1] or not self.is_available():
+                return
+            key = self._profile_key(session_id)
+            with self._profile_lock:
+                if key in self._profile_inflight:
+                    return
+                done = threading.Event()
+                self._profile_inflight[key] = done
+            # Copy the caller's context: multiplex secrets live in a ContextVar.
+            context = contextvars.copy_context()
+
+            def job(skip: bool) -> None:
+                context.run(self._fetch_profile, session_id, key, done, skip)
+
+            # F3: the process-wide pool bounds threads; newest job runs first.
+            _schedule_fetch(key, job)
+        except Exception as exc:
+            logger.warning("Harso profile fetch not started: %s", type(exc).__name__)
+
+    def _fetch_profile(self, session_id: str, key: Tuple[str, ...], done: threading.Event,
+                       skip: bool = False) -> None:
+        text = None
+        try:
+            if skip:  # evicted from the pending queue: release waiters only
+                return
+            scope = self._scope(session_id)
+            # Warm the server's admission cache before turn 1's recall.
+            self._post("/internal/harso/readiness", dict(scope),
+                       timeout=_PROFILE_TIMEOUT_SECONDS, max_bytes=_READINESS_MAX_BYTES)
+            response = self._post(
+                "/internal/harso/memory-tool",
+                {**scope, "action": "profile", "argument": ""},
+                timeout=_PROFILE_TIMEOUT_SECONDS,
+                max_bytes=_prefetch_limits()[1],
+            )
+            if response is not None:
+                found, body = response.get("found"), response.get("text")
+                # F2: only the server's fenced envelope is ever injected.
+                body = body.strip() if isinstance(body, str) else ""
+                text = body if (found is True and _fenced(body)) else ""
+        except Exception as exc:
+            logger.warning("Harso profile fetch failed: %s", type(exc).__name__)
+        finally:
+            with self._profile_lock:
+                # A failed refresh keeps the last good profile; a completed
+                # first fetch always records a value so later turns never wait.
+                if text is not None or key not in self._profile:
+                    self._profile.pop(key, None)
+                    self._profile[key] = text or ""
+                    while len(self._profile) > _PROFILE_CACHE_SESSIONS:
+                        self._profile.pop(next(iter(self._profile)))
+                if self._profile_inflight.get(key) is done:
+                    self._profile_inflight.pop(key, None)
+            done.set()
+
+    def _cached_profile(self, session_id: str, deadline: float) -> str:
+        """The cached profile; before the first fetch lands, wait until
+        ``deadline`` for it, then continue without."""
+        key = self._profile_key(session_id)
+        with self._profile_lock:
+            text = self._profile.get(key)
+            pending = self._profile_inflight.get(key)
+        if text is None and pending is not None:
+            pending.wait(max(0.0, deadline - time.monotonic()))
+            with self._profile_lock:
+                text = self._profile.get(key)
+        return text if text and _fenced(text) else ""
+
+    # -- Tools ----------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return []
+        if not _feature_settings()[0]:
+            return []
+        return json.loads(json.dumps(_TOOL_SCHEMAS))
+
+    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **_kwargs: Any) -> str:
+        """POST one memory-tool action; always a JSON string, never raises."""
+        try:
+            if tool_name not in _TOOL_ACTIONS or not _feature_settings()[0]:
+                return _TOOL_UNAVAILABLE
+            action, key = _TOOL_ACTIONS[tool_name]
+            argument = ""
+            if key is not None:
+                argument = args.get(key) if isinstance(args, dict) else None
+                if not isinstance(argument, str) or not argument.strip():
+                    return json.dumps({"error": f"{key} is required"})
+                argument = argument.strip()
+            session_id = self._session_id
+            if not session_id or not self.is_available():
+                return _TOOL_UNAVAILABLE
+            response = self._post(
+                "/internal/harso/memory-tool",
+                {**self._scope(session_id), "action": action, "argument": argument},
+                timeout=_TOOL_TIMEOUT_SECONDS,
+                max_bytes=_prefetch_limits()[1],
+            )
+            if not isinstance(response, dict):
+                return _TOOL_UNAVAILABLE
+            out = json.dumps(response)
+            # F4: the SERIALIZED result is what reaches the model; bound it.
+            if len(out) > min(_prefetch_limits()[2], _prefetch_limits()[1]):
+                logger.warning("Harso memory tool result over cap; dropped")
+                return json.dumps({"error": "memory result too large"})
+            return out
+        except Exception as exc:
+            logger.warning("Harso memory tool failed: %s", type(exc).__name__)
+            return _TOOL_UNAVAILABLE
 
     def _post(
         self,
@@ -215,7 +562,10 @@ class HarsoMemoryProvider(MemoryProvider):
                 payload = json.loads(body.decode("utf-8"))
                 return payload if isinstance(payload, dict) else None
         except (OSError, ValueError, urllib.error.HTTPError) as exc:
-            logger.warning("Harso request unavailable: %s", exc)
+            # Content-free: an HTTP reason or URL error text may echo headers.
+            status = getattr(exc, "code", None)
+            logger.warning("Harso request unavailable: %s%s", type(exc).__name__,
+                           f" {status}" if isinstance(status, int) else "")
             return None
 
     def _scope(self, session_id: str) -> Dict[str, str]:
@@ -242,6 +592,9 @@ class HarsoMemoryProvider(MemoryProvider):
         # Keep the head: user intent normally precedes pasted supporting text.
         query = query[:4096]
         timeout, max_bytes, max_chars = _prefetch_limits()
+        _tools, profile_on, profile_wait = _feature_settings()
+        # The profile wait overlaps the recall POST: at most wait + timeout.
+        deadline = time.monotonic() + profile_wait
         response = self._post(
             "/internal/harso/context",
             {
@@ -251,69 +604,22 @@ class HarsoMemoryProvider(MemoryProvider):
             timeout=timeout,
             max_bytes=max_bytes,
         )
-        if not response:
-            return ""
-        # Jev's advisory hint is independent of recall: it renders with or
-        # without admitted memory, after items and gaps. Anything else drops.
-        hint = response.get("routing_hint")
-        hint = hint.strip() if isinstance(hint, str) and len(hint.strip()) <= 200 else ""
-        hint = hint if _ROUTING_HINT.fullmatch(hint) else ""
-        # Explicit recall status supersedes the legacy degraded boolean.
-        if "recall_status" in response:
-            if response["recall_status"] not in ("ok", "degraded"):
-                return hint
-        elif response.get("degraded") is True:
-            return hint
-        items = response.get("items")
-        if not isinstance(items, list):
-            return hint
-        lines = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            citation, text = item.get("citation"), item.get("text")
-            citations = item.get("citations")
-            # Wire-contract ceiling per entry, not a recall-breadth tuning knob.
-            if (isinstance(citations, list) and citations
-                    and all(isinstance(ref, str) and ref.strip() for ref in citations)):
-                citation = " ".join(citations[:64])
-            if (isinstance(citation, str) and citation.strip()
-                    and isinstance(text, str) and text.strip()):
-                lines.append(f"{_date_prefix(item.get('occurred_at'))}{citation} {text}")
-        gaps = response.get("gaps")
-        reasons = list(dict.fromkeys(
-            gap["reason"] for gap in gaps
-            if isinstance(gap, dict) and gap.get("reason") in _GAP_REASONS
-        ))[:5] if isinstance(gaps, list) else []
-
-        def render(kept: List[str], excluded: bool) -> str:
-            parts = list(kept)
-            # Gaps may annotate admitted evidence, never create context by
-            # themselves; the hint is independent of memory admission.
-            if lines:
-                shown = reasons + ["budget-excluded"] if (
-                    excluded and "budget-excluded" not in reasons) else reasons
-                if shown:
-                    parts.append("Memory gaps: " + ", ".join(shown))
-            if hint:
-                parts.append(hint)
-            return "\n".join(parts)
-
-        # context_max_chars bounds the COMPLETE output, gaps line and hint
-        # included. Over it, keep a whole-item prefix in server order under the
-        # room left by the final suffix; never cut an item. The suffix is at
-        # most 278 chars, under the 1024 minimum, so an admitted item excluded
-        # by the bound is always reported as budget-excluded, even if none fit.
-        output = render(lines, False)
-        if len(output) <= max_chars:
-            return output
-        used, kept = len(render([], True)), []
-        for line in lines:
-            if used + len(line) + 1 > max_chars:
-                break
-            used += len(line) + 1
-            kept.append(line)
-        return render(kept, True)
+        if not profile_on:
+            return _render_recall(response, max_chars)
+        profile = self._cached_profile(session_id, deadline)
+        if not profile:
+            return _render_recall(response, max_chars)
+        # The profile counts toward context_max_chars and is never cut: over
+        # the cap by itself it drops. Recall then fits the room left, whole
+        # items only; if not even its gaps/hint suffix fits, the profile wins.
+        block = f"{_PROFILE_HEADER}\n{profile}"
+        if len(block) > max_chars:
+            return _render_recall(response, max_chars)
+        room = max_chars - len(block) - 1
+        recall = _render_recall(response, room, profile) if room > 0 else ""
+        if not recall or len(recall) > room:
+            return block
+        return f"{block}\n{recall}"
 
     def sync_turn(
         self,
