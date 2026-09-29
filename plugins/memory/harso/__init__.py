@@ -176,6 +176,12 @@ class HarsoMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **_kwargs: Any) -> None:
         self._session_id = session_id
 
+    def on_session_switch(self, new_session_id: str, **_kwargs: Any) -> None:
+        # A cached gateway agent serves a new conversation: calls that fall
+        # back to the bound session must name the current one, not the first.
+        if new_session_id:
+            self._session_id = new_session_id
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return []
 

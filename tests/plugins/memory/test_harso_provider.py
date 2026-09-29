@@ -645,6 +645,20 @@ def test_prefetch_explicit_session_overrides_initialized_session(monkeypatch):
     assert HarsoContextInput.model_validate(seen[0]["body"]).hermes_session_ref == other_session
 
 
+def test_session_switch_rebinds_the_fallback_session(monkeypatch):
+    # A cached gateway agent serving a new conversation must not recall or
+    # write under the first conversation's session.
+    provider = _provider(monkeypatch)
+    seen = _capture_turn(monkeypatch)
+    provider.initialize("weave-01990000-0000-7000-8000-000000000001")
+    provider.on_session_switch("weave-01990000-0000-7000-8000-000000000005")
+    provider.prefetch("Recall the decision")
+    provider.on_session_switch("")
+    provider.prefetch("Recall the decision")
+    refs = [entry["body"]["hermes_session_ref"] for entry in seen]
+    assert refs == ["weave-01990000-0000-7000-8000-000000000005"] * 2
+
+
 def test_prefetch_without_any_session_skips_request(monkeypatch):
     provider = _provider(monkeypatch)
     seen = _capture_turn(monkeypatch)
