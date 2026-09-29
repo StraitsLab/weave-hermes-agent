@@ -563,13 +563,13 @@ async def test_interrupt_is_demoted_to_queue_while_the_gateway_would_demote_it(a
     assert agent.interrupted == []
 
 
-async def _post_submit(adapter, request_id, busy_mode, message="hello"):
+async def _post_submit(adapter, request_id, busy_mode, message="hello", **extra):
     adapter.gateway_runner.session_credential_available = lambda *_args: True
     client = await _client(adapter)
     try:
         response = await client.post(f"/api/sessions/{SESSION_ID}/submit",
                                      headers={"Authorization": f"Bearer {adapter.config.extra['key']}"},
-                                     json={**_request(request_id, message), "busy_mode": busy_mode})
+                                     json={**_request(request_id, message), "busy_mode": busy_mode, **extra})
         return response.status, await response.json()
     finally:
         await client.close()
@@ -707,3 +707,65 @@ async def test_an_interrupt_is_dropped_if_its_target_changed_during_the_compress
 
     assert admission == "queued" and queued == ["new task"]
     assert agent.interrupted == []
+
+
+@pytest.mark.asyncio
+async def test_expected_target_mismatch_has_no_side_effects(adapter):
+    agent = _Agent()
+    queued = _busy_adapter(adapter, agent)
+    for mode in ("steer", "interrupt"):
+        result = await adapter._admit_native_session_submit(SESSION_ID, "later", "native-q", busy_mode=mode, expected_active_ref="finished-ref")
+        assert result == "target_changed"
+        assert queued == [] and agent.steered == [] and agent.interrupted == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["steer", "interrupt"])
+async def test_expected_target_is_precondition_not_replay_identity(adapter, mode):
+    agent = _Agent()
+    queued = _busy_adapter(adapter, agent)
+    target = next(iter(adapter._native_submit_active_refs.values()))
+    first, one = await _post_submit(adapter, "fenced-replay", mode, expected_active_ref=target)
+    assert first == 202
+    actions = (list(queued), list(agent.steered), list(agent.interrupted))
+    second, two = await _post_submit(adapter, "fenced-replay", mode, expected_active_ref="gone")
+    assert second == 202 and two == one
+    assert actions == (queued, agent.steered, agent.interrupted)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["steer", "interrupt"])
+async def test_expected_target_refusal_leaves_no_record_and_can_queue(adapter, mode):
+    agent = _Agent()
+    queued = _busy_adapter(adapter, agent)
+    status, body = await _post_submit(adapter, "fenced-refusal", mode, expected_active_ref="unrelated-native-ref")
+    assert status == 409 and body["error"]["code"] == "native_submit_target_changed"
+    assert queued == agent.steered == agent.interrupted == []
+    status, body = await _post_submit(adapter, "fenced-refusal", "queue")
+    assert status == 202 and body["admission"] == "queued"
+    assert queued == ["hello"]
+
+
+@pytest.mark.asyncio
+async def test_expected_target_fence_after_compression_await(adapter):
+    agent = _Agent()
+    agent._active_children = []
+    queued = _busy_adapter(adapter, agent)
+    target = next(iter(adapter._native_submit_active_refs.values()))
+    async def compression(key):
+        await asyncio.sleep(0)
+        adapter._native_submit_active_refs[key] = "unrelated-native-ref"
+        return False
+    adapter.gateway_runner._session_has_compression_in_flight = compression
+    status, body = await _post_submit(adapter, "fenced-await", "interrupt", expected_active_ref=target)
+    assert status == 409 and body["error"]["code"] == "native_submit_target_changed"
+    assert queued == agent.steered == agent.interrupted == []
+    status, _ = await _post_submit(adapter, "fenced-await", "queue")
+    assert status == 202 and queued == ["hello"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", [None, "", 3, True, [], {}])
+async def test_expected_target_schema_rejects_invalid_values(adapter, target):
+    status, body = await _post_submit(adapter, "bad-target", "steer", expected_active_ref=target)
+    assert status == 400 and body["error"]["code"] == "invalid_native_submit_schema"

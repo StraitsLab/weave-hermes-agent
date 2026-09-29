@@ -5188,9 +5188,9 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({"status": "ready", "credential_slot": "GATE_B_API_KEY"})
 
     @staticmethod
-    def _native_submit_request(body: Dict[str, Any]) -> tuple[Optional[tuple[str, str, str]], Optional["web.Response"]]:
+    def _native_submit_request(body: Dict[str, Any]) -> tuple[Optional[tuple[str, str, str, Optional[str]]], Optional["web.Response"]]:
         """Validate the deliberately narrow native-admission request shape."""
-        if set(body) != {"kind", "external_request_id", "message", "busy_mode"}:
+        if set(body) - {"expected_active_ref"} != {"kind", "external_request_id", "message", "busy_mode"}:
             return None, web.json_response(
                 _openai_error("Invalid native submit schema", code="invalid_native_submit_schema"), status=400
             )
@@ -5200,6 +5200,7 @@ class APIServerAdapter(BasePlatformAdapter):
             body.get("kind") != "hermes.session.submit"
             or not isinstance(body.get("busy_mode"), str)
             or body["busy_mode"] not in _NATIVE_SUBMIT_BUSY_MODES
+            or ("expected_active_ref" in body and (not isinstance(body["expected_active_ref"], str) or not body["expected_active_ref"]))
             or not isinstance(request_id, str)
             or not re.fullmatch(r"[\x21-\x7e]{1,128}", request_id)
             or not isinstance(message, str)
@@ -5215,11 +5216,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return None, web.json_response(
                 _openai_error("Invalid native submit schema", code="invalid_native_submit_schema"), status=400
             )
-        return (request_id, message, body["busy_mode"]), None
+        return (request_id, message, body["busy_mode"], body.get("expected_active_ref")), None
 
     async def _admit_native_session_submit(
         self, session_id: str, message: str, native_request_ref: str,
-        external_request_id: str = "", busy_mode: str = "queue",
+        external_request_id: str = "", busy_mode: str = "queue", expected_active_ref: Optional[str] = None,
     ) -> str:
         """Submit one ordinary turn through the running gateway's writer lease."""
         runner = self.gateway_runner
@@ -5282,6 +5283,8 @@ class APIServerAdapter(BasePlatformAdapter):
         is_session_running = getattr(runner, "_is_session_running", None)
         if not busy and callable(is_session_running):
             busy = bool(is_session_running(entry.session_key))
+        if expected_active_ref is not None and busy_mode != "queue" and self._native_submit_active_ref(entry.session_key) != expected_active_ref:
+            return "target_changed"
         if busy:
             # Weave (WEV-2108): the caller's busy_mode, never the ambient policy. steer folds the
             # text into the running turn; interrupt stops it and runs this submit next. Either
@@ -5300,16 +5303,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._native_submit_steered.setdefault(active_ref, []).append(native_request_ref)
                     self._native_submit_event(native_request_ref, "turn.started", steered_into=active_ref)
                     return "steered"
-            runner._enqueue_fifo(entry.session_key, event, self)
             # The gateway's own interrupt paths demote to queue while subagents run (#30170) or
             # compression is in flight (#56391); this path keeps both guards.
             from gateway.run import GatewayRunner
 
             compressing = getattr(runner, "_session_has_compression_in_flight", None)
+            interruptible = (busy_mode == "interrupt" and agent is not None and active_ref
+                             and hasattr(agent, "interrupt") and not GatewayRunner._agent_has_active_subagents(agent))
+            compression = bool(interruptible and callable(compressing) and await compressing(entry.session_key))
+            if expected_active_ref is not None and busy_mode != "queue" and self._native_submit_active_ref(entry.session_key) != expected_active_ref:
+                return "target_changed"
+            runner._enqueue_fifo(entry.session_key, event, self)
             if (
-                busy_mode == "interrupt" and agent is not None and active_ref and hasattr(agent, "interrupt")
-                and not GatewayRunner._agent_has_active_subagents(agent)
-                and not (callable(compressing) and await compressing(entry.session_key))
+                interruptible and not compression
                 # Fence after the await: the same turn must still be running on the same agent, and
                 # the guards must still hold, or this request could interrupt itself or a subagent.
                 and self._native_submit_active_ref(entry.session_key) == active_ref
@@ -5362,7 +5368,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         assert parsed is not None
-        external_request_id, message, busy_mode = parsed
+        external_request_id, message, busy_mode, expected_active_ref = parsed
         db = await self._ensure_session_db_async()
         if db is None:
             return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
@@ -5406,6 +5412,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_id, message, native_request_ref,
                         external_request_id=external_request_id,
                         **({} if busy_mode == "queue" else {"busy_mode": busy_mode}),
+                        **({} if expected_active_ref is None else {"expected_active_ref": expected_active_ref}),
                     )
                 except Exception:
                     await asyncio.to_thread(
@@ -5416,6 +5423,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     return web.json_response(
                         _openai_error("Native gateway admission unavailable", code="native_admission_unavailable"), status=503
                     )
+                if admission == "target_changed":
+                    await asyncio.to_thread(db.remove_native_session_submit, external_request_id=external_request_id, native_request_ref=native_request_ref)
+                    return web.json_response(_openai_error("Active turn changed", code="native_submit_target_changed"), status=409)
                 if admission == "queued":
                     self.__dict__.setdefault("_native_queued_submit_refs", set()).add(native_request_ref)
                 await asyncio.to_thread(
