@@ -3507,7 +3507,11 @@ def _blank_slate_minimal_toolsets(config: dict):
                 # minimal Blank Slate surface (#57315).
             all_keys.add(k)
 
-        disabled = sorted(all_keys - keep)
+        # disabled_toolsets strips at tool granularity, so a toolset sharing a tool with a kept one (e.g. the
+        # read-only ``skills-read`` subset of ``skills``) must not be listed, or it removes that kept tool.
+        from toolsets import resolve_toolset
+        kept_tools = {t for ts in keep for t in resolve_toolset(ts)}
+        disabled = sorted(k for k in all_keys - keep if not set(resolve_toolset(k)) & kept_tools)
         if disabled:
             config.setdefault("agent", {})["disabled_toolsets"] = disabled
     except Exception as exc:
