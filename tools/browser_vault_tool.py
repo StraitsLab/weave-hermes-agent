@@ -170,7 +170,18 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
         except _bd_lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
+    # Arm the tab BEFORE the value lands (fork, V-9d): registry.dispatch then refuses model-driven eval and
+    # screenshots on it until its main frame commits a new document. A tab that cannot be armed is not written to.
+    try:
+        supervisor.arm_vault()
+    except Exception as exc:
+        return {"success": False, "error_type": "vault_arm_failed",
+                "error": f"Could not identify the tab to protect ({type(exc).__name__}); nothing was written."}
     sup = supervisor.evaluate_runtime(expression)
+    try:  # and again after: a document committed between the two holds the value too (arming only ever adds)
+        supervisor.arm_vault()
+    except Exception as exc:
+        logger.warning("vault fill: post-write arm failed (%s); the pre-write arm stands", type(exc).__name__)
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
     return {

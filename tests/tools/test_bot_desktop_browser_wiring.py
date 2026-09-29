@@ -233,6 +233,9 @@ def test_secret_write_re_admits_after_a_takeover_during_the_code_prompt(monkeypa
     evaluated: list = []
 
     class _Sup:
+        def arm_vault(self):  # V-9d: the write arms the tab first; arming is not what this test is about
+            pass
+
         def evaluate_runtime(self, expr):
             evaluated.append(expr)
             return {"ok": True, "result": "{}"}

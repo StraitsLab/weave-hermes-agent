@@ -72,6 +72,45 @@ def _bound_json_error_result(result: str) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _vault_armed_refusal(name: str, args: dict, task_id) -> Optional[str]:
+    """Fork (V-9d): a tab that received a vault value holds it in its DOM until it loads a new document. Redaction
+    cannot hide a value the model transforms in-page (btoa, reversal, char codes) or reads as pixels, so model-driven
+    page JS, raw CDP beyond the page-blind methods, browser-use code (js/cdp/capture_screenshot) and screenshots are
+    refused here, the one point every model tool call crosses, while any tab the call can reach is armed (the target
+    tab of an eval is not known here, and a same-origin tab can reach the armed one through window.opener). A CDP
+    override (the one browser browser_cdp reaches, target ids included) or the real-profile browser is one browser
+    every task drives, so there an armed tab of any task counts, whatever task id the call names. That holds when the
+    config selects one now OR the task's cached session was attached to one (it keeps driving that browser after the
+    config changes); a failed check counts as shared. The vault's own fill runs over the supervisor."""
+    if not (name in ("browser_vision", "browser_cdp", "browser_exec")
+            or (name == "browser_console" and args.get("expression") is not None)):
+        return None
+    from tools import browser_tool as bt
+    from tools.browser_supervisor import vault_armed
+
+    key = (task_id or "default").removesuffix("::local")
+    try:
+        with bt._cleanup_lock:
+            cached = [(bt._active_sessions.get(k) or {}).get("features") or {} for k in (key, key + "::local")]
+        shared = bool(bt._shared_browser_selected() or any(f.get("cdp_override") or f.get("real_profile") for f in cached))
+    except Exception:  # fail closed: an unknown browser may be the shared one
+        shared = True
+    if not vault_armed(None if shared else key):
+        return None
+    if name == "browser_cdp":
+        from tools.browser_cdp_tool import _CDP_PRIVATE_PAGE_ALLOWED_METHODS
+
+        url = str((args.get("params") or {}).get("url") or "http:").lower()
+        # Tab listing / navigation read no page content; a javascript: URL is page JS, not a navigation.
+        if args.get("method") in _CDP_PRIVATE_PAGE_ALLOWED_METHODS and url.startswith(("http:", "https:")):
+            return None
+    return tool_error(
+        "Refused: a tab holds a value filled from the vault. Reading the page with JavaScript, raw CDP, browser code "
+        "or a screenshot is blocked until that tab loads a new page (submit the form or navigate). Click, type, "
+        "press, scroll, snapshot and navigate still work.",
+        error_type="vault_armed", success=False)
+
+
 _INLINE_IMAGE_URL = re.compile(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/]*={0,2}")
 
 
@@ -1220,6 +1259,9 @@ class ToolRegistry:
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        refusal = _vault_armed_refusal(name, args, kwargs.get("task_id"))
+        if refusal is not None:
+            return refusal
         try:
             if entry.is_async:
                 from model_tools import _run_async

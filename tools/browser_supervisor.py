@@ -97,6 +97,70 @@ DIALOG_BRIDGE_HOST = "hermes-dialog-bridge.invalid"
 DIALOG_BRIDGE_URL_PATTERN = f"http://{DIALOG_BRIDGE_HOST}/*"
 
 
+# ── Vault-armed tabs (fork, V-9d) ────────────────────────────────────────────
+# A tab that received a vault value holds it in its DOM, where arbitrary page JS or a screenshot could read it
+# back in a form no redaction recognises. registry.dispatch refuses model-driven eval/screenshot calls on an armed
+# tab (tools.registry._vault_armed_refusal). State per browser session key -> tab target id (= its main frame id)
+# -> [the main frame's current loaderId, the loaderIds whose document received a value, whether the tab lives in a
+# browser that outlives the session (a CDP override or the real profile; unknown counts), the CDP endpoint of the
+# browser that holds it (in memory only, never logged: it can carry a ?token=)]. Only a supervisor on that same
+# endpoint reconciles the record (prune, close, new document); a tab absent from another browser is not closed, so an
+# endpoint that never reattaches keeps its tabs armed for the life of the process. The tab is armed while its
+# current document is one that received a value: a new document disarms it, a same-document (hash/pushState)
+# navigation does not, and a back/forward-cache restore of a filled document re-arms it.
+_VAULT_ARMED: Dict[str, Dict[str, list]] = {}
+_VAULT_ARMED_LOCK = threading.Lock()
+
+
+def vault_armed(task_id: Optional[str], target_id: Optional[str] = None) -> bool:
+    """Whether ``target_id`` (None: any tab) of any browser session of ``task_id`` (its bare id or a ``::local``
+    sidecar; None: every session, for a browser all tasks share) shows a document that received a vault value."""
+    bare = task_id and task_id.removesuffix("::local")
+    with _VAULT_ARMED_LOCK:
+        return any(tab[0] in tab[1] for key, tabs in _VAULT_ARMED.items()
+                   if bare is None or key.removesuffix("::local") == bare
+                   for tid, tab in tabs.items() if target_id is None or tid == target_id)
+
+
+def _vault_record(session_key: str, target_id: str, endpoint: str) -> Optional[list]:
+    """The tab's record if the browser at ``endpoint`` holds it (call under _VAULT_ARMED_LOCK)."""
+    tab = _VAULT_ARMED.get(session_key, {}).get(target_id)
+    return tab if tab is not None and tab[3] is not None and tab[3] == endpoint else None
+
+
+def _vault_forget(session_key: str, target_id: str, endpoint: str) -> None:
+    """The tab closed in the browser at ``endpoint``: its vault state goes with it."""
+    with _VAULT_ARMED_LOCK:
+        if _vault_record(session_key, target_id, endpoint) is not None:
+            del _VAULT_ARMED[session_key][target_id]
+
+
+def vault_forget_session(session_key: str) -> None:
+    """The session was retired and its browser died with it: forget the tabs it armed there, never a shared-browser
+    tab (that browser is still alive, and so is the value in the tab)."""
+    with _VAULT_ARMED_LOCK:
+        tabs = _VAULT_ARMED.get(session_key, {})
+        for tid in [tid for tid, tab in tabs.items() if not tab[2]]:
+            del tabs[tid]
+
+
+def _browser_outlives_session(session_key: str) -> bool:
+    """Whether the session's browser is one that outlives it (a CDP override or the real-profile browser). No
+    session, a failed lookup, or a live bare/::local twin (the supervisor may drive either browser) counts as yes:
+    an entry of unknown ownership is never forgotten on a retire."""
+    try:
+        from tools import browser_tool
+
+        bare = session_key.removesuffix("::local")
+        twin = bare if session_key != bare else bare + "::local"
+        with browser_tool._cleanup_lock:
+            info, twin_alive = browser_tool._active_sessions.get(session_key), twin in browser_tool._active_sessions
+        features = (info or {}).get("features") or {}
+        return info is None or twin_alive or bool(features.get("cdp_override") or features.get("real_profile"))
+    except Exception:
+        return True
+
+
 def _is_dialog_bridge(url: str) -> bool:
     """Exactly the bridge origin ``http://hermes-dialog-bridge.invalid`` (never a lookalike, path or query)."""
     try:
@@ -630,6 +694,27 @@ class CDPSupervisor:
         except Exception as exc:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
+    def arm_vault(self, timeout: float = 5.0) -> None:
+        """Mark the page session's tab vault-armed for the document it shows now (fork, V-9d). Raises when the tab
+        cannot be identified; the vault then refuses to write rather than leave a filled tab unguarded."""
+        loop = self._loop
+        with self._state_lock:
+            session_id = self._page_session_id if self._active else None
+        if loop is None or not session_id:
+            raise RuntimeError("supervisor has no attached page session")
+        from agent.async_utils import safe_schedule_threadsafe
+
+        fut = safe_schedule_threadsafe(self._cdp("Page.getFrameTree", session_id=session_id, timeout=timeout), loop)
+        if fut is None:
+            raise RuntimeError("Browser supervisor loop unavailable")
+        frame = fut.result(timeout=timeout + 1)["result"]["frameTree"]["frame"]
+        shared = _browser_outlives_session(self.task_id)
+        with _VAULT_ARMED_LOCK:
+            tab = _VAULT_ARMED.setdefault(self.task_id, {}).setdefault(frame["id"], [None, set(), False, self.cdp_url])
+            tab[0] = frame["loaderId"]
+            tab[1].add(frame["loaderId"])
+            tab[2] = tab[2] or shared
+
     def evaluate_runtime(
         self,
         expression: str,
@@ -875,7 +960,18 @@ class CDPSupervisor:
                 logger.warning("web bot auth: Fetch.enable failed (%s); browser requests stay unsigned",
                                type(e).__name__)
         resp = await self._cdp("Target.getTargets")
+        await self._cdp("Target.setDiscoverTargets", {"discover": True})  # Target.targetDestroyed = a tab closed
         targets = resp.get("result", {}).get("targetInfos", [])
+        # A supervisor stop does not disarm (an external CDP browser outlives it with the value still in the tab);
+        # tabs of THIS browser that are gone by the next attach are forgotten here (fork, V-9d).
+        live = {t.get("targetId") for t in targets}
+        with _VAULT_ARMED_LOCK:
+            tabs = _VAULT_ARMED.get(self.task_id, {})
+            for gone in [tid for tid in tabs if tid not in live and _vault_record(self.task_id, tid, self.cdp_url)]:
+                del tabs[gone]
+            foreign = sum(tab[3] != self.cdp_url for tab in tabs.values())
+        if foreign:
+            logger.info("vault: session %s keeps %d armed tab(s) of another browser", self.task_id, foreign)
         page_target = next((t for t in targets if t.get("type") == "page"), None)
         if page_target is None:
             created = await self._cdp("Target.createTarget", {"url": "about:blank"})
@@ -1038,6 +1134,8 @@ class CDPSupervisor:
             await self._on_target_attached(params)
         elif method == "Target.detachedFromTarget":
             self._on_target_detached(params)
+        elif method == "Target.targetDestroyed" and params.get("targetId"):  # a tab closed (fork, V-9d)
+            _vault_forget(self.task_id, params["targetId"], self.cdp_url)
         elif method == "Runtime.consoleAPICalled":
             self._on_console(params, level_from="api")
         elif method == "Runtime.exceptionThrown":
@@ -1413,6 +1511,10 @@ class CDPSupervisor:
                 name=str(frame.get("name") or (existing.name if existing else "")),
             )
             self._frames[frame_id] = info
+        with _VAULT_ARMED_LOCK:  # an armed tab's main frame committed a document: the tab now shows that one (V-9d)
+            tab = _vault_record(self.task_id, frame_id, self.cdp_url)  # keyed by main frame id: subframes never match
+            if tab is not None:
+                tab[0] = frame.get("loaderId")
 
     def _on_frame_detached(
         self, params: Dict[str, Any], session_id: Optional[str]
