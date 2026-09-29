@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import logging
 import re
@@ -64,6 +65,17 @@ _TOOL_TIMEOUT_SECONDS = 8
 _PROFILE_HEADER = "Profile (always-on memory):"
 # Bound on per-session profile cache entries held by one (cached) agent.
 _PROFILE_CACHE_SESSIONS = 64
+# Live warm-up fetches across ALL sessions (a trickling server cannot pile up daemons).
+_PROFILE_FETCH_MAX = 8
+# Readiness answers are tiny; bound the read so a trickling body cannot pin a thread.
+_READINESS_MAX_BYTES = 4096
+_FENCE_OPEN, _FENCE_CLOSE = "<memory-data untrusted>", "</memory-data>"
+
+
+def _fenced(text: str) -> bool:
+    """Exactly one server fence around the whole text (weave-api memory_delivery.face_envelope)."""
+    return (text.startswith(_FENCE_OPEN) and text.endswith(_FENCE_CLOSE)
+            and text.count(_FENCE_OPEN) == 1 and text.count(_FENCE_CLOSE) == 1)
 _TOOL_UNAVAILABLE = json.dumps({"error": "memory unavailable"})
 # tool name -> (wire action, argument key or None)
 _TOOL_ACTIONS = {
@@ -349,6 +361,12 @@ class HarsoMemoryProvider(MemoryProvider):
 
     # -- Always-on profile ----------------------------------------------------
 
+    def _profile_key(self, session_id: str) -> Tuple[str, ...]:
+        """Cache key bound to the CURRENT secret scope: a cached agent reused
+        under another profile (multiplex) or revision never sees this entry."""
+        route = hashlib.sha256(self._route_key.encode("utf-8")).hexdigest()
+        return (self._endpoint, self._profile_id, self._profile_revision_id, route, session_id)
+
     def _start_profile_fetch(self, session_id: str) -> None:
         """Warm admission and refresh the profile on a daemon thread.
 
@@ -356,15 +374,19 @@ class HarsoMemoryProvider(MemoryProvider):
         try:
             if not session_id or not _feature_settings()[1] or not self.is_available():
                 return
+            key = self._profile_key(session_id)
             with self._profile_lock:
-                if session_id in self._profile_inflight:
+                if key in self._profile_inflight:
+                    return
+                # F3: one bounded pool of live fetches across ALL sessions.
+                if len(self._profile_inflight) >= _PROFILE_FETCH_MAX:
                     return
                 done = threading.Event()
-                self._profile_inflight[session_id] = done
+                self._profile_inflight[key] = done
             # Copy the caller's context: multiplex secrets live in a ContextVar.
             thread = threading.Thread(
                 target=contextvars.copy_context().run,
-                args=(self._fetch_profile, session_id, done),
+                args=(self._fetch_profile, session_id, key, done),
                 daemon=True,
                 name="harso-profile",
             )
@@ -372,19 +394,19 @@ class HarsoMemoryProvider(MemoryProvider):
                 thread.start()
             except Exception:
                 with self._profile_lock:
-                    self._profile_inflight.pop(session_id, None)
+                    self._profile_inflight.pop(key, None)
                 done.set()
                 raise
         except Exception as exc:
             logger.warning("Harso profile fetch not started: %s", type(exc).__name__)
 
-    def _fetch_profile(self, session_id: str, done: threading.Event) -> None:
+    def _fetch_profile(self, session_id: str, key: Tuple[str, ...], done: threading.Event) -> None:
         text = None
         try:
             scope = self._scope(session_id)
             # Warm the server's admission cache before turn 1's recall.
             self._post("/internal/harso/readiness", dict(scope),
-                       timeout=_PROFILE_TIMEOUT_SECONDS)
+                       timeout=_PROFILE_TIMEOUT_SECONDS, max_bytes=_READINESS_MAX_BYTES)
             response = self._post(
                 "/internal/harso/memory-tool",
                 {**scope, "action": "profile", "argument": ""},
@@ -393,34 +415,36 @@ class HarsoMemoryProvider(MemoryProvider):
             )
             if response is not None:
                 found, body = response.get("found"), response.get("text")
-                text = body.strip() if (
-                    found is True and isinstance(body, str)) else ""
+                # F2: only the server's fenced envelope is ever injected.
+                body = body.strip() if isinstance(body, str) else ""
+                text = body if (found is True and _fenced(body)) else ""
         except Exception as exc:
             logger.warning("Harso profile fetch failed: %s", type(exc).__name__)
         finally:
             with self._profile_lock:
                 # A failed refresh keeps the last good profile; a completed
                 # first fetch always records a value so later turns never wait.
-                if text is not None or session_id not in self._profile:
-                    self._profile.pop(session_id, None)
-                    self._profile[session_id] = text or ""
+                if text is not None or key not in self._profile:
+                    self._profile.pop(key, None)
+                    self._profile[key] = text or ""
                     while len(self._profile) > _PROFILE_CACHE_SESSIONS:
                         self._profile.pop(next(iter(self._profile)))
-                if self._profile_inflight.get(session_id) is done:
-                    self._profile_inflight.pop(session_id, None)
+                if self._profile_inflight.get(key) is done:
+                    self._profile_inflight.pop(key, None)
             done.set()
 
     def _cached_profile(self, session_id: str, deadline: float) -> str:
         """The cached profile; before the first fetch lands, wait until
         ``deadline`` for it, then continue without."""
+        key = self._profile_key(session_id)
         with self._profile_lock:
-            text = self._profile.get(session_id)
-            pending = self._profile_inflight.get(session_id)
+            text = self._profile.get(key)
+            pending = self._profile_inflight.get(key)
         if text is None and pending is not None:
             pending.wait(max(0.0, deadline - time.monotonic()))
             with self._profile_lock:
-                text = self._profile.get(session_id)
-        return text or ""
+                text = self._profile.get(key)
+        return text if text and _fenced(text) else ""
 
     # -- Tools ----------------------------------------------------------------
 
@@ -452,7 +476,12 @@ class HarsoMemoryProvider(MemoryProvider):
             )
             if not isinstance(response, dict):
                 return _TOOL_UNAVAILABLE
-            return json.dumps(response)
+            out = json.dumps(response)
+            # F4: the SERIALIZED result is what reaches the model; bound it.
+            if len(out) > min(_prefetch_limits()[2], _prefetch_limits()[1]):
+                logger.warning("Harso memory tool result over cap; dropped")
+                return json.dumps({"error": "memory result too large"})
+            return out
         except Exception as exc:
             logger.warning("Harso memory tool failed: %s", type(exc).__name__)
             return _TOOL_UNAVAILABLE
@@ -487,7 +516,10 @@ class HarsoMemoryProvider(MemoryProvider):
                 payload = json.loads(body.decode("utf-8"))
                 return payload if isinstance(payload, dict) else None
         except (OSError, ValueError, urllib.error.HTTPError) as exc:
-            logger.warning("Harso request unavailable: %s", exc)
+            # Content-free: an HTTP reason or URL error text may echo headers.
+            status = getattr(exc, "code", None)
+            logger.warning("Harso request unavailable: %s%s", type(exc).__name__,
+                           f" {status}" if isinstance(status, int) else "")
             return None
 
     def _scope(self, session_id: str) -> Dict[str, str]:
