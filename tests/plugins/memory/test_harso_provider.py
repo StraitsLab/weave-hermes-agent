@@ -1788,8 +1788,10 @@ def test_r1_live_profile_fetches_are_bounded_across_sessions(monkeypatch, featur
     for i in range(40):
         provider.on_session_switch(f"weave-01990000-0000-7000-8000-{i:012d}")
     try:
-        assert len(provider._profile_inflight) <= 8
+        # Threads are bounded process-wide; extra sessions wait in the bounded queue.
         assert sum(t.name == "harso-profile" for t in threading.enumerate()) <= 8
+        harso = importlib.import_module("plugins.memory.harso")
+        assert len(harso._FETCH_PENDING) <= harso._PROFILE_PENDING_MAX
     finally:
         router.profile_gate.set()
         _settle(provider)
@@ -1820,3 +1822,18 @@ def test_r1_transport_errors_log_no_reason_text(monkeypatch, features_on, caplog
     assert "HTTPError 401" in caplog.text
     for secret in ("cell-bearer", "route-key", "rejected"):
         assert secret not in caplog.text
+
+
+def test_r2_displaced_same_key_job_is_released_not_orphaned(monkeypatch):
+    """Review r2: two providers queueing the same scope/session while all
+    workers are busy must not orphan the first waiter (done never set)."""
+    harso = importlib.import_module("plugins.memory.harso")
+    monkeypatch.setattr(harso, "_FETCH_PENDING", harso.OrderedDict())
+    monkeypatch.setattr(harso, "_FETCH_WORKERS", harso._PROFILE_FETCH_MAX)  # pool saturated
+    calls = []
+    harso._schedule_fetch(("scope", "s"), lambda skip: calls.append(("a", skip)))
+    harso._schedule_fetch(("scope", "s"), lambda skip: calls.append(("b", skip)))
+    assert calls == [("a", True)]  # A released (cleanup) the moment B displaced it
+    assert list(harso._FETCH_PENDING) == [("scope", "s")]
+    harso._FETCH_PENDING.pop(("scope", "s"))(False)
+    assert calls == [("a", True), ("b", False)]

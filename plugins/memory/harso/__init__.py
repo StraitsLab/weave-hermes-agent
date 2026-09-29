@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+from collections import OrderedDict
 import hashlib
 import json
 import logging
@@ -65,8 +66,59 @@ _TOOL_TIMEOUT_SECONDS = 8
 _PROFILE_HEADER = "Profile (always-on memory):"
 # Bound on per-session profile cache entries held by one (cached) agent.
 _PROFILE_CACHE_SESSIONS = 64
-# Live warm-up fetches across ALL sessions (a trickling server cannot pile up daemons).
+# Process-wide warm-up fetch pool: at most this many worker threads for ALL
+# providers and sessions (a trickling server cannot pile up daemons). Waiting
+# jobs run newest first, so the chat that just opened is never starved.
 _PROFILE_FETCH_MAX = 8
+_PROFILE_PENDING_MAX = 64
+_FETCH_LOCK = threading.Lock()
+_FETCH_PENDING: "OrderedDict[Tuple[str, ...], Any]" = OrderedDict()
+_FETCH_WORKERS = 0
+
+
+def _fetch_worker() -> None:
+    global _FETCH_WORKERS
+    while True:
+        with _FETCH_LOCK:
+            if not _FETCH_PENDING:
+                _FETCH_WORKERS -= 1
+                return
+            _key, job = _FETCH_PENDING.popitem(last=True)
+        try:
+            job(False)
+        except Exception:  # a job never raises; the pool must outlive one that does
+            pass
+
+
+def _schedule_fetch(key: Tuple[str, ...], job: Any) -> None:
+    """Queue ``job(skip)``; start a worker if under the process-wide cap.
+    Every job leaves the queue by exactly one path: a worker runs it, or it
+    is displaced (same key, or oldest past the pending cap) and run with
+    skip=True (cleanup only), so no waiter hangs."""
+    global _FETCH_WORKERS
+    dropped = []
+    with _FETCH_LOCK:
+        replaced = _FETCH_PENDING.pop(key, None)
+        if replaced is not None:
+            dropped.append(replaced)
+        _FETCH_PENDING[key] = job
+        if len(_FETCH_PENDING) > _PROFILE_PENDING_MAX:
+            dropped.append(_FETCH_PENDING.popitem(last=False)[1])
+        start = _FETCH_WORKERS < _PROFILE_FETCH_MAX
+        if start:
+            _FETCH_WORKERS += 1
+    for stale in dropped:
+        stale(True)
+    if start:
+        try:
+            threading.Thread(target=_fetch_worker, daemon=True, name="harso-profile").start()
+        except Exception:
+            with _FETCH_LOCK:
+                _FETCH_WORKERS -= 1
+                orphan = _FETCH_PENDING.pop(key, None)
+            if orphan is not None:
+                orphan(True)
+            raise
 # Readiness answers are tiny; bound the read so a trickling body cannot pin a thread.
 _READINESS_MAX_BYTES = 4096
 _FENCE_OPEN, _FENCE_CLOSE = "<memory-data untrusted>", "</memory-data>"
@@ -378,31 +430,25 @@ class HarsoMemoryProvider(MemoryProvider):
             with self._profile_lock:
                 if key in self._profile_inflight:
                     return
-                # F3: one bounded pool of live fetches across ALL sessions.
-                if len(self._profile_inflight) >= _PROFILE_FETCH_MAX:
-                    return
                 done = threading.Event()
                 self._profile_inflight[key] = done
             # Copy the caller's context: multiplex secrets live in a ContextVar.
-            thread = threading.Thread(
-                target=contextvars.copy_context().run,
-                args=(self._fetch_profile, session_id, key, done),
-                daemon=True,
-                name="harso-profile",
-            )
-            try:
-                thread.start()
-            except Exception:
-                with self._profile_lock:
-                    self._profile_inflight.pop(key, None)
-                done.set()
-                raise
+            context = contextvars.copy_context()
+
+            def job(skip: bool) -> None:
+                context.run(self._fetch_profile, session_id, key, done, skip)
+
+            # F3: the process-wide pool bounds threads; newest job runs first.
+            _schedule_fetch(key, job)
         except Exception as exc:
             logger.warning("Harso profile fetch not started: %s", type(exc).__name__)
 
-    def _fetch_profile(self, session_id: str, key: Tuple[str, ...], done: threading.Event) -> None:
+    def _fetch_profile(self, session_id: str, key: Tuple[str, ...], done: threading.Event,
+                       skip: bool = False) -> None:
         text = None
         try:
+            if skip:  # evicted from the pending queue: release waiters only
+                return
             scope = self._scope(session_id)
             # Warm the server's admission cache before turn 1's recall.
             self._post("/internal/harso/readiness", dict(scope),
