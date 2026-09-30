@@ -134,6 +134,7 @@ _TOOL_ACTIONS = {
     "memory_profile": ("profile", None),
     "memory_search": ("search", "query"),
     "memory_open": ("open", "ref"),
+    "memory_forget_request": ("forget_request", "ref"),
 }
 _TOOL_SCHEMAS = [
     {
@@ -161,6 +162,15 @@ _TOOL_SCHEMAS = [
             "properties": {"ref": {"type": "string", "description": "A ref from memory_search."}},
             "required": ["ref"],
         },
+    },
+    {
+        "name": "memory_forget_request",
+        "description": ("You cannot delete memory. When the user asks to forget a fact, search for it "
+                        "and offer its forget card using an assertion ref from memory_search. "
+                        "Say it is pending until they tap Forget; Keep changes nothing."),
+        "parameters": {"type": "object", "properties": {"ref": {"type": "string",
+                       "description": "An assertion ref in memory_search facts, not an evidence ref."}},
+                       "required": ["ref"]},
     },
 ]
 
