@@ -1837,3 +1837,46 @@ def test_r2_displaced_same_key_job_is_released_not_orphaned(monkeypatch):
     assert list(harso._FETCH_PENDING) == [("scope", "s")]
     harso._FETCH_PENDING.pop(("scope", "s"))(False)
     assert calls == [("a", True), ("b", False)]
+
+
+# -- MEM-FACT-HISTORY: corrections and conditional values in the recall block --
+
+def _history_body(fact_history):
+    body = {**_recall_body(), "gaps": []}
+    body["items"] = [{"citation": "[harso: e1]", "text": "- coffee.order: oat cortado", "status": "corrected",
+                      "fact_history": fact_history}]
+    return body
+
+
+def test_corrected_fact_renders_when_it_changed_and_what_it_was(monkeypatch):
+    recalled, final = _recall_context(monkeypatch, _history_body([{
+        "assertion_ref": "assertion:x", "text": "oat cortado", "status": "corrected", "label": "coffee.order",
+        "changed_at": "2026-09-30T06:06:31.442686Z",
+        "previous": [{"text": "flat white", "said_at": "2026-09-30T06:05:15Z"}]}]))
+    assert final is not None and recalled in final
+    assert recalled.splitlines() == [
+        "[harso: e1] - coffee.order: oat cortado",
+        "  Fact history: coffee.order: oat cortado (changed 30 Sep 06:06; was: flat white, said 30 Sep 06:05)"]
+
+
+def test_conditional_values_render_together(monkeypatch):
+    recalled, _final = _recall_context(monkeypatch, _history_body([
+        {"text": "iced latte", "label": "coffee", "condition": "hot days", "status": "current"},
+        {"text": "tea", "label": "coffee", "condition": "cold/rainy", "status": "current"},
+        {"text": "Americano", "label": "coffee", "condition": "gloomy", "status": "current"}]))
+    assert recalled.splitlines()[1] == \
+        "  Fact history: coffee: iced latte (hot days) · tea (cold/rainy) · Americano (gloomy)"
+
+
+@pytest.mark.parametrize("fact_history", [
+    None, [], "x", [None], [{"text": "oat cortado"}],  # nothing notable
+    [{"text": "oat cortado", "changed_at": "yesterday", "previous": [{"text": "flat white"}]}],  # unparsed time
+    [{"text": "a\nb", "condition": "hot days"}],  # control characters never render
+    [{"text": "x" * 121, "condition": "hot days"}],  # over the server's text bound
+], ids=["absent", "empty", "string", "none-entry", "plain", "bad-time", "newline", "too-long"])
+def test_without_valid_history_the_recall_renders_exactly_as_before(monkeypatch, fact_history):
+    body = _history_body(fact_history)
+    if fact_history is None:
+        del body["items"][0]["fact_history"]
+    recalled, _final = _recall_context(monkeypatch, body)
+    assert recalled == "[harso: e1] - coffee.order: oat cortado"

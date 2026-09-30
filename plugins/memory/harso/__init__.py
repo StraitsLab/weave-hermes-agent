@@ -200,7 +200,9 @@ def _render_recall(response: Any, max_chars: int, profile: str = "") -> str:
                 and isinstance(text, str) and text.strip()):
             if profile and text.strip() in profile:
                 continue  # already shown verbatim in the always-on profile
-            lines.append(f"{_date_prefix(item.get('occurred_at'))}{citation} {text}")
+            line = f"{_date_prefix(item.get('occurred_at'))}{citation} {text}"
+            history = _render_fact_history(item.get("fact_history"))
+            lines.append(f"{line}\n  Fact history: {history}" if history else line)
     gaps = response.get("gaps")
     reasons = list(dict.fromkeys(
         gap["reason"] for gap in gaps
@@ -325,6 +327,73 @@ def _feature_settings() -> Tuple[bool, bool, float]:
         else:
             logger.warning("plugins.harso.profile_wait invalid; using %.1fs", wait)
     return tools, profile, wait
+
+
+# MEM-FACT-HISTORY: bounds of one rendered history entry (the server caps text at
+# 120 and label at 60; anything longer, or any control character, drops it).
+_HISTORY_TEXT_MAX = 120
+_HISTORY_FACTS_MAX = 32
+_HISTORY_PREVIOUS_MAX = 2
+
+
+def _history_text(value: Any, limit: int = _HISTORY_TEXT_MAX) -> str:
+    if (not isinstance(value, str) or not value.strip() or len(value) > limit
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)):
+        return ""
+    return value.strip()
+
+
+def _short_time(value: Any) -> str:
+    """``30 Sep 06:06`` in UTC for an ISO-8601 string, else ``""``."""
+    if not isinstance(value, str):
+        return ""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (ValueError, OverflowError):
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    return f"{parsed.day} {parsed.strftime('%b %H:%M')}"
+
+
+def _render_fact_history(entries: Any) -> str:
+    """One recall item's ``fact_history`` as one line, or ``""``.
+
+    A corrected fact: ``oat cortado (changed 30 Sep 06:06; was: flat white,
+    said 30 Sep 06:05)``. Values that hold under different conditions render
+    together under their label: ``coffee.order: iced latte (hot days) · tea
+    (rainy days)``. Malformed entries are dropped; with no field the recall
+    renders exactly as before."""
+    if not isinstance(entries, list):
+        return ""
+    groups: "OrderedDict[str, List[str]]" = OrderedDict()
+    for entry in entries[:_HISTORY_FACTS_MAX]:
+        if not isinstance(entry, dict):
+            continue
+        text = _history_text(entry.get("text"))
+        if not text:
+            continue
+        label = _history_text(entry.get("label"), 60)
+        notes = []
+        condition = _history_text(entry.get("condition"), 80)
+        if condition:
+            notes.append(condition)
+        previous = entry.get("previous")
+        changed = _short_time(entry.get("changed_at"))
+        if isinstance(previous, list) and previous and changed:
+            was = []
+            for old in previous[:_HISTORY_PREVIOUS_MAX]:
+                old_text = _history_text(old.get("text")) if isinstance(old, dict) else ""
+                said = _short_time(old.get("said_at")) if isinstance(old, dict) else ""
+                if old_text:
+                    was.append(f"{old_text}, said {said}" if said else old_text)
+            if was:
+                notes.append(f"changed {changed}; was: " + "; ".join(was))
+        if not notes:
+            continue
+        groups.setdefault(label, []).append(f"{text} ({'; '.join(notes)})")
+    return " | ".join((f"{label}: " if label else "") + " · ".join(values) for label, values in groups.items())
 
 
 def _date_prefix(occurred_at: Any) -> str:
