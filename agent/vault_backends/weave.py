@@ -56,8 +56,6 @@ _REFUSALS = {
     "VAULT_OTP_UNAVAILABLE": ("otp_unavailable", "This vault item has no usable authenticator key."),
     "VAULT_ITEM_UNAVAILABLE": ("not_found", "No such vault item. Use browser_vault_list."),
 }
-_APPROVAL = ("The user has not allowed this use yet. A request is waiting in their Harso app; tell them, "
-             "and call this tool again after they allow it. Do not ask for the password in chat.")
 _DENIED = ("The user did not allow this use of the vault item. Nothing was filled. Do not retry it, and do not ask "
            "for the password in chat.")
 # V-7b-3: an api_key write. weave-api opens a new once/deny card for exactly one request and never returns a key;
@@ -151,8 +149,8 @@ def _card_gate(approval_ref: Any, tool: str, description: str, denied: str) -> s
     return approval_ref
 
 
-def _work_gate(approval_ref: Any, handle: str, action: str, origin: str) -> None:
-    """A Work attempt has no chat to wait in: ask the attempt's own gate; the caller re-resolves exactly once."""
+def _read_gate(approval_ref: Any, handle: str, action: str, origin: str) -> None:
+    """Ask the cell or Work attempt's gate; the caller re-resolves exactly once."""
     tool = "browser_vault_enter_code" if action == "enter_otp" else "browser_vault_fill"
     _card_gate(approval_ref, tool, f"Use Harso vault item {handle} to {_VERB[action]} on {origin}", _DENIED)
 
@@ -243,9 +241,7 @@ class WeaveLoginBackend(LoginBackend):
             body.update(conversation_id=conversation_id, run_id=run_id)
         answer = self._call("POST", "/v1/vault/resolve", body)
         if answer.get("decision") == "approval_required":
-            if not bearer.startswith("wva1_"):  # a cell turn waits for the chat card
-                raise VaultUseRefused("approval_required", _APPROVAL)
-            _work_gate(answer.get("approval_ref"), handle, action, origin)
+            _read_gate(answer.get("approval_ref"), handle, action, origin)
             answer = self._call("POST", "/v1/vault/resolve", body)  # exactly once: the card is decided now
         value = answer.get(field)
         if answer.get("decision") not in ("once", "always") or answer.get("action") != action or not value:
