@@ -4532,8 +4532,8 @@ def browser_snapshot(
 
     effective_task_id = _last_session_key(task_id or "default")
 
-    # The supervisor merge below reads the page (dialogs, frame tree) over its own WebSocket after the CLI
-    # snapshot returned: one Bot Screen lease fence brackets the whole snapshot, merge included.
+    # One Bot Screen lease fence brackets both the pending-dialog shortcut
+    # and the AX snapshot plus supervisor merge.
     from tools.browser_tool_session import run_fenced
     fenced = run_fenced(effective_task_id, lambda _session: {"raw": _browser_snapshot_page(full, effective_task_id)})
     return fenced["raw"] if "raw" in fenced else json.dumps(fenced, ensure_ascii=False)
@@ -4541,6 +4541,21 @@ def browser_snapshot(
 
 def _browser_snapshot_page(full: bool, effective_task_id: str) -> str:
     """``browser_snapshot`` past the Camofox branch: agent-browser snapshot plus the supervisor merge."""
+    # A pending dialog blocks the page JS thread. Read the supervisor
+    # cache before any page command so AX snapshot cannot time out and
+    # discard the supervisor the agent needs to respond to the dialog.
+    try:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+        supervisor = SUPERVISOR_REGISTRY.get(effective_task_id)
+        if supervisor is not None:
+            state = supervisor.snapshot()
+            if state.active and state.pending_dialogs:
+                response = {"success": True, "snapshot": "", "element_count": 0}
+                response.update(_redact_browser_output(state.to_dict()))
+                return json.dumps(response, ensure_ascii=False)
+    except Exception as exc:
+        logger.debug("supervisor pending-dialog snapshot failed: %s", exc)
+
     # Build command args based on full flag
     args = []
     if not full:
