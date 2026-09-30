@@ -343,15 +343,55 @@ def test_the_authority_refusing_the_origin_is_a_typed_refusal_with_nothing_fille
     assert injected == [] and len(weave.resolves()) == 1
 
 
-def test_approval_required_fills_nothing_and_tells_the_model_to_wait(weave, admitted_turn):
+@pytest.mark.parametrize("settled", ["once", "always"])
+def test_chat_approval_allows_fill_in_the_same_turn(weave, admitted_turn, settled):
+    from tools.browser_vault_tool import browser_vault_fill
+
+    weave.decisions = ["approval_required"]
+    weave.decision = settled
+    with _page() as injected, _acp_gate("once") as asked:
+        raw = browser_vault_fill(HANDLE, task_id="t")
+    assert json.loads(raw)["success"] is True and PASSWORD in injected[0]
+    assert PASSWORD not in raw and asked == [f"plugin_rule:{CARD}"]
+    first, second = weave.resolves()
+    assert first["body"] == second["body"] == {
+        "handle": HANDLE, "action": "fill_login", "page_origin": ORIGIN,
+        "conversation_id": CONV, "run_id": NATIVE_REF,
+    }
+    assert first["authorization"] == second["authorization"] == f"Bearer {CELL_BEARER}"
+
+
+@pytest.mark.parametrize("choice", ["deny", "timeout"])
+def test_chat_approval_denial_never_fills_or_retries(weave, admitted_turn, choice):
+    from tools.browser_vault_tool import browser_vault_fill
+
+    weave.decision = "approval_required"
+    with _page() as injected, _acp_gate(choice) as asked:
+        out = json.loads(browser_vault_fill(HANDLE, task_id="t"))
+    assert (out["success"], out["error_type"]) == (False, "denied")
+    assert asked == [f"plugin_rule:{CARD}"] and injected == [] and len(weave.resolves()) == 1
+
+
+def test_chat_approval_gate_exception_is_unavailable(weave, admitted_turn):
+    from agent.vault_backends.base import VaultUnavailable
+    from agent.vault_backends.weave import WeaveLoginBackend
+
+    weave.decision = "approval_required"
+    with patch("tools.approval.request_tool_approval", side_effect=RuntimeError("private gate error")) as gate:
+        with pytest.raises(VaultUnavailable, match="approval request.*could not be raised") as error:
+            WeaveLoginBackend(weave.url).resolve_password(HANDLE, origin=ORIGIN)
+    assert "private gate error" not in str(error.value)
+    assert gate.call_args.kwargs == {"rule_key": CARD} and len(weave.resolves()) == 1
+
+
+def test_chat_approval_allow_without_ledger_decision_fails_closed(weave, admitted_turn):
     from tools.browser_vault_tool import browser_vault_fill
 
     weave.decision = "approval_required"
     with _page() as injected, _acp_gate("once") as asked:
         out = json.loads(browser_vault_fill(HANDLE, task_id="t"))
-    assert (out["success"], out["error_type"]) == (False, "approval_required")
-    assert "Harso app" in out["error"] and injected == []
-    assert asked == [] and len(weave.resolves()) == 1  # a cell turn waits for the chat card; it never raises the gate
+    assert (out["success"], out["error_type"]) == (False, "vault_unavailable")
+    assert asked == [f"plugin_rule:{CARD}"] and injected == [] and len(weave.resolves()) == 2
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -654,7 +694,7 @@ def test_otp_is_minted_by_the_server_never_locally(weave, admitted_turn):
     assert OTP in injected[0] and OTP not in raw
 
 
-def test_otp_approval_pending_is_the_answer_the_user_is_not_asked_instead(weave, admitted_turn):
+def test_otp_approval_denial_is_the_answer_the_user_is_not_asked_instead(weave, admitted_turn):
     from agent.vault_backends import unlock as unlock_mod
     from tools.browser_vault_tool import browser_vault_enter_code
 
@@ -662,12 +702,12 @@ def test_otp_approval_pending_is_the_answer_the_user_is_not_asked_instead(weave,
     asked = []
     unlock_mod.set_code_prompt_callback(lambda site, hint: asked.append(site) or "000000")
     try:
-        with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+        with _acp_gate("deny"), patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
              _page(controls=[{"index": 0, "type": "text", "name": "otp", "autocomplete": "one-time-code"}]) as injected:
             out = json.loads(browser_vault_enter_code(HANDLE, task_id="t"))
     finally:
         unlock_mod.set_code_prompt_callback(None)
-    assert (out["success"], out["error_type"]) == (False, "approval_required")
+    assert (out["success"], out["error_type"]) == (False, "denied")
     assert asked == [] and injected == []
 
 
