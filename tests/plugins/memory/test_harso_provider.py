@@ -1880,3 +1880,29 @@ def test_without_valid_history_the_recall_renders_exactly_as_before(monkeypatch,
         del body["items"][0]["fact_history"]
     recalled, _final = _recall_context(monkeypatch, body)
     assert recalled == "[harso: e1] - coffee.order: oat cortado"
+
+
+# review r1 F7B: a timestamp whose UTC form is out of range degrades that entry, never the recall.
+_EXTREMES = ["0001-01-01T00:00:00+14:00", "9999-12-31T23:59:59-12:00"]
+
+
+@pytest.mark.parametrize("date", _EXTREMES)
+def test_out_of_range_changed_at_renders_no_history_and_keeps_the_recall(monkeypatch, date):
+    recalled, final = _recall_context(monkeypatch, _history_body([{
+        "text": "oat cortado", "label": "coffee.order", "changed_at": date,
+        "previous": [{"text": "flat white", "said_at": "2026-09-30T06:05:00Z"}]}]))
+    assert final is not None and recalled == "[harso: e1] - coffee.order: oat cortado"
+
+
+@pytest.mark.parametrize("date", _EXTREMES)
+def test_out_of_range_previous_said_at_keeps_the_value_without_a_time(monkeypatch, date):
+    recalled, _final = _recall_context(monkeypatch, _history_body([{
+        "text": "oat cortado", "label": "coffee.order", "changed_at": "2026-09-30T06:06:31Z",
+        "previous": [{"text": "flat white", "said_at": date}]}]))
+    assert recalled.splitlines()[1] == \
+        "  Fact history: coffee.order: oat cortado (changed 30 Sep 06:06; was: flat white)"
+
+
+@pytest.mark.parametrize("date", _EXTREMES + ["2026-13-01T00:00:00Z", "", "yesterday"])
+def test_short_time_never_raises(date):
+    assert importlib.import_module("plugins.memory.harso")._short_time(date) == ""

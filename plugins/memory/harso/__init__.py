@@ -344,17 +344,21 @@ def _history_text(value: Any, limit: int = _HISTORY_TEXT_MAX) -> str:
 
 
 def _short_time(value: Any) -> str:
-    """``30 Sep 06:06`` in UTC for an ISO-8601 string, else ``""``."""
+    """``30 Sep 06:06`` in UTC for an ISO-8601 string, else ``""``.
+
+    Parsing, the UTC conversion and formatting are all guarded: a value
+    whose UTC form leaves the representable range (``0001-01-01T00:00:00+14:00``,
+    ``9999-12-31T23:59:59-12:00``) is no history, never a failed recall."""
     if not isinstance(value, str):
         return ""
     try:
         parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.astimezone(timezone.utc)
+        return f"{parsed.day} {parsed.strftime('%b %H:%M')}"
     except (ValueError, OverflowError):
         return ""
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    parsed = parsed.astimezone(timezone.utc)
-    return f"{parsed.day} {parsed.strftime('%b %H:%M')}"
 
 
 def _render_fact_history(entries: Any) -> str:

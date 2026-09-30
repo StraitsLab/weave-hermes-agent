@@ -1,26 +1,27 @@
-# Preflight: weave-hermes-agent #61, WEV-2108 slice 3b (native submit busy_mode)
+# Preflight: weave-hermes-agent #69 (MEM-FACT-HISTORY recall rendering), review r1 rework
 
-Scope: `/api/sessions/{id}/submit` honours busy_mode queue | steer | interrupt for a busy native session.
-No new scheduler, no new dependency; weave-api still sends queue until slice 3c.
+Replaces the stale #61 preflight (review r1 F8). Paired with weave-cloud #1267; the full paired matrix, mutant
+table and cloud gates are in weave-cloud `.lane/preflight.md` on `mem/fact-history`.
 
-Round-1 review (t_c792f214, BLOCK at b62cc65) and what changed:
-- F1 accepted steer lost: the finalizer now takes the last leftover and closes the steer window in one locked step (`AIAgent._close_steer_window`); a later steer is refused and queued as its own turn. The next turn reopens it. A leftover steer that meets a queued sibling now leads that sibling's message instead of being dropped.
-- F2 stale interrupt: after the compression await the interrupt re-checks the same active ref, the same live agent, and no active subagents; otherwise it only queues.
-- F3 mode-blind idempotency: busy_mode is in the request fingerprint; queue keeps the message-only hash so pre-existing records still replay.
-- F4 weak tests: HTTP interrupt test, exact turn.completed / turn.failed settlement, all 6 mode transitions, legacy replay, real finalizer + real AIAgent steer window, fenced interrupt (3 target changes).
-- F6 attribution: contributors/emails/hermes@straitslab.com mapped.
+## Identities
+- Base `627d6829a` (codex/wev-repin-v0.21.0). Reviewed head `d0c7689d4` (BLOCK r1, gpt-6.1-sol, cross-family).
+- Cloud side: #1267 merged to main at `eb13a8277` before the rework; the rework is on cloud `mem/fact-history`.
 
-Evidence at this head:
-- submit + finalizer tests: 39 passed. Related gateway/agent suites (21 files): 221 passed (207 at b62cc65).
-- Reviewer's own probe.py + integration.py: 12 passed (9 failed + 1 failed at b62cc65). Two probe assertions were adapted to the new contract: the probe drains via `_close_steer_window` (the finalizer's real call), and the sibling case accepts the steer text leading the queued message.
-- Mutants (9, one at a time, source restored): all killed.
+## Acceptance (fork scope: read-only rendering of cloud-provided history fields)
+| Rule | Test |
+|---|---|
+| A corrected fact renders when it changed and what it was | `test_corrected_fact_renders_when_it_changed_and_what_it_was` |
+| Conditional values render together under their label | `test_conditional_values_render_together` |
+| Invalid/absent history renders exactly as before | `test_without_valid_history_the_recall_renders_exactly_as_before` (8 cases) |
+| F7B: an out-of-range timestamp degrades that time only, never the recall | `test_out_of_range_changed_at_renders_no_history_and_keeps_the_recall` (2), `test_out_of_range_previous_said_at_keeps_the_value_without_a_time` (2), `test_short_time_never_raises` (5) |
 
-Round 2 (Fly delta review, GPT-6 Astra, BLOCK at 1b0dbfdc3) and what changed:
-- R2-F1: closing the window inside steer() broke the CLI / gateway / TUI /steer callers, which read False as "empty". steer() keeps its old contract; a new AIAgent.steer_if_open() refuses after the finalizer closes the window, and only native submit uses it (and queues on refusal). Reviewer's CLI and gateway reproductions now pass.
-- R2-F3: the fingerprint was ambiguous (a queue message could spell the steer/interrupt encoding). Now queue = bare sha256 hex (legacy replay kept), other modes = "<mode>:<sha256 hex>", which no bare digest can equal.
-Evidence: reviewer test_delta_regressions.py 6/6 pass; related suites + round-1 probes 216 passed; 10 mutants, all killed.
+## Fix (F7B)
+`_short_time` now parses, converts to UTC and formats inside one `try` and returns `""` on ValueError/OverflowError
+(`0001-01-01T00:00:00+14:00` and `9999-12-31T23:59:59-12:00` overflowed in `astimezone`, outside the old try).
 
-Round 3 (Fly delta review, BLOCK at 3b1fb5138) and what changed:
-- R3-F1: an accepted native steer whose queued sibling was refused during preparation (next_message None) was returned undelivered. The leftover steer now runs as its own turn in that case, and still leads a prepared sibling otherwise.
-- Note: round-2 preflight wrongly said the reviewer's test_delta_regressions.py passed 6/6; two of its assertions required the old refusing steer() contract, which R2-F1 deliberately restored. test_restored_contract.py (reviewer's) passes.
-Evidence: tests/gateway/test_native_steer_refused_sibling.py (reviewer reproduction, both sibling cases) passes; 12 mutants, all killed.
+## Evidence
+- Red at `d0c7689d4` (old plugin, new tests): 6 failed, 3 passed (4 render tests + the 2 extreme `_short_time` cases raise `OverflowError`; the 3 malformed-string cases already returned ""). Reviewer fork probe: 2 failed.
+- Green: `scripts/run_tests.sh tests/plugins/memory/test_harso_provider.py -j 1`: 266 passed, 0 failed.
+- Reviewer's `/tmp/rv1267/test_fork_probes.py` (paths rebound only): 6 passed.
+- Mutant m5 (raw value on parse failure + newline allowed), on a copy: KILLED, 10 failed / 256 passed.
+- Not run: the full fork suite (reviewer saw acp dependency failures unrelated to this file).
