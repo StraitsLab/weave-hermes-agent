@@ -356,3 +356,11 @@ class TestResolveToolsetMemo:
         assert first == second
         assert first  # non-empty sanity
 
+
+
+def test_skills_read_toolset_lists_and_views_but_never_manages():
+    from toolsets import resolve_toolset, validate_toolset
+    assert validate_toolset("skills-read")
+    tools = set(resolve_toolset("skills-read"))
+    assert {"skills_list", "skill_view"} <= tools
+    assert "skill_manage" not in tools
