@@ -25,3 +25,9 @@ table and cloud gates are in weave-cloud `.lane/preflight.md` on `mem/fact-histo
 - Reviewer's `/tmp/rv1267/test_fork_probes.py` (paths rebound only): 6 passed.
 - Mutant m5 (raw value on parse failure + newline allowed), on a copy: KILLED, 10 failed / 256 passed.
 - Not run: the full fork suite (reviewer saw acp dependency failures unrelated to this file).
+
+## Round 2 (D-124, final)
+The cloud review found F1/F2/N1/N2 and ruled F7 (this fork's only finding) RESOLVED. The fixes are all cloud-side, on
+weave-cloud #1281 `mem/fact-history` (typed replacement/operational fields, SQL 029 grants, fail-closed config). The
+wire fields this plugin renders are unchanged, so the fork has no code change. Local rerun of
+`tests/plugins/memory/test_harso_provider.py` (HERMES_HOME scratch, TZ=UTC): 266 passed. Stays DRAFT.
