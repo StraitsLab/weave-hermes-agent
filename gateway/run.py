@@ -31982,6 +31982,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _interrupt_depth=_interrupt_depth + 1,
                         event_message_id=next_message_id,
                         channel_prompt=next_channel_prompt,
+                        # In-band FIFO turns bypass _handle_message_with_agent;
+                        # retain the internal event marker here as well (D-119).
+                        persist_user_display_kind=(
+                            "internal_notification" if getattr(pending_event, "internal", False) else None
+                        ),
                         message_type=next_message_type,
                     )
                     _followup_failed = bool(isinstance(followup_result, dict) and followup_result.get("failed"))

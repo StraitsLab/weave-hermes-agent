@@ -5188,9 +5188,9 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({"status": "ready", "credential_slot": "GATE_B_API_KEY"})
 
     @staticmethod
-    def _native_submit_request(body: Dict[str, Any]) -> tuple[Optional[tuple[str, str, str, Optional[str]]], Optional["web.Response"]]:
+    def _native_submit_request(body: Dict[str, Any]) -> tuple[Optional[tuple[str, str, str, Optional[str], bool]], Optional["web.Response"]]:
         """Validate the deliberately narrow native-admission request shape."""
-        if set(body) - {"expected_active_ref"} != {"kind", "external_request_id", "message", "busy_mode"}:
+        if set(body) - {"expected_active_ref", "internal"} != {"kind", "external_request_id", "message", "busy_mode"}:
             return None, web.json_response(
                 _openai_error("Invalid native submit schema", code="invalid_native_submit_schema"), status=400
             )
@@ -5198,6 +5198,7 @@ class APIServerAdapter(BasePlatformAdapter):
         message = body.get("message")
         if (
             body.get("kind") != "hermes.session.submit"
+            or not isinstance(body.get("internal", False), bool)
             or not isinstance(body.get("busy_mode"), str)
             or body["busy_mode"] not in _NATIVE_SUBMIT_BUSY_MODES
             or ("expected_active_ref" in body and (not isinstance(body["expected_active_ref"], str) or not body["expected_active_ref"]))
@@ -5216,13 +5217,14 @@ class APIServerAdapter(BasePlatformAdapter):
             return None, web.json_response(
                 _openai_error("Invalid native submit schema", code="invalid_native_submit_schema"), status=400
             )
-        return (request_id, message, body["busy_mode"], body.get("expected_active_ref")), None
+        return (request_id, message, body["busy_mode"], body.get("expected_active_ref"), body.get("internal", False)), None
 
     async def _admit_native_session_submit(
         self, session_id: str, message: str, native_request_ref: str,
         external_request_id: str = "", busy_mode: str = "queue", expected_active_ref: Optional[str] = None,
+        internal: bool = False,
     ) -> str:
-        """Submit one ordinary turn through the running gateway's writer lease."""
+        """Submit one user or internal turn through the running gateway's writer lease."""
         runner = self.gateway_runner
         if (
             runner is None
@@ -5231,6 +5233,11 @@ class APIServerAdapter(BasePlatformAdapter):
             or getattr(runner, "_startup_restore_in_progress", False)
         ):
             raise RuntimeError("native gateway runner is unavailable")
+
+        # D-119: an internal notification is always its own turn, never a steer
+        # or interrupt of a user turn. Queue mode also ignores the active-ref fence.
+        if internal:
+            busy_mode = "queue"
 
         existing_start = self._native_submit_started.get(native_request_ref)
         if existing_start is not None:
@@ -5259,6 +5266,7 @@ class APIServerAdapter(BasePlatformAdapter):
             user_name=source.user_name,
             source=source,
             message_id=native_request_ref,
+            internal=internal,
             allow_gateway_control=False,
             metadata={
                 "gateway_session_key": entry.session_key,
@@ -5338,12 +5346,15 @@ class APIServerAdapter(BasePlatformAdapter):
             raise
 
     @staticmethod
-    def _native_submit_fingerprint(message: str, busy_mode: str) -> str:
+    def _native_submit_fingerprint(message: str, busy_mode: str, internal: bool = False) -> str:
         """Weave (WEV-2108): the idempotency identity of one submit. A retry that changes busy_mode is
         changed input (409), not a replay. queue keeps the message-only hash that records written
         before busy modes existed carry, so their identical retries still replay across a deploy."""
         digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
-        return digest if busy_mode == "queue" else f"{busy_mode}:{digest}"
+        fingerprint = digest if busy_mode == "queue" else f"{busy_mode}:{digest}"
+        # Preserve legacy user identities, but do not replay a user request as
+        # an internal notification (or vice versa) when its flag changes.
+        return f"internal:{fingerprint}" if internal else fingerprint
 
     @staticmethod
     def _native_submit_running_agent(runner: Any, session_key: str) -> Any:
@@ -5368,7 +5379,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         assert parsed is not None
-        external_request_id, message, busy_mode, expected_active_ref = parsed
+        external_request_id, message, busy_mode, expected_active_ref, internal = parsed
         db = await self._ensure_session_db_async()
         if db is None:
             return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
@@ -5393,7 +5404,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 db.register_native_session_submit,
                 session_id,
                 external_request_id=external_request_id,
-                message_sha256=self._native_submit_fingerprint(message, busy_mode),
+                message_sha256=self._native_submit_fingerprint(message, busy_mode, internal),
                 native_request_ref=native_request_ref,
             )
             outcome = result["outcome"]
@@ -5408,11 +5419,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 admission = result["admission"]
             else:
                 try:
+                    admission_options: Dict[str, Any] = {}
+                    if busy_mode != "queue":
+                        admission_options["busy_mode"] = busy_mode
+                    if expected_active_ref is not None:
+                        admission_options["expected_active_ref"] = expected_active_ref
+                    if internal:
+                        admission_options["internal"] = True
                     admission = await self._admit_native_session_submit(
                         session_id, message, native_request_ref,
                         external_request_id=external_request_id,
-                        **({} if busy_mode == "queue" else {"busy_mode": busy_mode}),
-                        **({} if expected_active_ref is None else {"expected_active_ref": expected_active_ref}),
+                        **admission_options,
                     )
                 except Exception:
                     await asyncio.to_thread(
