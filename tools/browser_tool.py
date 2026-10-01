@@ -1839,6 +1839,9 @@ def _real_profile_cdp() -> tuple:
         if not _want_headed:
             chrome_argv.append("--headless=new")
         try:
+            from tools.bot_desktop.browser import disable_password_manager
+
+            disable_password_manager(copy_dir)
             chrome_proc = subprocess.Popen(
                 chrome_argv,
                 stdout=subprocess.DEVNULL,
@@ -1847,7 +1850,7 @@ def _real_profile_cdp() -> tuple:
                 start_new_session=True,
                 env=_build_browser_env(),
             )
-        except (subprocess.SubprocessError, OSError) as e:
+        except (subprocess.SubprocessError, OSError, ValueError) as e:
             return None, f"browser.use_real_profile is on, but the launch failed: {e}"
         _real_profile_chrome_procs.append(chrome_proc)
 

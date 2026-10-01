@@ -28,6 +28,63 @@ def test_dock_and_agent_share_browser_identity(tmp_path, monkeypatch):
     assert dock_profile == agent_env["AGENT_BROWSER_PROFILE"] == str(tmp_path / "bot-desktop" / "browser-profile")
 
 
+@pytest.mark.parametrize("launch", ["agent", "dock", "real-profile"])
+@pytest.mark.parametrize("existing", [False, True])
+def test_browser_launch_disables_chromes_password_manager(tmp_path, monkeypatch, launch, existing):
+    """Vault credentials must not be saved, leak-checked or filled from Chrome's store."""
+    import json
+
+    from tools import browser_tool as bt
+    import hermes_cli.browser_connect as bc
+
+    user_data_dir = tmp_path / "browser"
+    prefs_file = user_data_dir / "Default" / "Preferences"
+    if existing:
+        prefs_file.parent.mkdir(parents=True)
+        prefs_file.write_text(json.dumps({
+            "credentials_enable_service": True,
+            "credentials_enable_autosignin": True,
+            "profile": {"password_manager_enabled": True, "password_manager_leak_detection": True, "name": "Keep me"},
+            "password_manager": {"password_manager_blocklist": ["old.example"]},
+            "unrelated": "Keep me too",
+        }), encoding="utf-8")
+    monkeypatch.setenv("AGENT_BROWSER_PROFILE", str(user_data_dir))
+    monkeypatch.setattr(browser, "executable", lambda: "/opt/chrome")
+
+    if launch == "agent":
+        monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":37"})
+        monkeypatch.setattr(runtime, "touch_activity", lambda: None)
+        env = bt._build_browser_env()
+        assert env["AGENT_BROWSER_PROFILE"] == str(user_data_dir)
+    elif launch == "dock":
+        assert browser.dock_launch() == ("/opt/chrome", str(user_data_dir))
+    else:
+        monkeypatch.setattr(bt, "_real_profile_cdp_cache", {})
+        monkeypatch.setattr(bt, "_use_real_profile", lambda: True)
+        monkeypatch.setattr(bt, "_using_lightpanda_engine", lambda: False)
+        monkeypatch.setattr(bt, "_agent_browser_get_cdp", lambda _: None)
+        monkeypatch.setattr(bc, "detect_default_chromium", lambda: "chrome")
+        monkeypatch.setattr(bc, "snapshot_real_profile", lambda _: (str(user_data_dir), None))
+        monkeypatch.setattr(bc, "chromium_executable", lambda _: "/opt/chrome")
+
+        def stop_at_launch(*args, **kwargs):
+            raise OSError("test stopped at Chrome launch")
+
+        monkeypatch.setattr(bt.subprocess, "Popen", stop_at_launch)
+        _, error = bt._real_profile_cdp()
+        assert "test stopped at Chrome launch" in error
+
+    prefs = json.loads(prefs_file.read_text(encoding="utf-8"))
+    assert prefs["credentials_enable_service"] is False
+    assert prefs["credentials_enable_autosignin"] is False
+    assert prefs["profile"]["password_manager_enabled"] is False
+    assert prefs["profile"]["password_manager_leak_detection"] is False
+    assert prefs["password_manager"]["password_manager_blocklist"] == ["*"]
+    if existing:
+        assert prefs["profile"]["name"] == "Keep me"
+        assert prefs["unrelated"] == "Keep me too"
+
+
 def test_user_pinned_profile_wins(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_BROWSER_PROFILE", str(tmp_path / "mine"))
     monkeypatch.setattr(runtime, "state_dir", lambda: tmp_path / "bot-desktop")
