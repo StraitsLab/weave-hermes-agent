@@ -18,9 +18,8 @@ Groups (each has a control that must pass and a mutant that must be killed):
 2. echo after a legitimate fill: DOM text, input value, title, console.log, JS error, img alt, dialog, a form GET
    URL. The page raises its own alert (a click on its Check button; model JS on the filled tab is refused), the
    agent accepts it with browser_dialog and sees its message there and in the next snapshot's recent_dialogs.
-   Narrowed: a snapshot taken WHILE the dialog is pending times out and drops the supervisor (pre-existing, not
-   V-9d), so pending_dialogs is a strict-xfail row until that is fixed. Mutant: redaction registration disabled ->
-   the eval goes red on every channel, dialog included.
+   A snapshot taken WHILE the dialog is pending returns redacted supervisor state without running the blocked
+   page AX snapshot. Mutant: redaction registration disabled -> the eval goes red on every channel, dialog included.
 3. origin change at fill: a hostile page on the bound origin redirects to a lookalike host (carrying the fill
    nonce it observed) between the pre-check and the fill. Mutant: the at-fill origin recheck removed -> red.
 4. legitimate control: exact-origin fill lands in the page; the agent sees only the placeholder.
@@ -539,11 +538,6 @@ def test_every_echo_of_a_filled_value_is_redacted_on_every_channel(harso):
     assert any(PLACEHOLDER in text for call, text in d.outputs if call.startswith("browser_navigate"))
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "pre-existing, not V-9d: while a dialog is pending the page's JS thread is blocked (the dialog bridge's sync XHR, "
-    "tools/browser_supervisor.py:193), so the agent-browser snapshot (tools/browser_tool.py:4549) times out after "
-    "30s, and the timeout path (tools/browser_tool.py:3695 -> :3583) stops the CDP supervisor that holds the dialog: "
-    "pending_dialogs never reaches the model and browser_dialog then finds no supervisor"))
 def test_a_snapshot_while_the_echo_dialog_is_pending_shows_it_redacted(harso):
     d = harso
     _ok(d.call("browser_navigate", url=f"{d.pages.origin()}/login"))
