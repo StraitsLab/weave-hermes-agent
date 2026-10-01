@@ -329,6 +329,7 @@ class TestRunBrowserCommandPathConstruction:
              patch("tools.browser_tool._discover_homebrew_node_dirs", return_value=[]), \
              patch("hermes_constants.Path.home", return_value=tmp_path), \
              patch("subprocess.Popen", side_effect=capture_popen), \
+             patch("tools.bot_desktop.browser.prepare_agent_profile"), \
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
@@ -386,6 +387,7 @@ class TestRunBrowserCommandPathConstruction:
              patch("tools.browser_tool._discover_homebrew_node_dirs", return_value=[]), \
              patch("hermes_constants.Path.home", return_value=tmp_path), \
              patch("subprocess.Popen", side_effect=capture_popen), \
+             patch("tools.bot_desktop.browser.prepare_agent_profile"), \
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
@@ -446,6 +448,7 @@ class TestRunBrowserCommandPathConstruction:
              patch("tools.browser_tool._discover_homebrew_node_dirs", return_value=[]), \
              patch("os.path.isdir", side_effect=selective_isdir), \
              patch("subprocess.Popen", side_effect=capture_popen), \
+             patch("tools.bot_desktop.browser.prepare_agent_profile"), \
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("tools.interrupt.is_interrupted", return_value=False), \

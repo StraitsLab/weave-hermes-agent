@@ -12,6 +12,7 @@ DevTools endpoint, so the dock exposes a debugging port and the agent ATTACHES t
 from __future__ import annotations
 
 import glob
+import json
 import os
 import shutil
 import socket
@@ -25,14 +26,39 @@ DISK_CACHE_BYTES = 256 * 1024 * 1024
 _SYSTEM_BROWSERS = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser")
 
 
-def profile_dir() -> Path:
+def profile_dir(env: Optional[dict] = None) -> Path:
     """User-data-dir the bot's browser uses on this profile's screen. ``AGENT_BROWSER_PROFILE`` pins your own:
     ``~`` expands, and a relative path is anchored at this profile's HERMES_HOME (where the rest of the screen's
     state lives), so ``pin`` means ``<HERMES_HOME>/pin`` and two profiles never share one jar by accident."""
-    override = os.path.expanduser(os.environ.get("AGENT_BROWSER_PROFILE", "").strip())
+    override = os.path.expanduser((os.environ if env is None else env).get("AGENT_BROWSER_PROFILE", "").strip())
     if override:
         return Path(override) if os.path.isabs(override) else runtime.get_hermes_home() / override
     return runtime.state_dir() / ("profile" if os.environ.get("HERMES_BD_STATE_DIR") else "browser-profile")  # fork
+
+
+def disable_password_manager(user_data_dir: str) -> None:
+    """Seed Chrome prefs before launch; preserve unrelated prefs and avoid rewriting an unchanged file."""
+    from utils import atomic_json_write
+
+    path = Path(user_data_dir) / "Default" / "Preferences"
+    prefs = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    before = json.dumps(prefs, sort_keys=True)
+    prefs["credentials_enable_service"] = False
+    prefs["credentials_enable_autosignin"] = False
+    prefs.setdefault("profile", {}).update(
+        password_manager_enabled=False, password_manager_leak_detection=False)
+    # credentials_enable_service only disables SAVING; Chromium still fills saved passwords.
+    # Its URL blocklist disables password management (including filling) for every site.
+    prefs.setdefault("password_manager", {})["password_manager_blocklist"] = ["*"]
+    if json.dumps(prefs, sort_keys=True) != before:
+        atomic_json_write(path, prefs, mode=0o600)
+
+
+def prepare_agent_profile(env: dict, default_dir: Optional[str] = None) -> None:
+    """Resolve and harden the exact profile Chrome will launch, including no-screen sessions."""
+    pinned = env.get("AGENT_BROWSER_PROFILE", "").strip()
+    env["AGENT_BROWSER_PROFILE"] = str(profile_dir(env) if pinned or default_dir is None else default_dir)
+    disable_password_manager(env["AGENT_BROWSER_PROFILE"])
 
 
 def executable() -> Optional[str]:
@@ -85,7 +111,11 @@ def _userns_restricted() -> bool:
 def dock_launch() -> Optional[Tuple[str, str]]:
     """``(executable, user_data_dir)`` for the dock's Browser icon, or ``None`` when no Chromium exists."""
     exe = executable()
-    return (exe, str(profile_dir())) if exe else None
+    if not exe:
+        return None
+    user_data_dir = str(profile_dir())
+    disable_password_manager(user_data_dir)
+    return exe, user_data_dir
 
 
 def dock_argv(exe: str, user_data_dir: str) -> list[str]:
@@ -179,6 +209,7 @@ def env_for_agent(env: dict) -> dict:
     screen is up (:func:`runtime.desktop_env`), so the heavier build is pinned just when it is the point.
     """
     env.setdefault("AGENT_BROWSER_PROFILE", str(profile_dir()))
+    prepare_agent_profile(env)
     exe = executable()
     if exe:
         pinned = env.get("AGENT_BROWSER_EXECUTABLE_PATH", "").strip()

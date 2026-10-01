@@ -1378,6 +1378,8 @@ def _run_chrome_fallback_command(
     browser_env = _build_browser_env()
     browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
     browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
+    from tools.bot_desktop.browser import prepare_agent_profile
+    prepare_agent_profile(browser_env, os.path.join(task_socket_dir, "profile"))
 
     if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in browser_env:
         browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = str(BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
@@ -1839,6 +1841,9 @@ def _real_profile_cdp() -> tuple:
         if not _want_headed:
             chrome_argv.append("--headless=new")
         try:
+            from tools.bot_desktop.browser import disable_password_manager
+
+            disable_password_manager(copy_dir)
             chrome_proc = subprocess.Popen(
                 chrome_argv,
                 stdout=subprocess.DEVNULL,
@@ -1847,7 +1852,7 @@ def _real_profile_cdp() -> tuple:
                 start_new_session=True,
                 env=_build_browser_env(),
             )
-        except (subprocess.SubprocessError, OSError) as e:
+        except (subprocess.SubprocessError, OSError, ValueError) as e:
             return None, f"browser.use_real_profile is on, but the launch failed: {e}"
         _real_profile_chrome_procs.append(chrome_proc)
 
@@ -3929,6 +3934,11 @@ def _dispatch_browser_command(
         # used during CLI discovery.
         browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
         browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
+
+        if engine != "lightpanda" and not session_info.get("cdp_url"):
+            # No screen: retain per-session isolation, but seed prefs before agent-browser launches Chrome.
+            from tools.bot_desktop.browser import prepare_agent_profile
+            prepare_agent_profile(browser_env, os.path.join(task_socket_dir, "profile"))
 
         # Tell the agent-browser daemon to self-terminate after being idle
         # for our configured inactivity timeout.  This is the daemon-side
