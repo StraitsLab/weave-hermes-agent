@@ -26,11 +26,11 @@ DISK_CACHE_BYTES = 256 * 1024 * 1024
 _SYSTEM_BROWSERS = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser")
 
 
-def profile_dir() -> Path:
+def profile_dir(env: Optional[dict] = None) -> Path:
     """User-data-dir the bot's browser uses on this profile's screen. ``AGENT_BROWSER_PROFILE`` pins your own:
     ``~`` expands, and a relative path is anchored at this profile's HERMES_HOME (where the rest of the screen's
     state lives), so ``pin`` means ``<HERMES_HOME>/pin`` and two profiles never share one jar by accident."""
-    override = os.path.expanduser(os.environ.get("AGENT_BROWSER_PROFILE", "").strip())
+    override = os.path.expanduser((os.environ if env is None else env).get("AGENT_BROWSER_PROFILE", "").strip())
     if override:
         return Path(override) if os.path.isabs(override) else runtime.get_hermes_home() / override
     return runtime.state_dir() / ("profile" if os.environ.get("HERMES_BD_STATE_DIR") else "browser-profile")  # fork
@@ -52,6 +52,13 @@ def disable_password_manager(user_data_dir: str) -> None:
     prefs.setdefault("password_manager", {})["password_manager_blocklist"] = ["*"]
     if json.dumps(prefs, sort_keys=True) != before:
         atomic_json_write(path, prefs, mode=0o600)
+
+
+def prepare_agent_profile(env: dict, default_dir: Optional[str] = None) -> None:
+    """Resolve and harden the exact profile Chrome will launch, including no-screen sessions."""
+    pinned = env.get("AGENT_BROWSER_PROFILE", "").strip()
+    env["AGENT_BROWSER_PROFILE"] = str(profile_dir(env) if pinned or default_dir is None else default_dir)
+    disable_password_manager(env["AGENT_BROWSER_PROFILE"])
 
 
 def executable() -> Optional[str]:
@@ -202,7 +209,7 @@ def env_for_agent(env: dict) -> dict:
     screen is up (:func:`runtime.desktop_env`), so the heavier build is pinned just when it is the point.
     """
     env.setdefault("AGENT_BROWSER_PROFILE", str(profile_dir()))
-    disable_password_manager(env["AGENT_BROWSER_PROFILE"])
+    prepare_agent_profile(env)
     exe = executable()
     if exe:
         pinned = env.get("AGENT_BROWSER_EXECUTABLE_PATH", "").strip()

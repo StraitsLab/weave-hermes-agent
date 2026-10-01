@@ -113,7 +113,9 @@ class TestHeadedFlagInjection:
             '{"success": true, "data": {"snapshot": '
             '"- heading \\"Hi\\" [ref=e1]", "refs": {"e1": {}}}}'
         )
-        with patch("subprocess.Popen", side_effect=capture_popen), \
+        # This argv-only test mocks file descriptors; profile prefs have their own real-file regression.
+        with patch("tools.bot_desktop.browser.prepare_agent_profile"), \
+             patch("subprocess.Popen", side_effect=capture_popen), \
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("os.unlink"), \

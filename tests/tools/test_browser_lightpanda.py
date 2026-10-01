@@ -373,7 +373,8 @@ class TestEngineOverride:
             return mock_proc
 
         # We need to mock the file operations too
-        with patch("subprocess.Popen", side_effect=capture_popen), \
+        with patch("tools.bot_desktop.browser.prepare_agent_profile"), \
+             patch("subprocess.Popen", side_effect=capture_popen), \
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("os.unlink"), \
