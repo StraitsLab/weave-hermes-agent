@@ -2,16 +2,20 @@
 
 import asyncio
 import hashlib
+import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.run import GatewayRunner
+import gateway.run as gateway_run
 from hermes_state import SessionDB
 
 
@@ -46,6 +50,7 @@ def adapter(tmp_path):
 
 async def _client(adapter):
     app = web.Application()
+    app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
     app.router.add_post(
         "/api/sessions/{session_id}/submit", adapter._handle_session_submit
     )
@@ -769,3 +774,236 @@ async def test_expected_target_fence_after_compression_await(adapter):
 async def test_expected_target_schema_rejects_invalid_values(adapter, target):
     status, body = await _post_submit(adapter, "bad-target", "steer", expected_active_ref=target)
     assert status == 400 and body["error"]["code"] == "invalid_native_submit_schema"
+
+
+@pytest_asyncio.fixture
+async def internal_gateway(tmp_path, monkeypatch):
+    """Real admission, runner, AIAgent and DB; only the provider is a local fixture."""
+    requests = []
+    started, release = asyncio.Event(), asyncio.Event()
+    release.set()
+
+    async def complete(request):
+        payload = await request.json()
+        assert request.headers["Authorization"] == "Bearer local-provider-key"
+        requests.append(payload)
+        started.set()
+        await release.wait()
+        reply = f"reply-{len(requests)}"
+        if payload.get("stream"):
+            chunks = [
+                {"id": "local", "object": "chat.completion.chunk", "created": 0,
+                 "model": "local-test", "choices": [{"index": 0, "delta": {"role": "assistant", "content": reply}, "finish_reason": None}]},
+                {"id": "local", "object": "chat.completion.chunk", "created": 0,
+                 "model": "local-test", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                 "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}},
+            ]
+            body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+            return web.Response(text=body, content_type="text/event-stream")
+        return web.json_response({
+            "id": "local", "object": "chat.completion", "created": 0,
+            "model": "local-test", "choices": [{"index": 0, "message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        })
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", complete)
+    provider = TestServer(app)
+    await provider.start_server()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text(json.dumps({
+        "model": {"default": "local-test", "provider": "custom", "base_url": str(provider.make_url("/v1")), "context_length": 131072},
+        "auxiliary": {"title_generation": {"enabled": False}},
+        "toolsets": [], "memory": {"memory_enabled": False, "user_profile_enabled": False},
+        "display": {"platforms": {"api_server": {"streaming": False}}},
+    }), encoding="utf-8")
+    runner = GatewayRunner(GatewayConfig())
+    runner._running = True
+    runner._gateway_loop = asyncio.get_running_loop()
+    db = runner._session_db._db
+    db.create_session(SESSION_ID, "api_server")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "local-api-key"}))
+    adapter._session_db = db
+    adapter.gateway_runner = runner
+    adapter.set_session_store(runner.session_store)
+    adapter.set_message_handler(runner._handle_message)
+    runner.adapters = {Platform.API_SERVER: adapter}
+    client = await _client(adapter)
+    try:
+        yield SimpleNamespace(runner=runner, adapter=adapter, db=db, client=client,
+                              requests=requests, started=started, release=release)
+    finally:
+        release.set()
+        await adapter.cancel_background_tasks()
+        await client.close()
+        await provider.close()
+        db.close()
+
+
+async def _bind_internal_gateway(gateway):
+    from gateway.session import SessionSource
+
+    source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID,
+                           chat_type="dm", user_id="api_server", user_name="API server")
+    assert gateway.runner.bind_session_credential(
+        source, SESSION_ID, "local-provider-key",
+        datetime.now(timezone.utc) + timedelta(minutes=5), "local-route")
+    return gateway.runner.session_store._generate_session_key(source)
+
+
+async def _submit_internal_gateway(gateway, request_id, message="Work result", **extra):
+    response = await gateway.client.post(
+        f"/api/sessions/{SESSION_ID}/submit", headers={"Authorization": "Bearer local-api-key"},
+        json={**_request(request_id, message), **extra})
+    return response.status, await response.json()
+
+
+async def _wait_native_terminal(gateway, ref):
+    async with asyncio.timeout(20):
+        while ref not in gateway.adapter._native_submit_terminals:
+            await asyncio.sleep(0.01)
+    rows = [row for row in gateway.db.get_messages(SESSION_ID) if row["role"] in {"user", "assistant"}]
+    assert any(row["role"] == "assistant" for row in rows), rows
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_internal_idle_submit_persists_hidden_user_and_clean_provider_payload(internal_gateway):
+    """D-119 3a/3f: actual wire payload and /messages, including resumed history."""
+    gateway = internal_gateway
+    await _bind_internal_gateway(gateway)
+    message = "[Work completed]\n  Preserve this content exactly.  "
+    status, receipt = await _submit_internal_gateway(gateway, "internal-idle", message, internal=True)
+    assert status == 202, receipt
+    assert receipt["admission"] == "streaming"
+    rows = await _wait_native_terminal(gateway, receipt["native_request_ref"])
+    assert [(row["role"], row["content"]) for row in rows] == [("user", message), ("assistant", "reply-1")]
+    assert rows[0]["display_kind"] == "internal_notification"
+    assert rows[1].get("display_kind") is None
+    response = await gateway.client.get(f"/api/sessions/{SESSION_ID}/messages", headers={"Authorization": "Bearer local-api-key"})
+    assert response.status == 200
+    messages = (await response.json())["data"]
+    assert messages[0]["display_kind"] == "internal_notification"
+    assert messages[0]["role"] == "user" and messages[0]["content"] == message
+    assert messages[1].get("display_kind") is None
+    status, next_receipt = await _submit_internal_gateway(gateway, "after-internal", "ordinary follow-up")
+    assert status == 202, next_receipt
+    await _wait_native_terminal(gateway, next_receipt["native_request_ref"])
+    assert len(gateway.requests) == 2
+    for payload in gateway.requests:
+        assert all("display_kind" not in item for item in payload["messages"])
+        assert any(item["role"] == "user" and message in item["content"] for item in payload["messages"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy_mode", ["steer", "interrupt"])
+async def test_internal_busy_submit_is_fifo_not_steer_or_interrupt(internal_gateway, busy_mode):
+    """D-119 3b: the real running user turn finishes before internal turns start."""
+    gateway = internal_gateway
+    key = await _bind_internal_gateway(gateway)
+    gateway.release.clear()
+    status, user_receipt = await _submit_internal_gateway(gateway, "running-user", "user task")
+    assert status == 202, user_receipt
+    await asyncio.wait_for(gateway.started.wait(), timeout=10)
+    # Agent publication is asynchronous; the provider can be reached before
+    # the gateway tracking task replaces its startup sentinel.
+    async with asyncio.timeout(10):
+        while (agent := gateway.adapter._native_submit_running_agent(gateway.runner, key)) is None:
+            await asyncio.sleep(0.01)
+    receipts = []
+    for index in range(2):
+        status, receipt = await _submit_internal_gateway(
+            gateway, f"internal-busy-{index}", f"Work result {index}", internal=True,
+            busy_mode=busy_mode, expected_active_ref="stale-target-ignored-for-internal")
+        assert status == 202, receipt
+        assert receipt["admission"] == "queued"
+        receipts.append(receipt)
+    queued = [gateway.adapter._pending_messages[key], *gateway.runner._session_state(key).conversation.queued_events]
+    for index, event in enumerate(queued):
+        assert event.internal is True and event.allow_gateway_control is False
+        assert event.message_id == receipts[index]["native_request_ref"]
+        assert event.metadata["native_submit_authenticated"] is True
+        assert event.metadata["external_request_id"] == f"internal-busy-{index}"
+        assert event.metadata["gateway_session_id"] == SESSION_ID
+        assert event.metadata["gateway_session_key"] == key
+        assert event.metadata["gateway_session_strict"] is True
+    assert len(queued) == 2 and len(gateway.requests) == 1
+    assert agent._pending_steer is None and not agent._interrupt_requested
+    assert user_receipt["native_request_ref"] not in gateway.adapter._native_submit_terminals
+    gateway.release.set()
+    for receipt in [user_receipt, *receipts]:
+        rows = await _wait_native_terminal(gateway, receipt["native_request_ref"])
+    assert [(row["role"], row["content"]) for row in rows] == [
+        ("user", "user task"), ("assistant", "reply-1"),
+        ("user", "Work result 0"), ("assistant", "reply-2"),
+        ("user", "Work result 1"), ("assistant", "reply-3")]
+    assert [row.get("display_kind") for row in rows] == [None, None, "internal_notification", None, "internal_notification", None]
+    assert len(gateway.requests) == 3
+    assert all("display_kind" not in item for payload in gateway.requests for item in payload["messages"])
+
+
+@pytest.mark.asyncio
+async def test_internal_submit_identical_retry_runs_one_real_turn(internal_gateway):
+    gateway = internal_gateway
+    await _bind_internal_gateway(gateway)
+    gateway.release.clear()
+    status, receipt = await _submit_internal_gateway(gateway, "internal-retry", internal=True)
+    assert status == 202, receipt
+    await asyncio.wait_for(gateway.started.wait(), timeout=10)
+    retry_status, retry = await _submit_internal_gateway(gateway, "internal-retry", internal=True)
+    assert retry_status == 202 and retry == receipt
+    gateway.release.set()
+    rows = await _wait_native_terminal(gateway, receipt["native_request_ref"])
+    terminal_status, terminal_retry = await _submit_internal_gateway(gateway, "internal-retry", internal=True)
+    assert terminal_status == 202 and terminal_retry == receipt
+    assert len(gateway.requests) == 1 and len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_internal_submit_without_bound_credential_keeps_409(internal_gateway):
+    status, body = await _submit_internal_gateway(internal_gateway, "internal-unbound", internal=True)
+    assert status == 409 and body["error"]["code"] == "credential_unavailable"
+    assert internal_gateway.requests == []
+    assert internal_gateway.db.get_messages(SESSION_ID) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("internal", ["yes", "false", 0, 1, None, [], {}])
+async def test_internal_submit_rejects_non_boolean_schema_values(internal_gateway, internal):
+    status, body = await _submit_internal_gateway(internal_gateway, "internal-bad-schema", internal=internal)
+    assert status == 400 and body["error"]["code"] == "invalid_native_submit_schema"
+
+
+@pytest.mark.asyncio
+async def test_internal_false_is_an_ordinary_turn(internal_gateway):
+    gateway = internal_gateway
+    await _bind_internal_gateway(gateway)
+    status, receipt = await _submit_internal_gateway(gateway, "explicit-user", internal=False)
+    assert status == 202, receipt
+    rows = await _wait_native_terminal(gateway, receipt["native_request_ref"])
+    assert rows[0]["role"] == "user" and rows[0].get("display_kind") is None
+
+
+@pytest.mark.asyncio
+async def test_internal_gateway_harness_runs_an_ordinary_turn(internal_gateway):
+    await _bind_internal_gateway(internal_gateway)
+    status, receipt = await _submit_internal_gateway(internal_gateway, "harness-user")
+    assert status == 202, receipt
+    rows = await _wait_native_terminal(internal_gateway, receipt["native_request_ref"])
+    assert [(row["role"], row["content"]) for row in rows] == [("user", "Work result"), ("assistant", "reply-1")]
+    assert len(internal_gateway.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first,second", [(False, True), (True, False)])
+async def test_internal_flag_change_conflicts_instead_of_replaying(internal_gateway, first, second):
+    gateway = internal_gateway
+    await _bind_internal_gateway(gateway)
+    status, receipt = await _submit_internal_gateway(gateway, "changed-internal", internal=first)
+    assert status == 202, receipt
+    await _wait_native_terminal(gateway, receipt["native_request_ref"])
+    status, body = await _submit_internal_gateway(gateway, "changed-internal", internal=second)
+    assert status == 409 and body["error"]["code"] == "native_submit_idempotency_conflict"
+    assert len(gateway.requests) == 1
