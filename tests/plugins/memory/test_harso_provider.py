@@ -1595,7 +1595,7 @@ def test_profile_counts_toward_the_cap_and_is_dropped_whole_when_alone_over(
                                 "[harso: e0] " + "0" * 400, "Memory gaps: budget-excluded"]
 
 
-_TOOL_NAMES = ["memory_profile", "memory_search", "memory_open"]
+_TOOL_NAMES = ["memory_profile", "memory_search", "memory_open", "memory_forget_request"]
 
 
 def test_tool_schemas_are_listed_and_registered(monkeypatch, features_on):
@@ -1837,3 +1837,19 @@ def test_r2_displaced_same_key_job_is_released_not_orphaned(monkeypatch):
     assert list(harso._FETCH_PENDING) == [("scope", "s")]
     harso._FETCH_PENDING.pop(("scope", "s"))(False)
     assert calls == [("a", True), ("b", False)]
+
+
+def test_forget_request_only_proposes_on_read_route(monkeypatch, features_on):
+    ref = "assertion:01990000-0000-7000-8000-00000000000a"
+    reply = {"action": "forget_request", "ref": ref, "found": True, "pending": True,
+             "card": {"target_ref": ref, "text": "my test phrase"}}
+    provider, router = _profile_provider(monkeypatch, tool=reply)
+    provider._session_id = _SESSION
+    assert json.loads(provider.handle_tool_call("memory_forget_request", {"ref": ref})) == reply
+    assert router.calls[-1]["path"] == "/internal/harso/memory-tool"
+    assert router.calls[-1]["body"] == {**_SCOPE, "action": "forget_request", "argument": ref}
+    schemas = {s["name"]: s for s in provider.get_tool_schemas()}
+    assert "cannot delete" in schemas["memory_forget_request"]["description"]
+    router.calls.clear()
+    assert json.loads(provider.handle_tool_call("memory_forget", {"ref": ref})) == {"error": "memory unavailable"}
+    assert router.calls == []
