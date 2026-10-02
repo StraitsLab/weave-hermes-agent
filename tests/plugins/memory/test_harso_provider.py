@@ -1595,7 +1595,7 @@ def test_profile_counts_toward_the_cap_and_is_dropped_whole_when_alone_over(
                                 "[harso: e0] " + "0" * 400, "Memory gaps: budget-excluded"]
 
 
-_TOOL_NAMES = ["memory_profile", "memory_search", "memory_open", "memory_forget_request"]
+_TOOL_NAMES = ["memory_propose", "memory_profile", "memory_search", "memory_open", "memory_forget_request"]
 
 
 def test_tool_schemas_are_listed_and_registered(monkeypatch, features_on):
@@ -1853,3 +1853,45 @@ def test_forget_request_only_proposes_on_read_route(monkeypatch, features_on):
     router.calls.clear()
     assert json.loads(provider.handle_tool_call("memory_forget", {"ref": ref})) == {"error": "memory unavailable"}
     assert router.calls == []
+
+
+# WEV-1830: proposals cite the durable current user row, never an assertion.
+def test_memory_propose_schema_and_source_bound_hint(monkeypatch, features_on):
+    provider, router = _profile_provider(monkeypatch, tool={"noted": True,
+        "applies_when": "your message is processed (usually under a minute)"})
+    provider._session_id = _SESSION
+    schema = {s["name"]: s for s in provider.get_tool_schemas()}["memory_propose"]
+    assert schema["description"] == "You cannot write memory. Use this when the user asks you to remember or correct something; tell them it is noted."
+    assert set(schema["parameters"]["properties"]) == {"ref", "text", "kind"}
+    result = json.loads(provider.handle_tool_call("memory_propose",
+        {"ref": None, "text": "my locker is 412", "kind": "remember"},
+        messages=[{"role": "user", "content": "remember my locker is 412", "_row_id": 41}]))
+    assert result["noted"] is True
+    assert router.calls[-1]["path"] == "/internal/harso/memory-tool"
+    assert router.calls[-1]["body"] == {**_SCOPE, "action": "propose", "ref": None,
+        "text": "my locker is 412", "kind": "remember", "current_user_ref": "message:41"}
+
+
+def test_memory_propose_never_falls_back_to_an_older_user_row(monkeypatch, features_on):
+    provider, router = _profile_provider(monkeypatch)
+    provider._session_id = _SESSION
+    result = json.loads(provider.handle_tool_call("memory_propose",
+        {"ref": None, "text": "my locker is 412", "kind": "remember"},
+        messages=[{"role": "user", "_row_id": 9}, {"role": "user", "content": "new turn"}]))
+    assert "error" in result and router.calls == []
+
+
+def test_real_agent_dispatch_passes_the_current_source_to_memory_propose(monkeypatch, features_on):
+    from types import SimpleNamespace
+    from agent.agent_runtime_helpers import invoke_tool
+    provider, router = _profile_provider(monkeypatch, tool={"noted": True})
+    provider._session_id = _SESSION
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    agent = SimpleNamespace(_memory_manager=manager, session_id=_SESSION)
+    result = json.loads(invoke_tool(agent, "memory_propose",
+        {"ref": None, "text": "my locker is 412", "kind": "remember"}, "task",
+        messages=[{"role": "user", "content": "remember my locker is 412", "_row_id": 41}],
+        pre_tool_block_checked=True, skip_tool_request_middleware=True, skip_tool_execution_middleware=True))
+    assert result == {"noted": True}
+    assert router.calls[-1]["body"]["current_user_ref"] == "message:41"
