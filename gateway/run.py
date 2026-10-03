@@ -7438,24 +7438,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def bind_session_credential(
         self, source: SessionSource, session_id: str, bearer: str,
         expires_at: datetime, provider_route_revision_id: str,
+        *, raise_on_reset: bool = False,
     ) -> bool:
         """Bind one memory-only credential to an existing strict session."""
         with self._session_credential_lock:
             entry = self.session_store.bind_existing_session(
-                source, session_id, reopen=False,
+                source, session_id, reopen=False, raise_on_reset=raise_on_reset,
             )
-            if entry is None or entry.session_id != session_id:
+            if entry is None:
                 return False
-            conversation = self._session_state(entry.session_key).conversation
-            holder = conversation.credential_holder
-            if holder is None:
-                conversation.credential_holder = SessionCredential(bearer, expires_at)
-                conversation.credential_route_revision_id = provider_route_revision_id
-                return True
-            return (
-                conversation.credential_route_revision_id == provider_route_revision_id
-                and holder.refresh(bearer, expires_at)
-            )
+            # A reset can replace the entry after strict binding returns.
+            # Publish the holder only while that exact route still owns the key.
+            with self.session_store._lock:
+                current = self.session_store._entries.get(entry.session_key)
+                if current is not entry or current.session_id != session_id:
+                    if raise_on_reset:
+                        from gateway.session import SessionResetRequired
+                        raise SessionResetRequired("source_displaced")
+                    return False
+                conversation = self._session_state(entry.session_key).conversation
+                holder = conversation.credential_holder
+                if holder is None:
+                    conversation.credential_holder = SessionCredential(bearer, expires_at)
+                    conversation.credential_route_revision_id = provider_route_revision_id
+                    return True
+                return (
+                    conversation.credential_route_revision_id == provider_route_revision_id
+                    and holder.refresh(bearer, expires_at)
+                )
 
     def session_credential_available(
         self, source: SessionSource, session_id: str,
