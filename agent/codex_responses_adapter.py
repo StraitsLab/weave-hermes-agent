@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, NamedTuple, Optional
 
 from agent.message_sanitization import deterministic_call_id
-from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.prompt_builder import DEFAULT_AGENT_IDENTITY, NEUTRAL_AGENT_IDENTITY
 
 logger = logging.getLogger(__name__)
 
@@ -1237,7 +1237,18 @@ def _preflight_codex_api_kwargs(
         instructions = ""
     if not isinstance(instructions, str):
         instructions = str(instructions)
-    instructions = instructions.strip() or DEFAULT_AGENT_IDENTITY
+    instructions = instructions.strip()
+    if not instructions:
+        engine_identity = True
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            agent_config = load_config_readonly().get("agent", {})
+            if isinstance(agent_config, dict):
+                engine_identity = bool(agent_config.get("engine_identity", True))
+        except Exception as exc:
+            logger.debug("Could not read engine identity setting: %s", exc)
+        instructions = DEFAULT_AGENT_IDENTITY if engine_identity else NEUTRAL_AGENT_IDENTITY
     if sanitize_harmony_tokens:
         instructions = _neutralize_harmony_tokens(instructions)
 

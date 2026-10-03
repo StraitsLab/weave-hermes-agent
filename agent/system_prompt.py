@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
+    NEUTRAL_AGENT_IDENTITY,
     EXECUTION_GUIDANCE_MODELS,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
@@ -492,6 +493,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
+    engine_identity = getattr(agent, "_engine_identity", True)
 
     # Try SOUL.md as primary identity unless the caller explicitly skipped it.
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
@@ -513,7 +515,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     if not _soul_loaded:
         # Fallback to hardcoded identity
-        stable_parts.append(DEFAULT_AGENT_IDENTITY)
+        stable_parts.append(DEFAULT_AGENT_IDENTITY if engine_identity else NEUTRAL_AGENT_IDENTITY)
     _epoch_stamp = _identity_epoch_line(agent, _soul_snapshot.get("digest", "unstable")) if _epoch_on else ""
 
     # Pointer to the docs (and, when it exists, the hermes-agent skill) for
@@ -525,7 +527,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # per-session, so cache-safe either way.
     _has_skill_view = "skill_view" in (agent.valid_tool_names or set())
     _help_guidance_slot = len(stable_parts)
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
+    if engine_identity:
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -584,7 +587,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Steering only lands inside tool results, so it's only reachable when the
     # agent has tools. Static text → byte-stable prompt (no cache hit).
     if agent.valid_tool_names:
-        stable_parts.append(STEER_CHANNEL_NOTE)
+        stable_parts.append(
+            STEER_CHANNEL_NOTE if engine_identity else STEER_CHANNEL_NOTE.replace("Hermes", "The runtime")
+        )
 
     # Tool-use enforcement: tells the model to actually call tools instead
     # of describing intended actions.  Controlled by config.yaml
@@ -673,6 +678,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
             skills_dir_override=_agent_skills_dir(agent),
+            **({} if engine_identity else {"engine_identity": False}),
         )
     else:
         skills_prompt = ""
@@ -682,7 +688,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # the hermes-agent skill actually present in the index (gating on the
     # rendered index line keeps this a pure string check — no second
     # filesystem scan, and it inherits the index cache's stability).
-    if _has_skill_view and "- hermes-agent:" in skills_prompt:
+    if engine_identity and _has_skill_view and "- hermes-agent:" in skills_prompt:
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
@@ -690,7 +696,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # so the agent can correctly report which model it is (workaround for API bug).
     # Stable for the lifetime of an agent instance — model and provider are fixed
     # at construction time.
-    if agent.provider == "alibaba":
+    if engine_identity and agent.provider == "alibaba":
         _model_short = agent.model.split("/")[-1] if "/" in agent.model else agent.model
         stable_parts.append(
             f"You are powered by the model named {_model_short}. "
@@ -702,7 +708,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
     # Stable for the lifetime of the process.
-    _env_hints = _r.build_environment_hints()
+    _env_hints = _r.build_environment_hints(**({} if engine_identity else {"engine_identity": False}))
     if _env_hints:
         stable_parts.append(_env_hints)
 
@@ -828,7 +834,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _root_str = str(get_default_hermes_root())
     else:
         _home_str = _root_str = str(get_hermes_home())
-    if active_profile == "default":
+    if engine_identity and active_profile == "default":
         post_workspace_parts.append(
             "Active Hermes profile: default. Other profiles (if any) live "
             "under " + _root_str + "/profiles/<name>/. Each profile has its own "
@@ -837,7 +843,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             "skills/plugins/cron/memories unless the user explicitly directs "
             "you to."
         )
-    else:
+    elif engine_identity:
         # A non-default name is only ever returned when the resolved home is
         # ALREADY <root>/profiles/<name> — that is exactly how both
         # _profile_name_for_home() and _resolve_active_profile_name() derive
@@ -1051,9 +1057,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line = f"Timezone: {', '.join(_zone_bits)}" if _zone_bits else ""
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
-    if agent.model:
+    if engine_identity and agent.model:
         timestamp_line += f"\nModel: {agent.model}"
-    if agent.provider:
+    if engine_identity and agent.provider:
         timestamp_line += f"\nProvider: {agent.provider}"
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
