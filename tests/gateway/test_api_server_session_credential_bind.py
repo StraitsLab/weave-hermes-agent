@@ -1,6 +1,7 @@
 """Behavior contracts for native REST session credential binding."""
 
 import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -146,8 +147,155 @@ async def test_bind_distinguishes_unknown_from_malformed_and_ended_sessions(adap
     assert unknown.status == 404
     assert unknown_body["error"]["code"] == "session_not_found"
     assert ended.status == 409
-    assert ended_body["error"]["code"] == "credential_unavailable"
+    assert ended_body["error"]["code"] == "session_reset_required"
+    assert "Retry-After" not in ended.headers
     assert runner._session_db._db.get_session("ended-native-bind-session")["end_reason"] == "closed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end_original", [False, True], ids=["displaced-live", "reset-ended"])
+async def test_persisted_reset_route_requires_reset_without_binding_a_credential(
+    adapter_and_runner, end_original, caplog,
+):
+    adapter, runner = adapter_and_runner
+    store = runner.session_store
+    source = SessionSource(
+        platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm",
+        user_id="api_server", user_name="API server",
+    )
+    entry = store.bind_existing_session(source, SESSION_ID, reopen=False)
+    runner._session_db._db.append_message(SESSION_ID, "user", "keep this history")
+    descendant = store.reset_session(entry.session_key)
+    db = runner._session_db._db
+    if not end_original:
+        # A failed end write can leave the displaced parent live.
+        db.reopen_session(SESSION_ID)
+    with store._lock:
+        store._entries.clear()
+        store._loaded = False
+    store._ensure_loaded()
+    assert store.lookup_by_session_key(entry.session_key).session_id == descendant.session_id
+    before_messages = db.get_messages(SESSION_ID)
+    client = await _client(adapter)
+    try:
+        response = await client.post(
+            f"/api/sessions/{SESSION_ID}/credential/bind",
+            headers={"Authorization": f"Bearer {adapter.config.extra['key']}"},
+            json=_bind_body(),
+        )
+        body = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 409
+    assert body["error"]["code"] == "session_reset_required"
+    assert "Retry-After" not in response.headers
+    cause = "session_ended" if end_original else "source_displaced"
+    assert f"native_session_reset_required cause={cause}" in caplog.text
+    assert descendant.session_id not in repr(body) + caplog.text
+    assert BEARER not in repr(body) + caplog.text
+    assert store.lookup_by_session_key(entry.session_key).session_id == descendant.session_id
+    state = runner._peek_session_state(entry.session_key)
+    assert state is None or state.conversation.credential_holder is None
+    assert (db.get_session(SESSION_ID)["end_reason"] is not None) == end_original
+    assert db.get_messages(SESSION_ID) == before_messages
+
+
+@pytest.mark.asyncio
+async def test_bind_waiting_on_routing_lock_observes_a_closed_session(
+    adapter_and_runner, monkeypatch,
+):
+    """Closing a row before the routing lock is acquired must defeat strict bind."""
+    import threading
+
+    adapter, runner = adapter_and_runner
+    store = runner.session_store
+    entered = threading.Event()
+    routing_lock = store._lock
+    generate_key = store._generate_session_key
+
+    class ObservedLock:
+        def acquire(self, *args, **kwargs):
+            return routing_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            routing_lock.release()
+
+        def __enter__(self):
+            entered.set()
+            self.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.release()
+
+    monkeypatch.setattr(store, "_lock", ObservedLock())
+    client = await _client(adapter)
+    store._lock.acquire()
+    try:
+        binding = asyncio.create_task(client.post(
+            f"/api/sessions/{SESSION_ID}/credential/bind",
+            headers={"Authorization": f"Bearer {adapter.config.extra['key']}"},
+            json=_bind_body(),
+        ))
+        assert await asyncio.to_thread(entered.wait, 5)
+        await asyncio.to_thread(runner._session_db._db.end_session, SESSION_ID, "closed")
+    finally:
+        store._lock.release()
+    try:
+        response = await asyncio.wait_for(binding, 5)
+        body = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 409
+    assert body["error"]["code"] == "session_reset_required"
+    assert "Retry-After" not in response.headers
+    key = generate_key(SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm"))
+    state = runner._peek_session_state(key)
+    assert state is None or state.conversation.credential_holder is None
+    assert runner._session_db._db.get_session(SESSION_ID)["end_reason"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_reset_after_strict_bind_does_not_publish_a_holder(
+    adapter_and_runner, monkeypatch,
+):
+    adapter, runner = adapter_and_runner
+    store = runner.session_store
+    bind = store.bind_existing_session
+    reset = threading.Event()
+    allow_return = threading.Event()
+
+    def paused_bind(*args, **kwargs):
+        entry = bind(*args, **kwargs)
+        reset.set()
+        assert allow_return.wait(5)
+        return entry
+
+    monkeypatch.setattr(store, "bind_existing_session", paused_bind)
+    client = await _client(adapter)
+    binding = asyncio.create_task(client.post(
+        f"/api/sessions/{SESSION_ID}/credential/bind",
+        headers={"Authorization": f"Bearer {adapter.config.extra['key']}"}, json=_bind_body(),
+    ))
+    try:
+        assert await asyncio.to_thread(reset.wait, 5)
+        source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm")
+        key = store._generate_session_key(source)
+        descendant = await asyncio.to_thread(store.reset_session, key)
+        allow_return.set()
+        response = await asyncio.wait_for(binding, 5)
+        body = await response.json()
+    finally:
+        allow_return.set()
+        await client.close()
+
+    assert response.status == 409
+    assert body["error"]["code"] == "session_reset_required"
+    assert store.lookup_by_session_key(key).session_id == descendant.session_id
+    state = runner._peek_session_state(key)
+    assert state is None or state.conversation.credential_holder is None
 
 
 @pytest.mark.asyncio
