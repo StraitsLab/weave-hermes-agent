@@ -11877,6 +11877,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except _PassiveAppendGroupAborted as aborted:
             return [dict(aborted.result) for _ in checked]
 
+    def delete_passive_item(self, session_id: str, external_item_id: str) -> bool:
+        """Delete one passive message in its owning session, including trigger-owned FTS rows.
+
+        Keep the content-free idempotency mapping (ids and SHA-256 digest): a
+        replay answers ``identical_retry`` and cannot resurrect the erased row.
+        Return False for a missing item, an erased row, or another session's item.
+        """
+        def _do(conn):
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'passive_append_idempotency'"
+            ).fetchone() is None:
+                return False
+            item = conn.execute(
+                "SELECT session_id, native_message_id FROM passive_append_idempotency WHERE external_item_id = ?",
+                (external_item_id,),
+            ).fetchone()
+            if item is None or item["session_id"] != session_id:
+                return False
+            deleted = conn.execute(
+                "DELETE FROM messages WHERE id = ? AND session_id = ?",
+                (item["native_message_id"], session_id),
+            ).rowcount
+            if deleted:
+                conn.execute(
+                    "UPDATE sessions SET message_count = message_count - ? WHERE id = ?",
+                    (deleted, session_id),
+                )
+            return deleted > 0
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def append_passive_message(
         self,
         session_id: str,

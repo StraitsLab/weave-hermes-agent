@@ -2340,6 +2340,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/api/sessions/{session_id}/events/stream", self._handle_session_events_stream),
             ("POST", "/api/sessions/{session_id}/append", self._handle_session_append),
             ("POST", "/api/sessions/{session_id}/append/group", self._handle_session_append_group),
+            ("DELETE", "/api/sessions/{session_id}/items/{external_item_id}", self._handle_session_item_delete),
             ("POST", "/api/sessions/{session_id}/credential/bind", self._handle_session_credential_bind),
             ("POST", "/api/sessions/{session_id}/submit", self._handle_session_submit),
             ("GET", "/api/sessions/{session_id}/submit/{native_request_ref}/events", self._handle_native_submit_events),
@@ -3532,6 +3533,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": True,
                 "session_passive_append": True,
                 "session_passive_append_group": True,
+                "session_passive_item_delete": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -3597,6 +3599,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_passive_append": {"method": "POST", "path": "/api/sessions/{session_id}/append"},
                 "session_passive_append_group": {"method": "POST", "path": "/api/sessions/{session_id}/append/group"},
+                "session_passive_item_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}/items/{external_item_id}"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
                 "browser_control_register": {"method": "POST", "path": "/v1/browser-control/register"},
                 "browser_control_ws": {"method": "GET", "path": "/v1/browser-control/ws"},
@@ -5126,6 +5129,30 @@ class APIServerAdapter(BasePlatformAdapter):
         outcomes = {result["outcome"] for result in results}
         status = 201 if outcomes == {"inserted"} else 200 if outcomes == {"identical_retry"} else 409
         return web.json_response({"kind": "hermes_append_group_receipt", "receipts": receipts}, status=status)
+
+    async def _handle_session_item_delete(self, request: "web.Request") -> "web.Response":
+        """Authenticate, then delete one passive item: 204 if deleted, else 404 item_not_found.
+
+        Missing items, already erased rows, and another session's items all return
+        the same 404 error. The retained idempotency mapping prevents resurrection.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+        try:
+            deleted = await asyncio.to_thread(
+                db.delete_passive_item, request.match_info["session_id"], request.match_info["external_item_id"])
+        except Exception as exc:
+            logger.warning("[%s] passive item delete failed: %s", self.name, type(exc).__name__)
+            return web.json_response(
+                _openai_error("Session item deletion unavailable", code="session_item_delete_unavailable"), status=503)
+        if not deleted:
+            return web.json_response(_openai_error("Item was not found", code="item_not_found"), status=404)
+        return web.Response(status=204)
 
     async def _handle_session_credential_bind(self, request: "web.Request") -> "web.Response":
         """Bind one controller-supplied bearer to an existing live session."""

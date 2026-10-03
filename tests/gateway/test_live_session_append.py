@@ -296,9 +296,13 @@ def test_concurrent_duplicate_has_one_mapping_and_native_row(session_db):
 
 def _app(adapter):
     app = web.Application()
-    app.router.add_post(
-        "/api/sessions/{session_id}/append", adapter._handle_session_append
-    )
+    for method, path, handler in adapter._http_route_table():
+        if path in {
+            "/api/sessions/{session_id}/append",
+            "/api/sessions/{session_id}/append/group",
+            "/api/sessions/{session_id}/items/{external_item_id}",
+        }:
+            app.router.add_route(method, path, handler)
     return app
 
 
@@ -559,6 +563,61 @@ def _group_body(requests, predecessor=None):
     if predecessor is not None:
         body["predecessor_sequence"] = predecessor
     return body
+
+
+@pytest.mark.asyncio
+async def test_http_delete_passive_item_erases_search_and_cannot_resurrect(session_db):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-group"}))
+    adapter._session_db = session_db
+    headers = {"Authorization": "Bearer sk-group"}
+    session_db.create_session(HERMES_SESSION_ID, "api_server")
+    pair = [_request(item["external_item_id"], role=item["role"], content=item["content"])
+            for item in _pair()]
+    append_url = f"/api/sessions/{SESSION_ID}/append/group"
+    delete_url = f"/api/sessions/{SESSION_ID}/items/{CARD_ID}"
+    kept_url = f"/api/sessions/{SESSION_ID}/items/{ANSWER_ID}"
+
+    def search(text):
+        with session_db._read_ctx() as conn:
+            indexes = ["messages_fts", "messages_fts_trigram"]
+            if session_db._fts_cjk_available:
+                indexes.append("messages_fts_cjk")
+            return [conn.execute(
+                f"SELECT rowid FROM {index} WHERE {index} MATCH ?", (f'"{text}"',)
+            ).fetchall() for index in indexes]
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        missing = await client.delete(delete_url, headers=headers)
+        assert missing.status == 404
+        assert (await missing.json())["error"]["code"] == "item_not_found"
+        assert (await client.post(append_url, headers=headers, json=_group_body(pair))).status == 201
+        assert all(search("RESULT_CARD"))
+        assert all(search("RESULT_MESSAGE"))
+        assert (await client.delete(delete_url, headers=headers)).status == 204
+        assert _rows(session_db) == [("assistant", "RESULT_MESSAGE")]
+        assert session_db.get_session(SESSION_ID)["message_count"] == 1
+        assert not any(search("RESULT_CARD"))
+        assert all(search("RESULT_MESSAGE"))
+
+        for url in (
+            delete_url,
+            f"/api/sessions/{SESSION_ID}/items/{OTHER_ID}",
+            f"/api/sessions/{HERMES_SESSION_ID}/items/{ANSWER_ID}",
+        ):
+            missing = await client.delete(url, headers=headers)
+            assert missing.status == 404
+            assert (await missing.json())["error"]["code"] == "item_not_found"
+        assert (await client.delete(kept_url)).status == 401
+        replay = await client.post(append_url, headers=headers, json=_group_body(pair))
+        assert replay.status == 200
+        assert [r["outcome"] for r in (await replay.json())["receipts"]] == [
+            "identical_retry", "identical_retry",
+        ]
+        assert _rows(session_db) == [("assistant", "RESULT_MESSAGE")]
+        assert session_db.get_session(SESSION_ID)["message_count"] == 1
+        assert session_db.get_session(HERMES_SESSION_ID)["message_count"] == 0
+        assert not any(search("RESULT_CARD"))
+        assert all(search("RESULT_MESSAGE"))
 
 
 @pytest.mark.asyncio
