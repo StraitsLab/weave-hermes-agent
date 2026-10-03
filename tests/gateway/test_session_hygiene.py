@@ -650,8 +650,9 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider_overflow", [False, True])
 async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, provider_overflow
 ):
     """A compression that still streams progress must not hold the turn hostage.
 
@@ -672,8 +673,68 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     cleanup_done = threading.Event()
     fake_db = MagicMock()
     fake_db.get_compression_failure_cooldown.return_value = None
+    live_agent = None
+    if provider_overflow:
+        from unittest.mock import patch
+        from hermes_state import SessionDB
+        from run_agent import AIAgent as LiveAIAgent
 
-    class StreamingCompressAgent:
+        fake_db = SessionDB(db_path=tmp_path / "state.db")
+        fake_db.create_session("sess-turnhold", source="test")
+        fake_db.set_session_title("sess-turnhold", "Existing long chat")
+        with (
+            patch("run_agent.OpenAI"),
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+        ):
+            live_agent = LiveAIAgent(
+                api_key="test-key",
+                base_url="https://example.invalid/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                session_id="sess-turnhold",
+                session_db=fake_db,
+            )
+        live_agent.client = MagicMock()
+        live_agent._cached_system_prompt = "You are helpful."
+        live_agent._use_prompt_caching = False
+        live_agent.save_trajectories = False
+        live_agent.compression_in_place = True
+        live_agent.compression_enabled = True
+        # Keep proactive compression below threshold so the provider proves
+        # overflow first. Only provider calls are doubled; the conversation,
+        # durable cooldown guard, compressor and in-place commit are real.
+        live_agent.context_compressor.context_length = 2_000_000
+        live_agent.context_compressor.threshold_tokens = 1_500_000
+        live_agent.context_compressor.protect_first_n = 1
+        live_agent.context_compressor.protect_last_n = 2
+        monkeypatch.setattr(
+            live_agent.context_compressor,
+            "_generate_summary",
+            lambda *_args, **_kwargs: "Earlier questions were answered.",
+        )
+        monkeypatch.setattr("run_agent.jittered_backoff", lambda *_a, **_k: 0)
+        overflow = Exception(
+            "HTTP 400: prompt is too long: 1012399 tokens > 1000000 maximum"
+        )
+        overflow.status_code = 400
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content="Answered after compression",
+                    tool_calls=None,
+                    reasoning_content=None,
+                    reasoning=None,
+                ),
+                finish_reason="stop",
+            )],
+            model="test/model",
+            usage=None,
+        )
+        live_agent.client.chat.completions.create.side_effect = [overflow, response]
+
+    class StreamingCompressAgent(LiveAIAgent if provider_overflow else object):
         last_instance = None
 
         def __init__(self, **kwargs):
@@ -712,9 +773,12 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
                 if commit_fence is not None:
                     commit_fence.finish_commit()
 
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = StreamingCompressAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    if provider_overflow:
+        monkeypatch.setattr(sys.modules["run_agent"], "AIAgent", StreamingCompressAgent)
+    else:
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = StreamingCompressAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(
@@ -758,7 +822,26 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     runner._session_db = SimpleNamespace(_db=fake_db)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
+    turn_results = []
+
+    async def run_live_turn(**kwargs):
+        # Double auxiliary routing and prompt/tool discovery, not overflow
+        # handling, the durable guard, compression or its database commit.
+        with (
+            patch("agent.conversation_compression.check_compression_model_feasibility"),
+            patch("agent.conversation_compression._refresh_agent_tool_definitions"),
+            patch.object(live_agent, "_build_system_prompt", return_value="You are helpful."),
+        ):
+            result = await asyncio.to_thread(
+                live_agent.run_conversation,
+                kwargs["message"],
+                conversation_history=kwargs["history"],
+            )
+        turn_results.append(result)
+        return result
+
     runner._run_agent = AsyncMock(
+        side_effect=run_live_turn if provider_overflow else None,
         return_value={
             "final_response": "ok",
             "messages": [],
@@ -787,21 +870,31 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     )
 
     started = time.monotonic()
-    result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
+    try:
+        result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
+    finally:
+        release_worker.set()
+        await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=3)
     elapsed = time.monotonic() - started
 
     # The turn proceeded on the uncompressed transcript well under the 600s
     # ceiling — the turn-hold budget (~0.3s) abandoned the streaming wait.
-    assert result == "ok"
+    assert result == ("Answered after compression" if provider_overflow else "ok")
     assert elapsed < 5.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
     assert worker_started.is_set()
     assert runner._run_agent.await_count == 1
-    # The stale commit must be fenced: the late worker never mutates the session.
-    fake_db.archive_and_compact.assert_not_called()
-
-    release_worker.set()
-    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=3)
-    fake_db.archive_and_compact.assert_not_called()
+    if provider_overflow:
+        assert turn_results[0]["completed"] is True
+        assert not turn_results[0].get("compression_deferred")
+        assert live_agent.client.chat.completions.create.call_count == 2
+        assert live_agent.context_compressor.compression_count == 1
+        # Six history rows + the user message + an answer would be eight
+        # without compression. The real in-place commit shrinks that history.
+        assert len(turn_results[0]["messages"]) < 8
+        assert fake_db.get_compression_failure_cooldown("sess-turnhold") is None
+    else:
+        # The stale commit must be fenced: the late worker never mutates the session.
+        fake_db.archive_and_compact.assert_not_called()
     StreamingCompressAgent.last_instance.close.assert_called_once()
 
     # Behavior witness 1: turn-hold expiry must NOT stamp the idle-timeout
@@ -816,26 +909,21 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
         for c in sent_contents
     ), f"turn-hold must send deferral notice, got: {sent_contents}"
 
-    # Behavior witness 2: turn-hold must NOT advance the failure STREAK.
-    fake_db.get_compression_failure_cooldown.assert_called()
-    # The escalating ladder (x1, x3, x9) is reserved for real failures via
-    # _hygiene_cooldown_for_failure -> increment_hygiene_failure_streak.
-    # The turn-hold path records only a flat, non-escalating retry-after
-    # (spacing out re-attempts so sustained traffic does not spawn and
-    # cancel a fresh compressor every turn) and must never touch the streak.
-    assert not fake_db.increment_hygiene_failure_streak.called, \
-        "turn-hold must not advance the failure streak"
-    assert fake_db.record_compression_failure_cooldown.called, \
-        "turn-hold must record the flat retry-after spacing"
-    _th_args = fake_db.record_compression_failure_cooldown.call_args[0]
-    import time as _time_mod
-    _th_retry = _th_args[1] - _time_mod.time()
-    assert _th_retry <= 120, (
-        f"turn-hold retry-after must stay flat (~60s), got {_th_retry:.0f}s "
-        "— escalating ladder leaked into the deferral path"
-    )
-    assert "turn-hold" in (_th_args[2] or ""), \
-        "retry-after reason must name the turn-hold deferral"
+    # Turn-hold retry spacing belongs to the gateway, not the compressor's
+    # durable failure guard. Real failures alone advance the failure streak.
+    if not provider_overflow:
+        fake_db.get_compression_failure_cooldown.assert_called()
+        fake_db.increment_hygiene_failure_streak.assert_not_called()
+        fake_db.record_compression_failure_cooldown.assert_not_called()
+    retry_until = runner._hygiene_turnhold_retry_until["sess-turnhold"]
+    assert 0 < retry_until - time.monotonic() <= 60
+
+    # A second turn skips gateway hygiene while the spacing remains active.
+    if not provider_overflow:
+        await runner._handle_message(event)
+        assert runner._run_agent.await_count == 2
+        assert StreamingCompressAgent.last_instance.close.call_count == 1
+        assert runner._hygiene_turnhold_retry_until["sess-turnhold"] == retry_until
 
     # Behavior witness 3: the #87011 contract remains truthful —
     # "session hygiene compression timed out" still means a real idle

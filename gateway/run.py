@@ -21235,6 +21235,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 if _needs_compress:
+                    # Healthy turn-hold deferrals space gateway hygiene only.
+                    # They must not block provider-proven overflow recovery.
+                    _turnhold_retry_until = getattr(
+                        self, "_hygiene_turnhold_retry_until", {}
+                    ).get(session_entry.session_id, 0.0)
+                    if _turnhold_retry_until > time.monotonic():
+                        logger.info(
+                            "Session hygiene: skipping compression for %s; "
+                            "turn-hold retry spacing active",
+                            session_entry.session_id,
+                        )
+                        _needs_compress = False
                     # Use the persistent DB-backed cooldown (same as the
                     # in-conversation compression path in context_compressor.py)
                     # so the cooldown survives gateway restarts. The in-memory
@@ -21615,23 +21627,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 context="session hygiene turn-hold",
                                             )
                                             _hyg_cleanup_deferred = True
-                                            # Short, NON-escalating retry-after. Without
-                                            # it, every subsequent turn re-spawns a fresh
-                                            # compressor, holds it for the turn-hold
-                                            # budget, and cancels it again — a per-turn
-                                            # summary-model token burn that never commits
-                                            # under sustained traffic. This is deliberately
-                                            # NOT _hygiene_cooldown_for_failure: the
-                                            # compressor is healthy, so the failure streak
-                                            # must not advance (behavior witness below);
-                                            # only the flat retry spacing is recorded.
-                                            _record_hygiene_cooldown(
-                                                self, session_entry.session_id,
-                                                _HYGIENE_TURNHOLD_RETRY_SECONDS,
-                                                "hygiene compression deferred: "
-                                                "turn-hold budget expired while the "
-                                                "summary was still streaming",
-                                            )
+                                            # The compressor is healthy but slow. Space
+                                            # gateway hygiene only; a failure cooldown
+                                            # would block live overflow recovery.
+                                            if not hasattr(self, "_hygiene_turnhold_retry_until"):
+                                                self._hygiene_turnhold_retry_until = {}
+                                            self._hygiene_turnhold_retry_until[
+                                                session_entry.session_id
+                                            ] = time.monotonic() + _HYGIENE_TURNHOLD_RETRY_SECONDS
                                             from agent.session_activity import (
                                                 ActivityProvenance,
                                             )
