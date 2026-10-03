@@ -3534,6 +3534,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_passive_append": True,
                 "session_passive_append_group": True,
                 "session_passive_item_delete": True,
+                "session_list_id_prefix": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -4421,33 +4422,51 @@ class APIServerAdapter(BasePlatformAdapter):
         offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
         source = request.query.get("source") or None
         include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
-        # Exact-title lookup, used by `hermes peer dm` to resolve a peer's
-        # canonical "Bot Chat" session. ``include_hidden`` is honored ONLY
-        # alongside a title filter: Bot Mode hides canonical chats, so a
-        # title-scoped lookup must see them (issue #91583), but a blanket
-        # hidden listing stays off this client surface.
+        id_prefix = (request.query.get("id_prefix") or "").strip()
+        if "id_prefix" in request.query and not 16 <= len(id_prefix) <= 200:
+            return web.json_response(_openai_error(
+                "id_prefix must be 16-200 characters", code="invalid_id_prefix"
+            ), status=400)
+        # Scoped title and id-prefix lookups may see hidden sessions. Title
+        # lookup resolves canonical Bot Chats; id-prefix lookup finds every
+        # matching child for erasure. Blanket hidden listing stays off this
+        # client surface.
         title_filter = (request.query.get("title") or "").strip() or None
         include_hidden = bool(title_filter) and _coerce_request_bool(
             request.query.get("include_hidden"), default=False
         )
-        sessions = await asyncio.to_thread(db.list_sessions_rich,
-            source=source,
-            limit=limit,
-            offset=offset,
-            include_children=include_children,
-            order_by_last_active=True,
-            # A pin means "always reachable", so a pinned conversation that has
-            # aged past the recency window is back-filled rather than dropped.
-            include_pinned=True,
-            # Push the title needle into SQL so a hidden/old canonical row is
-            # found even when it falls outside the recency window, then apply
-            # the exact-match contract below (search_query is substring-based).
-            search_query=title_filter,
-            include_hidden=include_hidden,
-        )
+        if id_prefix:
+            sessions = await asyncio.to_thread(db.list_sessions_rich,
+                source=source,
+                limit=limit,
+                offset=offset,
+                include_children=True,
+                include_archived=True,
+                include_hidden=True,
+                include_pinned=False,
+                id_prefix=id_prefix,
+                search_query=title_filter,
+                order_by_last_active=True,
+            )
+        else:
+            sessions = await asyncio.to_thread(db.list_sessions_rich,
+                source=source,
+                limit=limit,
+                offset=offset,
+                include_children=include_children,
+                order_by_last_active=True,
+                # A pin means "always reachable", so a pinned conversation that has
+                # aged past the recency window is back-filled rather than dropped.
+                include_pinned=True,
+                # Push the title needle into SQL so a hidden/old canonical row is
+                # found even when it falls outside the recency window, then apply
+                # the exact-match contract below (search_query is substring-based).
+                search_query=title_filter,
+                include_hidden=include_hidden,
+            )
         if title_filter:
             sessions = [s for s in sessions if (s.get("title") or "").strip() == title_filter]
-            if not sessions:
+            if not sessions and not id_prefix:
                 # Recoverable-archive resurrection (#92687): a canonical Bot
                 # Chat archived by the ws-orphan reaper / older agent cleanup
                 # is invisible to list_sessions_rich (include_archived=False),
@@ -4474,7 +4493,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass  # resolution degrades to today's no-row behavior
         # Back-filled pins arrive PAST the limit, so counting them would report
         # another page that doesn't exist. Only the recency window decides.
-        windowed = sum(1 for s in sessions if not s.get("pinned"))
+        windowed = len(sessions) if id_prefix else sum(1 for s in sessions if not s.get("pinned"))
         return web.json_response({
             "object": "list",
             "data": [self._session_response(s) for s in sessions],

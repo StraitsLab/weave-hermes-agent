@@ -872,6 +872,49 @@ async def test_patch_session_persists_pinned_and_archived(adapter, session_db):
 
 
 @pytest.mark.asyncio
+async def test_list_sessions_id_prefix_finds_archived_and_hidden_children(adapter, session_db):
+    prefix = "weave-result-watch-0123456789abcdef0123456789abcdef-"
+    session_db.create_session("alerts-root", "api_server")
+    for suffix in ("aaaa", "bbbb", "cccc"):
+        session_db.create_session(prefix + suffix, "api_server", parent_session_id="alerts-root")
+    session_db.set_session_archived(prefix + "aaaa", True)
+    session_db.set_session_hidden(prefix + "bbbb", True)
+    decoy = "weave-result-watch-ffffffffffffffffffffffffffffffff-dddd"
+    session_db.create_session(decoy, "api_server", parent_session_id="alerts-root")
+    session_db.set_session_hidden(decoy, True)
+    session_db.create_session("x" + prefix + "eeee", "api_server")
+
+    async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+        resp = await cli.get("/api/sessions", params={"id_prefix": prefix, "limit": 200})
+        assert resp.status == 200, await resp.text()
+        rows = {row["id"]: row for row in (await resp.json())["data"]}
+        assert set(rows) == {prefix + suffix for suffix in ("aaaa", "bbbb", "cccc")}
+        assert rows[prefix + "aaaa"]["archived"] is True
+        assert rows[prefix + "bbbb"]["hidden"] is True
+
+        resp = await cli.get("/api/sessions", params={"include_hidden": "1", "limit": 200})
+        assert resp.status == 200
+        ids = {row["id"] for row in (await resp.json())["data"]}
+        assert ids.isdisjoint({prefix + "aaaa", prefix + "bbbb", decoy})
+
+        resp = await cli.get("/api/sessions", params={"id_prefix": "weave_result_watch_0123"})
+        assert resp.status == 200
+        assert (await resp.json())["data"] == []
+
+        resp = await cli.get("/v1/capabilities")
+        assert (await resp.json())["features"]["session_list_id_prefix"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["", " ", "short", "x" * 201])
+async def test_list_sessions_rejects_invalid_id_prefix(adapter, prefix):
+    async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+        resp = await cli.get("/api/sessions", params={"id_prefix": prefix})
+        assert resp.status == 400, await resp.text()
+        assert (await resp.json())["error"]["code"] == "invalid_id_prefix"
+
+
+@pytest.mark.asyncio
 async def test_patch_session_rejects_non_boolean_pinned(adapter, session_db):
     session_id = session_db.create_session("pin-type-session", "api_server")
     app = _create_session_app(adapter)
