@@ -1242,6 +1242,14 @@ class AsyncSessionStore:
 _DB_UNPINNED = object()
 
 
+class SessionResetRequired(RuntimeError):
+    """A strict caller cannot reuse an ended or displaced session identity."""
+
+    def __init__(self, cause: str):
+        self.cause = cause
+        super().__init__("Session reset required")
+
+
 class SessionStore:
     """
     Manages session storage and retrieval.
@@ -3023,6 +3031,7 @@ class SessionStore:
 
     def bind_existing_session(
         self, source: SessionSource, session_id: str, reopen: bool = True,
+        *, raise_on_reset: bool = False,
     ) -> Optional[SessionEntry]:
         """Atomically bind one source key to an already-existing session row.
 
@@ -3031,20 +3040,27 @@ class SessionStore:
         """
         if not isinstance(session_id, str) or not session_id or self._db is None:
             return None
-        try:
-            row = self._db.get_session(session_id)
-            if row is None or (not reopen and row.get("end_reason") is not None):
-                return None
-        except Exception:
-            return None
-
         session_key = self._generate_session_key(source)
         now = _now()
         with self._lock:
             self._ensure_loaded_locked()
+            # Read and classify inside the routing mutation lock. A separate
+            # post-refusal lookup could observe a different reset generation.
+            try:
+                row = self._db.get_session(session_id)
+            except Exception:
+                return None
+            if row is None:
+                return None
+            if not reopen and (row.get("end_reason") is not None or row.get("ended_at") is not None):
+                if raise_on_reset:
+                    raise SessionResetRequired("session_ended")
+                return None
             existing = self._entries.get(session_key)
             if existing is not None:
                 if existing.session_id != session_id:
+                    if not reopen and raise_on_reset:
+                        raise SessionResetRequired("source_displaced")
                     return None
                 existing.origin = source
                 existing.platform = source.platform

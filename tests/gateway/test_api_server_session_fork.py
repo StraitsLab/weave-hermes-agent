@@ -112,6 +112,48 @@ async def test_fork_repoints_evicts_revokes_and_returns_closed_receipt(setup):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["displaced-live", "reset-ended", "ended-exact"])
+async def test_stale_fork_requires_reset_without_creating_a_successor(setup, state, caplog):
+    adapter, runner, db = setup
+    store = runner.session_store
+    key = store._generate_session_key(_source())
+    db.append_message(PREDECESSOR, "user", "keep this history")
+    if state == "ended-exact":
+        db.end_session(PREDECESSOR, "closed")
+        descendant_id = "no-descendant-created"
+    else:
+        descendant_id = store.reset_session(key).session_id
+        if state == "displaced-live":
+            db.reopen_session(PREDECESSOR)
+    with store._lock:
+        store._entries.clear()
+        store._loaded = False
+    store._ensure_loaded()
+    routed_entry = store.lookup_by_session_key(key)
+    routed_id = routed_entry.session_id if routed_entry else None
+    messages = db.get_messages(PREDECESSOR)
+    client = await _client(adapter)
+    try:
+        response = await client.post(f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request())
+        body = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 409
+    assert body["error"]["code"] == "session_reset_required"
+    assert "Retry-After" not in response.headers
+    cause = "source_displaced" if state == "displaced-live" else "session_ended"
+    assert f"native_session_reset_required cause={cause}" in caplog.text
+    assert db.get_session(SUCCESSOR) is None
+    current = store.lookup_by_session_key(key)
+    assert (current.session_id if current else None) == routed_id
+    assert db.get_messages(PREDECESSOR) == messages
+    assert descendant_id not in repr(body) + caplog.text
+    assert "bearer-must-not-escape" not in repr(body) + caplog.text
+    assert (db.get_session(PREDECESSOR)["end_reason"] is not None) == (state != "displaced-live")
+
+
+@pytest.mark.asyncio
 async def test_busy_memory_queue_and_active_turn_are_retryable(setup):
     adapter, runner, db = setup
     key = runner.session_store._generate_session_key(_source())
@@ -129,7 +171,27 @@ async def test_busy_memory_queue_and_active_turn_are_retryable(setup):
     assert queued.status == active.status == 409
     assert queued_body["error"]["code"] == "session_boundary_unavailable"
     assert active_body["error"]["code"] == "session_boundary_unavailable"
+    assert queued.headers["Retry-After"] == active.headers["Retry-After"] == "1"
     assert db.get_session(SUCCESSOR) is None
+
+
+@pytest.mark.asyncio
+async def test_live_compression_lock_keeps_fork_retryable(setup):
+    adapter, _, db = setup
+    assert db.try_acquire_compression_lock(PREDECESSOR, "test-compression-holder")
+    client = await _client(adapter)
+    try:
+        response = await client.post(f"/api/sessions/{PREDECESSOR}/fork", headers=AUTH, json=_request())
+        body = await response.json()
+    finally:
+        await client.close()
+        db.release_compression_lock(PREDECESSOR, "test-compression-holder")
+
+    assert response.status == 409
+    assert body["error"]["code"] == "session_boundary_unavailable"
+    assert response.headers["Retry-After"] == "1"
+    assert db.get_session(SUCCESSOR) is None
+    assert db.get_session(PREDECESSOR)["end_reason"] is None
 
 
 @pytest.mark.asyncio

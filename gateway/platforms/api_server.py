@@ -5178,14 +5178,28 @@ class APIServerAdapter(BasePlatformAdapter):
             profile=_api_request_profile.get() or None,
         )
         async with self._native_lifecycle_lock(session_id):
-            bound = await asyncio.to_thread(
-                runner.bind_session_credential, source, session_id, bearer, expires_at, revision,
-            )
+            from gateway.session import SessionResetRequired
+
+            try:
+                bound = await asyncio.to_thread(
+                    runner.bind_session_credential, source, session_id, bearer, expires_at, revision,
+                    raise_on_reset=True,
+                )
+            except SessionResetRequired as exc:
+                return self._session_reset_required(exc.cause)
         if not bound:
             return web.json_response(
                 _openai_error("Credential unavailable", code="credential_unavailable"), status=409
             )
         return web.json_response({"status": "ready", "credential_slot": "GATE_B_API_KEY"})
+
+    @staticmethod
+    def _session_reset_required(cause: str) -> "web.Response":
+        # Fixed tokens only: neither bearer values nor descendant identities.
+        logger.warning("native_session_reset_required cause=%s", cause)
+        return web.json_response(
+            _openai_error("Session reset required", code="session_reset_required"), status=409,
+        )
 
     @staticmethod
     def _native_submit_request(body: Dict[str, Any]) -> tuple[Optional[tuple[str, str, str, Optional[str], bool]], Optional["web.Response"]]:
@@ -5986,9 +6000,14 @@ class APIServerAdapter(BasePlatformAdapter):
         first_lock, second_lock = sorted((source_id, successor_id))
         async with self._native_lifecycle_lock(first_lock), self._native_lifecycle_lock(second_lock):
             if await asyncio.to_thread(db.get_session, successor_id) is None:
-                bound = await runner.async_session_store.bind_existing_session(
-                    source, source_id, reopen=False,
-                )
+                from gateway.session import SessionResetRequired
+
+                try:
+                    bound = await runner.async_session_store.bind_existing_session(
+                        source, source_id, reopen=False, raise_on_reset=True,
+                    )
+                except SessionResetRequired as exc:
+                    return self._session_reset_required(exc.cause)
                 if bound is None or bound.session_id != source_id:
                     return unavailable()
             queued = session_key in self._pending_messages or bool(
