@@ -135,8 +135,18 @@ _TOOL_ACTIONS = {
     "memory_search": ("search", "query"),
     "memory_open": ("open", "ref"),
     "memory_forget_request": ("forget_request", "ref"),
+    "memory_propose": ("propose", "text"),
 }
 _TOOL_SCHEMAS = [
+    {
+        "name": "memory_propose",
+        "description": "You cannot write memory. Use this when the user asks you to remember or correct something; tell them it is noted.",
+        "parameters": {"type": "object", "additionalProperties": False,
+            "properties": {"ref": {"type": ["string", "null"]},
+                           "text": {"type": "string", "minLength": 1, "maxLength": 400},
+                           "kind": {"type": "string", "enum": ["remember", "correction"]}},
+            "required": ["ref", "text", "kind"]},
+    },
     {
         "name": "memory_profile",
         "description": "The user's current always-on profile.",
@@ -524,9 +534,19 @@ class HarsoMemoryProvider(MemoryProvider):
             session_id = self._session_id
             if not session_id or not self.is_available():
                 return _TOOL_UNAVAILABLE
+            payload = {**self._scope(session_id), "action": action, "argument": argument}
+            if action == "propose":
+                messages = _kwargs.get("messages") or []
+                current = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+                if (current is None or type(current.get("_row_id")) is not int or current["_row_id"] <= 0
+                        or args.get("kind") not in ("remember", "correction") or len(argument) > 400
+                        or (args.get("ref") is not None and not isinstance(args.get("ref"), str))):
+                    return json.dumps({"error": "a durable current user message and valid hint are required"})
+                payload = {**self._scope(session_id), "action": action, "ref": args.get("ref"),
+                           "text": argument, "kind": args["kind"],
+                           "current_user_ref": f"message:{current['_row_id']}"}
             response = self._post(
-                "/internal/harso/memory-tool",
-                {**self._scope(session_id), "action": action, "argument": argument},
+                "/internal/harso/memory-tool", payload,
                 timeout=_TOOL_TIMEOUT_SECONDS,
                 max_bytes=_prefetch_limits()[1],
             )
