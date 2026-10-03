@@ -2045,6 +2045,9 @@ def init_agent(
     # targets.
     agent._task_completion_guidance = bool(_agent_section.get("task_completion_guidance", True))
 
+    # Fixed for this agent/session, like the other cached prompt settings.
+    agent._engine_identity = bool(_agent_section.get("engine_identity", True))
+
     # Universal parallel-tool-call guidance toggle.  Default True.  Separate
     # flag from task_completion_guidance because a user may want one but not
     # the other.  Steers the model to batch independent tool calls into a

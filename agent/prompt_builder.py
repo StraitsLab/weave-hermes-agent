@@ -147,6 +147,8 @@ def _strip_yaml_frontmatter(content: str) -> str:
 # Constants
 # =========================================================================
 
+NEUTRAL_AGENT_IDENTITY = "You are a helpful AI assistant."
+
 DEFAULT_AGENT_IDENTITY = (
     # Rewritten (#95681, maintainer-directed): the old text was a trait list
     # ("helpful, knowledgeable, direct") — every model already believes that
@@ -1309,7 +1311,7 @@ def _clear_backend_probe_cache() -> None:
     _BACKEND_PROBE_CACHE.clear()
 
 
-def build_environment_hints() -> str:
+def build_environment_hints(*, engine_identity: bool = True) -> str:
     """Return environment-specific guidance for the system prompt.
 
     Always emits a factual block describing the execution environment:
@@ -1396,6 +1398,9 @@ def build_environment_hints() -> str:
 
     if is_wsl():
         hints.append(WSL_ENVIRONMENT_HINT)
+
+    if not engine_identity:
+        hints = [hint.replace("Hermes", "the agent") for hint in hints]
 
     # Embedder-supplied environment description. Lets a host that wraps Hermes
     # (e.g. a sandbox runner / managed platform) explain the environment the
@@ -1765,6 +1770,7 @@ def build_skills_system_prompt(
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
     skills_dir_override: "Path | None" = None,
+    engine_identity: bool = True,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1818,6 +1824,7 @@ def build_skills_system_prompt(
             available_toolsets,
             compact_categories,
             project_dirs=project_dirs,
+            engine_identity=engine_identity,
         )
     finally:
         if _home_token is not None:
@@ -1831,11 +1838,14 @@ def _build_skills_system_prompt_inner(
     available_toolsets: "set[str] | None",
     compact_categories: "frozenset[str] | None",
     project_dirs: "list[Path] | None" = None,
+    engine_identity: bool = True,
 ) -> str:
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    if not engine_identity:
+        disabled = set(disabled) | {"hermes-agent"}
     project_dirs = project_dirs or []
     cache_key = (
         str(skills_dir),
