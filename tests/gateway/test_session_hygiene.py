@@ -736,8 +736,10 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
 
     class StreamingCompressAgent(LiveAIAgent if provider_overflow else object):
         last_instance = None
+        instance_count = 0
 
         def __init__(self, **kwargs):
+            type(self).instance_count += 1
             self.session_id = kwargs.get("session_id", "fake-session")
             self._session_db = kwargs.get("session_db")
             self._last_compaction_in_place = False
@@ -922,6 +924,8 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     if not provider_overflow:
         await runner._handle_message(event)
         assert runner._run_agent.await_count == 2
+        assert StreamingCompressAgent.instance_count == 1
+        fake_db.archive_and_compact.assert_not_called()
         assert StreamingCompressAgent.last_instance.close.call_count == 1
         assert runner._hygiene_turnhold_retry_until["sess-turnhold"] == retry_until
 
