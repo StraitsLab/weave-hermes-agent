@@ -4575,6 +4575,11 @@ def _browser_snapshot_page(full: bool, effective_task_id: str) -> str:
 
     if result.get("success"):
         data = result.get("data", {})
+        if not full and data.get("snapshot", "").strip() in ("", "(empty page)"):
+            # Compact mode can omit all text on pages without interactive elements.
+            full_result = _run_browser_command(effective_task_id, "snapshot", [])
+            if full_result.get("success"):
+                data = full_result.get("data", {})
         snapshot_text = data.get("snapshot", "")
         refs = data.get("refs", {})
 

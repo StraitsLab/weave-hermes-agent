@@ -39,6 +39,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _pick_page_target(targets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Prefer the last non-internal page, falling back to the first page."""
+    pages = [target for target in targets if target.get("type") == "page"]
+    for target in reversed(pages):
+        if not target.get("url", "").startswith(("chrome://", "chrome-untrusted://", "devtools://")):
+            return target
+    return pages[0] if pages else None
+
+
 def _redact_cdp_error_text(exc: object) -> str:
     """Redact any CDP endpoint credentials from an error's string form.
 
@@ -972,7 +981,7 @@ class CDPSupervisor:
             foreign = sum(tab[3] != self.cdp_url for tab in tabs.values())
         if foreign:
             logger.info("vault: session %s keeps %d armed tab(s) of another browser", self.task_id, foreign)
-        page_target = next((t for t in targets if t.get("type") == "page"), None)
+        page_target = _pick_page_target(targets)
         if page_target is None:
             created = await self._cdp("Target.createTarget", {"url": "about:blank"})
             target_id = created["result"]["targetId"]
