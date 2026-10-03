@@ -892,7 +892,7 @@ async def test_list_sessions_id_prefix_finds_archived_and_hidden_children(adapte
         assert rows[prefix + "aaaa"]["archived"] is True
         assert rows[prefix + "bbbb"]["hidden"] is True
 
-        resp = await cli.get("/api/sessions", params={"include_hidden": "1", "limit": 200})
+        resp = await cli.get("/api/sessions", params={"include_hidden": "1", "include_children": "1", "limit": 200})
         assert resp.status == 200
         ids = {row["id"] for row in (await resp.json())["data"]}
         assert ids.isdisjoint({prefix + "aaaa", prefix + "bbbb", decoy})
