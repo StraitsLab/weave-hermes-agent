@@ -1,4 +1,5 @@
 """Tests for the fuzzy matching module."""
+import pytest
 
 from tools.fuzzy_match import fuzzy_find_and_replace
 
@@ -608,3 +609,28 @@ class TestContextAwareCorrectness:
         # Was ~5.5s before anchoring; generous ceiling to avoid CI flake.
         assert elapsed < 2.0, f"context_aware no-match took {elapsed:.2f}s"
 
+
+
+class TestReindentKeepsShallowerLines:
+    """WEV-2669: a non-exact match must not pull lines shallower than the anchor
+    (closing bracket, appended top-level def) onto the anchor's indent."""
+
+    NEW_TEST = "\n\n\ndef test_new():\n    if True:\n        assert 1"
+
+    def _case(self, file_indent, old_indent):
+        content = ('def test_existing():\n    frames = [\n        "move",\n'
+                   f'{file_indent}"return",\n    ]\n    assert frames\n')
+        old = f'{old_indent}"return",\n    ]\n    assert frames'
+        return content, old, old + self.NEW_TEST
+
+    @pytest.mark.parametrize("file_indent,old_indent", [
+        (" " * 21, " " * 22),   # anchor one space too deep
+        ("\t\t", " " * 8),      # file uses tabs, anchor uses spaces
+    ])
+    def test_appended_top_level_def_survives(self, file_indent, old_indent):
+        content, old, new = self._case(file_indent, old_indent)
+        out, count, strategy, err = fuzzy_find_and_replace(content, old, new)
+        assert err is None and count == 1 and strategy != "exact"
+        compile(out, "<patched>", "exec")
+        assert "\n    ]\n    assert frames\n" in out
+        assert "\ndef test_new():\n    if True:\n        assert 1" in out
