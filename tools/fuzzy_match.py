@@ -330,8 +330,10 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
        leading whitespace of the file_region's first non-blank line).
     3. Re-emit each non-blank line as ``file_base + (line_indent - llm_base)``.
 
-    Blank lines and lines less-indented than the LLM's base are anchored
-    directly to the file's base indent.
+    Blank lines are left untouched. The first line less-indented than the
+    LLM's base, and every line after it, is kept exactly as written: the
+    caller placed it absolutely (e.g. a new top-level def appended after an
+    indented anchor), so re-anchoring it would flatten its nesting.
 
     No-op cases (returns ``new_string`` unchanged):
     - file_region or old_string has no meaningful line
@@ -359,9 +361,11 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
     # LLM's intended *relative* nesting between lines while anchoring to
     # the file's actual indent style.
     out_lines: List[str] = []
+    left_base = False
     for line in new_string.split("\n"):
-        if not line.strip():
-            # Blank lines: leave whitespace untouched.
+        if not line.strip() or left_base:
+            # Blank lines, and everything after the first line shallower than
+            # the LLM's base: leave untouched.
             out_lines.append(line)
             continue
         line_indent = _leading_whitespace(line)
@@ -371,9 +375,12 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
             remainder = line[len(old_indent):]
             out_lines.append(file_indent + remainder)
         else:
-            # Line is less-indented than the LLM's base — e.g. a dedent at
-            # the start of new_string. Anchor to the file's base.
-            out_lines.append(file_indent + line.lstrip(" \t"))
+            # Line is less-indented than the LLM's base: the caller placed it
+            # absolutely (a closing bracket, a new top-level def). Keep it and
+            # every later line exactly as written. Anchoring them to the file's
+            # base flattens nesting and can break compilation (WEV-2669).
+            left_base = True
+            out_lines.append(line)
     return "\n".join(out_lines)
 
 
