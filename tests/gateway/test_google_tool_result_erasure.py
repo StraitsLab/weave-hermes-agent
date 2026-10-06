@@ -397,3 +397,59 @@ async def test_erasure_retries_failed_spillover_cleanup(tmp_path, monkeypatch):
     finally:
         adapter._close_cached_session_dbs()
         db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["", "/p/general"], ids=["root", "route"])
+async def test_erasure_completes_under_cell_descriptor_home(tmp_path, monkeypatch, prefix):
+    """Cells launch Hermes with HERMES_HOME=/proc/self/fd/N and a profiles symlink.
+
+    The confinement check must compare resolved paths, or every cell erasure
+    blanks rows and then refuses to delete spillover forever.
+    """
+    import os
+    from pathlib import Path
+    from agent import secret_scope as ss
+
+    root, route = tmp_path / "state" / "gateway", tmp_path / "state" / "profiles" / "general"
+    route.mkdir(parents=True)
+    root.mkdir(parents=True)
+    os.symlink("../profiles", root / "profiles")
+    dbs = [_seed(root), _seed(route)]
+    _enable(root)
+    _enable(route)
+    key = "isolated-general-route-key-123456"
+    (route / ".env").write_text(f"API_SERVER_KEY={key}\n")
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    proc = Path(f"/proc/self/fd/{fd}")
+    monkeypatch.setenv("HERMES_HOME", str(proc))
+    target, other = (route, root) if prefix else (root, route)
+    headers = {"Authorization": f"Bearer {key}"} if prefix else HEADERS
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    adapter.gateway_runner = SimpleNamespace(config=SimpleNamespace(
+        multiplex_profiles=True, multiplex_profile_allowlist=["general"]))
+    monkeypatch.setattr("hermes_cli.profiles.profiles_to_serve",
+                        lambda **kwargs: [("default", proc), ("general", proc / "profiles" / "general")])
+    before = {home: _snapshot(db) for home, db in zip((root, route), dbs)}
+    other_disk = _disk(other)
+    ss.set_multiplex_active(True)
+    try:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            erased = await client.post(prefix + URL, headers=headers, json={"tool_name_prefix": PREFIX})
+            assert erased.status == 200
+            assert await erased.json() == {"count": 2}
+            assert not (target / "cache/spillover/google-one.txt").exists()
+            assert (target / "cache/spillover/linear-one.txt").read_bytes() == b"keep linear spillover bytes"
+            target_db = dbs[0] if target == root else dbs[1]
+            _assert_erased(before[target], _snapshot(target_db))
+            assert (other / "cache/spillover/google-one.txt").read_bytes() == b"privategmailcanary"
+            assert _disk(other) == other_disk
+            replay = await client.post(prefix + URL, headers=headers, json={"tool_name_prefix": PREFIX})
+            assert replay.status == 200
+            assert await replay.json() == {"count": 0}
+    finally:
+        ss.set_multiplex_active(False)
+        adapter._close_cached_session_dbs()
+        for db in dbs:
+            db.close()
+        os.close(fd)

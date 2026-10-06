@@ -5183,13 +5183,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Capture the request scope before leaving the event loop. Never accept
         # a client-supplied home or follow a call ID out of the spillover folder.
-        spillover = get_hermes_home() / "cache" / "spillover"
+        home = get_hermes_home().resolve()
+        spillover = home / "cache" / "spillover"
 
         def erase():
             result = db.erase_tool_results(body["tool_name_prefix"])
             for call_id in result["tool_call_ids"]:
                 path = spillover / _safe_result_filename(call_id)
-                if path.parent.resolve() != spillover.absolute():
+                if path.parent.resolve() != spillover:
                     raise ValueError("Unsafe spillover directory")
                 path.unlink(missing_ok=True)
             return result["count"]
