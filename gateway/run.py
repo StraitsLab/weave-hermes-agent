@@ -32463,11 +32463,14 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                 cache_config = _load_gateway_config()
                 gateway_settings = cache_config.get("gateway") or {}
                 if gateway_settings.get("housekeeping_all_profile_homes", False) is True:
+                    cache_gateway_config = GatewayConfig.from_dict(cache_config)
+                    profile_homes = (
+                        _multiplex_profile_homes(cache_gateway_config)
+                        if cache_gateway_config.multiplex_profiles else []
+                    )
                     cache_homes = list(dict.fromkeys([
                         get_hermes_home(),
-                        *(home for _name, home in _multiplex_profile_homes(
-                            GatewayConfig.from_dict(cache_config)
-                        )),
+                        *(home for _name, home in profile_homes),
                     ]))
             except Exception as e:
                 logger.debug("Could not resolve cache cleanup homes: %s", e)

@@ -51,9 +51,10 @@ def test_gateway_housekeeping_calls_periodic_memory_trim(monkeypatch):
     assert calls == [{"reason": "messaging gateway housekeeping"}]
 
 
+@pytest.mark.parametrize("multiplex", [True, False], ids=["multiplex", "single"])
 @pytest.mark.parametrize("enabled", [True, False, None], ids=["on", "off", "default-off"])
 def test_hourly_cache_expiry_reaches_route_homes_only_when_enabled(
-    tmp_path, monkeypatch, enabled
+    tmp_path, monkeypatch, enabled, multiplex
 ):
     from hermes_constants import get_hermes_home, get_hermes_home_override
 
@@ -80,7 +81,7 @@ def test_hourly_cache_expiry_reaches_route_homes_only_when_enabled(
     setting = "" if enabled is None else f"  housekeeping_all_profile_homes: {str(enabled).lower()}\n"
     (root_home / "config.yaml").write_text(
         "gateway:\n"
-        "  multiplex_profiles: true\n"
+        f"  multiplex_profiles: {str(multiplex).lower()}\n"
         "  multiplex_profile_allowlist: [general]\n"
         + setting,
         encoding="utf-8",
@@ -99,7 +100,7 @@ def test_hourly_cache_expiry_reaches_route_homes_only_when_enabled(
 
     for home in (root_home, route_home, excluded_home):
         for cache in ("spillover", "documents", "images", "audio"):
-            should_expire = home == root_home or (home == route_home and enabled is True)
+            should_expire = home == root_home or (home == route_home and enabled is True and multiplex)
             assert files[home, cache, "old"].exists() is not should_expire, (home, cache)
             assert files[home, cache, "fresh"].read_text(encoding="utf-8") == f"{cache} fresh"
     assert get_hermes_home_override() == previous_override
@@ -118,7 +119,7 @@ def test_hourly_cache_expiry_reaches_route_homes_only_when_enabled(
         os.utime(config_path, (timestamp, timestamp))
         gateway_run._start_gateway_housekeeping(_HourlyPassStopEvent(), interval=0)
         for cache in ("spillover", "documents", "images", "audio"):
-            assert not files[route_home, cache, "old"].exists()
+            assert files[route_home, cache, "old"].exists() is not multiplex
             assert files[route_home, cache, "fresh"].exists()
             assert files[excluded_home, cache, "old"].exists()
         assert get_hermes_home_override() == previous_override
