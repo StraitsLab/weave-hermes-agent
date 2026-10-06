@@ -1690,6 +1690,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._native_submit_events: Dict[str, List[Dict[str, Any]]] = {}
         self._native_submit_clarifies: Dict[tuple[str, str], str] = {}
         self._native_submit_started: Dict[str, "asyncio.Future[str]"] = {}
+        # In-process hand-offs survive a failed receipt write or start timeout.
+        self._native_submit_handoffs: Dict[str, Any] = {}
         self._native_submit_subscribers: Dict[str, tuple[asyncio.Queue, asyncio.AbstractEventLoop]] = {}
         self._native_submit_sequences: Dict[str, int] = {}
         self._native_submit_event_lock = threading.Lock()
@@ -5233,6 +5235,11 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return (request_id, message, body["busy_mode"], body.get("expected_active_ref"), body.get("internal", False)), None
 
+    def _record_native_submit_handoff(self, native_request_ref: str, admission: Any) -> None:
+        self._native_submit_handoffs[native_request_ref] = admission
+        if len(self._native_submit_handoffs) > 1_024:
+            self._native_submit_handoffs.pop(next(iter(self._native_submit_handoffs)), None)
+
     async def _admit_native_session_submit(
         self, session_id: str, message: str, native_request_ref: str,
         external_request_id: str = "", busy_mode: str = "queue", expected_active_ref: Optional[str] = None,
@@ -5321,6 +5328,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     logger.warning("[api_server] native submit steer failed", exc_info=True)
                     steered = False
                 if steered:
+                    self._record_native_submit_handoff(native_request_ref, "steered")
                     # Open until the turn it joined ends: that turn's finish closes it (below).
                     self._native_submit_steered.setdefault(active_ref, []).append(native_request_ref)
                     self._native_submit_event(native_request_ref, "turn.started", steered_into=active_ref)
@@ -5336,6 +5344,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if expected_active_ref is not None and busy_mode != "queue" and self._native_submit_active_ref(entry.session_key) != expected_active_ref:
                 return "target_changed"
             runner._enqueue_fifo(entry.session_key, event, self)
+            self._record_native_submit_handoff(native_request_ref, "queued")
             if (
                 interruptible and not compression
                 # Fence after the await: the same turn must still be running on the same agent, and
@@ -5351,13 +5360,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return "queued"
         started = asyncio.get_running_loop().create_future()
         self._native_submit_started[native_request_ref] = started
-        try:
-            await self.handle_message(event)
-            return await asyncio.wait_for(asyncio.shield(started), timeout=5.0)
-        except Exception:
-            if not started.done():
-                started.cancel()
-            raise
+        self._record_native_submit_handoff(native_request_ref, started)
+        await self.handle_message(event)
+        return await asyncio.wait_for(asyncio.shield(started), timeout=5.0)
 
     @staticmethod
     def _native_submit_fingerprint(message: str, busy_mode: str, internal: bool = False) -> str:
@@ -5440,30 +5445,36 @@ class APIServerAdapter(BasePlatformAdapter):
                         admission_options["expected_active_ref"] = expected_active_ref
                     if internal:
                         admission_options["internal"] = True
-                    admission = await self._admit_native_session_submit(
-                        session_id, message, native_request_ref,
-                        external_request_id=external_request_id,
-                        **admission_options,
+                    if native_request_ref in self._native_submit_handoffs:
+                        handed_off = self._native_submit_handoffs[native_request_ref]
+                        admission = await asyncio.shield(handed_off) if asyncio.isfuture(handed_off) else handed_off
+                    else:
+                        admission = await self._admit_native_session_submit(
+                            session_id, message, native_request_ref,
+                            external_request_id=external_request_id,
+                            **admission_options,
+                        )
+                    if admission == "target_changed":
+                        await asyncio.to_thread(db.remove_native_session_submit, external_request_id=external_request_id, native_request_ref=native_request_ref)
+                        return web.json_response(_openai_error("Active turn changed", code="native_submit_target_changed"), status=409)
+                    if admission == "queued":
+                        self.__dict__.setdefault("_native_queued_submit_refs", set()).add(native_request_ref)
+                    await asyncio.to_thread(
+                        db.set_native_session_submit_admission,
+                        native_request_ref=native_request_ref,
+                        admission=admission,
                     )
                 except Exception:
-                    await asyncio.to_thread(
-                        db.remove_native_session_submit,
-                        external_request_id=external_request_id,
-                        native_request_ref=native_request_ref,
-                    )
+                    if native_request_ref not in self._native_submit_handoffs:
+                        await asyncio.to_thread(
+                            db.remove_native_session_submit,
+                            external_request_id=external_request_id,
+                            native_request_ref=native_request_ref,
+                        )
                     return web.json_response(
                         _openai_error("Native gateway admission unavailable", code="native_admission_unavailable"), status=503
                     )
-                if admission == "target_changed":
-                    await asyncio.to_thread(db.remove_native_session_submit, external_request_id=external_request_id, native_request_ref=native_request_ref)
-                    return web.json_response(_openai_error("Active turn changed", code="native_submit_target_changed"), status=409)
-                if admission == "queued":
-                    self.__dict__.setdefault("_native_queued_submit_refs", set()).add(native_request_ref)
-                await asyncio.to_thread(
-                    db.set_native_session_submit_admission,
-                    native_request_ref=native_request_ref,
-                    admission=admission,
-                )
+
             return web.json_response({
                 "object": "hermes.session.admission",
                 "session_id": session_id,
