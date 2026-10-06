@@ -248,8 +248,7 @@ async def test_disabled_erasure_is_byte_identical(tmp_path, monkeypatch, config)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("escape", ["call-id", "symlink"])
-async def test_erasure_refuses_spillover_escape(tmp_path, monkeypatch, escape):
+async def test_erasure_refuses_spillover_directory_symlink(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db = _seed(tmp_path)
     _enable(tmp_path)
@@ -258,14 +257,10 @@ async def test_erasure_refuses_spillover_escape(tmp_path, monkeypatch, escape):
     sentinel = outside / "google-one.txt"
     sentinel.write_bytes(b"keep outside bytes")
     spillover = tmp_path / "cache/spillover"
-    if escape == "call-id":
-        db.append_message("one", "tool", "private escape text", tool_name=PREFIX + "gmail__read",
-                          tool_call_id="../../outside/google-one")
-    else:
-        for file in spillover.iterdir():
-            file.unlink()
-        spillover.rmdir()
-        spillover.symlink_to(outside, target_is_directory=True)
+    for file in spillover.iterdir():
+        file.unlink()
+    spillover.rmdir()
+    spillover.symlink_to(outside, target_is_directory=True)
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
     try:
         async with TestClient(TestServer(_app(adapter))) as client:
@@ -278,7 +273,7 @@ async def test_erasure_refuses_spillover_escape(tmp_path, monkeypatch, escape):
 
 
 @pytest.mark.asyncio
-async def test_erasure_refuses_success_while_wal_checkpoint_is_blocked(tmp_path, monkeypatch):
+async def test_erasure_refuses_success_while_database_reader_blocks_completion(tmp_path, monkeypatch):
     import sqlite3
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -300,15 +295,72 @@ async def test_erasure_refuses_success_while_wal_checkpoint_is_blocked(tmp_path,
             assert failed.status == 503
             assert (tmp_path / "cache/spillover/google-one.txt").exists()
             reader.rollback()
-            after = _snapshot(db)
             retry = await client.post(URL, headers=HEADERS, json={"tool_name_prefix": PREFIX})
             assert retry.status == 200
-            assert await retry.json() == {"count": 0}
-            assert _snapshot(db) == after
+            # WAL commits before checkpoint refusal; DELETE rolls back the
+            # blocked write. Both must finish erasure once the reader releases.
+            assert {row["content"] for row in _snapshot(db)["messages"]
+                    if row["role"] == "tool" and row["tool_name"].startswith(PREFIX)} == {MARKER}
             assert not (tmp_path / "cache/spillover/google-one.txt").exists()
             assert all(b"privategmailcanary" not in raw for raw in _disk(tmp_path).values())
+            assert all(b"privatedrivecanary" not in raw for raw in _disk(tmp_path).values())
+            after = _snapshot(db)
+            replay = await client.post(URL, headers=HEADERS, json={"tool_name_prefix": PREFIX})
+            assert replay.status == 200
+            assert await replay.json() == {"count": 0}
+            assert _snapshot(db) == after
     finally:
         reader.close()
+        adapter._close_cached_session_dbs()
+        db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_id", [
+    "call_abc123", "toolu_01A-", "x" * 130,
+    "functions.mcp__google_gmail__search:0", "../../outside/google-one",
+    "._-", "résultat/邮件", "x" * 120, "x" * 121,
+], ids=["simple", "trailing-dash", "long", "kimi", "traversal",
+        "empty-stem", "unicode", "max-stem", "over-max-stem"])
+async def test_erasure_deletes_real_writer_spillover(tmp_path, monkeypatch, call_id):
+    from pathlib import Path
+    from tools.tool_result_storage import extract_persisted_path, maybe_persist_tool_result
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = _seed(tmp_path)
+    _enable(tmp_path)
+    sentinel = tmp_path / "outside/google-one.txt"
+    sentinel.parent.mkdir()
+    sentinel.write_bytes(b"keep outside bytes")
+    content = "privatewritercanary " * 200
+    tool_name = PREFIX + "gmail__search"
+    # Exercise the writer, not a test-owned filename or a copied naming rule.
+    stored = maybe_persist_tool_result(content, tool_name, call_id, threshold=1)
+    spill = Path(extract_persisted_path(stored))
+    assert spill.parent == tmp_path / "cache/spillover"
+    assert spill.read_text() == content
+    db.append_message("one", "tool", stored, tool_name=tool_name, tool_call_id=call_id)
+    before = _snapshot(db)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    try:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            erased = await client.post(URL, headers=HEADERS, json={"tool_name_prefix": PREFIX})
+            assert erased.status == 200
+            receipt = await erased.json()
+            assert receipt == {"count": 3}
+            assert not spill.exists(), f"Writer spillover remains: {spill.name}"
+            _assert_erased(before, _snapshot(db))
+            assert not _matches(db, "privatewritercanary")
+            assert all(b"privatewritercanary" not in raw for raw in _disk(tmp_path).values())
+            assert sentinel.read_bytes() == b"keep outside bytes"
+            assert (tmp_path / "cache/spillover/linear-one.txt").read_bytes() == b"keep linear spillover bytes"
+            after = _snapshot(db)
+            replay = await client.post(URL, headers=HEADERS, json={"tool_name_prefix": PREFIX})
+            assert replay.status == 200
+            assert await replay.json() == {"count": 0}
+            assert _snapshot(db) == after
+            print(f"writer probe {call_id!r} -> {spill.name}: 200 {receipt}; deleted; replay count 0")
+    finally:
         adapter._close_cached_session_dbs()
         db.close()
 

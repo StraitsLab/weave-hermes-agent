@@ -5179,6 +5179,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(
                 _openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
         from hermes_constants import get_hermes_home
+        from tools.tool_result_storage import _safe_result_filename
 
         # Capture the request scope before leaving the event loop. Never accept
         # a client-supplied home or follow a call ID out of the spillover folder.
@@ -5187,9 +5188,7 @@ class APIServerAdapter(BasePlatformAdapter):
         def erase():
             result = db.erase_tool_results(body["tool_name_prefix"])
             for call_id in result["tool_call_ids"]:
-                if not isinstance(call_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", call_id):
-                    raise ValueError("Unsafe spillover call ID")
-                path = spillover / f"{call_id}.txt"
+                path = spillover / _safe_result_filename(call_id)
                 if path.parent.resolve() != spillover.absolute():
                     raise ValueError("Unsafe spillover directory")
                 path.unlink(missing_ok=True)
