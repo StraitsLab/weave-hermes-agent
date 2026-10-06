@@ -1690,6 +1690,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._native_submit_events: Dict[str, List[Dict[str, Any]]] = {}
         self._native_submit_clarifies: Dict[tuple[str, str], str] = {}
         self._native_submit_started: Dict[str, "asyncio.Future[str]"] = {}
+        # Runtime adapter setting; every first/retry start wait shares this bound.
+        self._native_submit_start_timeout_s = float(extra.get("native_submit_start_timeout_s", 5.0))
         # In-process hand-offs survive a failed receipt write or start timeout.
         self._native_submit_handoffs: Dict[str, Any] = {}
         self._native_submit_subscribers: Dict[str, tuple[asyncio.Queue, asyncio.AbstractEventLoop]] = {}
@@ -5240,6 +5242,23 @@ class APIServerAdapter(BasePlatformAdapter):
         if len(self._native_submit_handoffs) > 1_024:
             self._native_submit_handoffs.pop(next(iter(self._native_submit_handoffs)), None)
 
+    async def _wait_native_submit_start(
+        self, native_request_ref: str, started: "asyncio.Future[str]", *, retry: bool = False,
+    ) -> str:
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(started), timeout=self._native_submit_start_timeout_s,
+            )
+        except Exception:
+            # A failed receipt write does not undo a start. Only recover a failed
+            # future on retry with observed lifecycle evidence, never a timeout.
+            if (retry and started.done() and not started.cancelled()
+                    and started.exception() is not None
+                    and (native_request_ref in self._native_submit_active_refs.values()
+                         or native_request_ref in self._native_submit_terminals)):
+                return "streaming"
+            raise
+
     async def _admit_native_session_submit(
         self, session_id: str, message: str, native_request_ref: str,
         external_request_id: str = "", busy_mode: str = "queue", expected_active_ref: Optional[str] = None,
@@ -5262,7 +5281,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         existing_start = self._native_submit_started.get(native_request_ref)
         if existing_start is not None:
-            return await asyncio.shield(existing_start)
+            return await self._wait_native_submit_start(native_request_ref, existing_start, retry=True)
 
         source = SessionSource(
             platform=Platform.API_SERVER,
@@ -5362,7 +5381,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._native_submit_started[native_request_ref] = started
         self._record_native_submit_handoff(native_request_ref, started)
         await self.handle_message(event)
-        return await asyncio.wait_for(asyncio.shield(started), timeout=5.0)
+        return await self._wait_native_submit_start(native_request_ref, started)
 
     @staticmethod
     def _native_submit_fingerprint(message: str, busy_mode: str, internal: bool = False) -> str:
@@ -5447,7 +5466,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         admission_options["internal"] = True
                     if native_request_ref in self._native_submit_handoffs:
                         handed_off = self._native_submit_handoffs[native_request_ref]
-                        admission = await asyncio.shield(handed_off) if asyncio.isfuture(handed_off) else handed_off
+                        admission = (await self._wait_native_submit_start(native_request_ref, handed_off, retry=True)
+                                     if asyncio.isfuture(handed_off) else handed_off)
                     else:
                         admission = await self._admit_native_session_submit(
                             session_id, message, native_request_ref,

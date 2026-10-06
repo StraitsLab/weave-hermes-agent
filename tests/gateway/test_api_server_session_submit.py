@@ -1063,7 +1063,7 @@ async def test_start_timeout_retry_reuses_pending_start_and_runs_once(internal_g
     start_entered, release_start = asyncio.Event(), asyncio.Event()
     refs = []
     original_start = gateway.adapter._on_native_submit_started
-    original_wait = asyncio.wait_for
+    gateway.adapter._native_submit_start_timeout_s = 0.02
 
     async def delayed_start(event, session_key):
         refs.append(event.metadata["native_request_ref"])
@@ -1071,11 +1071,7 @@ async def test_start_timeout_retry_reuses_pending_start_and_runs_once(internal_g
         await release_start.wait()
         return await original_start(event, session_key)
 
-    async def short_start_wait(awaitable, timeout):
-        return await original_wait(awaitable, timeout=0.02 if timeout == 5.0 else timeout)
-
     monkeypatch.setattr(gateway.adapter, "_on_native_submit_started", delayed_start)
-    monkeypatch.setattr(asyncio, "wait_for", short_start_wait)
     status, body = await _submit_internal_gateway(gateway, "start-timeout", "one delayed message")
     assert status == 503 and body["error"]["code"] == "native_admission_unavailable"
     await asyncio.wait_for(start_entered.wait(), timeout=10)
@@ -1091,6 +1087,7 @@ async def test_start_timeout_retry_reuses_pending_start_and_runs_once(internal_g
         return result
 
     monkeypatch.setattr(gateway.db, "register_native_session_submit", register)
+    gateway.adapter._native_submit_start_timeout_s = 1.0
     retry = asyncio.create_task(_submit_internal_gateway(gateway, "start-timeout", "one delayed message"))
     try:
         await asyncio.wait_for(retry_registered.wait(), timeout=10)
@@ -1104,6 +1101,81 @@ async def test_start_timeout_retry_reuses_pending_start_and_runs_once(internal_g
     assert len(rows) == 2
     assert receipt["native_request_ref"] == first_ref
     assert refs == [first_ref]
+
+
+@pytest.mark.asyncio
+async def test_start_never_fires_retry_releases_session_lock(internal_gateway, monkeypatch):
+    gateway = internal_gateway
+    await _bind_internal_gateway(gateway)
+    gateway.adapter._native_submit_start_timeout_s = 0.02
+    entered, release_start = asyncio.Event(), asyncio.Event()
+    refs = []
+    original_start = gateway.adapter._on_native_submit_started
+
+    async def delayed_start(event, session_key):
+        refs.append(event.metadata["native_request_ref"])
+        entered.set()
+        await release_start.wait()
+        await original_start(event, session_key)
+
+    monkeypatch.setattr(gateway.adapter, "_on_native_submit_started", delayed_start)
+    try:
+        status, body = await _submit_internal_gateway(gateway, "never-starts", "held start")
+        assert status == 503 and body["error"]["code"] == "native_admission_unavailable"
+        await asyncio.wait_for(entered.wait(), 1)
+        ref = refs[0]
+        retry = asyncio.create_task(_submit_internal_gateway(gateway, "never-starts", "held start"))
+        other = asyncio.create_task(_submit_internal_gateway(gateway, "other-submit", "other message"))
+        status, body = await asyncio.wait_for(retry, 1)
+        assert status == 503 and body["error"]["code"] == "native_admission_unavailable"
+        status, receipt = await asyncio.wait_for(other, 1)
+        assert status == 202 and receipt["admission"] == "queued", receipt
+        pending = gateway.db.register_native_session_submit(
+            SESSION_ID, external_request_id="never-starts",
+            message_sha256=gateway.adapter._native_submit_fingerprint("held start", "queue"),
+            native_request_ref="unused")
+        assert pending["native_request_ref"] == ref and pending["admission"] is None
+        assert not gateway.adapter._native_submit_started[ref].cancelled()
+        assert refs == [ref]
+    finally:
+        release_start.set()
+    await _wait_native_terminal(gateway, receipt["native_request_ref"])
+    rows = await _wait_gateway_idle(gateway)
+    assert len(gateway.requests) == 2
+    assert len(rows) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_before_retry", [False, True])
+async def test_start_hook_write_failure_retry_settles_once(internal_gateway, monkeypatch, finish_before_retry):
+    gateway = internal_gateway
+    key = await _bind_internal_gateway(gateway)
+    gateway.release.clear()
+    writes = _fail_admission_write_once(monkeypatch, gateway, 1)
+    status, body = await _submit_internal_gateway(gateway, "hook-write-failure", "one hook message")
+    assert status == 503 and body["error"]["code"] == "native_admission_unavailable"
+    ref = writes[0]["native_request_ref"]
+    await asyncio.wait_for(gateway.started.wait(), 10)
+    if finish_before_retry:
+        gateway.release.set()
+        await _wait_native_terminal(gateway, ref)
+        await _wait_gateway_idle(gateway)
+    else:
+        assert gateway.adapter._native_submit_active_ref(key) == ref
+    status, receipt = await _submit_internal_gateway(gateway, "hook-write-failure", "one hook message")
+    assert status == 202 and receipt["admission"] == "streaming", receipt
+    assert receipt["native_request_ref"] == ref
+    persisted = gateway.db.register_native_session_submit(
+        SESSION_ID, external_request_id="hook-write-failure",
+        message_sha256=gateway.adapter._native_submit_fingerprint("one hook message", "queue"),
+        native_request_ref="unused")
+    assert persisted["admission"] == "streaming"
+    gateway.release.set()
+    await _wait_native_terminal(gateway, ref)
+    rows = await _wait_gateway_idle(gateway)
+    assert len(gateway.requests) == 1
+    assert [(row["role"], row["content"]) for row in rows] == [
+        ("user", "one hook message"), ("assistant", "reply-1")]
 
 
 @pytest.mark.asyncio
