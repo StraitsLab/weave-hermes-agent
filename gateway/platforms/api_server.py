@@ -2341,6 +2341,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/append", self._handle_session_append),
             ("POST", "/api/sessions/{session_id}/append/group", self._handle_session_append_group),
             ("DELETE", "/api/sessions/{session_id}/items/{external_item_id}", self._handle_session_item_delete),
+            ("POST", "/api/erasure/tool-results", self._handle_tool_result_erasure),
             ("POST", "/api/sessions/{session_id}/credential/bind", self._handle_session_credential_bind),
             ("POST", "/api/sessions/{session_id}/submit", self._handle_session_submit),
             ("GET", "/api/sessions/{session_id}/submit/{native_request_ref}/events", self._handle_native_submit_events),
@@ -5148,6 +5149,59 @@ class APIServerAdapter(BasePlatformAdapter):
         outcomes = {result["outcome"] for result in results}
         status = 201 if outcomes == {"inserted"} else 200 if outcomes == {"identical_retry"} else 409
         return web.json_response({"kind": "hermes_append_group_receipt", "receipts": receipts}, status=status)
+
+    async def _handle_tool_result_erasure(self, request: "web.Request") -> "web.Response":
+        """Erase only Google tool results in this request's authenticated home.
+
+        Opt in with config.yaml erasure.google_tool_results_enabled: true.
+        Read the serving home's setting on each call; missing/invalid is off.
+        """
+        try:
+            from hermes_cli.config import cfg_get, load_config_strict
+
+            config, _ = load_config_strict()
+            enabled = cfg_get(config, "erasure", "google_tool_results_enabled", default=False) is True
+        except Exception:
+            enabled = False
+        if not enabled:
+            return web.json_response(_openai_error("Not found", code="not_found"), status=404)
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        if set(body) != {"tool_name_prefix"} or body["tool_name_prefix"] != "mcp__google_":
+            return web.json_response(
+                _openai_error("Unsupported tool-result erasure prefix", code="invalid_tool_name_prefix"), status=400)
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+        from hermes_constants import get_hermes_home
+
+        # Capture the request scope before leaving the event loop. Never accept
+        # a client-supplied home or follow a call ID out of the spillover folder.
+        spillover = get_hermes_home() / "cache" / "spillover"
+
+        def erase():
+            result = db.erase_tool_results(body["tool_name_prefix"])
+            for call_id in result["tool_call_ids"]:
+                if not isinstance(call_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", call_id):
+                    raise ValueError("Unsafe spillover call ID")
+                path = spillover / f"{call_id}.txt"
+                if path.parent.resolve() != spillover.absolute():
+                    raise ValueError("Unsafe spillover directory")
+                path.unlink(missing_ok=True)
+            return result["count"]
+
+        try:
+            count = await asyncio.to_thread(erase)
+        except Exception as exc:
+            logger.warning("[%s] tool-result erasure failed: %s", self.name, type(exc).__name__)
+            return web.json_response(
+                _openai_error("Tool-result erasure unavailable", code="tool_result_erasure_unavailable"), status=503)
+        return web.json_response({"count": count})
 
     async def _handle_session_item_delete(self, request: "web.Request") -> "web.Response":
         """Authenticate, then delete one passive item: 204 if deleted, else 404 item_not_found.

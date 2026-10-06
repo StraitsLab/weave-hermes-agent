@@ -11882,6 +11882,49 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except _PassiveAppendGroupAborted as aborted:
             return [dict(aborted.result) for _ in checked]
 
+    def erase_tool_results(self, tool_name_prefix: str) -> Dict[str, Any]:
+        """Blank Google results without removing rows, pairs or sessions.
+
+        Return all matching call IDs even on replay so failed spillover deletion
+        can be retried. The count includes only newly blanked rows. Prefixes are
+        literal (SQL LIKE would treat underscores as wildcards).
+        """
+        if tool_name_prefix != "mcp__google_":
+            raise ValueError("Unsupported tool-result erasure prefix")
+        marker = "[removed: Google disconnected]"
+
+        def _do(conn):
+            conn.execute("PRAGMA secure_delete=ON")
+            # SQLite secure_delete alone does not purge FTS5's old postings.
+            # Fail closed if the SQLite build cannot securely delete FTS data.
+            for index in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"):
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (index,),
+                ).fetchone():
+                    conn.execute(f"INSERT INTO {index}({index}, rank) VALUES('secure-delete', 1)")
+            rows = conn.execute(
+                "SELECT tool_call_id FROM messages WHERE role='tool' "
+                "AND substr(tool_name, 1, ?) = ?",
+                (len(tool_name_prefix), tool_name_prefix),
+            ).fetchall()
+            count = conn.execute(
+                "UPDATE messages SET content=? WHERE role='tool' "
+                "AND substr(tool_name, 1, ?) = ? AND content IS NOT ?",
+                (marker, len(tool_name_prefix), tool_name_prefix, marker),
+            ).rowcount
+            return {"count": count, "tool_call_ids": list(dict.fromkeys(
+                row["tool_call_id"] for row in rows if row["tool_call_id"]
+            ))}
+
+        result = self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        # A successful response must not leave pre-erasure frames in the WAL.
+        # Busy readers cause a retryable failure, not a false erasure receipt.
+        with self._lock:
+            checkpoint = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint and checkpoint[0]:
+                raise RuntimeError("Tool-result erasure checkpoint is busy")
+        return result
+
     def delete_passive_item(self, session_id: str, external_item_id: str) -> bool:
         """Delete one passive message in its owning session, including trigger-owned FTS rows.
 
