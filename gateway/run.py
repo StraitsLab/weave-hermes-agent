@@ -32454,13 +32454,37 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                 logger.debug("Channel directory refresh error: %s", e)
 
         if tick_count % IMAGE_CACHE_EVERY == 0:
-            for cache_name, cleanup_fn in MEDIA_CACHE_CLEANUPS:
+            from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+            # Re-read the runtime setting each hour. Off preserves the exact
+            # unscoped cleanup path; on scopes the same list to each served home.
+            cache_homes = [None]
+            try:
+                cache_config = _load_gateway_config()
+                gateway_settings = cache_config.get("gateway") or {}
+                if gateway_settings.get("housekeeping_all_profile_homes", False) is True:
+                    cache_homes = list(dict.fromkeys([
+                        get_hermes_home(),
+                        *(home for _name, home in _multiplex_profile_homes(
+                            GatewayConfig.from_dict(cache_config)
+                        )),
+                    ]))
+            except Exception as e:
+                logger.debug("Could not resolve cache cleanup homes: %s", e)
+
+            for cache_home in cache_homes:
+                home_token = set_hermes_home_override(cache_home) if cache_home is not None else None
                 try:
-                    removed = cleanup_fn(max_age_hours=24)
-                    if removed:
-                        logger.info("%s cache cleanup: removed %d stale file(s)", cache_name, removed)
-                except Exception as e:
-                    logger.debug("%s cache cleanup error: %s", cache_name, e)
+                    for cache_name, cleanup_fn in MEDIA_CACHE_CLEANUPS:
+                        try:
+                            removed = cleanup_fn(max_age_hours=24)
+                            if removed:
+                                logger.info("%s cache cleanup: removed %d stale file(s)", cache_name, removed)
+                        except Exception as e:
+                            logger.debug("%s cache cleanup error: %s", cache_name, e)
+                finally:
+                    if home_token is not None:
+                        reset_hermes_home_override(home_token)
 
         if tick_count % PASTE_SWEEP_EVERY == 0:
             try:
