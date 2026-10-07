@@ -7471,21 +7471,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self, source: SessionSource, session_id: str,
     ) -> bool:
         """Return whether this exact strict session has a usable holder."""
+        return self.session_credential_for(source, session_id) is not None
+
+    def session_credential_for(
+        self, source: SessionSource, session_id: str,
+    ) -> Optional[SessionCredential]:
+        """Return the live callable, never a bearer snapshot or another session's key."""
         with self._session_credential_lock:
             entry = self.session_store._entries.get(
                 self.session_store._generate_session_key(source)
             )
             if entry is None or entry.session_id != session_id:
-                return False
+                return None
             state = self._peek_session_state(entry.session_key)
             holder = state.conversation.credential_holder if state is not None else None
             if holder is None:
-                return False
+                return None
             try:
                 holder()
             except RuntimeError:
-                return False
-            return True
+                return None
+            return holder
 
     def revoke_session_credential(self, source: SessionSource, session_id: str) -> None:
         """Revoke the holder for one exact strict session, if present."""
