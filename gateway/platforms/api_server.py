@@ -3001,10 +3001,35 @@ class APIServerAdapter(BasePlatformAdapter):
         # _ProviderAuthResolutionError lets _run_agent() (and
         # _handle_runs()) distinguish this from an unrelated RuntimeError
         # elsewhere in the call graph.
+        user_config = _load_gateway_config()
+        model_config = user_config.get("model", {})
+        configured_provider = model_config.get("provider") if isinstance(model_config, dict) else None
+        gate_b_provider = "custom:weave-gate-b"
+        gate_b = gate_b_provider in (
+            configured_provider, requested_provider,
+            route.get("provider") if isinstance(route, dict) else None,
+        )
+        session_credential = None
+        if gate_b:
+            source = SessionSource(
+                platform=Platform.API_SERVER, chat_id=session_id or "", chat_type="dm",
+                user_id="api_server", user_name="API server",
+                profile=_api_request_profile.get() or None,
+            )
+            runner = self.gateway_runner
+            if runner is not None and session_id:
+                session_credential = runner.session_credential_for(source, session_id)
+            if session_credential is None:
+                raise _ProviderAuthResolutionError("credential unavailable")
         try:
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            # Gate-B must not resolve through the global auth-fallback chain.
+            runtime_kwargs = (
+                _resolve_request_runtime_agent_kwargs(gate_b_provider)
+                if gate_b else _resolve_runtime_agent_kwargs()
+            )
         except RuntimeError as exc:
             raise _ProviderAuthResolutionError(str(exc)) from exc
+        gate_b_base_url = runtime_kwargs.get("base_url") if gate_b else None
         model = _resolve_gateway_model()
 
         # When the primary provider's auth fails (expired token / 429 quota
@@ -3038,12 +3063,21 @@ class APIServerAdapter(BasePlatformAdapter):
             provider_name = _clean_request_string(provider)
             if not provider_name:
                 return None
+            if gate_b:
+                if provider_name not in (gate_b_provider, "custom"):
+                    raise _ProviderAuthResolutionError("session credential route mismatch")
+                # Resolved custom providers lose their named identity. Do not
+                # resolve bare "custom" through the ambient OpenRouter route.
+                provider_name = gate_b_provider
+                required = True
             try:
                 return _resolve_request_runtime_agent_kwargs(
                     provider_name,
                     target_model=target_model or None,
                 )
             except Exception as exc:
+                if gate_b:
+                    raise _ProviderAuthResolutionError("credential unavailable") from exc
                 try:
                     from gateway.run import _resolve_runtime_agent_kwargs_for_provider
 
@@ -3212,7 +3246,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._last_resolved_model[_resolved_key] = model
                 self._last_resolved_model["*"] = model
 
-        user_config = _load_gateway_config()
+        if gate_b:
+            if (runtime_kwargs.get("provider") != "custom"
+                    or not gate_b_base_url
+                    or runtime_kwargs.get("base_url") != gate_b_base_url):
+                raise _ProviderAuthResolutionError("session credential route mismatch")
+            # Keep the existing holder callable for per-request refresh/revoke.
+            # Neither a route key nor a pooled/global key may replace it.
+            runtime_kwargs["api_key"] = session_credential
+            runtime_kwargs["credential_pool"] = None
+
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
         max_iterations = _current_max_iterations()
         if room_dispatch is not None:
@@ -3226,7 +3269,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = (
             None
-            if confirmed_runtime_lock
+            if confirmed_runtime_lock or gate_b
             else GatewayRunner._load_fallback_model()
         )
 
