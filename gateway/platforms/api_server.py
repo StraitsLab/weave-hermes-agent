@@ -5310,6 +5310,11 @@ class APIServerAdapter(BasePlatformAdapter):
         internal: bool = False,
     ) -> str:
         """Submit one user or internal turn through the running gateway's writer lease."""
+        from gateway.native_bot_admission import enabled, admit
+        if enabled():
+            return await admit(self, _api_request_profile.get() or "default", session_id,
+                               message, native_request_ref, external_request_id, internal=internal,
+                               busy_mode=busy_mode, expected_active_ref=expected_active_ref)
         runner = self.gateway_runner
         if (
             runner is None
@@ -5772,7 +5777,16 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Invalid clarification response", code="invalid_native_clarify_response"), status=400)
         from tools.clarify_gateway import resolve_gateway_clarify
 
-        if not resolve_gateway_clarify(clarify_id, body["response"]):
+        native = self.__dict__.get('_native_bot_clarifies', {}).pop((native_request_ref, clarify_id), None)
+        if native is not None:
+            transport, question_id = native
+            result = await asyncio.to_thread(transport.rpc, 'clarify.respond',
+                {'request_id': clarify_id, 'answer': body['response'],
+                 **({'question_id': question_id} if question_id else {})})
+            resolved = result.get('status') == 'ok'
+        else:
+            resolved = resolve_gateway_clarify(clarify_id, body['response'])
+        if not resolved:
             self._native_submit_clarifies[(native_request_ref, clarify_id)] = "terminal"
             self._native_submit_events.pop(native_request_ref, None)
             return web.json_response(_openai_error("Native clarification is terminal", code="native_clarify_terminal"), status=409)
