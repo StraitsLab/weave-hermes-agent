@@ -96,6 +96,9 @@ def gate_b_agent(adapter_and_runner, tmp_path, monkeypatch):
         gateway_run, "_resolve_runtime_agent_kwargs", _resolve_runtime_agent_kwargs,
     )
     monkeypatch.setenv("GATE_B_API_KEY", "ambient-gate-b-key")
+    monkeypatch.setattr(GatewayRunner, "_load_fallback_model", staticmethod(
+        lambda: [{"provider": "openrouter", "model": "fallback-model"}],
+    ))
     constructor = MagicMock()
     agent = constructor.return_value
     agent.run_conversation.return_value = {"final_response": "done"}
@@ -177,7 +180,8 @@ async def test_gate_b_run_refuses_unusable_binding(gate_b_agent, state):
 
 
 @pytest.mark.asyncio
-async def test_gate_b_run_holder_refresh_and_revoke_are_live(gate_b_agent):
+@pytest.mark.parametrize("update", ["refresh", "revoke", "expire"])
+async def test_gate_b_run_holder_refresh_and_revoke_are_live(gate_b_agent, update):
     adapter, runner, constructor = gate_b_agent
     entered, proceed = threading.Event(), threading.Event()
     observed = []
@@ -201,18 +205,28 @@ async def test_gate_b_run_holder_refresh_and_revoke_are_live(gate_b_agent):
         task = asyncio.create_task(_finished_run(client, adapter))
         assert await asyncio.to_thread(entered.wait, 5)
         holder = constructor.call_args.kwargs["api_key"]
-        assert (await client.post(
-            f"/api/sessions/{SESSION_ID}/credential/bind", headers=headers,
-            json=_bind_body(bearer="refreshed-bearer"),
-        )).status == 200
+        if update == "refresh":
+            assert (await client.post(
+                f"/api/sessions/{SESSION_ID}/credential/bind", headers=headers,
+                json=_bind_body(bearer="refreshed-bearer"),
+            )).status == 200
+        elif update == "revoke":
+            assert (await client.patch(
+                f"/api/sessions/{SESSION_ID}", headers=headers, json={"end_reason": "closed"},
+            )).status == 200
+        else:
+            assert holder.refresh(BEARER, datetime.now(timezone.utc) - timedelta(seconds=1))
         proceed.set()
-        assert (await task)["status"] == "completed"
-        assert observed == [BEARER, "refreshed-bearer"]
-        assert (await client.patch(
-            f"/api/sessions/{SESSION_ID}", headers=headers, json={"end_reason": "closed"},
-        )).status == 200
-        with pytest.raises(RuntimeError, match="credential unavailable"):
-            holder()
+        result = await task
+        if update == "refresh":
+            assert result["status"] == "completed", result
+            assert observed == [BEARER, "refreshed-bearer"]
+        else:
+            assert result["status"] == "failed", result
+            assert "credential unavailable" in result["error"]
+            assert observed == [BEARER]
+            with pytest.raises(RuntimeError, match="credential unavailable"):
+                holder()
     finally:
         proceed.set()
         if task is not None:
@@ -247,22 +261,44 @@ async def test_gate_b_run_separates_two_sessions(gate_b_agent):
         await client.close()
 
 
-def test_gate_b_create_agent_refuses_wrong_profile(gate_b_agent):
-    from gateway.platforms.api_server import _api_request_profile, _ProviderAuthResolutionError
-
+@pytest.mark.asyncio
+async def test_gate_b_runs_use_exact_profile_holder(gate_b_agent, tmp_path, monkeypatch):
     adapter, runner, constructor = gate_b_agent
     runner.config.multiplex_profiles = True
-    source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm")
-    assert runner.bind_session_credential(
-        source, SESSION_ID, BEARER, datetime.now(timezone.utc) + timedelta(minutes=5), "revision",
-    )
-    token = _api_request_profile.set("other-profile")
+    adapter._session_db = None
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
+    config_text = (tmp_path / "config.yaml").read_text()
+    for name in ("alpha", "beta"):
+        home = tmp_path / "profiles" / name
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(config_text)
+        (home / ".env").write_text(f"API_SERVER_KEY={adapter.config.extra['key']}\n")
+        db = SessionDB(home / "state.db")
+        db.create_session(SESSION_ID, "api_server")
+        db.close()
+    client = await _profile_client(adapter)
+    headers = {"Authorization": f"Bearer {adapter.config.extra['key']}"}
     try:
-        with pytest.raises(_ProviderAuthResolutionError, match="credential unavailable"):
-            adapter._create_agent(session_id=SESSION_ID)
+        assert (await client.post(
+            f"/p/alpha/api/sessions/{SESSION_ID}/credential/bind", headers=headers,
+            json=_bind_body(bearer="alpha-bearer"),
+        )).status == 200
+        result = await _finished_run(client, adapter, prefix="/p/beta")
+        assert result["status"] == "failed", result
+        constructor.assert_not_called()
+        for name in ("alpha", "beta"):
+            assert (await client.post(
+                f"/p/{name}/api/sessions/{SESSION_ID}/credential/bind", headers=headers,
+                json=_bind_body(bearer=f"{name}-bearer"),
+            )).status == 200
+            result = await _finished_run(client, adapter, prefix=f"/p/{name}")
+            assert result["status"] == "completed", result
+            assert constructor.call_args.kwargs["api_key"]() == f"{name}-bearer"
     finally:
-        _api_request_profile.reset(token)
-    constructor.assert_not_called()
+        await client.close()
+        runner.session_store.close_all_db_handles()
+        for db in adapter._session_dbs.values():
+            db.close()
 
 
 @pytest.mark.parametrize("selection", [
@@ -301,6 +337,40 @@ def test_gate_b_create_agent_preserves_route_and_has_no_ambient_dependency(gate_
     assert kwargs["base_url"] == "https://gate-b.invalid/v1"
     assert kwargs["fallback_model"] is None
     ambient.assert_not_called()
+
+
+def test_non_gate_b_create_agent_keeps_upstream_credentials_and_fallback(gate_b_agent, monkeypatch):
+    adapter, runner, constructor = gate_b_agent
+    source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm")
+    assert runner.bind_session_credential(
+        source, SESSION_ID, BEARER, datetime.now(timezone.utc) + timedelta(minutes=5), "revision",
+    )
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"model": {"provider": "stock"}})
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {
+        "api_key": "upstream-key", "provider": "stock", "base_url": "https://stock.invalid/v1",
+    })
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: "upstream-model")
+    adapter._create_agent(session_id=SESSION_ID)
+    kwargs = constructor.call_args.kwargs
+    assert kwargs["api_key"] == "upstream-key"
+    assert kwargs["provider"] == "stock"
+    assert kwargs["model"] == "upstream-model"
+    assert kwargs["fallback_model"] == [{"provider": "openrouter", "model": "fallback-model"}]
+
+
+def test_gate_b_create_agent_does_not_recover_an_unpinned_model(gate_b_agent, monkeypatch):
+    from gateway.platforms.api_server import _ProviderAuthResolutionError
+
+    adapter, runner, constructor = gate_b_agent
+    source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm")
+    assert runner.bind_session_credential(
+        source, SESSION_ID, BEARER, datetime.now(timezone.utc) + timedelta(minutes=5), "revision",
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: "")
+    adapter._last_resolved_model["*"] = "another-sessions-model"
+    with pytest.raises(_ProviderAuthResolutionError, match="model unavailable"):
+        adapter._create_agent(session_id=SESSION_ID)
+    constructor.assert_not_called()
 
 
 async def _client(adapter):

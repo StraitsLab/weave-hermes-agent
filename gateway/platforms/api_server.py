@@ -2993,21 +2993,22 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         from hermes_cli.tools_config import _get_platform_tools
 
-        # Catch RuntimeError ONLY around this call, not the wider
-        # _create_agent()+run_conversation() span --
-        # _resolve_runtime_agent_kwargs() is the sole raiser of
-        # RuntimeError(format_runtime_provider_error(...)) for provider
-        # auth/credential failure.  Re-raising as
-        # _ProviderAuthResolutionError lets _run_agent() (and
-        # _handle_runs()) distinguish this from an unrelated RuntimeError
-        # elsewhere in the call graph.
+        # Gate-B uses the same source identity as /credential/bind. A memory
+        # key supplied by the client is not an authorization namespace.
+        session_key = gateway_session_key or session_id
+        session_override = (
+            None if confirmed_runtime_lock else self._session_model_override_for(session_key)
+        )
         user_config = _load_gateway_config()
         model_config = user_config.get("model", {})
-        configured_provider = model_config.get("provider") if isinstance(model_config, dict) else None
+        configured_provider = (
+            model_config.get("provider") if isinstance(model_config, dict) else None
+        )
         gate_b_provider = "custom:weave-gate-b"
         gate_b = gate_b_provider in (
             configured_provider, requested_provider,
             route.get("provider") if isinstance(route, dict) else None,
+            session_override.get("provider") if session_override else None,
         )
         session_credential = None
         if gate_b:
@@ -3023,6 +3024,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise _ProviderAuthResolutionError("credential unavailable")
         try:
             # Gate-B must not resolve through the global auth-fallback chain.
+            # Keep auth errors typed for the existing run.failed handling.
             runtime_kwargs = (
                 _resolve_request_runtime_agent_kwargs(gate_b_provider)
                 if gate_b else _resolve_runtime_agent_kwargs()
@@ -3069,7 +3071,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 # Resolved custom providers lose their named identity. Do not
                 # resolve bare "custom" through the ambient OpenRouter route.
                 provider_name = gate_b_provider
-                required = True
             try:
                 return _resolve_request_runtime_agent_kwargs(
                     provider_name,
@@ -3106,11 +3107,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # lock is an execution contract: it bypasses the session /model
         # override and fails closed (never reuses global credentials) if
         # its provider cannot be resolved.
-        session_key = gateway_session_key or session_id
         session_row_model = _clean_request_string(session_model)
-        session_override = None
-        if not confirmed_runtime_lock:
-            session_override = self._session_model_override_for(session_key)
         # Model-string precedence delegates to the shared owner
         # hermes_cli.model_switch.resolve_effective_model (session /model
         # override > session-persisted model > global) — the rule 7dd00bb47d
@@ -3196,6 +3193,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     request_provider or "",
                 )
 
+        if gate_b and not model:
+            raise _ProviderAuthResolutionError("session credential model unavailable")
+
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
         # fall back to the provider's first catalog model so the API call
@@ -3247,9 +3247,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._last_resolved_model["*"] = model
 
         if gate_b:
-            if (runtime_kwargs.get("provider") != "custom"
-                    or not gate_b_base_url
-                    or runtime_kwargs.get("base_url") != gate_b_base_url):
+            if (
+                runtime_kwargs.get("provider") != "custom"
+                or not gate_b_base_url
+                or runtime_kwargs.get("base_url") != gate_b_base_url
+            ):
                 raise _ProviderAuthResolutionError("session credential route mismatch")
             # Keep the existing holder callable for per-request refresh/revoke.
             # Neither a route key nor a pooled/global key may replace it.
