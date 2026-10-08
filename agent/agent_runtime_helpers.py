@@ -22,6 +22,7 @@ Methods covered:
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import logging
@@ -4653,6 +4654,61 @@ def _connection_candidates(conn: Any):
         inner = getattr(candidate, "_connection", None)
         if inner is not None and id(inner) not in seen:
             stack.append(inner)
+
+
+def _socket_from_response(response: Any):
+    """Raw socket behind an httpx response's network stream (``extensions["network_stream"]``
+    first, then ``response.stream``), or None. Callers own their error handling."""
+    exts = getattr(response, "extensions", None) or {}
+    direct = exts.get("network_stream") if isinstance(exts, dict) else None
+    for start in (direct, getattr(response, "stream", None)):
+        if start is None:
+            continue
+        for candidate in _connection_candidates(start):
+            sock = _socket_from_candidate(candidate)
+            if sock is not None:
+                return sock
+    return None
+
+
+def _socket_from_stream(stream: Any):
+    """Raw socket behind an httpcore network stream (several backends), or None."""
+    sock = getattr(stream, "_sock", None)
+    if sock is None and callable(getattr(stream, "get_extra_info", None)):
+        with contextlib.suppress(Exception):
+            sock = stream.get_extra_info("socket")
+    if sock is None:
+        sock = getattr(getattr(stream, "stream", None), "_sock", None)
+    if sock is None and callable(getattr(getattr(stream, "_stream", None), "extra", None)):
+        # anyio-backed streams expose the raw socket through SocketAttribute.raw_socket.
+        with contextlib.suppress(Exception):
+            from anyio.abc import SocketAttribute
+            sock = stream._stream.extra(SocketAttribute.raw_socket)
+    return sock
+
+
+def _socket_from_candidate(candidate: Any):
+    """Raw socket behind a connection/stream wrapper yielded by ``_connection_candidates``."""
+    stream = getattr(candidate, "_network_stream", None) or getattr(candidate, "_stream", None)
+    sock = _socket_from_stream(stream) if stream is not None else None
+    return sock if sock is not None else _socket_from_stream(candidate)
+
+
+def _shutdown_socket(sock: Any) -> None:
+    """``shutdown(SHUT_RDWR)`` WITHOUT closing the FD. ``close()`` from a non-owner thread is
+    unsafe: the SSL BIO caches the raw FD, the kernel recycles it, and a flushed TLS record lands
+    in the wrong file (once clobbered a SQLite header). ``shutdown()`` is FD-safe from any thread.
+    Already shut down / not connected / FD invalid are all benign."""
+    import socket as _socket
+    try:
+        # Clear a blocking timeout so a hung SSL_read notices the shutdown. Still no close().
+        settimeout = getattr(sock, "settimeout", None)
+        if callable(settimeout):
+            with contextlib.suppress(OSError):
+                settimeout(0)
+        sock.shutdown(_socket.SHUT_RDWR)
+    except OSError:
+        pass
 
 
 def _iter_pool_sockets(client: Any):

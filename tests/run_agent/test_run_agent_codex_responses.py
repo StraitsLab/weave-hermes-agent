@@ -1027,9 +1027,186 @@ def test_run_codex_stream_returns_terminal_response_when_post_terminal_drain_fai
     assert response.status == "completed"
     assert response.usage is usage
     assert response.id == "resp_post_terminal_1"
-    assert any(
-        "finalization" in record.message for record in caplog.records
+
+
+def test_run_codex_stream_skips_post_terminal_drain_without_socket(monkeypatch):
+    """Without an interruptible socket the finalizer drain is skipped, so a relay that keeps SSE
+    open after ``response.completed`` can no longer wedge the turn (#103864)."""
+    from agent import codex_runtime
+
+    agent = _build_agent(monkeypatch)
+    message_item = SimpleNamespace(
+        type="message",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="All done.")],
     )
+    usage = SimpleNamespace(input_tokens=10, output_tokens=6, total_tokens=16)
+    events = [
+        SimpleNamespace(type="response.output_item.done", item=message_item),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(status="completed", usage=usage, id="resp_no_socket"),
+        ),
+    ]
+    pulled_after_terminal = {"count": 0}
+
+    class _NeverClosingStream(_FakeCreateStream):
+        """A relay that never ends the SSE body: every post-terminal pull would block forever."""
+
+        def __iter__(self):
+            yield from super().__iter__()
+            pulled_after_terminal["count"] += 1
+            raise AssertionError("post-terminal drain must be skipped without a socket")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **kwargs: _NeverClosingStream(events))
+    )
+    monkeypatch.setattr(codex_runtime, "_stream_drain_timeout", lambda: 2.0)
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response.status == "completed"
+    assert response.id == "resp_no_socket"
+    assert pulled_after_terminal["count"] == 0
+
+
+def test_run_codex_stream_post_terminal_timeout_shuts_down_socket_not_close(monkeypatch):
+    """When the drain exceeds ``agent.stream_drain_timeout`` the watchdog only ``shutdown()``s the
+    socket (FD-safe from another thread); the owner thread sees the wakeup and returns the
+    already-assembled response. ``close()`` is never called from the watchdog."""
+    import threading
+
+    import httpx
+
+    from agent import codex_runtime
+    from agent import agent_runtime_helpers
+
+    agent = _build_agent(monkeypatch)
+    message_item = SimpleNamespace(
+        type="message",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="All done.")],
+    )
+    usage = SimpleNamespace(input_tokens=10, output_tokens=6, total_tokens=16)
+    events = [
+        SimpleNamespace(type="response.output_item.done", item=message_item),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(status="completed", usage=usage, id="resp_timeout"),
+        ),
+    ]
+
+    class _FakeSocket:
+        def __init__(self):
+            self.shutdown_calls = 0
+            self.close_calls = 0
+            self.woken = threading.Event()
+
+        def settimeout(self, _value):
+            pass
+
+        def shutdown(self, _how):
+            self.shutdown_calls += 1
+            self.woken.set()
+
+        def close(self):
+            self.close_calls += 1
+
+    sock = _FakeSocket()
+
+    class _HangingStream(_FakeCreateStream):
+        """Keeps the SSE body open after the terminal event until the socket is shut down."""
+
+        response = SimpleNamespace(extensions={}, stream=None)
+
+        def __iter__(self):
+            yield from super().__iter__()
+            # Simulate a blocking read that only returns once shutdown() lands.
+            assert sock.woken.wait(5.0), "watchdog never shut the socket down"
+            raise httpx.ReadError("socket shut down during drain")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **kwargs: _HangingStream(events))
+    )
+    monkeypatch.setattr(codex_runtime, "_stream_drain_timeout", lambda: 0.05)
+    monkeypatch.setattr(agent_runtime_helpers, "_socket_from_response", lambda _resp: sock)
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response.status == "completed"
+    assert response.id == "resp_timeout"
+    assert sock.shutdown_calls == 1
+    assert sock.close_calls == 0
+
+
+def test_run_codex_stream_post_terminal_clean_drain_never_shutdowns(monkeypatch):
+    """A relay that closes promptly after ``response.completed`` drains cleanly: the watchdog is
+    cancelled and the socket is never shut down."""
+    from agent import codex_runtime
+    from agent import agent_runtime_helpers
+
+    agent = _build_agent(monkeypatch)
+    message_item = SimpleNamespace(
+        type="message",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="All done.")],
+    )
+    usage = SimpleNamespace(input_tokens=10, output_tokens=6, total_tokens=16)
+    events = [
+        SimpleNamespace(type="response.output_item.done", item=message_item),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(status="completed", usage=usage, id="resp_clean"),
+        ),
+    ]
+
+    class _FakeSocket:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def settimeout(self, _value):
+            pass
+
+        def shutdown(self, _how):
+            self.shutdown_calls += 1
+
+    sock = _FakeSocket()
+
+    class _CleanStream(_FakeCreateStream):
+        response = SimpleNamespace(extensions={}, stream=None)
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **kwargs: _CleanStream(events))
+    )
+    monkeypatch.setattr(codex_runtime, "_stream_drain_timeout", lambda: 2.0)
+    monkeypatch.setattr(agent_runtime_helpers, "_socket_from_response", lambda _resp: sock)
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response.status == "completed"
+    assert response.id == "resp_clean"
+    assert sock.shutdown_calls == 0
+
+
+def test_stream_drain_timeout_reads_agent_config(monkeypatch):
+    """``agent.stream_drain_timeout`` is honoured; invalid/missing values fall back to 2.0."""
+    from agent import codex_runtime
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config, "load_config_readonly", lambda: {"agent": {"stream_drain_timeout": 0.5}}
+    )
+    assert codex_runtime._stream_drain_timeout() == 0.5
+    monkeypatch.setattr(
+        hermes_config, "load_config_readonly", lambda: {"agent": {"stream_drain_timeout": 0}}
+    )
+    assert codex_runtime._stream_drain_timeout() == 0.0
+    monkeypatch.setattr(
+        hermes_config, "load_config_readonly", lambda: {"agent": {"stream_drain_timeout": True}}
+    )
+    assert codex_runtime._stream_drain_timeout() == 2.0
+    monkeypatch.setattr(hermes_config, "load_config_readonly", lambda: {})
+    assert codex_runtime._stream_drain_timeout() == 2.0
 
 
 def test_run_conversation_codex_plain_text(monkeypatch):
