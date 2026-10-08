@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
@@ -26,6 +27,28 @@ from typing import Any, Callable, Dict, List
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
+
+# Post-terminal SSE drain budget. See ``_stream_drain_timeout``.
+_DEFAULT_STREAM_DRAIN_TIMEOUT = 2.0
+
+
+def _stream_drain_timeout() -> float:
+    """``agent.stream_drain_timeout`` (seconds) — how long the post-terminal SSE drain may block.
+
+    The drain is a courtesy to Relay's finalizer, never a correctness requirement: ``final`` is fully
+    assembled before it starts. A relay that never closes the socket after ``response.completed`` would
+    otherwise wedge the turn until the idle watchdog discards the already-billed response (#103864).
+    ``0`` skips the drain entirely.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        agent_cfg = load_config_readonly().get("agent")
+        value = agent_cfg.get("stream_drain_timeout") if isinstance(agent_cfg, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return max(0.0, float(value))
+    except Exception:
+        pass
+    return _DEFAULT_STREAM_DRAIN_TIMEOUT
 
 
 def _codex_request_failure_details(error: BaseException) -> tuple[int | None, str]:
@@ -1626,7 +1649,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
         intercepted_events = []
-        writer_token = {"value": None}
+        writer_token = {"value": None, "raw_stream": None}
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = _sanitize_consumer_codex_request(
@@ -1641,6 +1664,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             # Claim the delta sink for THIS physical attempt. A newer attempt
             # supersedes this token and fences late deltas out of the turn.
             writer_token["value"] = claim_stream_writer(agent)
+            # Keep the raw SDK stream so the post-terminal drain can reach the
+            # underlying socket (``raw_stream.response``) and bound itself.
+            writer_token["raw_stream"] = _raw_stream
 
         def _accept_codex_chunk(_chunk: Any) -> bool:
             token = writer_token["value"]
@@ -1769,41 +1795,100 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 raise
 
             # A terminal response has already been assembled at this point
-            # (``final`` is built), so a transport error while draining the
-            # rest of the iterator — done only to let Relay run its response
-            # finalizer — must NOT discard it or trigger a new physical
-            # request. Record it as a non-fatal finalization warning and
-            # still return the already-completed, already-billed response.
-            if not agent._interrupt_requested:
+            # (``final`` is built), so the remaining iterator is drained only to
+            # let Relay run its response finalizer. That drain must NOT discard
+            # the completed response, trigger a new physical request, or block
+            # unbounded on a relay that keeps the socket open after
+            # ``response.completed`` (#103864): it is bounded by
+            # ``agent.stream_drain_timeout`` and skipped without an
+            # interruptible socket.
+            def _drain_for_finalizer(stream_to_drain: Any) -> None:
+                budget = _stream_drain_timeout()
+                if budget <= 0:
+                    return
+                from agent.agent_runtime_helpers import (
+                    _shutdown_socket,
+                    _socket_from_response,
+                )
+
+                # Only the raw SDK stream carries ``.response``; any lookup
+                # failure means "not interruptible".
                 try:
-                    for _ignored in event_stream:
+                    sock = _socket_from_response(
+                        getattr(writer_token.get("raw_stream"), "response", None)
+                    )
+                except Exception:
+                    sock = None
+                if sock is None:
+                    # Without a shutdown-capable socket a synchronous drain
+                    # could become unbounded. The drain is only for Relay's
+                    # finalizer, so skip it; the stream is closed by its owner
+                    # on return.
+                    logger.debug(
+                        "Codex post-terminal drain skipped: no interruptible "
+                        "stream socket found. %s",
+                        agent._client_log_context(),
+                    )
+                    return
+
+                timed_out = threading.Event()
+
+                def _wake_owner() -> None:
+                    timed_out.set()
+                    # FD-safe from a stranger thread: never close() here. The
+                    # owner (this thread) observes EOF/error and performs the
+                    # real close from the same thread that was reading.
+                    _shutdown_socket(sock)
+
+                watchdog = threading.Timer(budget, _wake_owner)
+                watchdog.name = "codex-post-terminal-watchdog"
+                watchdog.daemon = True
+                try:
+                    watchdog.start()
+                    for _ignored in stream_to_drain:
                         pass
                 except (
                     _httpx.RemoteProtocolError,
                     _httpx.ReadTimeout,
+                    _httpx.ReadError,
                     _httpx.ConnectError,
                     ConnectionError,
+                    _APIConnectionError,
                 ) as exc:
-                    logger.warning(
-                        "Codex Responses stream transport finalization failed "
-                        "after a terminal response was already received; "
-                        "returning the completed response instead of "
-                        "retrying. %s error=%s",
-                        agent._client_log_context(), exc,
+                    if timed_out.is_set():
+                        # The timeout-triggered shutdown is the expected wakeup,
+                        # not another provider failure.
+                        logger.warning(
+                            "Codex Responses stream remained open %.1fs after a "
+                            "terminal response; shut down the socket and "
+                            "returning the completed response. %s",
+                            budget, agent._client_log_context(),
+                        )
+                    else:
+                        if isinstance(exc, _APIConnectionError):
+                            _log_codex_request_failure(
+                                agent,
+                                exc,
+                                stream_opened=writer_token["value"] is not None,
+                            )
+                        logger.warning(
+                            "Codex Responses stream transport finalization failed "
+                            "after a terminal response was already received; "
+                            "returning the completed response instead of "
+                            "retrying. %s error=%s",
+                            agent._client_log_context(), exc,
+                        )
+                except Exception:
+                    logger.debug(
+                        "Codex Responses stream finalization failed after a "
+                        "terminal response",
+                        exc_info=True,
                     )
-                except _APIConnectionError as exc:
-                    _log_codex_request_failure(
-                        agent,
-                        exc,
-                        stream_opened=writer_token["value"] is not None,
-                    )
-                    logger.warning(
-                        "Codex Responses stream transport finalization failed "
-                        "after a terminal response was already received; "
-                        "returning the completed response instead of "
-                        "retrying. %s error=%s",
-                        agent._client_log_context(), exc,
-                    )
+                finally:
+                    watchdog.cancel()
+
+            if not agent._interrupt_requested:
+                _drain_for_finalizer(event_stream)
 
             if final.status in {"incomplete", "failed"}:
                 logger.warning(

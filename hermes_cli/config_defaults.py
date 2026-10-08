@@ -48,6 +48,11 @@ DEFAULT_CONFIG = {
         # positive integer to cap, or use "none"/"unlimited"/"inf"/0/-1 —
         # all normalized by hermes_cli.config.resolve_turn_limit.
         "max_turns": None,
+        # Post-terminal SSE drain budget (seconds). After ``response.completed`` the Codex stream
+        # is drained only as a courtesy to Relay's finalizer; a relay that keeps the socket open
+        # would otherwise wedge the turn until the idle watchdog discards the already-billed
+        # response (#103864). 0 skips the drain. Well-behaved endpoints close immediately.
+        "stream_drain_timeout": 2.0,
         # Optional wall-clock budget in seconds per conversation run.
         # null/absent = feature fully off (zero behavior change). When set,
         # the agent gets a one-time wrap-up notice at 80% elapsed and
