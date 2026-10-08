@@ -238,20 +238,10 @@ async def run():
             "/api/sessions", json={"id": sid, "title": "Bot Chat"}
         )
         assert response.status_code == 201, (response.status_code, response.text)
-        from datetime import datetime, timedelta, timezone
-
-        response = await client.post(
-            f"/api/sessions/{sid}/credential/bind",
-            json={
-                "credential_slot": "GATE_B_API_KEY",
-                "bearer": "fixture-not-a-secret",
-                "expires_at": (
-                    datetime.now(timezone.utc) + timedelta(minutes=5)
-                ).isoformat(),
-                "provider_route_revision_id": "fixture-revision",
-            },
-        )
-        assert response.status_code == 200, (response.status_code, response.text)
+        # Native key_cmd/profile auth owns inference. No legacy credential bind.
+        denied = await client.post(f"/api/sessions/{sid}/submit", headers={"Authorization": "Bearer wrong"},
+            json={"kind":"hermes.session.submit","external_request_id":"denied","message":"denied","busy_mode":"queue"})
+        assert denied.status_code == 401
         response = await client.post(
             f"/api/sessions/{sid}/submit",
             json={
@@ -276,21 +266,33 @@ async def run():
         assert any(x["helper"] for x in requests) and any(
             x["notification"] for x in requests
         )
+        # The observed Live failure: CLI completion left the durable row ended.
+        # A new native turn resumes it without deleting or rotating the chat.
+        ended = await client.patch(f"/api/sessions/{sid}", json={"end_reason": "cli_close"})
+        assert ended.status_code == 200, ended.text
+        # Older API callers still send a bind. Native inference must acknowledge
+        # that obsolete envelope without rebinding/reopening the ended session.
+        from datetime import datetime, timedelta, timezone
+        old_bind = await client.post(f"/api/sessions/{sid}/credential/bind", json={
+            "credential_slot": "GATE_B_API_KEY", "bearer": "obsolete-unused-bearer",
+            "expires_at": (datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(),
+            "provider_route_revision_id": "obsolete-revision"})
+        assert old_bind.status_code == 200, old_bind.text
+        again = await client.post(f"/api/sessions/{sid}/submit", json={
+            "kind": "hermes.session.submit", "external_request_id": "after-close",
+            "message": "Confirm the completed helper result.", "busy_mode": "queue"})
+        assert again.status_code == 202, again.text
+        replay = await client.post(f"/api/sessions/{sid}/submit", json={
+            "kind": "hermes.session.submit", "external_request_id": "after-close",
+            "message": "Confirm the completed helper result.", "busy_mode": "queue"})
+        assert replay.status_code == 202 and replay.json() == again.json()
+        preserved = await client.get(f"/api/sessions/{sid}/messages")
+        assert "NATIVE_BEM_RECEIVED_729" in preserved.text
+        capability = (await client.get("/v1/capabilities")).json()
+        assert capability["features"]["native_session_inference"] is True
         side = "weave-01964000-0000-7000-8000-000000000403"
         response = await client.post("/api/sessions", json={"id": side})
         assert response.status_code == 201
-        response = await client.post(
-            f"/api/sessions/{side}/credential/bind",
-            json={
-                "credential_slot": "GATE_B_API_KEY",
-                "bearer": "fixture-not-a-secret",
-                "expires_at": (
-                    datetime.now(timezone.utc) + timedelta(minutes=5)
-                ).isoformat(),
-                "provider_route_revision_id": "fixture-revision",
-            },
-        )
-        assert response.status_code == 200, response.text
         slow = {
             "kind": "hermes.session.submit",
             "external_request_id": "slow-request",

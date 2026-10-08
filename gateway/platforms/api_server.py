@@ -3539,6 +3539,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        from gateway.native_bot_admission import enabled as native_bot_sessions
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -3558,6 +3559,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
             },
             "features": {
+                "native_session_inference": native_bot_sessions(),
                 "chat_completions": True,
                 "chat_completions_streaming": True,
                 "responses_api": True,
@@ -5221,6 +5223,12 @@ class APIServerAdapter(BasePlatformAdapter):
         _, session_err = await self._get_existing_session_or_404(session_id)
         if session_err:
             return session_err
+        from gateway.native_bot_admission import enabled as native_bot_sessions
+        if native_bot_sessions():
+            # Native profiles resolve their own short-lived key_cmd credential.
+            # Do not bind an unused controller bearer to the legacy runner or
+            # resurrect its ended-session record during a rolling API update.
+            return web.json_response({"status": "ready", "credential_slot": "GATE_B_API_KEY"})
         source = SessionSource(
             platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
             user_id="api_server", user_name="API server",
@@ -5484,9 +5492,11 @@ class APIServerAdapter(BasePlatformAdapter):
             profile=_api_request_profile.get() or None,
         )
         async with self._native_lifecycle_lock(session_id):
-            credential_available = getattr(runner, "session_credential_available", None)
-            if not callable(credential_available) or not await asyncio.to_thread(credential_available, source, session_id):
-                return web.json_response(_openai_error("Credential unavailable", code="credential_unavailable"), status=409)
+            from gateway.native_bot_admission import enabled as native_bot_sessions
+            if not native_bot_sessions():
+                credential_available = getattr(runner, "session_credential_available", None)
+                if not callable(credential_available) or not await asyncio.to_thread(credential_available, source, session_id):
+                    return web.json_response(_openai_error("Credential unavailable", code="credential_unavailable"), status=409)
             native_request_ref = uuid.uuid4().hex
             result = await asyncio.to_thread(
                 db.register_native_session_submit,
