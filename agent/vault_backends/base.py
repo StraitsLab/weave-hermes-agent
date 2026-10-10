@@ -160,19 +160,11 @@ def is_enabled(name: str) -> bool:
 def enabled_backends() -> List[LoginBackend]:
     """Local first, then every detected external manager the user has not turned off.
 
-    Fork (V5): ``vault.backend: weave`` makes the Harso vault the ONLY login source (a Harso cell or Work
-    attempt): no local Fernet file and no manager CLI session may hold a secret there. Any other value than
-    ``local``/``weave`` leaves the vault with no source at all rather than guessing one."""
+    Any ``vault.backend`` other than ``local`` leaves the vault with no source at all rather than guessing one."""
     from agent.vault_backends.local import LocalLoginBackend
 
     cfg = _cfg()
     choice = cfg.get("backend", "local")
-    if choice == "weave":
-        from agent.vault_backends.weave import WeaveLoginBackend, timeout_seconds
-
-        # Read per call from the profile's config.yaml (mtime-cached): an edit applies to the next vault call.
-        return [WeaveLoginBackend(str(cfg.get("weave_api_url") or ""),
-                                  timeout_seconds(cfg.get("weave_timeout_seconds")))]
     if choice != "local":
         logger.warning("vault.backend %.40r is not a known backend; the vault has no login source", choice)
         return []
