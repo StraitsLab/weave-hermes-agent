@@ -564,6 +564,12 @@ def _registered_tool_worker(agent):
     (incl. BaseException) discard it and clear its interrupt bit so a recycled tid starts clean."""
     tid = threading.current_thread().ident
     with agent._tool_worker_threads_lock:
+        # Bind recycled thread IDs to the current owner before publishing them.
+        # Interrupt fan-out takes this same lock, so a new stop is not cleared.
+        _ra()._set_interrupt(
+            bool(agent._interrupt_requested), tid,
+            reason=getattr(agent, "_tool_interrupt_reason", None),
+        )
         agent._tool_worker_threads.add(tid)
     try:
         yield tid
