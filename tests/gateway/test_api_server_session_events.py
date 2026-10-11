@@ -178,14 +178,14 @@ async def test_events_reject_cross_session_and_terminal_native_refs(adapter):
             f"/api/sessions/{SESSION_ID}/submit/{REQUEST_REF}/events",
             headers=headers,
         )
-        terminal_body = await terminal.json()
+        terminal_body = await terminal.text()
     finally:
         await client.close()
 
     assert unauthorized.status == 401
     assert wrong_session.status == 404
-    assert terminal.status == 409
-    assert terminal_body["error"]["code"] == "native_admission_terminal"
+    assert terminal.status == 200
+    assert '"type": "turn.completed"' in terminal_body
 
 
 @pytest.mark.asyncio

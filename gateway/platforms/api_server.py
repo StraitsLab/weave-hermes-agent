@@ -1697,7 +1697,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._native_submit_subscribers: Dict[str, tuple[asyncio.Queue, asyncio.AbstractEventLoop]] = {}
         self._native_submit_sequences: Dict[str, int] = {}
         self._native_submit_event_lock = threading.Lock()
-        self._native_submit_terminals: Dict[str, None] = {}
+        self._native_submit_terminals: Dict[str, Dict[str, Any]] = {}
         # Weave (WEV-2108): running native_request_ref -> refs steered into that turn.
         self._native_submit_steered: Dict[str, List[str]] = {}
         # Weave: native_request_ref -> approval session key while the turn is
@@ -5616,8 +5616,8 @@ class APIServerAdapter(BasePlatformAdapter):
         return event
 
     def _native_submit_close(self, native_request_ref: str, event_type: str, **fields: Any) -> None:
-        self._native_submit_event(native_request_ref, event_type, **fields)
-        self._native_submit_terminals[native_request_ref] = None
+        terminal = self._native_submit_event(native_request_ref, event_type, **fields)
+        self._native_submit_terminals[native_request_ref] = terminal
         if len(self._native_submit_terminals) > 1_024:
             evicted = next(iter(self._native_submit_terminals))
             self._native_submit_terminals.pop(evicted, None)
@@ -5697,7 +5697,11 @@ class APIServerAdapter(BasePlatformAdapter):
         ):
             return web.json_response(_openai_error("Native admission was not found", code="native_admission_not_found"), status=404)
         if native_request_ref in self._native_submit_terminals:
-            return web.json_response(_openai_error("Native admission is terminal", code="native_admission_terminal"), status=409)
+            # Keep one bounded terminal receipt, not a second event log. Reconnect
+            # must distinguish a completed/failed turn from a broken connection.
+            terminal = self._native_submit_terminals[native_request_ref]
+            return web.Response(body=_sse_frame(terminal, event=terminal["type"]),
+                                content_type="text/event-stream", headers={"Cache-Control": "no-store"})
 
         queue: asyncio.Queue = asyncio.Queue(maxsize=32)
         old_subscriber = self._native_submit_subscribers.pop(native_request_ref, None)

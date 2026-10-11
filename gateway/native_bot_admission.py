@@ -18,6 +18,7 @@ def enabled() -> bool:
 
 class Projection:
     trusted_controller = True
+    requires_tool_lifecycle = True
 
     def __init__(self, adapter, profile, session_id, loop):
         self.adapter, self.profile, self.session_id, self.loop = (
@@ -63,7 +64,7 @@ class Projection:
             emit(
                 ref,
                 "tool.started" if kind == "tool.start" else "tool.completed",
-                tool_call_id=str(payload.get("tool_call_id", payload.get("id", "")))[
+                tool_call_id=str(payload.get("tool_id", payload.get("tool_call_id", payload.get("id", ""))))[
                     :256
                 ],
                 tool_name=str(payload.get("name", payload.get("tool", "")))[:256],
