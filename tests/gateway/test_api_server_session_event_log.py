@@ -201,7 +201,9 @@ async def test_every_non_append_change_resets_a_disconnected_client(adapter, cha
     resolved = db.resolve_resume_session_id(SID)
     assert page["session_id"] == resolved
     if resolved == SID:
-        assert [i["message"] for i in page["items"]] == msgs["data"]
+        # /messages is the display read and also keeps rows in-place compaction archived; the event
+        # log holds only active rows, so after a compaction it is the newest suffix of that history.
+        assert [i["message"] for i in page["items"]] == msgs["data"][len(msgs["data"]) - len(page["items"]):]
     assert first == {"event": "reset", "data": {"cursor": _c(page["epoch"], 0)}}
 
 
