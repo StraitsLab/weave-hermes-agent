@@ -327,7 +327,8 @@ async def run():
         assert response.status_code in (202, 503), response.text
         await asyncio.wait_for(reading, 10)
         response = await client.get(f"/api/sessions/{side}/submit/{active}/events")
-        assert response.status_code == 409, response.text
+        assert response.status_code == 200, response.text
+        assert "turn.failed" in response.text and "turn.completed" not in response.text
         assert len([x for x in requests if x.get("finish") == "tool_calls"]) < 8
         response = await client.get(f"/api/sessions/{side}/messages")
         assert "NATIVE_BEM_RECEIVED_729" not in response.text

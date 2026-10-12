@@ -195,6 +195,16 @@ def test_unregistered_peer_rejected(tmp_path):
     assert result["peers"] == ["spark"]
 
 
+def test_local_delivery_uses_gateway_cli_without_path(tmp_path, monkeypatch):
+    from tools import bot_relay
+    home = _managed_home(tmp_path)
+    seen = []
+    monkeypatch.setattr(bot_relay, "_hermes_cli", lambda: "/gateway/bin/hermes")
+    monkeypatch.setattr(bot_mode_dm, "_start_delivery", lambda argv, *args, **kwargs: seen.append(argv) or "{}")
+    bot_mode_dm.message_agent_tool(target="researcher", message="test", agent=_FakeAgent(home))
+    assert seen[0][0] == "/gateway/bin/hermes"
+
+
 # ── delivery command shape ───────────────────────────────────────────────────
 
 
@@ -246,8 +256,9 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     command = call["command"]
     mode, dm_file, transport_argv = _runner_parts(command)
     assert mode == "query-file"
+    from tools.bot_relay import _hermes_cli
     assert transport_argv == [
-        "hermes",
+        _hermes_cli(),
         "-p",
         "researcher",
         "chat",
@@ -294,7 +305,8 @@ def test_peer_delivery_command_pins_registry_profile_for_secondary_bots(
     assert mode == "stdin"
     # The registry the tool validated against is the machine root's — the
     # default profile's home — so the CLI runs there, not in reviewer.
-    assert transport_argv == ["hermes", "-p", "default", "peer", "dm", "spark"]
+    from tools.bot_relay import _hermes_cli
+    assert transport_argv == [_hermes_cli(), "-p", "default", "peer", "dm", "spark"]
 
 
 def test_peer_delivery_command(tmp_path, monkeypatch):
@@ -309,7 +321,8 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     assert "spark" in result["to"]
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
     assert mode == "stdin"
-    assert transport_argv == ["hermes", "-p", "default", "peer", "dm", "spark/researcher"]
+    from tools.bot_relay import _hermes_cli
+    assert transport_argv == [_hermes_cli(), "-p", "default", "peer", "dm", "spark/researcher"]
 
     # bare peer name targets the peer's main agent
     result2 = json.loads(
@@ -318,7 +331,8 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     assert result2["status"] == "sent"
     mode, _dm_file, transport_argv = _runner_parts(calls[1]["command"])
     assert mode == "stdin"
-    assert transport_argv == ["hermes", "-p", "default", "peer", "dm", "spark"]
+    from tools.bot_relay import _hermes_cli
+    assert transport_argv == [_hermes_cli(), "-p", "default", "peer", "dm", "spark"]
 
 
 def test_named_profile_sender_prefix(tmp_path, monkeypatch):

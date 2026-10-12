@@ -288,6 +288,8 @@ def message_agent_tool(
     if not raw_target:
         return _err("target is required.", roster=teammates, peers=peers)
 
+    from tools.bot_relay import _hermes_cli
+
     sender_handle = _handle(me)
     prefix = f"Message from 🤖 {sender_handle} (@{sender_handle}): "
 
@@ -313,7 +315,7 @@ def message_agent_tool(
         # local-teammate path's `-p <resolved>` pin below.
         return _start_delivery(
             [
-                "hermes",
+                _hermes_cli(),
                 "-p",
                 _self_profile_name(root),
                 "peer",
@@ -361,7 +363,7 @@ def message_agent_tool(
 
     return _start_delivery(
         [
-            "hermes",
+            _hermes_cli(),
             "-p",
             resolved,
             "chat",
