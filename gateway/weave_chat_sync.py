@@ -110,7 +110,10 @@ class _Writer:
                     "kind": CARD_TYPES[kind], "state": "pending", "body": body}
             live["cards"].append(card)
             live["card_keys"].append(card["cell_key"])
-        return kind in ("turn.completed", "turn.failed")
+        if kind in ("turn.completed", "turn.failed"):
+            live["outcome"] = kind.split(".")[1]
+            return True
+        return False
 
     def _flush(self, live: Dict[str, Any]) -> None:
         cards, live["cards"] = live["cards"], []
@@ -131,18 +134,24 @@ class _Writer:
         live["sent"], live["rev"], live["shown"] = len(live["text"]), out["rev"], live["status"]
 
     def _finish(self, live: Dict[str, Any]) -> None:
-        rows = visible_rows(live["read"]())
+        messages = live["read"]()
+        rows = visible_rows(messages)
         if live["session"] in _SYNCED:
             rows = rows[-40:]  # earlier rows are already in Supabase; compaction keeps their keys
-        answer = next((r for r in reversed(rows) if r["role"] == "assistant"), None)
-        if live["rev"] is not None:
-            if answer is not None:
-                answer["item_id"] = live["item"]  # the streamed row becomes the saved answer
-                answer["body"]["status"] = None
-            else:  # nothing saved (failed or interrupted turn): hide the partial reply
-                _call(live, [{"item_id": live["item"], "role": "assistant", "kind": "text",
-                              "state": "removed", "body": {}}])
+        # This turn's answer: its last visible assistant message, saved after the turn started.
+        mine = [m for m in messages if m.get("role") == "assistant" and isinstance(m.get("content"), str)
+                and m["content"].strip() and (m.get("timestamp") or 0) >= live["started"]]
+        answer = next((r for r in rows if mine and r["cell_key"] == row_key(mine[-1])), None)
+        if answer is not None and live.get("outcome") == "completed":
+            rows.remove(answer)
+            answer["item_id"] = live["item"]  # the streamed row becomes the saved answer
+            answer["body"]["status"] = None
+            last = answer
+        else:  # no answer: hide any partial reply. Either way the live row tells the apps the turn ended.
+            last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "removed",
+                    "body": {"outcome": live.get("outcome") or "failed", "status": None}}
         rows += [{"cell_key": key, "role": "assistant", "state": "resolved"} for key in live["card_keys"]]
+        rows.append(last)  # last, so every saved row is in Supabase before the apps settle the turn
         for start in range(0, len(rows), 100):
             _call(live, rows[start:start + 100])
         _SYNCED.add(live["session"])  # first turn after boot copied the whole chat (backfill)
@@ -175,7 +184,7 @@ def publish(session_id: str, ref: str, event: Dict[str, Any], read_display: Call
                 return
             with _LOCK:
                 _WRITER = _WRITER or _Writer()
-            _WRITER.live[ref] = {"session": session_id, "url": url, "key": key, "bearer": bearer,
+            _WRITER.live[ref] = {"session": session_id, "url": url, "key": key, "bearer": bearer, "started": time.time() - 1,
                                  "read": read_display, "item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}")),
                                  "text": "", "sent": 0, "rev": None, "status": None, "shown": None,
                                  "cards": [], "card_keys": []}
