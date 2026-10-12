@@ -608,6 +608,24 @@ def _run_agent_tool_execution_middleware(
         "dispatched": False,
     }
     dispatch_lock = threading.Lock()
+    lifecycle_lock = threading.Lock()
+    lifecycle_started = False
+
+    def _execution_started(final_args) -> None:
+        nonlocal lifecycle_started
+        with lifecycle_lock:
+            if lifecycle_started:
+                return
+            lifecycle_started = True
+        # Observation only: forwarding middleware retains its own authorization.
+        try:
+            _begin_tool_execution(
+                agent, function_name=function_name, function_args=final_args,
+                effective_task_id=effective_task_id, tool_call_id=tool_call_id,
+                display_index=display_index,
+            )
+        except Exception:
+            logging.debug("Tool start observation failed", exc_info=True)
 
     def _authorized_dispatch(final_args: dict[str, Any]) -> Any:
         with dispatch_lock:
@@ -620,14 +638,7 @@ def _run_agent_tool_execution_middleware(
             state["args"] = final_args
 
         def _begin() -> None:
-            _begin_tool_execution(
-                agent,
-                function_name=function_name,
-                function_args=final_args,
-                effective_task_id=effective_task_id,
-                tool_call_id=tool_call_id,
-                display_index=display_index,
-            )
+            _execution_started(final_args)
 
         def _advance_start_order(callback=None) -> None:
             if begin_execution is None:
@@ -759,6 +770,7 @@ def _run_agent_tool_execution_middleware(
                 next_args if isinstance(next_args, dict) else request_args
             ),
             original_args=function_args,
+            on_execution_started=_execution_started,
             task_id=effective_task_id or "",
             session_id=getattr(agent, "session_id", "") or "",
             tool_call_id=tool_call_id or "",
