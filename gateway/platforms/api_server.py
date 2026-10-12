@@ -4788,6 +4788,8 @@ class APIServerAdapter(BasePlatformAdapter):
             limit=limit,
             offset=offset,
             latest=latest_page,
+            # Weave: the user's history keeps turns that in-place compaction archived (as the dashboard does).
+            include_compacted=True,
         )
         return web.json_response({
             "object": "list",

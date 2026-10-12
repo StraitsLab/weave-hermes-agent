@@ -222,3 +222,34 @@ class TestMessagesEndpointProjection:
         rendered = " ".join(str(message.get("content") or "") for message in messages)
         assert "PRIOR CONTEXT" not in rendered
         assert "CONTEXT COMPACTION" not in rendered
+
+
+class TestMessagesEndpointKeepsCompactedHistory:
+    @pytest.mark.asyncio
+    async def test_turns_archived_by_in_place_compaction_stay_in_history(self, adapter, session_db):
+        sid = session_db.create_session("compacted-history", "api_server")
+        for i in range(6):
+            session_db.append_message(sid, "user", f"user turn {i}")
+            session_db.append_message(sid, "assistant", f"reply {i}")
+        watermark = session_db.get_active_message_watermark(sid)
+        session_db.archive_and_compact(
+            sid,
+            [{"role": "user", "content": STANDALONE_SUMMARY},
+             {"role": "user", "content": "user turn 5"}, {"role": "assistant", "content": "reply 5"}],
+            watermark=watermark,
+            tail_count=2,
+        )
+        session_db.append_message(sid, "user", "user turn 6")
+        session_db.append_message(sid, "assistant", "reply 6")
+
+        async with TestClient(TestServer(_messages_app(adapter))) as client:
+            response = await client.get(f"/api/sessions/{sid}/messages")
+            assert response.status == 200
+            payload = await response.json()
+
+        shown = [m["content"] for m in payload["data"] if m.get("display_kind") != "hidden"]
+        expected = []
+        for i in range(7):
+            expected += [f"user turn {i}", f"reply {i}"]
+        assert shown == expected
+        assert "CONTEXT COMPACTION" not in " ".join(shown)
