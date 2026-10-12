@@ -6230,7 +6230,10 @@ def _session_verbose(sid: str) -> bool:
 
 
 def _tool_progress_enabled(sid: str) -> bool:
-    return _session_tool_progress_mode(sid) != "off"
+    # Native product activity is data, independent of optional verbose presentation.
+    transport = (_sessions.get(sid) or {}).get("transport")
+    return (getattr(transport, "requires_tool_lifecycle", False) is True
+            or _session_tool_progress_mode(sid) != "off")
 
 
 def _tool_lifecycle_required_for_ui(name: str) -> bool:
