@@ -59,7 +59,33 @@ def run_git(cwd: str, *args: str) -> str:
     return bounded_git_probe(["git", "-C", cwd, *args], timeout=_GIT_TIMEOUT)
 
 
+def _inside_git_checkout(cwd: str) -> bool:
+    """Weave (WEV-3325): whether ``cwd`` can be in a git repo, from a few stat calls.
+
+    ``branch()`` runs on every session resume. In a cell whose cwd is not a repo
+    (``/opt/data``), both git probes fork+exec only to fail. After an idle spell
+    the spawns are slow enough that they reach ``_GIT_TIMEOUT`` and add seconds
+    to the first message. A ``.git`` entry (directory, or file for worktrees and
+    submodules) in ``cwd`` or a parent, or a bare-repo layout, means "ask git".
+    ``GIT_DIR``/``GIT_WORK_TREE`` can point git elsewhere, so those still probe.
+    """
+    if os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE"):
+        return True
+    path = os.path.abspath(cwd)
+    while True:
+        if os.path.lexists(os.path.join(path, ".git")):
+            return True
+        if all(os.path.exists(os.path.join(path, part)) for part in ("HEAD", "objects", "refs")):
+            return True
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        path = parent
+
+
 def branch(cwd: str) -> str:
+    if not cwd or not os.path.isdir(cwd) or not _inside_git_checkout(cwd):
+        return ""
     return run_git(cwd, "branch", "--show-current") or run_git(cwd, "rev-parse", "--short", "HEAD")
 
 
