@@ -5594,6 +5594,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "type": event_type,
             **fields,
         }
+        if _broadcast:
+            self._native_submit_chat_sync(native_request_ref, event)
         subscriber = self._native_submit_subscribers.get(native_request_ref)
         if _broadcast and subscriber is not None:
             queue, loop = subscriber
@@ -5616,6 +5618,29 @@ class APIServerAdapter(BasePlatformAdapter):
             else:
                 loop.call_soon_threadsafe(_enqueue)
         return event
+
+    def _native_submit_chat_sync(self, native_request_ref: str, event: Dict[str, Any]) -> None:
+        """Weave (WEV-3349): hand the live event to the Supabase chat writer (off unless configured)."""
+        owner = self._native_submit_ref_sessions.get(native_request_ref)
+        if owner is None:
+            return
+        profile, session_id = owner
+        db = self._ensure_session_db()
+        if db is None:
+            return
+        from gateway.weave_chat_sync import publish
+
+        def read_display() -> List[Dict[str, Any]]:
+            resolved = db.resolve_resume_session_id(session_id) or session_id
+            return [_project_client_message(m) for m in db.get_messages(resolved, include_compacted=True)]
+
+        def secret(name: str) -> str:
+            try:
+                return _scoped_get_secret(name, "") or ""
+            except _UnscopedSecretError:
+                return ""
+
+        publish(session_id, native_request_ref, event, read_display, secret)
 
     def _native_submit_close(self, native_request_ref: str, event_type: str, **fields: Any) -> None:
         terminal = self._native_submit_event(native_request_ref, event_type, **fields)
