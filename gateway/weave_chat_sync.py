@@ -19,6 +19,7 @@ database with the route bearer it already holds (WEAVE_API_MCP_BEARER).
 """
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import queue
@@ -80,11 +81,14 @@ class _Writer:
                     self._flush(live)
                     if ref in ended:
                         self.live.pop(ref, None)
+                        _ENDED.append(ref)
+                        _ENDED.append(ref)
                         self._finish(live)
                 except Exception:  # noqa: BLE001 - Supabase down: keep going; the next turn end resyncs
                     logger.warning("chat writer: write failed", exc_info=True)
                     if ref in ended:
                         self.live.pop(ref, None)
+                        _ENDED.append(ref)
 
     def _take(self, ref: str, event: Dict[str, Any]) -> bool:
         live, kind = self.live.get(ref), event.get("type")
@@ -168,6 +172,7 @@ def _call(live: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[str, A
 _WRITER: Optional[_Writer] = None
 _LOCK = threading.Lock()
 _SYNCED: set = set()
+_ENDED: "collections.deque[str]" = collections.deque(maxlen=256)  # refs already finished: a late event reopens nothing
 
 
 def publish(session_id: str, ref: str, event: Dict[str, Any], read_display: Callable[[], List[Dict[str, Any]]],
@@ -176,8 +181,10 @@ def publish(session_id: str, ref: str, event: Dict[str, Any], read_display: Call
     global _WRITER
     try:
         if _WRITER is None or ref not in _WRITER.live:
-            if event.get("type") != "turn.started":
-                return  # a turn the writer did not see start (writer off, or started before boot)
+            # A turn opens on its first event: an immediate turn emits no turn.started (only queued or steered
+            # ones do). Even a bare terminal event opens it, so the turn's rows are saved and its live row ends.
+            if ref in _ENDED:
+                return
             url = (secret("WEAVE_CHAT_SUPABASE_URL") or "").rstrip("/")
             key, bearer = secret("WEAVE_CHAT_SUPABASE_KEY") or "", secret("WEAVE_API_MCP_BEARER") or ""
             if not (url.startswith("https://") and key and bearer and session_id.startswith("weave-")):
@@ -188,7 +195,8 @@ def publish(session_id: str, ref: str, event: Dict[str, Any], read_display: Call
                                  "read": read_display, "item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}")),
                                  "text": "", "sent": 0, "rev": None, "status": None, "shown": None,
                                  "cards": [], "card_keys": []}
-            return
+            if event.get("type") == "turn.started":
+                return
         _WRITER.events.put_nowait((ref, event))
     except queue.Full:
         logger.warning("chat writer queue full; live piece dropped (the saved row still lands)")

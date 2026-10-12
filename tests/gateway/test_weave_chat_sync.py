@@ -67,11 +67,11 @@ def wait_for(cond, timeout=5.0):
     raise AssertionError("timed out")
 
 
-def run_turn(url, session, ref, events, saved, monkeypatch):
+def run_turn(url, session, ref, events, saved, monkeypatch, started=True):
     # The fake server is plain http; the writer only accepts https settings, so swap the scheme back at call time.
     real = sync._call
     monkeypatch.setattr(sync, "_call", lambda live, items: real({**live, "url": live["url"].replace("https://", "http://")}, items))
-    for event in [{"type": "turn.started"}] + events:
+    for event in ([{"type": "turn.started"}] if started else []) + events:
         sync.publish(session, ref, event, lambda: saved, secrets(url))
 
 
@@ -149,3 +149,19 @@ def test_a_turn_without_streamed_text_still_ends_on_its_live_row(server, monkeyp
     live_id = str(sync.uuid.uuid5(sync.uuid.NAMESPACE_URL, "weave-chat:ref6"))
     wait_for(lambda: rows.get(live_id, {}).get("state") == "final")
     assert rows[live_id]["text"] == "Done."
+
+
+def test_an_immediate_turn_without_turn_started_still_streams(server, monkeypatch):
+    # The gateway emits turn.started only for queued or steered submits; an immediate turn begins with its text.
+    url, _calls, rows = server
+    now = time.time()
+    saved = [{"id": 1, "role": "user", "content": "hi", "timestamp": now}, {"id": 2, "role": "assistant", "content": "Hello", "timestamp": now + 1}]
+    run_turn(url, "weave-abc", "ref7", [{"type": "assistant.delta", "delta": "Hel"}, {"type": "assistant.delta", "delta": "lo"},
+                                         {"type": "turn.completed"}], saved, monkeypatch, started=False)
+    live_id = str(sync.uuid.uuid5(sync.uuid.NAMESPACE_URL, "weave-chat:ref7"))
+    wait_for(lambda: rows.get(live_id, {}).get("state") == "final")
+    assert rows[live_id]["text"] == "Hello"
+    # A late event for a finished turn reopens nothing.
+    sync.publish("weave-abc", "ref7", {"type": "assistant.delta", "delta": "x"}, lambda: saved, secrets(url))
+    time.sleep(0.2)
+    assert "ref7" not in sync._WRITER.live
