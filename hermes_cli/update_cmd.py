@@ -83,6 +83,7 @@ _STALE_PURGE_PROTECTED = frozenset(
         "hermes_cli.main",
         "hermes_cli.update_cmd",
         "hermes_cli.hermes_logging",
+        "hermes_cli.update_receipt",  # Holds the in-flight update receipt across the code swap.
     }
 )
 
