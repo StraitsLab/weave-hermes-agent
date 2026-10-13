@@ -127,6 +127,7 @@ class _Writer:
             card_id = event.get("request_id") or event.get("clarify_id") or ""
             body = {k: v for k, v in event.items()
                     if k not in ("type", "sequence", "native_request_ref", "command", "pattern_key")}
+            body["native_request_ref"] = ref  # WEV-3404: an answer row reaches the cell by the turn's ref
             if kind == "approval.request":
                 pattern = str(event.get("pattern_key") or "")
                 consent = pattern.removeprefix("plugin_rule:") if pattern.startswith("plugin_rule:") else None

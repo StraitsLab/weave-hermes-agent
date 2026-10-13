@@ -120,6 +120,7 @@ def test_cards_and_their_resolution_are_rows(server, monkeypatch):
     first = next(i for c in calls for i in c["p_items"] if i.get("cell_key") == "approval:r1")
     assert first["state"] == "pending" and first["body"]["choices"] == ["once", "deny"]
     assert first["body"]["approval_ref"] == "018f" and "command" not in first["body"]
+    assert first["body"]["native_request_ref"] == "ref2"  # WEV-3404: an answer row finds the turn by this
     assert rows["clarify:c1"]["state"] == "resolved"
 
 
