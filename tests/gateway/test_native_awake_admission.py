@@ -262,3 +262,15 @@ async def test_cancel_inflight_registration_removes_only_owned_reservation(adapt
         message_sha256=adapter._native_submit_fingerprint("hello", "queue"),
         native_request_ref="next-ref")["outcome"] == "inserted"
     acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_writer_thread_releases_hold_on_owning_loop(adapter, monkeypatch):
+    calls=[]
+    monkeypatch.setattr(native_awake, "release", lambda ref: calls.append((ref, asyncio.get_running_loop())))
+    adapter._native_awake_refs={"writer-ref"}
+    owner_loop=asyncio.get_running_loop()
+    adapter._native_awake_loop=owner_loop
+    await asyncio.to_thread(adapter._release_native_awake, "writer-ref")
+    await asyncio.sleep(.01)
+    assert calls == [("writer-ref", owner_loop)]

@@ -5492,6 +5492,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return None if agent is None or agent is _AGENT_PENDING_SENTINEL else agent
 
     async def _handle_session_submit(self, request: "web.Request") -> "web.Response":
+        self._native_awake_loop = asyncio.get_running_loop()
         """POST /api/sessions/{id}/submit — native gateway admission receipt."""
         auth_err = self._check_auth(request)
         if auth_err:
@@ -5742,6 +5743,15 @@ class APIServerAdapter(BasePlatformAdapter):
             publish(session_id, native_request_ref, event, read_display, secret)
 
     def _release_native_awake(self, native_request_ref: str) -> None:
+        loop = getattr(self, "_native_awake_loop", None)
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        if loop is not None and current is not loop:
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(self._release_native_awake, native_request_ref)
+            return
         refs = self.__dict__.setdefault("_native_awake_refs", set())
         if native_request_ref in refs:
             refs.discard(native_request_ref)
