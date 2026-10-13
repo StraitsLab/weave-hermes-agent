@@ -2758,7 +2758,7 @@ class MCPServerTask:
                 logger.exception("Error in MCP message handler for '%s'", self.name)
         return _handler
 
-    async def _refresh_tools(self):
+    async def _refresh_tools(self, *, require_ready: bool = False):
         """Re-fetch tools from the server and update the registry.
 
         Called when the server sends ``notifications/tools/list_changed``.
@@ -2769,6 +2769,8 @@ class MCPServerTask:
         from tools.registry import registry
 
         if not self._advertises_tools():
+            if require_ready:
+                raise RuntimeError("MCP server does not advertise tools")
             # A server that doesn't implement tools/* should never send
             # tools/list_changed, but guard anyway — calling tools/list
             # would raise MCPError(-32601).
@@ -2780,9 +2782,14 @@ class MCPServerTask:
 
             # 1. Fetch current tool list from server (follow nextCursor)
             async with self._rpc_lock:
+                if require_ready and (not self._ready.is_set() or self.session is None):
+                    raise RuntimeError("MCP server is not ready")
+                session = self.session
                 new_mcp_tools = await _paginate_full_list(
-                    self.session.list_tools, "tools", self.name
+                    session.list_tools, "tools", self.name
                 )
+                if require_ready and (not self._ready.is_set() or self.session is not session):
+                    raise RuntimeError("MCP session changed during schema refresh")
 
             # 2. Re-register with fresh tool list. Avoid nuke-and-repave for
             # all names: live agent turns may already have tool-call IDs
@@ -5647,6 +5654,19 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
             if future.done():
                 return future.result()
             continue
+
+
+def refresh_mcp_server_tools(name: str) -> List[str]:
+    """Refresh one connected server on its owning loop; never connect or discover."""
+    async def refresh():
+        with _lock:
+            server = _servers.get(name)
+        if server is None:
+            raise RuntimeError("MCP server is not connected")
+        await server._refresh_tools(require_ready=True)
+        return list(server._registered_tool_names)
+
+    return _run_on_mcp_loop(refresh, timeout=10)
 
 
 def _interrupted_call_result() -> str:
