@@ -165,3 +165,25 @@ def test_an_immediate_turn_without_turn_started_still_streams(server, monkeypatc
     sync.publish("weave-abc", "ref7", {"type": "assistant.delta", "delta": "x"}, lambda: saved, secrets(url))
     time.sleep(0.2)
     assert "ref7" not in sync._WRITER.live
+
+
+def test_terminal_callback_waits_for_final_write(server, monkeypatch):
+    url, calls, rows = server
+    entered, proceed, completed = threading.Event(), threading.Event(), threading.Event()
+    original = sync._Writer._finish
+    def finish(self, live):
+        entered.set()
+        assert proceed.wait(3)
+        original(self, live)
+    monkeypatch.setattr(sync._Writer, "_finish", finish)
+    real = sync._call
+    monkeypatch.setattr(sync, "_call", lambda live, items: real({**live, "url": live["url"].replace("https://", "http://")}, items))
+    try:
+        assert sync.publish("weave-callback", "callback-ref", {"type": "turn.completed"},
+                            lambda: [], secrets(url), on_finished=completed.set)
+        assert entered.wait(2)
+        assert not completed.is_set()
+        proceed.set()
+        assert completed.wait(2)
+    finally:
+        proceed.set()

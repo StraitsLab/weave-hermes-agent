@@ -82,13 +82,15 @@ class _Writer:
                     if ref in ended:
                         self.live.pop(ref, None)
                         _ENDED.append(ref)
-                        _ENDED.append(ref)
                         self._finish(live)
                 except Exception:  # noqa: BLE001 - Supabase down: keep going; the next turn end resyncs
                     logger.warning("chat writer: write failed", exc_info=True)
                     if ref in ended:
                         self.live.pop(ref, None)
                         _ENDED.append(ref)
+                finally:
+                    if ref in ended and live.get("on_finished"):
+                        live["on_finished"]()
 
     def _take(self, ref: str, event: Dict[str, Any]) -> bool:
         live, kind = self.live.get(ref), event.get("type")
@@ -115,6 +117,7 @@ class _Writer:
             live["cards"].append(card)
             live["card_keys"].append(card["cell_key"])
         if kind in ("turn.completed", "turn.failed"):
+            live["on_finished"] = event.get("_on_finished")
             live["outcome"] = kind.split(".")[1]
             return True
         return False
@@ -176,7 +179,7 @@ _ENDED: "collections.deque[str]" = collections.deque(maxlen=256)  # refs already
 
 
 def publish(session_id: str, ref: str, event: Dict[str, Any], read_display: Callable[[], List[Dict[str, Any]]],
-            secret: Callable[[str], str]) -> None:
+            secret: Callable[[str], str], *, on_finished=None) -> bool:
     """Hand one live event to the writer. Never blocks and never raises into the gateway."""
     global _WRITER
     try:
@@ -197,7 +200,8 @@ def publish(session_id: str, ref: str, event: Dict[str, Any], read_display: Call
                                  "cards": [], "card_keys": []}
             if event.get("type") == "turn.started":
                 return
-        _WRITER.events.put_nowait((ref, event))
+        _WRITER.events.put_nowait((ref, {**event, "_on_finished": on_finished} if on_finished else event))
+        return True
     except queue.Full:
         logger.warning("chat writer queue full; live piece dropped (the saved row still lands)")
     except Exception:  # noqa: BLE001

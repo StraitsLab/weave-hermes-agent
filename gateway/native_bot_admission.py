@@ -147,6 +147,42 @@ class Projection:
         return result["result"]
 
 
+async def _before_dispatch(function, *args):
+    from gateway.native_awake import finish_owned
+    operation = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError as cancelled:
+        try:
+            await finish_owned(operation)
+        except Exception:
+            pass  # No prompt was sent; preserve caller cancellation on worker failure.
+        raise cancelled
+
+
+async def _dispatch(adapter, transport, request_ref, method, params, admission):
+    """Settle a sent RPC before surrendering ownership on HTTP cancellation."""
+    from gateway.native_awake import finish_owned
+
+    adapter._native_submit_handoffs[request_ref] = "dispatch_pending"
+    operation = asyncio.create_task(asyncio.to_thread(transport.rpc, method, params))
+    try:
+        result = await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        try:
+            result = await finish_owned(operation)
+            if result.get("status") == ("queued" if admission == "steered" else "streaming"):
+                adapter._reconcile_native_submit_evidence(request_ref, admission)
+                adapter._native_submit_handoffs[request_ref] = admission
+            else:
+                adapter._native_submit_handoffs.pop(request_ref, None)
+        except Exception:
+            # The sent RPC failed without a definitive refusal: genuinely ambiguous.
+            pass
+        raise
+    return result
+
+
 async def admit(
     adapter,
     profile,
@@ -167,13 +203,13 @@ async def admit(
     if transport is None:
         transport = Projection(adapter, profile, session_id, asyncio.get_running_loop())
         transports[owner] = transport
-    resumed = await asyncio.to_thread(
+    resumed = await _before_dispatch(
         transport.rpc,
         "session.resume",
         {"session_id": session_id, "profile": profile, "omit_messages": True},
     )
     sid = resumed["session_id"]
-    session, error = await asyncio.to_thread(server._sess, {"session_id": sid}, "admit")
+    session, error = await _before_dispatch(server._sess, {"session_id": sid}, "admit")
     if error or session is None or session.get("agent") is None:
         raise RuntimeError("native session is not ready")
     # The HTTP request ending does not end the bot: this transport is the cell's
@@ -190,16 +226,17 @@ async def admit(
         return "target_changed"
     if session.get("running"):
         if busy_mode == "steer" and active_ref:
-            result = await asyncio.to_thread(
-                transport.rpc, "session.steer", {"session_id": sid, "text": message}
-            )
+            # Link before sending so terminal evidence can close an ambiguous steer.
+            adapter._native_submit_ref_sessions[request_ref] = (profile, session_id)
+            adapter._native_submit_steered.setdefault(active_ref, []).append(request_ref)
+            result = await _dispatch(adapter, transport, request_ref,
+                "session.steer", {"session_id": sid, "text": message}, "steered")
             if result.get("status") == "queued":
                 adapter._native_submit_ref_sessions[request_ref] = (profile, session_id)
-                adapter._native_submit_steered.setdefault(active_ref, []).append(
-                    request_ref
-                )
                 adapter._native_submit_handoffs[request_ref] = "steered"
                 return "steered"
+            adapter._native_submit_handoffs.pop(request_ref, None)
+            adapter._native_submit_steered.get(active_ref, []).remove(request_ref)
         if busy_mode == "interrupt":
             await asyncio.to_thread(
                 transport.rpc, "session.interrupt", {"session_id": sid}
@@ -214,18 +251,20 @@ async def admit(
     adapter._native_submit_approval_keys[request_ref] = key
     adapter._native_submit_external_ids[request_ref] = external_id
     adapter._native_submit_ref_sessions[request_ref] = (profile, session_id)
-    result = await asyncio.to_thread(
-        transport.rpc,
-        "prompt.submit",
+    # Dispatch timeout is ambiguous: retain the hold until terminal evidence
+    # or bounded expiry, never release potentially live work on HTTP failure.
+    result = await _dispatch(
+        adapter, transport, request_ref, "prompt.submit",
         {
             "session_id": sid,
             "text": message,
             "queued": True,
             **({"display_kind": "hidden"} if internal else {}),
-        },
+        }, "streaming",
     )
     if result.get("status") != "streaming":
         transport.ref = None
+        adapter._native_submit_handoffs.pop(request_ref, None)
         raise RuntimeError("native prompt was not admitted")
     adapter._native_submit_handoffs[request_ref] = "streaming"
     return "streaming"

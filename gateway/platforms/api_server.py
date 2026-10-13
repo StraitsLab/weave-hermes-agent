@@ -2333,6 +2333,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
+            ("POST", "/v1/mcp/refresh", self._handle_mcp_refresh),
             ("POST", "/v1/mcp/reload", self._handle_mcp_reload),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
@@ -3339,13 +3340,15 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
     async def _handle_mcp_reload(self, request: "web.Request") -> "web.Response":
-        """POST /v1/mcp/reload — root-authority whole-set MCP reload (WEV-1795).
+        """POST /v1/mcp/reload — whole-set reload; request body is ignored."""
+        return await self._handle_mcp_change(request, schema_only=False)
 
-        Auth first (401), then 403 for named-profile mirrors (non-default
-        ``_api_request_profile``), 409 while a reload is in flight.  The shared
-        ``GatewayRunner._reload_mcp_toolset`` keeps blocking work off the event
-        loop and returns ``{added, removed, reconnected, tools, servers}``.
-        """
+    async def _handle_mcp_refresh(self, request: "web.Request") -> "web.Response":
+        """POST /v1/mcp/refresh — refresh only weave-connectors schemas."""
+        return await self._handle_mcp_change(request, schema_only=True)
+
+    async def _handle_mcp_change(self, request: "web.Request", *, schema_only: bool) -> "web.Response":
+        """Share root authentication and the whole-set/scoped concurrency guard."""
         auth_error = self._check_auth(request)
         if auth_error is not None:
             return auth_error
@@ -3359,6 +3362,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error("MCP reload is root-authority only", code="mcp_reload_forbidden"),
                 status=403,
             )
+        server = None
+        if schema_only:
+            try:
+                body = await request.json()
+            except Exception:
+                body = None
+            if body != {"server": "weave-connectors"}:
+                return web.json_response(
+                    _openai_error("Expected schema refresh selector: weave-connectors", code="mcp_refresh_invalid_selector"),
+                    status=400,
+                )
+            server = "weave-connectors"
         if self._mcp_reload_in_progress:
             return web.json_response(
                 _openai_error("An MCP reload is already in progress", code="mcp_reload_in_progress"),
@@ -3372,8 +3387,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
         self._mcp_reload_in_progress = True
+        refresh_lease = uuid.uuid4().hex
+        refresh_held = False
         try:
-            changes = await reload_mcp_toolset()
+            if schema_only:
+                from gateway import native_awake
+                await native_awake.acquire(refresh_lease)
+                refresh_held = True
+            changes = await reload_mcp_toolset(server=server) if server else await reload_mcp_toolset()
         except Exception as exc:
             logger.warning("MCP reload failed: %s", exc)
             return web.json_response(
@@ -3382,6 +3403,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         finally:
             self._mcp_reload_in_progress = False
+            if refresh_held:
+                native_awake.release(refresh_lease)
         return web.json_response(changes)
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
@@ -3560,6 +3583,7 @@ class APIServerAdapter(BasePlatformAdapter):
             },
             "features": {
                 "native_session_inference": native_bot_sessions(),
+                "hub_revision_submit": True,
                 "chat_completions": True,
                 "chat_completions_streaming": True,
                 "responses_api": True,
@@ -5263,10 +5287,13 @@ class APIServerAdapter(BasePlatformAdapter):
     @staticmethod
     def _native_submit_request(body: Dict[str, Any]) -> tuple[Optional[tuple[str, str, str, Optional[str], bool]], Optional["web.Response"]]:
         """Validate the deliberately narrow native-admission request shape."""
-        if set(body) - {"expected_active_ref", "internal"} != {"kind", "external_request_id", "message", "busy_mode"}:
+        if set(body) - {"expected_active_ref", "internal", "hub_tools"} != {"kind", "external_request_id", "message", "busy_mode"}:
             return None, web.json_response(
                 _openai_error("Invalid native submit schema", code="invalid_native_submit_schema"), status=400
             )
+        from gateway.hub_revision import validate
+        if "hub_tools" in body and not validate(body["hub_tools"]):
+            return None, web.json_response(_openai_error("Invalid hub revision", code="invalid_native_submit_schema"), status=400)
         request_id = body.get("external_request_id")
         message = body.get("message")
         if (
@@ -5500,13 +5527,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not callable(credential_available) or not await asyncio.to_thread(credential_available, source, session_id):
                     return web.json_response(_openai_error("Credential unavailable", code="credential_unavailable"), status=409)
             native_request_ref = uuid.uuid4().hex
-            result = await asyncio.to_thread(
+            from gateway import native_awake
+            registration = asyncio.create_task(asyncio.to_thread(
                 db.register_native_session_submit,
                 session_id,
                 external_request_id=external_request_id,
                 message_sha256=self._native_submit_fingerprint(message, busy_mode, internal),
                 native_request_ref=native_request_ref,
-            )
+            ))
+            try:
+                result = await asyncio.shield(registration)
+            except asyncio.CancelledError:
+                try:
+                    result = await native_awake.finish_owned(registration)
+                    if result["outcome"] == "inserted":
+                        await native_awake.finish_owned(asyncio.create_task(asyncio.to_thread(
+                            db.remove_native_session_submit, external_request_id=external_request_id,
+                            native_request_ref=result["native_request_ref"],
+                        )))
+                finally:
+                    raise
             outcome = result["outcome"]
             if outcome == "session_not_found":
                 return web.json_response(_openai_error("Session not found", code="session_not_found"), status=404)
@@ -5518,7 +5558,23 @@ class APIServerAdapter(BasePlatformAdapter):
             if outcome == "identical_retry" and result.get("admission") in {"streaming", "queued", "steered"}:
                 admission = result["admission"]
             else:
+                owns_hold = False
                 try:
+                    if native_request_ref not in self.__dict__.setdefault("_native_awake_refs", set()):
+                        owns_hold = True
+                        acquisition = asyncio.create_task(native_awake.acquire(native_request_ref))
+                        try:
+                            await asyncio.shield(acquisition)
+                        except asyncio.CancelledError as cancelled:
+                            try:
+                                await native_awake.finish_owned(acquisition)
+                            except Exception:
+                                pass  # Drain failed acquisition, but still release our lease.
+                            finally:
+                                # Even a lost helper ack may have created our lease.
+                                self._native_awake_refs.add(native_request_ref)
+                            raise cancelled
+                        self._native_awake_refs.add(native_request_ref)
                     admission_options: Dict[str, Any] = {}
                     if busy_mode != "queue":
                         admission_options["busy_mode"] = busy_mode
@@ -5528,6 +5584,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         admission_options["internal"] = True
                     if native_request_ref in self._native_submit_handoffs:
                         handed_off = self._native_submit_handoffs[native_request_ref]
+                        if handed_off == "dispatch_pending":
+                            raise RuntimeError("native dispatch outcome unresolved")
                         admission = (await self._wait_native_submit_start(native_request_ref, handed_off, retry=True)
                                      if asyncio.isfuture(handed_off) else handed_off)
                     else:
@@ -5537,8 +5595,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             **admission_options,
                         )
                     if admission == "target_changed":
+                        self._release_native_awake(native_request_ref)
                         await asyncio.to_thread(db.remove_native_session_submit, external_request_id=external_request_id, native_request_ref=native_request_ref)
                         return web.json_response(_openai_error("Active turn changed", code="native_submit_target_changed"), status=409)
+                    # A positive admission is owned by execution, not this HTTP task.
+                    self._record_native_submit_handoff(native_request_ref, admission)
                     if admission == "queued":
                         self.__dict__.setdefault("_native_queued_submit_refs", set()).add(native_request_ref)
                     await asyncio.to_thread(
@@ -5546,8 +5607,18 @@ class APIServerAdapter(BasePlatformAdapter):
                         native_request_ref=native_request_ref,
                         admission=admission,
                     )
+                except asyncio.CancelledError:
+                    if native_request_ref not in self._native_submit_handoffs:
+                        if owns_hold:
+                            self._release_native_awake(native_request_ref)
+                        await native_awake.finish_owned(asyncio.create_task(asyncio.to_thread(
+                            db.remove_native_session_submit, external_request_id=external_request_id,
+                            native_request_ref=native_request_ref,
+                        )))
+                    raise
                 except Exception:
                     if native_request_ref not in self._native_submit_handoffs:
+                        self._release_native_awake(native_request_ref)
                         await asyncio.to_thread(
                             db.remove_native_session_submit,
                             external_request_id=external_request_id,
@@ -5557,12 +5628,17 @@ class APIServerAdapter(BasePlatformAdapter):
                         _openai_error("Native gateway admission unavailable", code="native_admission_unavailable"), status=503
                     )
 
+            if "hub_tools" in body:
+                from gateway.hub_revision import HubRevision
+                revisions = self.__dict__.setdefault("_hub_revisions", {})
+                revisions.setdefault(profile, HubRevision(self)).request(body["hub_tools"]["revision"])
             return web.json_response({
                 "object": "hermes.session.admission",
                 "session_id": session_id,
                 "external_request_id": external_request_id,
                 "admission": admission,
                 "native_request_ref": native_request_ref,
+                **({"hub_tools": body["hub_tools"]} if "hub_tools" in body else {}),
             }, status=202)
 
     @staticmethod
@@ -5580,11 +5656,23 @@ class APIServerAdapter(BasePlatformAdapter):
             on_subscriber_loop = False
         _close() if on_subscriber_loop else loop.call_soon_threadsafe(_close)
 
+    def _reconcile_native_submit_evidence(self, native_request_ref: str, admission: str = "streaming") -> None:
+        """An observed start/terminal proves admission, even if its RPC ack was lost."""
+        if self._native_submit_handoffs.get(native_request_ref) != "dispatch_pending":
+            return
+        db = self._ensure_session_db()
+        if db is not None:
+            # Persist before forgetting the ambiguity; replay survives adapter restart.
+            db.set_native_session_submit_admission(native_request_ref=native_request_ref, admission=admission)
+            self._record_native_submit_handoff(native_request_ref, admission)
+
     def _native_submit_event(
         self, native_request_ref: str, event_type: str, *, _broadcast: bool = True,
         **fields: Any,
     ) -> Dict[str, Any]:
         """Publish one bounded live projection without retaining an event log."""
+        if event_type in {"turn.started", "turn.completed", "turn.failed"}:
+            self._reconcile_native_submit_evidence(native_request_ref)
         with self._native_submit_event_lock:
             sequence = self._native_submit_sequences.get(native_request_ref, 0) + 1
             self._native_submit_sequences[native_request_ref] = sequence
@@ -5622,11 +5710,16 @@ class APIServerAdapter(BasePlatformAdapter):
     def _native_submit_chat_sync(self, native_request_ref: str, event: Dict[str, Any]) -> None:
         """Weave (WEV-3349): hand the live event to the Supabase chat writer (off unless configured)."""
         owner = self._native_submit_ref_sessions.get(native_request_ref)
+        terminal = event.get("type") in {"turn.completed", "turn.failed"}
         if owner is None:
+            if terminal:
+                self._release_native_awake(native_request_ref)
             return
         profile, session_id = owner
         db = self._ensure_session_db()
         if db is None:
+            if terminal:
+                self._release_native_awake(native_request_ref)
             return
         from gateway.weave_chat_sync import publish
 
@@ -5640,7 +5733,20 @@ class APIServerAdapter(BasePlatformAdapter):
             except _UnscopedSecretError:
                 return ""
 
-        publish(session_id, native_request_ref, event, read_display, secret)
+        if terminal:
+            # The final Supabase write is still part of the turn's delivery.
+            done = lambda: self._release_native_awake(native_request_ref)
+            if not publish(session_id, native_request_ref, event, read_display, secret, on_finished=done):
+                done()
+        else:
+            publish(session_id, native_request_ref, event, read_display, secret)
+
+    def _release_native_awake(self, native_request_ref: str) -> None:
+        refs = self.__dict__.setdefault("_native_awake_refs", set())
+        if native_request_ref in refs:
+            refs.discard(native_request_ref)
+            from gateway import native_awake
+            native_awake.release(native_request_ref)
 
     def _native_submit_close(self, native_request_ref: str, event_type: str, **fields: Any) -> None:
         terminal = self._native_submit_event(native_request_ref, event_type, **fields)

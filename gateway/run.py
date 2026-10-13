@@ -25587,11 +25587,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
-    async def _reload_mcp_toolset(self) -> dict:
-        """Shutdown, rediscover, and refresh cached agents' MCP tools.
+    async def _reload_mcp_toolset(self, *, server: str | None = None) -> dict:
+        """Reload config, or refresh one connected server's registry schemas.
 
         Shared by the ``/reload-mcp`` slash command (``_execute_mcp_reload``)
-        and ``POST /v1/mcp/reload`` (api_server).  Returns
+        and the root-only MCP reload/refresh API routes.  Returns
         ``{"added", "removed", "reconnected", "tools", "servers"}``.  Blocking
         work runs via ``run_in_executor`` so the event loop keeps answering
         (e.g. ``/health``) during a slow stdio shutdown.  Raises on failure.
@@ -25603,12 +25603,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         with _lock:
             old_servers = set(_servers.keys())
 
-        # Read new config before shutting down, so we know what will be added/removed
-        # Shutdown existing connections
-        await loop.run_in_executor(None, shutdown_mcp_servers)
-
-        # Reconnect by discovering tools (reads config.yaml fresh)
-        new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+        if server is not None:
+            if server != "weave-connectors":
+                raise ValueError("Unsupported MCP schema refresh selector")
+            from tools.mcp_tool import refresh_mcp_server_tools
+            new_tools = await loop.run_in_executor(None, refresh_mcp_server_tools, server)
+        else:
+            await loop.run_in_executor(None, shutdown_mcp_servers)
+            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
 
         # Compute what changed
         with _lock:
@@ -25616,7 +25618,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         added = connected_servers - old_servers
         removed = old_servers - connected_servers
-        reconnected = connected_servers & old_servers
+        reconnected = connected_servers & old_servers if server is None else set()
 
         # Refresh cached agents so existing sessions see new MCP tools on
         # their next turn — without this, the user has to `/new` (which
@@ -25626,7 +25628,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # gate in _handle_reload_mcp_command before we reach this point.
         try:
             from tools.mcp_tool import refresh_agent_mcp_tools
-            _cache = getattr(self, "_agent_cache", None)
+            # Scoped refresh publishes only the registry. Every agent (including
+            # native TUI sessions outside this cache) adopts it in the turn
+            # prologue; never rewrite an active turn's tool prefix here.
+            # Full reload keeps its legacy explicit-refresh behavior.
+            _cache = getattr(self, "_agent_cache", None) if server is None else None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
             if _cache_lock is not None and _cache:
                 with _cache_lock:
@@ -25654,6 +25660,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         return {
+            **({"schema_refreshed": server} if server is not None else {}),
             "added": sorted(added),
             "removed": sorted(removed),
             "reconnected": sorted(reconnected),

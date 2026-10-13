@@ -641,7 +641,7 @@ def build_turn_context(
     # prefix of an in-flight turn.  No-op when no MCP servers are registered
     # (the common case, gated by the cheap ``has_registered_mcp_tools`` check)
     # or when the tool set is unchanged (``refresh_agent_mcp_tools`` diffs by
-    # name and leaves the snapshot untouched on no-change).
+    # name and schema content and leaves the snapshot untouched on no-change).
     try:
         if not getattr(agent, "_skip_mcp_refresh", False):
             # Import-cost gate: ``tools.mcp_tool`` pulls in the whole ``mcp``
@@ -656,7 +656,7 @@ def build_turn_context(
             if "tools.mcp_tool" in _sys.modules:
                 from tools.mcp_tool import has_registered_mcp_tools, refresh_agent_mcp_tools
                 if has_registered_mcp_tools():
-                    refresh_agent_mcp_tools(agent, quiet_mode=True)
+                    refresh_agent_mcp_tools(agent, quiet_mode=True, content_aware=True)
     except Exception:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
