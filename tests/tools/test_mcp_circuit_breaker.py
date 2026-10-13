@@ -569,3 +569,32 @@ def test_initial_connect_budget_parks_instead_of_exiting_then_revives(monkeypatc
             run_task.cancel()
 
     asyncio.run(_scenario())
+
+
+def test_tool_result_error_does_not_trip_breaker(monkeypatch, tmp_path):
+    """A server that answers with isError is reachable. Refused or malformed
+    calls must never open the breaker; only transport failures count."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    async def _call_tool_refused(*a, **kw):
+        result = MagicMock()
+        result.is_error = True
+        block = MagicMock()
+        block.text = "bad arguments"
+        result.content = [block]
+        result.structured_content = None
+        return result
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_refused)
+    mcp_tool._ensure_mcp_loop()
+    try:
+        handler = _make_tool_handler("srv", "tool1", 10.0)
+        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1):
+            parsed = json.loads(handler({}))
+            assert parsed["error"] == "bad arguments", parsed
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0
+    finally:
+        _cleanup(mcp_tool, "srv")

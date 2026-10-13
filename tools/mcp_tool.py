@@ -6200,9 +6200,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         # Dead children but stale server.session, so the
                         # transport-down path above never fired — signal the
                         # server task to respawn and return a clean
-                        # reconnecting error. No explicit _bump_server_error:
-                        # the error return flows through the handler's JSON
-                        # parse, which already bumps once.
+                        # reconnecting error. This is a transport failure,
+                        # so it counts toward the breaker here.
+                        _bump_server_error(server_name)
                         if _signal_reconnect(server):
                             return tool_error(
                                 f"MCP server '{server_name}' stdio subprocess is "
@@ -6404,15 +6404,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+            # The server answered, so it is reachable: a refused or malformed
+            # call (isError) is the model's problem, not an outage. Only
+            # transport failures (the except below, and the dead-stdio path
+            # inside _call, which bumps itself) count toward the breaker;
+            # otherwise three bad arguments block every tool for the cooldown.
+            if "stdio subprocess is dead" not in result:
+                _reset_server_error(server_name)
             return result
         except InterruptedError:
             return _interrupted_call_result()
