@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from contextlib import nullcontext
 
 
 def enabled() -> bool:
@@ -53,7 +54,8 @@ class Projection:
             return
         # Loop callbacks carry no request scope: enter this profile's home so
         # the session database (and secrets) resolve to the cell's profile.
-        with self.adapter._profile_scope(self.profile):
+        scope = getattr(self.adapter, "_profile_scope", None)
+        with (scope(self.profile) if scope else nullcontext()):
             self._scoped_event(ref, kind, payload)
 
     def _scoped_event(self, ref, kind, payload):
