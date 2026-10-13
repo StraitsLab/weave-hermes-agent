@@ -46,3 +46,16 @@ def test_projection_events_run_inside_profile_scope(monkeypatch):
     projection.ref = "ref-1"
     projection._event("ref-1", "message.start", {})
     assert seen == [("enter", "general"), ("turn.started", "ref-1"), ("exit", "general")]
+
+
+def test_a_bare_yes_answers_the_blocking_approval_instead_of_starting_a_turn(monkeypatch):
+    """DEC-415: a spoken yes on a call arrives as a plain send; while the agent waits on an approval it answers it."""
+    from gateway import native_bot_admission as nba
+    resolved = []
+    monkeypatch.setattr("tools.approval.has_blocking_approval", lambda key: key == "k1")
+    monkeypatch.setattr("tools.approval.resolve_gateway_approval", lambda key, choice, **kw: resolved.append((key, choice)) or 1)
+    assert nba._answer_blocking_approval("k1", "Yes.") is True
+    assert nba._answer_blocking_approval("k1", "no thanks") is True
+    assert nba._answer_blocking_approval("k1", "yes but make it two") is False  # not a bare answer: a normal send
+    assert nba._answer_blocking_approval("k2", "yes") is False  # nothing pending: a conversational yes
+    assert resolved == [("k1", "once"), ("k1", "deny")]

@@ -191,6 +191,24 @@ async def _dispatch(adapter, transport, request_ref, method, params, admission):
     return result
 
 
+APPROVE_WORDS = frozenset({"approve", "yes", "ok", "okay", "confirm", "y", "yes please", "go ahead", "do it", "sure"})
+DENY_WORDS = frozenset({"deny", "no", "reject", "cancel", "n", "no thanks", "stop", "don't"})
+
+
+def _answer_blocking_approval(session_key, message):
+    """True when `message` was a bare answer to the session's oldest blocking approval and resolved it."""
+    from tools.approval import has_blocking_approval, resolve_gateway_approval
+
+    if not has_blocking_approval(session_key):
+        return False
+    word = " ".join((message or "").strip().lower().rstrip(".!").split())
+    if word in APPROVE_WORDS:
+        return bool(resolve_gateway_approval(session_key, "once"))
+    if word in DENY_WORDS:
+        return bool(resolve_gateway_approval(session_key, "deny"))
+    return False
+
+
 async def admit(
     adapter,
     profile,
@@ -225,6 +243,11 @@ async def admit(
     if internal:
         busy_mode = "queue"
     key = session["session_key"]
+    # DEC-415: a bare yes/no while the agent waits on an approval answers it (as the Slack path does
+    # in gateway/run.py). A spoken "yes" on a call reaches the cell as a plain send; nothing else does.
+    if not internal and _answer_blocking_approval(key, message):
+        adapter._native_submit_handoffs[request_ref] = "answered_approval"
+        return "answered_approval"
     active_ref = adapter._native_submit_active_ref(key)
     if (
         expected_active_ref is not None

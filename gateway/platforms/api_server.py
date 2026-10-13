@@ -5599,6 +5599,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         self._release_native_awake(native_request_ref)
                         await asyncio.to_thread(db.remove_native_session_submit, external_request_id=external_request_id, native_request_ref=native_request_ref)
                         return web.json_response(_openai_error("Active turn changed", code="native_submit_target_changed"), status=409)
+                    if admission == "answered_approval":
+                        # DEC-415: the send answered the running turn's approval; no turn of its own, so the
+                        # running turn's hold keeps the Sprite awake and this ref owns nothing.
+                        self._release_native_awake(native_request_ref)
+                        await asyncio.to_thread(db.set_native_session_submit_admission,
+                                                native_request_ref=native_request_ref, admission=admission)
+                        return web.json_response({"object": "hermes.session.admission", "session_id": session_id,
+                                                  "external_request_id": external_request_id, "admission": admission,
+                                                  "native_request_ref": native_request_ref}, status=202)
                     # A positive admission is owned by execution, not this HTTP task.
                     self._record_native_submit_handoff(native_request_ref, admission)
                     if admission == "queued":
