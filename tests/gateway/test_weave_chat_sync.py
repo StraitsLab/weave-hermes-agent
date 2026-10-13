@@ -187,3 +187,34 @@ def test_terminal_callback_waits_for_final_write(server, monkeypatch):
         assert completed.wait(2)
     finally:
         proceed.set()
+
+
+def test_show_tag_marks_a_reply_visible_and_leaves_the_tag_out():
+    """DEC-415: the model decides what the screen shows on a call; the tag never reaches the row."""
+    assert sync.visible_reply("[SHOW] Here is the table.") == ("Here is the table.", True)
+    assert sync.visible_reply("  [SHOW]\nTwo lines") == ("Two lines", True)
+    assert sync.visible_reply("Sure, lunch is at one.") == ("Sure, lunch is at one.", False)
+    assert sync.visible_reply("See https://example.com") == ("See https://example.com", True)
+    assert sync.visible_reply("x" * 401) == ("x" * 401, True)
+    assert sync.visible_reply("[READ] ok", show_tag="[READ]", show_over=5) == ("ok", True)
+    assert sync.visible_reply("short", show_tag="[READ]", show_over=3) == ("short", True)
+    rows = sync.visible_rows([{"role": "user", "content": "[SHOW] not for user rows", "timestamp": 1.0},
+                              {"role": "assistant", "content": "[SHOW] shown", "timestamp": 2.0},
+                              {"role": "assistant", "content": "spoken", "timestamp": 3.0}])
+    assert [r["body"] for r in rows] == [{"text": "[SHOW] not for user rows"}, {"text": "shown", "visible": True},
+                                         {"text": "spoken", "visible": False}]
+
+
+def test_show_settings_come_from_the_profile_secrets(server, monkeypatch):
+    url, calls, rows = server
+    now = time.time()
+    values = {"WEAVE_CHAT_SUPABASE_URL": url.replace("http://", "https://"), "WEAVE_CHAT_SUPABASE_KEY": "k",
+              "WEAVE_API_MCP_BEARER": "b", "WEAVE_CHAT_SHOW_TAG": "[READ]", "WEAVE_CHAT_SHOW_OVER_CHARS": "nope"}
+    real = sync._call
+    monkeypatch.setattr(sync, "_call", lambda live, items: real({**live, "url": live["url"].replace("https://", "http://")}, items))
+    saved = [{"id": 1, "role": "assistant", "content": "[READ] read me", "timestamp": now + 1.0}]
+    for event in ({"type": "assistant.delta", "delta": "[READ] read me"}, {"type": "turn.completed"}):
+        sync.publish("weave-show", "ref-show", event, lambda: saved, lambda name: values.get(name, ""))
+    wait_for(lambda: any(i.get("state") == "final" for c in calls for i in c["p_items"]))
+    final = next(i for c in calls for i in c["p_items"] if i.get("state") == "final")
+    assert final["body"] == {"text": "read me", "visible": True, "status": None}
