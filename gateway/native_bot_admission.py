@@ -51,6 +51,12 @@ class Projection:
     def _event(self, ref, kind, payload):
         if not ref or ref != self.ref:
             return
+        # Loop callbacks carry no request scope: enter this profile's home so
+        # the session database (and secrets) resolve to the cell's profile.
+        with self.adapter._profile_scope(self.profile):
+            self._scoped_event(ref, kind, payload)
+
+    def _scoped_event(self, ref, kind, payload):
         emit = self.adapter._native_submit_event
         if kind == "message.start":
             emit(ref, "turn.started")
