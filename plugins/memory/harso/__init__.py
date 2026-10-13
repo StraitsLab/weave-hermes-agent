@@ -40,7 +40,7 @@ _PREFETCH_TIMEOUT_SECONDS = 0.8
 #               45 ("evidence:" + UUIDv7); occurred_at exactly 27
 #               ("YYYY-MM-DDTHH:MM:SS.ffffffZ"); session_id exactly 42
 #               ("weave-" + UUID); kind "projection"/"evidence".
-#   envelope: <= 5 allowlisted gap reasons; routing hint <= 200 chars.
+#   envelope: <= 5 allowlisted gap reasons; routing and card hints <= 200 chars each.
 # Transport (JSON bytes; json.dumps default ", "/": " separators, above
 # Starlette's compact ones): content worst escape is 6 bytes per content byte
 # (a control char -> \u00XX) = 786432; per item, all fields but "text" =
@@ -59,6 +59,11 @@ _ACTION = rf"external action: (?:likely|unlikely|unsure) \({_P}\)"
 # free text can match, so nothing instruction-shaped reaches the chat model.
 _ROUTING_HINT = re.compile(
     rf"Routing hint: (?:(?:inline|work) \({_P}\)(?:; {_ACTION})?|none; {_ACTION})")
+# WEV-3395: weave-api's card suggestion (jev_routing card hint). A card name is
+# kebab-case only and repeated exactly, so no free text reaches the chat model.
+_CARD_HINT = re.compile(
+    rf"Card hint: (?P<card>[a-z0-9]+(?:-[a-z0-9]+)*) \({_P}\)\. "
+    r"Fetch it with answer_template name=(?P=card)\.")
 # Always-on profile + memory tools (config.yaml ``plugins.harso``).
 _PROFILE_WAIT_SECONDS = 1.0
 _PROFILE_TIMEOUT_SECONDS = 3
@@ -197,6 +202,10 @@ def _render_recall(response: Any, max_chars: int, profile: str = "") -> str:
     hint = response.get("routing_hint")
     hint = hint.strip() if isinstance(hint, str) and len(hint.strip()) <= 200 else ""
     hint = hint if _ROUTING_HINT.fullmatch(hint) else ""
+    card = response.get("card_hint")
+    card = card.strip() if isinstance(card, str) and len(card.strip()) <= 200 else ""
+    card = card if _CARD_HINT.fullmatch(card) else ""
+    hint = "\n".join(part for part in (hint, card) if part)
     # Explicit recall status supersedes the legacy degraded boolean.
     if "recall_status" in response:
         if response["recall_status"] not in ("ok", "degraded"):
@@ -243,7 +252,8 @@ def _render_recall(response: Any, max_chars: int, profile: str = "") -> str:
     # context_max_chars bounds the COMPLETE output, gaps line and hint
     # included. Over it, keep a whole-item prefix in server order under the
     # room left by the final suffix; never cut an item. The suffix is at
-    # most 278 chars, under the 1024 minimum, so an admitted item excluded
+    # most 479 chars (gaps line + routing hint + card hint), under the 1024
+    # minimum, so an admitted item excluded
     # by the bound is always reported as budget-excluded, even if none fit.
     output = render(lines, False)
     if len(output) <= max_chars:
