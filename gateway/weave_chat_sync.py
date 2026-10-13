@@ -16,6 +16,13 @@ already a row there; the database matches the cell's copy to it by text and stam
 Credentials are read in the turn's own profile scope: WEAVE_CHAT_SUPABASE_URL and
 WEAVE_CHAT_SUPABASE_KEY (publishable key) switch it on; the cell proves itself to the
 database with the route bearer it already holds (WEAVE_API_MCP_BEARER).
+
+Visible replies (DEC-415): on a live call the voice speaks the assistant's reply and the
+screen shows it only when the model marks it. A reply that starts with the show tag
+(WEAVE_CHAT_SHOW_TAG, default ``[SHOW]``) loses the tag and its saved row carries
+``body.visible = true``; so does a reply with a link or attachment, or one longer than
+WEAVE_CHAT_SHOW_OVER_CHARS (default 400). Every other assistant row carries ``visible = false``
+and the apps decide by context: a chat screen shows all rows, a call screen only visible ones.
 """
 from __future__ import annotations
 
@@ -41,7 +48,18 @@ def row_key(message: Dict[str, Any]) -> str:
     return f"{message['role']}:{message.get('timestamp')!r}"
 
 
-def visible_rows(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+_LINKISH = ("http://", "https://", "](", "<artifact", "file://")
+
+
+def visible_reply(text: str, show_tag: str = "[SHOW]", show_over: int = 400) -> "tuple[str, bool]":
+    """(text without the show tag, whether the screen shows it on a call). DEC-415."""
+    stripped = text.lstrip()
+    if show_tag and stripped.startswith(show_tag):
+        return stripped[len(show_tag):].lstrip(), True
+    return text, any(mark in text for mark in _LINKISH) or len(text) > show_over
+
+
+def visible_rows(messages: List[Dict[str, Any]], show_tag: str = "[SHOW]", show_over: int = 400) -> List[Dict[str, Any]]:
     """The rows a person sees: what they said and what the assistant answered (no tool channel)."""
     out = []
     for m in messages:
@@ -53,8 +71,11 @@ def visible_rows(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if m["role"] == "user" and content.lstrip().startswith(SCAFFOLDING):
             continue
         at = m.get("timestamp")
+        body: Dict[str, Any] = {"text": content}
+        if m["role"] == "assistant":
+            body["text"], body["visible"] = visible_reply(content, show_tag, show_over)
         out.append({"cell_key": row_key(m), "role": m["role"], "kind": "text", "state": "final",
-                    "body": {"text": content},
+                    "body": body,
                     **({"at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(at)) + f".{int(at % 1 * 1e6):06d}Z"}
                        if isinstance(at, (int, float)) else {})})
     return out
@@ -142,7 +163,7 @@ class _Writer:
 
     def _finish(self, live: Dict[str, Any]) -> None:
         messages = live["read"]()
-        rows = visible_rows(messages)
+        rows = visible_rows(messages, live["show_tag"], live["show_over"])
         if live["session"] in _SYNCED:
             rows = rows[-40:]  # earlier rows are already in Supabase; compaction keeps their keys
         # This turn's answer: its last visible assistant message, saved after the turn started.
@@ -192,12 +213,17 @@ def publish(session_id: str, ref: str, event: Dict[str, Any], read_display: Call
             key, bearer = secret("WEAVE_CHAT_SUPABASE_KEY") or "", secret("WEAVE_API_MCP_BEARER") or ""
             if not (url.startswith("https://") and key and bearer and session_id.startswith("weave-")):
                 return
+            show_tag = (secret("WEAVE_CHAT_SHOW_TAG") or "[SHOW]").strip()
+            try:
+                show_over = int(secret("WEAVE_CHAT_SHOW_OVER_CHARS") or 400)
+            except ValueError:
+                show_over = 400
             with _LOCK:
                 _WRITER = _WRITER or _Writer()
             _WRITER.live[ref] = {"session": session_id, "url": url, "key": key, "bearer": bearer, "started": time.time() - 1,
                                  "read": read_display, "item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}")),
                                  "text": "", "sent": 0, "rev": None, "status": None, "shown": None,
-                                 "cards": [], "card_keys": []}
+                                 "cards": [], "card_keys": [], "show_tag": show_tag, "show_over": show_over}
             if event.get("type") == "turn.started":
                 return
         _WRITER.events.put_nowait((ref, {**event, "_on_finished": on_finished} if on_finished else event))
