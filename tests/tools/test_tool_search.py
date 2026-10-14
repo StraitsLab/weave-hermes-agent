@@ -287,9 +287,9 @@ class TestAssembly:
             {"queries": ["probe"]}, current_tool_defs=[tool_def, deferred_def],
             config=ToolSearchConfig.from_raw({"enabled": "on", "always_eager": [name]}),
         ))
-        assert found["total_available"] == 1
-        assert name not in found["tools"]
-        assert found["results"][0]["matches"] == [deferred_name]
+        assert found["total_available"] == 2
+        assert name in found["tools"]
+        assert set(found["results"][0]["matches"]) == {name, deferred_name}
 
     def test_unknown_always_eager_name_is_ignored(self, caplog):
         from tools.registry import registry

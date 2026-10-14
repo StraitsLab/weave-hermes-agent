@@ -372,6 +372,25 @@ class TestMultiQuerySearch:
 
 
 class TestBatchedDescribe:
+    @pytest.mark.parametrize("operation", ["describe", "search"])
+    def test_always_eager_mcp_tool_remains_available(self, operation):
+        from tools.tool_search import ToolSearchConfig, dispatch_tool_describe, dispatch_tool_search
+
+        name = "mcp__weave_connectors__present_output"
+        tool_def = _register(name, "mcp-weave-connectors", "Show a card in chat.",
+                             {"template": {"type": "string"}}, ["template"])
+        cfg = ToolSearchConfig.from_raw({"always_eager": [name]})
+        if operation == "describe":
+            result = json.loads(dispatch_tool_describe(
+                {"names": [name]}, current_tool_defs=[tool_def], config=cfg))
+            assert result["tools"][name] == {
+                key: tool_def["function"][key] for key in ("description", "parameters")}
+            assert "not_found" not in result
+        else:
+            result = json.loads(dispatch_tool_search(
+                {"queries": ["present output"]}, current_tool_defs=[tool_def], config=cfg))
+            assert result["results"][0]["matches"] == [name]
+
     def test_map_response_with_not_found(self, issue_defs):
         from tools.tool_search import ToolSearchConfig, dispatch_tool_describe
 
