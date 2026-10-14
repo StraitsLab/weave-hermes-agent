@@ -115,6 +115,7 @@ class _ArtifactScopeFacade:
 #: Browser-extension control protocol version advertised in capabilities and
 #: echoed in registration responses. Strict validation is centralized in the
 #: broker's ``browser_control_protocol_supported`` helper.
+_HUB = "mcp__weave_connectors__"  # Weave: the cell's name prefix for Harso hub tools
 _BROWSER_CONTROL_PROTOCOL_VERSION = 1
 _BROWSER_CONTROL_WS_PROTOCOL = "hermes-browser-control-v1"
 _BROWSER_CONTROL_TICKET_PROTOCOL_PREFIX = "hermes-browser-control-ticket."
@@ -5817,11 +5818,21 @@ class APIServerAdapter(BasePlatformAdapter):
             from agent.display import _detect_tool_failure
 
             failed, _ = _detect_tool_failure(str(tool_name or "tool"), result)
+            # Weave (WEV-3395): a card a Harso hub tool returns rides the event to the chat writer. Forwarded
+            # connector tools are `mcp__weave_connectors__<provider>__<tool>`; only Harso's own tools have no `__`.
+            name, card = str(tool_name or ""), None
+            if not failed and name.startswith(_HUB) and "__" not in name[len(_HUB):] and isinstance(result, str):
+                try:
+                    payload = json.JSONDecoder().raw_decode(result)[0]
+                    card = (payload.get("structuredContent") or payload.get("result")).get("card")
+                except (ValueError, AttributeError):
+                    card = None
             self._native_submit_event(
                 native_request_ref,
                 "tool.failed" if failed else "tool.completed",
                 tool_call_id=str(tool_call_id)[:256],
                 tool_name=str(tool_name)[:256],
+                **({"card": card} if isinstance(card, dict) and card.get("kind") == "output_blocks" else {}),
             )
 
     def _native_submit_final(self, session_key: str, content: Any) -> None:
