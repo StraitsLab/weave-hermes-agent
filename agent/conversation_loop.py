@@ -7275,8 +7275,24 @@ def run_conversation(
 
                 # Validate tool call names - detect model hallucinations
                 # Repair mismatched tool names before validating
+                _deferred = None
                 for tc in assistant_message.tool_calls:
                     if tc.function.name not in agent.valid_tool_names:
+                        # A deferred tool called by its bare name runs through the tool_call bridge (same scope
+                        # gate and argument check) instead of fuzzy-repairing onto an eager look-alike (WEV-3395).
+                        if "tool_call" in agent.valid_tool_names:
+                            if _deferred is None:
+                                from agent.tool_executor import _tool_search_scoped_names
+                                _deferred = _tool_search_scoped_names(agent)
+                            if tc.function.name in _deferred:
+                                try:
+                                    _args = json.loads(tc.function.arguments or "{}")
+                                except (TypeError, ValueError):
+                                    _args = tc.function.arguments
+                                logger.info("bare deferred call %s runs via tool_call", tc.function.name)
+                                tc.function.arguments = json.dumps({"name": tc.function.name, "arguments": _args})
+                                tc.function.name = "tool_call"
+                                continue
                         repaired = agent._repair_tool_call(tc.function.name)
                         if repaired:
                             print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
