@@ -1093,7 +1093,7 @@ def dispatch_tool_search(args: Dict[str, Any],
     else:
         limit = max(1, min(config.max_search_limit, _safe_int(raw_limit, config.search_default_limit)))
 
-    _, deferrable = classify_tools(current_tool_defs, always_eager=config.always_eager)
+    _, deferrable = classify_tools(current_tool_defs)
     catalog = build_catalog(deferrable)
 
     results: List[Dict[str, Any]] = []
@@ -1166,7 +1166,7 @@ def dispatch_tool_describe(args: Dict[str, Any],
             "Retry with fewer names per call."
         )
 
-    _, deferrable = classify_tools(current_tool_defs, always_eager=config.always_eager)
+    _, deferrable = classify_tools(current_tool_defs)
     by_name: Dict[str, Dict[str, Any]] = {}
     for td in deferrable:
         fn = td.get("function") or {}
