@@ -69,13 +69,19 @@ class Projection:
                 delta=str(payload.get("text", payload.get("delta", "")))[:4096],
             )
         elif kind in ("tool.start", "tool.complete"):
+            from gateway.weave_chat_sync import hub_card
+
+            name = payload.get("name", payload.get("tool", ""))
+            # Weave (WEV-3395): a Harso hub tool's answer card rides tool.completed to the chat writer.
+            card = hub_card(name, payload.get("result")) if kind == "tool.complete" else None
             emit(
                 ref,
                 "tool.started" if kind == "tool.start" else "tool.completed",
                 tool_call_id=str(payload.get("tool_id", payload.get("tool_call_id", payload.get("id", ""))))[
                     :256
                 ],
-                tool_name=str(payload.get("name", payload.get("tool", "")))[:256],
+                tool_name=str(name)[:256],
+                **({"card": card} if card else {}),
             )
         elif kind == "approval.request":
             emit(ref, kind, **self.adapter._native_approval_projection(payload))

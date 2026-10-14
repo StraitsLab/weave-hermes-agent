@@ -48,6 +48,28 @@ def test_projection_events_run_inside_profile_scope(monkeypatch):
     assert seen == [("enter", "general"), ("turn.started", "ref-1"), ("exit", "general")]
 
 
+def test_tool_complete_carries_a_hub_card_only():
+    """WEV-3395: the stock TUI tool.complete (result already parsed) passes a Harso hub tool's card on."""
+    import asyncio
+    import json
+    from gateway import native_bot_admission
+
+    seen = []
+    adapter = SimpleNamespace(_native_submit_event=lambda ref, kind, **f: seen.append((kind, f)))
+    projection = native_bot_admission.Projection(adapter, "general", "s1", asyncio.new_event_loop())
+    projection.ref = "ref-1"
+    card = {"kind": "output_blocks", "major": 1, "header": {"title": "SQ 638"}}
+    result = {"result": "Shown.", "structuredContent": {"shown": True, "card": card}}
+    projection._scoped_event("ref-1", "tool.complete", {"tool_id": "c1", "result": result,
+                                                        "name": "mcp__weave_connectors__show_flight_status"})
+    projection._scoped_event("ref-1", "tool.complete", {"tool_id": "c2", "result": json.dumps(result),
+                                                        "name": "mcp__weave_connectors__acme__lookup"})
+    projection._scoped_event("ref-1", "tool.start", {"tool_id": "c3", "name": "mcp__weave_connectors__weather_now"})
+    assert seen[0] == ("tool.completed", {"tool_call_id": "c1", "tool_name": "mcp__weave_connectors__show_flight_status",
+                                          "card": card})
+    assert ["card" in fields for _kind, fields in seen] == [True, False, False]
+
+
 def test_a_bare_yes_answers_the_blocking_approval_instead_of_starting_a_turn(monkeypatch):
     """DEC-415: a spoken yes on a call arrives as a plain send; while the agent waits on an approval it answers it."""
     from gateway import native_bot_admission as nba

@@ -46,6 +46,26 @@ SCAFFOLDING = ("[System:", "[IMPORTANT: Background", "[Your active task list", "
                "[CONTEXT COMPACTION", "[ASYNC DELEGATION", "[Planning state preserved")
 
 
+HUB = "mcp__weave_connectors__"  # the cell's name prefix for Harso hub tools
+
+
+def hub_card(tool_name: Any, result: Any) -> Optional[Dict[str, Any]]:
+    """WEV-3395: the answer card a Harso hub tool returned (MCP structuredContent or result ``card``), else None.
+
+    Forwarded connector tools are ``<HUB><provider>__<tool>`` and never count. ``result`` is the raw MCP JSON
+    string (a guardrail note may follow it) or that JSON already parsed.
+    """
+    name = str(tool_name or "")
+    if not name.startswith(HUB) or "__" in name[len(HUB):]:
+        return None
+    try:
+        payload = json.JSONDecoder().raw_decode(result)[0] if isinstance(result, str) else result
+        card = (payload.get("structuredContent") or payload.get("result")).get("card")
+    except (ValueError, AttributeError):
+        return None
+    return card if isinstance(card, dict) and card.get("kind") == "output_blocks" else None
+
+
 def row_key(message: Dict[str, Any]) -> str:
     return f"{message['role']}:{message.get('timestamp')!r}"
 
