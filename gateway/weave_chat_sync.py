@@ -4,7 +4,9 @@ One daemon thread per gateway process. Two feeds:
 
 * live: ``APIServerAdapter._native_submit_event`` hands every live event here (``publish``).
   Text deltas of a turn grow ONE ``writing`` row; approvals and clarifications become
-  ``pending`` card rows. Pieces are flushed at most every ``FLUSH_S``.
+  ``pending`` card rows. Pieces are flushed at most every ``FLUSH_S``. A ``tool.completed``
+  that carries an answer card (WEV-3395) puts the turn's last card on its answer row as
+  ``body.output``, the field the apps already draw.
 * saved: when a turn ends, the session's display rows (the set ``/messages`` serves,
   compacted turns included) are upserted ``final``. The turn's assistant answer adopts
   the live row, so the streamed text and the saved message are the same row.
@@ -123,6 +125,8 @@ class _Writer:
             live["status"] = str(event.get("tool_name") or "")[:120]
         elif kind in ("tool.completed", "tool.failed"):
             live["status"] = None
+            if isinstance(event.get("card"), dict):  # WEV-3395: the turn's last card goes on its answer row
+                live["card"] = event["card"]
         elif kind in CARD_TYPES:
             card_id = event.get("request_id") or event.get("clarify_id") or ""
             body = {k: v for k, v in event.items()
@@ -175,6 +179,8 @@ class _Writer:
             rows.remove(answer)
             answer["item_id"] = live["item"]  # the streamed row becomes the saved answer
             answer["body"]["status"] = None
+            if live.get("card"):
+                answer["body"]["output"] = live["card"]
             last = answer
         else:  # no answer: hide any partial reply. Either way the live row tells the apps the turn ended.
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "removed",

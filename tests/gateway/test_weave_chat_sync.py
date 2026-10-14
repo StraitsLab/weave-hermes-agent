@@ -124,6 +124,26 @@ def test_cards_and_their_resolution_are_rows(server, monkeypatch):
     assert rows["clarify:c1"]["state"] == "resolved"
 
 
+def test_a_tool_card_lands_on_the_answer_row(server, monkeypatch):
+    """WEV-3395: the last card a hub tool returned rides the answer row as body.output, the field the apps draw."""
+    url, calls, rows = server
+    now = time.time()
+    card = {"kind": "output_blocks", "major": 1, "header": {"title": "SQ 638"}, "fallback_text": "SQ 638 on time"}
+    saved = [{"id": 1, "role": "user", "content": "SQ 638?", "timestamp": now + 0.5},
+             {"id": 2, "role": "assistant", "content": "On time.", "timestamp": now + 2.0}]
+    run_turn(url, "weave-abc", "ref-card", [
+        {"type": "tool.completed", "tool_name": "mcp__weave_connectors__show_flight_status", "card": card},
+        {"type": "assistant.delta", "delta": "On time."},
+        {"type": "turn.completed"},
+    ], saved, monkeypatch)
+    answer_key = f"assistant:{now + 2.0!r}"
+    wait_for(lambda: any(r.get("cell_key") == answer_key for r in rows.values()))
+    answer = next(i for c in calls for i in c["p_items"] if i.get("cell_key") == answer_key)
+    assert answer["body"]["output"] == card and answer["body"]["text"] == "On time."
+    user = next(i for c in calls for i in c["p_items"] if i.get("cell_key") == f"user:{now + 0.5!r}")
+    assert "output" not in user["body"]
+
+
 def test_off_without_settings_and_never_raises(server, monkeypatch):
     url, calls, _rows = server
     sync.publish("weave-abc", "ref3", {"type": "turn.started"}, lambda: [], lambda name: "")

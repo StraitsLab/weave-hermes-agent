@@ -134,6 +134,27 @@ async def test_native_tool_failure_callback_emits_bounded_failed_event(adapter):
 
 
 @pytest.mark.asyncio
+async def test_native_tool_completed_carries_a_hub_card_only(adapter):
+    """WEV-3395: Harso's own hub tools pass their card on; a forwarded connector tool never does."""
+    queue = asyncio.Queue(maxsize=32)
+    adapter._native_submit_subscribers[REQUEST_REF] = (queue, asyncio.get_running_loop())
+    adapter._native_submit_active_refs["native-session-key"] = REQUEST_REF
+    card = {"kind": "output_blocks", "major": 1, "header": {"title": "SQ 638"}}
+    result = json.dumps({"result": "Shown.", "structuredContent": {"shown": True, "card": card}})
+
+    adapter._native_submit_tool_completed("native-session-key", "c1", "mcp__weave_connectors__show_flight_status",
+                                          result + "\n\n[loop warning]")
+    adapter._native_submit_tool_completed("native-session-key", "c2", "mcp__weave_connectors__acme__lookup", result)
+    adapter._native_submit_tool_completed("native-session-key", "c3", "web_search", result)
+    adapter._native_submit_tool_completed("native-session-key", "c4", "mcp__weave_connectors__weather_now",
+                                          json.dumps({"result": {"facts": {}, "card": {"kind": "other"}}}))
+
+    events = [queue.get_nowait() for _ in range(4)]
+    assert events[0]["card"] == card
+    assert ["card" in event for event in events] == [True, False, False, False]
+
+
+@pytest.mark.asyncio
 async def test_native_turn_failure_closes_the_live_feed_as_failed(adapter):
     adapter._session_db.register_native_session_submit(
         SESSION_ID,
