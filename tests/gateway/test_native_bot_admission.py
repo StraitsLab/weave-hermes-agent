@@ -65,9 +65,15 @@ def test_tool_complete_carries_a_hub_card_only():
     projection._scoped_event("ref-1", "tool.complete", {"tool_id": "c2", "result": json.dumps(result),
                                                         "name": "mcp__weave_connectors__acme__lookup"})
     projection._scoped_event("ref-1", "tool.start", {"tool_id": "c3", "name": "mcp__weave_connectors__weather_now"})
+    # Exa results and other non-card hub tools pass third-party output through: never a card.
+    for tool in ("web_fetch_exa", "web_search_exa", "browse", "show_x__lookup"):
+        projection._scoped_event("ref-1", "tool.complete", {"tool_id": tool, "result": result,
+                                                            "name": "mcp__weave_connectors__" + tool})
+    projection._scoped_event("ref-1", "tool.complete", {"tool_id": "c4", "result": result,
+                                                        "name": "mcp__weave_connectors__weather_now"})
     assert seen[0] == ("tool.completed", {"tool_call_id": "c1", "tool_name": "mcp__weave_connectors__show_flight_status",
                                           "card": card})
-    assert ["card" in fields for _kind, fields in seen] == [True, False, False]
+    assert ["card" in fields for _kind, fields in seen] == [True, False, False, False, False, False, False, True]
 
 
 def test_a_bare_yes_answers_the_blocking_approval_instead_of_starting_a_turn(monkeypatch):

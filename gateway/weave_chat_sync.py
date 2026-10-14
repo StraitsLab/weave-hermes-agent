@@ -47,16 +47,18 @@ SCAFFOLDING = ("[System:", "[IMPORTANT: Background", "[Your active task list", "
 
 
 HUB = "mcp__weave_connectors__"  # the cell's name prefix for Harso hub tools
+CODE_CARDS = {HUB + "weather_now", HUB + "page_read"}  # hub tools whose own code builds a card
 
 
 def hub_card(tool_name: Any, result: Any) -> Optional[Dict[str, Any]]:
-    """WEV-3395: the answer card a Harso hub tool returned (MCP structuredContent or result ``card``), else None.
+    """WEV-3395: the answer card a Harso card tool returned (MCP structuredContent or result ``card``), else None.
 
-    Forwarded connector tools are ``<HUB><provider>__<tool>`` and never count. ``result`` is the raw MCP JSON
-    string (a guardrail note may follow it) or that JSON already parsed.
+    Only Harso's card tools count: ``show_<card>`` (weave-api fills and checks it) and CODE_CARDS. Every other hub
+    tool can carry third-party output (Exa results, forwarded ``<provider>__<tool>`` connectors), so it never does.
+    ``result`` is the raw MCP JSON string (a guardrail note may follow it) or that JSON already parsed.
     """
     name = str(tool_name or "")
-    if not name.startswith(HUB) or "__" in name[len(HUB):]:
+    if name not in CODE_CARDS and not (name.startswith(HUB + "show_") and "__" not in name[len(HUB):]):
         return None
     try:
         payload = json.JSONDecoder().raw_decode(result)[0] if isinstance(result, str) else result
