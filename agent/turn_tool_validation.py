@@ -102,6 +102,10 @@ def validate_tool_calls(
     repaired_ids = set()
     for tc in tool_calls:
         if tc.function.name not in valid_names:
+            from agent.harso_deferred_call import bridge_bare_deferred_call
+            if bridge_bare_deferred_call(agent, tc, valid_names):
+                repaired_ids.add(id(tc))
+                continue
             repaired = agent._repair_tool_call(tc.function.name)
             if repaired:
                 agent._vprint(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'",
