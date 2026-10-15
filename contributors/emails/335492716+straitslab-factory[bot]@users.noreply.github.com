@@ -1,1 +1,1 @@
-straitslab-factory[bot]
+straitslab-factory

@@ -30,8 +30,9 @@ jobs:
       - name: Check for unmapped contributor emails
         id: check-emails
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Merge base with the PR's own base branch (Harso fork: PRs target harso/v0.22, not main,
+          # and main is the old v0.21 fork, so origin/main counted all upstream commits as new).
+          MERGE_BASE=$(git merge-base "origin/${GITHUB_BASE_REF:-main}" HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
