@@ -19,6 +19,8 @@ def merge_routes(native: list[tuple[str, str, Any]], harso: list[tuple[str, str,
 def _http_routes(adapter: Any) -> list[tuple[str, str, Any]]:
     routes: list[tuple[str, str, Any]] = []
     # seam:s1:routes (native sessions: submit/events/approvals/clarify/append/credential/fork)
+    from gateway.platforms import api_server_harso_sessions
+    routes.extend(api_server_harso_sessions._http_routes(adapter))
     # seam:s2:routes (cron: /api/jobs/{job_id}/runs)
     # seam:s5:routes (MCP: /v1/mcp/reload, /v1/mcp/refresh)
     return routes

@@ -51,7 +51,6 @@ logger = logging.getLogger("gateway.run")
 
 _tool_call_logger_lock = threading.Lock()
 
-
 def _tool_call_logger() -> logging.Logger:
     """Process-wide ``hermes.tool_calls`` Logger + one RotatingFileHandler on logs/tool_calls.log.
     Named Loggers live in ``logging.Logger.manager.loggerDict`` forever, so the former per-turn name
@@ -75,8 +74,6 @@ def _tool_call_logger() -> logging.Logger:
             tool_logger.addHandler(handler)
     return tool_logger
 
-
-
 _CONTEXT_OVERFLOW_ERROR_PHRASES = (
     "context length", "context size", "context window",
     "maximum context", "token limit", "too many tokens",
@@ -85,16 +82,9 @@ _CONTEXT_OVERFLOW_ERROR_PHRASES = (
     "payload too large", "input is too long",
 )
 
-def _unexpected_silence_reply() -> str:
-    """Reply when the model returned only a silence marker for a message that needed an answer."""
-    return t("gateway.errors.unexpected_silence")
+from gateway.run_turn_silence import _unexpected_silence_reply
 
-
-def _bg_prompt_preview(prompt: str, limit: int = 60) -> str:
-    """Short single-line quote of a /bg prompt for its failure notice (the task id means nothing to the user)."""
-    text = " ".join(str(prompt or "").split())
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
-
+from gateway.run_turn_silence import _bg_prompt_preview
 
 def is_context_overflow_failure_result(agent_result: dict, history_len: int) -> bool:
     """One verdict for "this failed turn is a context overflow", shared by transcript persistence
@@ -109,12 +99,10 @@ def is_context_overflow_failure_result(agent_result: dict, history_len: int) -> 
     err = str(agent_result.get("error") or "").lower()
     return any(p in err for p in _CONTEXT_OVERFLOW_ERROR_PHRASES) or ("400" in err and history_len > 50)
 
-
 # Setup/prefix rows rather than conversation: the agent rebuilds its own system prompt, and a
 # transcript meta row is logging-only — neither reaches the model, but both are the head a
 # fail-closed payload keeps.
 _HYGIENE_SETUP_ROLES = ("system", "session_meta")
-
 
 def bound_model_input_without_hygiene(history: list[Any], limit: int) -> list[Any]:
     """Fail-closed in-context bound for a turn where hygiene has not landed (#111988).
@@ -140,7 +128,6 @@ def bound_model_input_without_hygiene(history: list[Any], limit: int) -> list[An
            and history[tail_start].get("role") == "tool"):
         tail_start += 1
     return history[:head_end] + history[tail_start:]
-
 
 def hygiene_no_commit_reason(agent) -> str:
     """Name WHY a hygiene compression left the session id unchanged with no in-place commit.
@@ -171,7 +158,9 @@ from gateway.run_turn_hygiene import GatewayTurnHygieneMixin
 from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
 
 
-class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin):
+from gateway.native_session_followup import NativeFollowupMixin
+
+class GatewayTurnMixin(NativeFollowupMixin, GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
 
@@ -282,6 +271,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
+            from gateway.native_session_lifecycle import mark_result
+            mark_result(event, agent_result)
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -337,6 +328,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             )
 
         except Exception as e:
+            from gateway.native_session_lifecycle import mark_result
+            mark_result(event, {"failed": True})
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
             # Restore session context variables to their pre-handler state
@@ -2007,6 +2000,9 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         # different profile's adapter, and only that instance holds the per-message reaction state.
         from gateway.run_turn_followup_ack import _followup_cancel_outcome, _run_followup_processing_hook
         _hook_adapter = self._intake_adapter_for(next_source) if pending_event is not None else None
+        native_token = await self._begin_native_followup(pending_event, next_session_key)
+        if self._native_followup_skipped(pending_event):
+            return response
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).
@@ -2027,15 +2023,19 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
             )
         except asyncio.CancelledError:
+            await self._end_native_followup(native_token, next_session_key, failed=True)
             await _run_followup_processing_hook(
                 _hook_adapter, pending_event, "on_processing_complete", _followup_cancel_outcome(_hook_adapter))
             raise
         except BaseException:
+            await self._end_native_followup(native_token, next_session_key, failed=True)
             await _run_followup_processing_hook(
                 _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.FAILURE)
             raise
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
+        await self._end_native_followup(native_token, next_session_key,
+                                        failed=bool(followup_result.get('failed') or followup_result.get('error')))
         merged = _preserve_queued_followup_history_offset(result, followup_result)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal

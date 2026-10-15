@@ -47,13 +47,13 @@ async def test_session_chat_terminal_result_is_not_success(flag, status):
     adapter._run_agent = AsyncMock(return_value=({'final_response': 'diagnostic', flag: True,
                                                  'completed': False, 'messages': []}, {}))
     app = web.Application()
-    app.router.add_post('/chat', adapter._handle_session_chat)
-    app.router.add_post('/stream', adapter._handle_session_chat_stream)
+    app.router.add_post('/chat/{session_id}', adapter._handle_session_chat)
+    app.router.add_post('/stream/{session_id}', adapter._handle_session_chat_stream)
     try:
         async with TestClient(TestServer(app)) as client:
-            response = await client.post('/chat', json={})
+            response = await client.post('/chat/owned', json={})
             assert (await response.json())['status'] == status
-            response = await client.post('/stream', json={})
+            response = await client.post('/stream/owned', json={})
             text = await response.text()
             assert f'event: run.{status}\n' in text
             assert 'event: run.completed\n' not in text
