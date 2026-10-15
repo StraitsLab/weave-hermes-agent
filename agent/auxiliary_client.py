@@ -2441,30 +2441,7 @@ def _refresh_nous_recommended_model(*, vision: bool, stale_model: Optional[str])
     return _NOUS_MODEL if _NOUS_MODEL.strip().lower() != stale else None
 
 
-def _read_main_field(field: str, *, readonly: bool, lower: bool = False) -> str:
-    """Main ``model.<field>``: runtime override (``set_runtime_main``) first, then config.yaml.
-
-    The override wins so "active main model" gates see the live CLI/gateway runtime, not the persisted
-    default. ``readonly`` picks ``load_config_readonly`` (model/provider) vs ``load_config`` (api_key/base_url).
-    """
-    override = _runtime_main_value(field)
-    if field == "api_key" and callable(override):
-        return override
-    if isinstance(override, str) and override.strip():
-        value = override.strip()
-        return value.lower() if lower else value
-    with contextlib.suppress(Exception):
-        from hermes_cli import config as _cfg_mod
-        cfg = (_cfg_mod.load_config_readonly if readonly else _cfg_mod.load_config)()
-        model_cfg = cfg.get("model", {})
-        if field == "model" and isinstance(model_cfg, str) and model_cfg.strip():
-            return model_cfg.strip()
-        if isinstance(model_cfg, dict):
-            value = model_cfg.get("default" if field == "model" else field, "")
-            if isinstance(value, str) and value.strip():
-                value = value.strip()
-                return value.lower() if lower else value
-    return ""
+from agent.auxiliary_main_config import read_main_field as _read_main_field
 
 
 # Module-level callables (tests patch them): model/provider (lowercased) read the readonly config;

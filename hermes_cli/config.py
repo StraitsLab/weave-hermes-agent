@@ -47,6 +47,7 @@ from hermes_constants import (
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home, get_process_hermes_home
 from utils import atomic_replace, fast_safe_load, file_signature, mkstemp_beside
+from hermes_cli.config_layers import load_config_strict, merge_managed_overlay as _merge_managed_overlay
 from hermes_cli.config_read_errors import (
     _CONFIG_PARSE_FAILURES, _FIX_PERMS, _FIX_YAML, FailedConfigRead, _backups_dir_display,
     _refuse_failed_read, _refuse_overwrite, _warn_config_parse_failure, _yaml_error_details,
@@ -2279,24 +2280,6 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
     return lkg_copy
 
 
-def _merge_managed_overlay(expanded: dict[str, Any]) -> tuple[dict[str, Any], Any]:
-    """Apply the managed-scope overlay; returns ``(merged, managed_config_or_falsy)``.
-    Managed wins at the leaf and is applied AFTER user expansion so a user ``${VAR}`` cannot shadow
-    a managed literal: managed values expand only against the process environment. This
-    deliberately inverts the usual env-over-config precedence for the keys the managed layer pins
-    (docs/design/managed-scope.md §4.1)."""
-    managed_config = managed_scope.load_managed_config()
-    if not managed_config:
-        return expanded, managed_config
-    # Same canonicalization as the user config BEFORE merging (parity with
-    # managed_scope.apply_managed_overlay) so the merged result never exposes a nested dict.
-    managed_normalized = _normalize_root_model_keys(managed_config)
-    if isinstance(managed_normalized.get("model"), str):
-        managed_normalized = dict(managed_normalized)
-        managed_normalized["model"] = {"default": managed_normalized["model"]}
-    return _deep_merge(expanded, _expand_env_vars(managed_normalized)), managed_config
-
-
 def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[dict[str, Any]]:
     """Lookup: the cached expanded config for ``path_key`` if its signature equals
     ``cache_sig`` AND every ``${VAR}`` it was expanded against still has the same value, else
@@ -2320,46 +2303,6 @@ def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[dict[str, 
     if all(_env_ref_lookup(k) == v for k, v in env_snapshot.items()):
         return hit
     return None
-
-
-def load_config_strict() -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
-    """Read fresh policy layers, failing closed without consulting or seeding caches."""
-    with _CONFIG_LOCK:
-        user = _read_config_mapping_strict(get_config_path())
-        managed_dir = managed_scope.get_managed_dir()
-        managed = _read_config_mapping_strict(managed_dir / "config.yaml") if managed_dir else {}
-        from hermes_cli.moa_config import apply_user_moa_presets
-        config = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), copy.deepcopy(user))
-        apply_user_moa_presets(config, user)
-        expanded = _expand_env_vars(_canonicalize_config(config))
-        if managed:
-            normalized = _normalize_root_model_keys(copy.deepcopy(managed))
-            if isinstance(normalized.get("model"), str):
-                normalized["model"] = {"default": normalized["model"]}
-            expanded = _deep_merge(expanded, _expand_env_vars(normalized))
-        return expanded, (user, managed)
-
-
-def _read_config_mapping_strict(path: Path) -> dict[str, Any]:
-    """Missing/documentless files are empty; null, non-mapping or multiple roots refuse."""
-    from ruamel.yaml import YAML
-    from ruamel.yaml.nodes import MappingNode
-    try:
-        with open(path, encoding="utf-8-sig") as stream:
-            document = stream.read()
-        parser = YAML(typ="safe", pure=True)
-        parser.version = (1, 1)
-        node = parser.compose(document)
-        if node is None:
-            return {}
-        if not isinstance(node, MappingNode):
-            raise TypeError(f"{path}: top-level YAML must be a mapping")
-        loaded = yaml.safe_load(document)
-        if not isinstance(loaded, dict):
-            raise TypeError(f"{path}: top-level YAML must construct a mapping")
-        return loaded
-    except FileNotFoundError:
-        return {}
 
 
 def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:

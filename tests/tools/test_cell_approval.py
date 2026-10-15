@@ -1,5 +1,5 @@
 """Unattended API requests cannot inherit a CLI approval prompt."""
-from tools import approval as approval
+from tools import approval
 import pytest
 
 

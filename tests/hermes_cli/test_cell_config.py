@@ -10,7 +10,7 @@ def test_cell_overrides_are_native_and_disable_curator(tmp_path, monkeypatch):
     from hermes_cli.config import load_config
     from agent import curator
     text = (Path(__file__).resolve().parents[2] / "docs/harso-cell-config.md").read_text()
-    source = re.search(r"```yaml\n(.*?)```", text, re.S).group(1)
+    source = re.search(r"```yaml\n(.*?)```", text, re.DOTALL).group(1)
     overrides = yaml.safe_load(source)
 
     def native(keys, defaults):
