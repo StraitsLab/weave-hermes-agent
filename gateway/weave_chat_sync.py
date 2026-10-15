@@ -190,9 +190,11 @@ class _Writer:
 
     def _finish(self, live: Dict[str, Any]) -> None:
         messages = live["read"]()
-        rows = visible_rows(messages, live["show_tag"], live["show_over"])
-        if live["session"] in _SYNCED:
-            rows = rows[-40:]  # earlier rows are already in Supabase; compaction keeps their keys
+        # Only this turn's rows: what arrived since it started, with slack for the steered sends it absorbed.
+        # Earlier rows are already in Supabase (every chat has synced since 2026-10-13); re-sending the whole
+        # transcript after a gateway restart re-stamped 71 rows and flooded the app (2026-10-15).
+        rows = visible_rows([m for m in messages if (m.get("timestamp") or 0) >= live["started"] - 120],
+                            live["show_tag"], live["show_over"])
         # This turn's answer: its last visible assistant message, saved after the turn started.
         mine = [m for m in messages if m.get("role") == "assistant" and isinstance(m.get("content"), str)
                 and m["content"].strip() and (m.get("timestamp") or 0) >= live["started"]]
@@ -201,6 +203,7 @@ class _Writer:
             rows.remove(answer)
             answer["item_id"] = live["item"]  # the streamed row becomes the saved answer
             answer["body"]["status"] = None
+            answer.pop("at", None)  # keep the row's open time: it sorts under the send it answers, not under a later steer
             if live.get("card"):
                 answer["body"]["output"] = live["card"]
             last = answer
@@ -211,7 +214,6 @@ class _Writer:
         rows.append(last)  # last, so every saved row is in Supabase before the apps settle the turn
         for start in range(0, len(rows), 100):
             _call(live, rows[start:start + 100])
-        _SYNCED.add(live["session"])  # first turn after boot copied the whole chat (backfill)
 
 
 def _call(live: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -224,7 +226,6 @@ def _call(live: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[str, A
 
 _WRITER: Optional[_Writer] = None
 _LOCK = threading.Lock()
-_SYNCED: set = set()
 _ENDED: "collections.deque[str]" = collections.deque(maxlen=256)  # refs already finished: a late event reopens nothing
 
 

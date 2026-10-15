@@ -46,7 +46,6 @@ def server(monkeypatch):
     httpd = HTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     monkeypatch.setattr(sync, "_WRITER", None)
-    monkeypatch.setattr(sync, "_SYNCED", set())
     monkeypatch.setattr(sync, "FLUSH_S", 0.05)
     yield f"http://127.0.0.1:{httpd.server_port}", calls, rows
     httpd.shutdown()
@@ -104,8 +103,12 @@ def test_reply_streams_into_one_row_and_is_saved_as_that_row(server, monkeypatch
     assert "secret tool output" not in json.dumps(calls)  # the tool channel never leaves the cell
     assert "[System:" not in json.dumps(calls)
     finals = [i.get("cell_key") for i in sent if i.get("state") == "final"]
-    assert set(finals) == {f"user:{now + 0.5!r}", f"assistant:{now - 500!r}", answer_key}
+    # Only this turn's rows go: the older answer is already in Supabase, and re-sending the whole transcript
+    # after a restart re-stamped every row (2026-10-15).
+    assert set(finals) == {f"user:{now + 0.5!r}", answer_key}
     assert finals[-1] == answer_key  # the turn's answer lands last: the apps settle on it
+    answer_row = next(i for i in sent if i.get("cell_key") == answer_key)
+    assert "at" not in answer_row  # the streamed row keeps its open time, under the send it answers
 
 
 def test_cards_and_their_resolution_are_rows(server, monkeypatch):
