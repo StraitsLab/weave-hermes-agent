@@ -1171,6 +1171,12 @@ class NativeSessionAPI:
             if approval.get("request_id")
         ]
 
+    @classmethod
+    def supports_exec_approval_buttons(cls) -> bool:
+        """The native stream is this adapter's approval surface: without this the turn runner never
+        calls ``send_exec_approval`` and falls back to a plain-text send api_server cannot deliver."""
+        return True
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str, description: str = "",
         metadata: Optional[dict[str, Any]] = None, allow_permanent: bool = True,
