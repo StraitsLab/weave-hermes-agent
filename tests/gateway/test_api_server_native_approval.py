@@ -363,3 +363,60 @@ async def test_card_force_redacts_secrets_when_global_redaction_is_off(adapter, 
         assert event["command"].startswith("git clone")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice", ["once", "deny"])
+async def test_chat_vault_waits_for_native_card_answer(adapter, monkeypatch, choice):
+    from agent.vault_backends import weave
+    from agent.vault_backends.base import VaultUseRefused
+
+    card_ref = "0199dddd-0000-7000-8000-000000000001"
+    handle = "wv:0199bbbb-0000-7000-8000-00000000000a"
+    monkeypatch.setattr(weave, "_bearer", lambda: "wvc1_" + "a" * 43)
+    monkeypatch.setattr(weave, "_run_context", lambda: {"session_id": SESSION_ID, "run_id": "0199aaaa-0000-7000-8000-000000000001"})
+    backend = weave.WeaveLoginBackend("https://vault.example")
+    resolves = []
+
+    def resolve(method, path, body):
+        resolves.append(dict(body))
+        if len(resolves) == 1:
+            return {"decision": "approval_required", "approval_ref": card_ref}
+        return {"decision": "once", "action": "fill_login", "password": "test-vault-value"}
+
+    monkeypatch.setattr(backend, "_call", resolve)
+
+    def action():
+        try:
+            return backend.resolve_password(handle, origin="https://site.example")
+        except VaultUseRefused as error:
+            return error.error_type
+
+    await adapter._on_native_submit_started(_event(), SESSION_KEY)
+    stream = await _stream_events(adapter)
+    thread, outcome = _start_gate(adapter, asyncio.get_running_loop(), action)
+    client = await _client(adapter)
+    try:
+        # A completed thread with no event is the original chat-refusal bug.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if not thread.is_alive() or not stream.empty():
+                break
+            await asyncio.sleep(0.01)
+        assert thread.is_alive() and "result" not in outcome
+        card = stream.get_nowait()
+        assert card["type"] == "approval.request"
+        assert card["pattern_key"] == f"plugin_rule:{card_ref}"
+        assert len(resolves) == 1
+        response = await client.post(
+            f"/api/sessions/{SESSION_ID}/submit/{REF}/approval/{card['request_id']}",
+            headers=HEADERS, json={"choice": choice},
+        )
+        assert response.status == 200
+        await asyncio.to_thread(thread.join, 5)
+        assert not thread.is_alive()
+        assert outcome["result"] == ("test-vault-value" if choice == "once" else "denied")
+        assert len(resolves) == (2 if choice == "once" else 1)
+        assert resolves[-1] == resolves[0]
+    finally:
+        ap.resolve_gateway_approval(SESSION_KEY, "deny", resolve_all=True)
+        await asyncio.to_thread(thread.join, 5)
+        await client.close()

@@ -1,5 +1,9 @@
 """Native cell configuration; turns use the gateway FIFO and existing prompt queues."""
 import os
+from contextvars import ContextVar
+
+# Authenticated native admission identity, inherited by the gateway's executor.
+native_turn_context = ContextVar("harso_native_turn_context", default=None)
 
 
 def enabled():
