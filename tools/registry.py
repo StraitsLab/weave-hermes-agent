@@ -950,12 +950,16 @@ class ToolRegistry:
                 result = _run_async(entry.handler(args, **kwargs))
             else:
                 result = entry.handler(args, **kwargs)
-            return self._normalize_handler_result(name, result)
+            from tools.harso_result_redaction import _scrub_vault_values
+            return self._normalize_handler_result(name, _scrub_vault_values(result, tool=name))
         except Exception as e:
-            # exc_info already renders the exception, so keep the message copy bounded.
-            logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))
+            import traceback
+            from tools.harso_result_redaction import _scrub_vault_values
+            message = _scrub_vault_values(str(e))
+            logged = _scrub_vault_values("".join(traceback.format_exception(e)))
+            logger.error("Tool %s dispatch error: %s", name, _bound_error_text(logged))
             # Sanitize so framing tokens/CDATA/fences in exception text aren't structural noise.
-            raw = f"Tool execution failed: {type(e).__name__}: {e}"
+            raw = f"Tool execution failed: {type(e).__name__}: {message}"
             try:
                 from model_tools import _sanitize_tool_error
                 sanitized = _sanitize_tool_error(raw)
