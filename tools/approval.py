@@ -1256,3 +1256,19 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
 
 # Load permanent allowlist from config on module import
 load_permanent_allowlist()
+
+_attended_api_sessions = set()
+
+def native_submit_attended_enabled() -> bool:
+    """Read ``approvals.native_submit_attended`` (default True) at runtime."""
+    return is_truthy_value(approval_context._get_approval_config().get("native_submit_attended", True))
+
+def mark_api_session_attended(session_key: str, attended: bool = True) -> None:
+    """Mark or clear one api_server session key as having a human approval surface."""
+    if not session_key:
+        return
+    with _lock:
+        if attended:
+            _attended_api_sessions.add(session_key)
+        else:
+            _attended_api_sessions.discard(session_key)

@@ -134,8 +134,10 @@ class GatewayTurnPrepareMixin:
         # turn (#74349). Set again below only when THIS resolution fell back.
         self._pre_agent_fallback_notice = None
         policy = policy_for_source(self, source) if source is not None else None
-        if policy is not None:
-            return _resolve_policy_agent_runtime(self, policy)
+        from gateway.native_session_credentials import selected_runtime
+        selected = selected_runtime(self, policy, source, session_key, user_config)
+        if selected is not None:
+            return selected
         skey = self._resolve_session_key_or_none(source, session_key)
         model = _resolve_gateway_model(user_config)
         if skey:
@@ -649,6 +651,10 @@ class GatewayTurnPrepareMixin:
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.
         from gateway.response_filters import display_kind_for_event
         persist_user_display_kind = display_kind_for_event(event)
+        from gateway.native_bot_admission import internal_presentation
+        native_kind = internal_presentation(event)
+        if native_kind is not None:
+            persist_user_display_kind = native_kind or None
         _redact_pii = False  # privacy.redact_pii, re-read per message
         with suppress(Exception):
             _redact_pii = bool((_load_gateway_config().get("privacy") or {}).get("redact_pii", False))

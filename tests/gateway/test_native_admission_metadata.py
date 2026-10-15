@@ -112,11 +112,15 @@ async def test_native_codec_closed_metadata_contract_and_reply_expected(tmp_path
     finally:
         authority.db.close()
     # Closed producer matrix: no other adapter stamps MessageEvent.metadata on ordinary inbound,
-    # so the WhatsApp keys above are the whole contract. A new producer must extend it here.
+    # WhatsApp owns ordinary transport metadata; Harso owns its native HTTP
+    # admissions. Both must be registered here when their producer set changes.
     producers = set()
     for path in [*REPO.glob('gateway/platforms/**/*.py'), *REPO.glob('plugins/platforms/**/*.py')]:
         for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
             if (isinstance(node, ast.Call) and getattr(node.func, 'id', getattr(node.func, 'attr', '')) == 'MessageEvent'
                     and any(k.arg == 'metadata' for k in node.keywords)):
                 producers.add(path.relative_to(REPO).as_posix())
-    assert producers == {'plugins/platforms/whatsapp/adapter.py'}, producers
+    assert producers == {
+        'plugins/platforms/whatsapp/adapter.py',
+        'gateway/platforms/api_server_harso_sessions.py',
+    }, producers

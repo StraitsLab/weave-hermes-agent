@@ -252,6 +252,14 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     # stitched as a "partial delivery" nobody received (classic -q parity).
                     raise _NoStreamConsumer()
 
+        native_delta = getattr(getattr(ctx, '_status_adapter', None), '_native_submit_delta', None)
+        if callable(native_delta):
+            existing_delta = stream_delta_cb
+            def stream_delta_cb(text):
+                if existing_delta is not None:
+                    existing_delta(text)
+                native_delta(ctx.session_key, text)
+
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
                 return
@@ -1272,6 +1280,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # returns, so early run_sync returns are also finalised.
         # See the outer finally/completion section below. See #60671.
         final_response = result.get("final_response")
+        native_final = getattr(getattr(ctx, '_status_adapter', None), '_native_submit_final', None)
+        if callable(native_final):
+            native_final(ctx.session_key, final_response)
         # Actual token counts from the agent instance used for this run.
         agent = ctx.agent_holder[0]
         has_comp = bool(agent) and hasattr(agent, "context_compressor")

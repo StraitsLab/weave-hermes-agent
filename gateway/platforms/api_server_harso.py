@@ -19,6 +19,8 @@ def merge_routes(native: list[tuple[str, str, Any]], harso: list[tuple[str, str,
 def _http_routes(adapter: Any) -> list[tuple[str, str, Any]]:
     routes: list[tuple[str, str, Any]] = []
     # seam:s1:routes (native sessions: submit/events/approvals/clarify/append/credential/fork)
+    from gateway.platforms import api_server_harso_sessions
+    routes.extend(api_server_harso_sessions._http_routes(adapter))
     # seam:s2:routes (cron: /api/jobs/{job_id}/runs)
     from gateway.platforms import api_server_harso_cron as cron
     routes.extend(route for route in cron._http_routes(adapter) if route[1].endswith("/runs"))

@@ -143,7 +143,9 @@ def _is_unattended_platform_approval_context() -> bool:
     blocks the session for the full approval timeout (60-300s) and then fails closed anyway — the deadlock
     in #37284/#87509.
     """
-    return _get_session_platform() in _UNATTENDED_APPROVAL_PLATFORMS
+    from tools.approval import _attended_api_sessions
+    return (_get_session_platform() in _UNATTENDED_APPROVAL_PLATFORMS
+            and get_current_session_key("") not in _attended_api_sessions)
 
 
 # Platforms where a *registered* gateway notify callback still does not mean a human can answer:
