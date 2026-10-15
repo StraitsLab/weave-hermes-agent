@@ -27,6 +27,11 @@ PR_ONLY_JOBS = ("history-check", "lockfile-diff", "prompt-surface-diff", "supply
 DEFERRED_JOBS = ("e2e-desktop",)
 EXCLUDED_JOBS = frozenset((*PR_ONLY_JOBS, *DEFERRED_JOBS))
 
+# Harso fork: cells run Linux only. The Windows/macOS lanes still run and must
+# not be skipped when selected, but their test failures are reported, not
+# blocking: on standard runners they fail on unchanged upstream code.
+ADVISORY_FAILURE_JOBS = frozenset(("tests-os",))
+
 NEEDS_JSON_OUTPUT = "needs-json"
 
 # Reusable-workflow parents of the update/E2E consumers, and of the real
@@ -52,6 +57,7 @@ def evaluate_gate(
     """
     failed: list[str] = []
     allowed_skips: list[str] = []
+    advisory: list[str] = []
     entries = needs or {}
     lanes = (entries.get("detect") or {}).get("outputs") or {}
     required = {job for job, keys in _UPDATE_CONSUMER_LANES.items()
@@ -66,12 +72,18 @@ def evaluate_gate(
         if result == "skipped" and name not in required and (not release or name in EXCLUDED_JOBS):
             allowed_skips.append(name)
             continue
+        if result == "failure" and name in ADVISORY_FAILURE_JOBS:
+            advisory.append(name)
+            continue
         failed.append(name)
-    return {
+    verdict = {
         "ok": not failed,
         "failed": sorted(failed),
         "allowed_skips": sorted(allowed_skips),
     }
+    if advisory:
+        verdict["advisory_failures"] = sorted(advisory)
+    return verdict
 
 
 def compact_results(needs: dict[str, dict[str, Any]] | None) -> dict[str, str]:
@@ -113,6 +125,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{NEEDS_JSON_OUTPUT}={json.dumps(compact)}")
     for line in render_report(needs, verdict):
         print(line)
+    for name in verdict.get("advisory_failures", []):
+        print(f"::warning::{name} failed (advisory on the Harso fork: Linux-only cells)")
     if verdict["ok"]:
         print("All checks passed" if args.release else "All checks passed (or were skipped)")
     return 0 if verdict["ok"] else 1
