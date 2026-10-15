@@ -108,6 +108,9 @@ def runtime(runner, source, session_key, user_config):
     entry = runner.session_store._entries.get(key)
     holder = runner.session_credential_for(source, entry.session_id) if entry else None
     if holder is None:
+        from gateway.native_bot_admission import enabled as native_bot_sessions
+        if native_bot_sessions():
+            return None  # native cells mint their own key through the profile's key_cmd provider
         raise RuntimeError("credential unavailable")
     candidates = config.get("custom_providers") or []
     if isinstance(candidates, dict):
