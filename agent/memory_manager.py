@@ -76,7 +76,7 @@ def configured_memory_manager(
     try:
         provider = load_memory_provider(name)
         available = provider is not None and provider.is_available()
-    except Exception:
+    except Exception:  # health: allow BLE001 -- a broken provider plugin falls back to built-in memory
         available = False
     if not available:
         return manager

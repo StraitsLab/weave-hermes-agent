@@ -57,25 +57,7 @@ class NativeMemoryMutations:
             result = dict(native_writer())
             if result.get("success") is True:
                 result["operation_id"] = operation_id
-                result.setdefault("provider_acknowledged", True)
-                has_external = any(p.name != "builtin" for p in self._providers)
-                metadata = {"operation_id": operation_id}
-                if "revision" in result:
-                    metadata["revision"] = result["revision"]
-                if old_text:
-                    metadata["old_text"] = old_text
-                try:
-                    if not has_external:
-                        result["provider_acknowledged"] = False
-                        result["provider_status"] = "not_configured"
-                    elif not self.on_memory_write(action, target, content, metadata=metadata):
-                        result["provider_acknowledged"] = False
-                        result["provider_status"] = "failed"
-                    else:
-                        result["provider_status"] = "acknowledged"
-                except Exception:
-                    result["provider_acknowledged"] = False
-                    result["provider_status"] = "failed"
+                self._mirror_native_mutation(result, operation_id, action, target, content, old_text)
             if self._native_journal is not None:
                 result = self._native_journal.complete(operation_id, result)
             with self._native_lock:
@@ -92,7 +74,7 @@ class NativeMemoryMutations:
             with self._native_lock:
                 self._native_completed[operation_id] = result
             return result
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- every writer failure must close the journal entry so a retry is not stuck in doubt
             result = {"success": False, "operation_id": operation_id,
                       "error": "native_mutation_failed"}
             try:
@@ -108,3 +90,23 @@ class NativeMemoryMutations:
                 self._native_owners.pop(operation_id, None)
                 if event is not None:
                     event.set()
+
+    def _mirror_native_mutation(self, result: dict[str, Any], operation_id: str, action: str, target: str,
+                                content: str, old_text: str) -> None:
+        """Mirror a committed native write to the external provider; record the outcome on ``result``."""
+        result.setdefault("provider_acknowledged", True)
+        metadata = {"operation_id": operation_id}
+        if "revision" in result:
+            metadata["revision"] = result["revision"]
+        if old_text:
+            metadata["old_text"] = old_text
+        if not any(p.name != "builtin" for p in self._providers):
+            result["provider_acknowledged"] = False
+            result["provider_status"] = "not_configured"
+            return
+        try:
+            acknowledged = self.on_memory_write(action, target, content, metadata=metadata)
+        except Exception:  # health: allow BLE001 -- the native write already committed; a mirror failure is reported, not raised
+            acknowledged = False
+        result["provider_acknowledged"] = bool(acknowledged) and result["provider_acknowledged"]
+        result["provider_status"] = "acknowledged" if acknowledged else "failed"

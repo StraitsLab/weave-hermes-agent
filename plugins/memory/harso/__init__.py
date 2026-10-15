@@ -86,8 +86,8 @@ def _fetch_worker() -> None:
             _key, job = _FETCH_PENDING.popitem(last=True)
         try:
             job(False)
-        except Exception:  # a job never raises; the pool must outlive one that does
-            pass
+        except Exception:  # health: allow BLE001 -- pool boundary: one failing job must not end the shared fetch worker
+            logger.debug("Harso fetch job failed", exc_info=True)
 
 
 def _schedule_fetch(key: tuple[str, ...], job: Any) -> None:
@@ -275,7 +275,7 @@ def _prefetch_limits() -> tuple[float, int, int]:
         from hermes_cli.config import load_config_readonly
 
         config = load_config_readonly()
-    except Exception:
+    except Exception:  # health: allow BLE001 -- any unreadable config means defaults; never break the turn
         logger.warning("plugins.harso config unreadable; using defaults")
         return defaults
     if not isinstance(config, dict):
@@ -322,7 +322,7 @@ def _feature_settings() -> tuple[bool, bool, float]:
         from hermes_cli.config import load_config_readonly
 
         config = load_config_readonly()
-    except Exception:
+    except Exception:  # health: allow BLE001 -- _prefetch_limits already logs an unreadable config
         return tools, profile, wait
     plugins = config.get("plugins") if isinstance(config, dict) else None
     section = plugins.get("harso") if isinstance(plugins, dict) else None
@@ -460,7 +460,7 @@ class HarsoMemoryProvider(MemoryProvider):
 
             # F3: the process-wide pool bounds threads; newest job runs first.
             _schedule_fetch(key, job)
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- memory is optional: a failed start must not fail the turn
             logger.warning("Harso profile fetch not started: %s", type(exc).__name__)
 
     def _fetch_profile(self, session_id: str, key: tuple[str, ...], done: threading.Event,
@@ -484,7 +484,7 @@ class HarsoMemoryProvider(MemoryProvider):
                 # F2: only the server's fenced envelope is ever injected.
                 body = body.strip() if isinstance(body, str) else ""
                 text = body if (found is True and _fenced(body)) else ""
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- memory is optional; the type name only, never the body (may hold user text)
             logger.warning("Harso profile fetch failed: %s", type(exc).__name__)
         finally:
             with self._profile_lock:
@@ -558,7 +558,7 @@ class HarsoMemoryProvider(MemoryProvider):
                 logger.warning("Harso memory tool result over cap; dropped")
                 return json.dumps({"error": "memory result too large"})
             return out
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- tool boundary: the model gets one fixed unavailable result, never the error text
             logger.warning("Harso memory tool failed: %s", type(exc).__name__)
             return _TOOL_UNAVAILABLE
 
@@ -613,7 +613,7 @@ class HarsoMemoryProvider(MemoryProvider):
             return ""
         try:
             query = flatten_message_text(query).strip()
-        except Exception:
+        except Exception:  # health: allow BLE001 -- malformed content must never raise into the user's turn
             # Malformed content must never raise into the user's turn.
             return ""
         if not query:

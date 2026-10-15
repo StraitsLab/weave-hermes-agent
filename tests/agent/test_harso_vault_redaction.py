@@ -80,7 +80,6 @@ class TestVaultValueScrubIsBoundedTime:
         ([f"p{i}\\\\\\x/y" for i in range(8)], ("\\" * 40 + "/") * 2_500),  # 8 registrations, 100KB
     ], ids=["1bs-100k", "2bs-1k", "8bs-40", "8bs-1k", "mixed", "prefix", "8regs-100k"])
     def test_near_miss_output_is_scrubbed_in_bounded_time(self, values, text):
-        import json
         import subprocess
         import sys
 
