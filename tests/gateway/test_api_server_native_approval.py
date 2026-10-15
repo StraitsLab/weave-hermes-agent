@@ -420,3 +420,12 @@ async def test_chat_vault_waits_for_native_card_answer(adapter, monkeypatch, cho
         ap.resolve_gateway_approval(SESSION_KEY, "deny", resolve_all=True)
         await asyncio.to_thread(thread.join, 5)
         await client.close()
+
+
+def test_turn_runner_sends_native_approvals_as_cards(adapter):
+    """WEV-3259: the turn runner only calls ``send_exec_approval`` for an adapter that says it renders
+    approval buttons. Without that flag a native-submit approval falls back to a plain-text send the
+    api_server cannot deliver: no ``approval.request`` reaches the app and the gate times out unseen."""
+    from gateway.run_turn_runner import _renders_exec_approval_buttons
+
+    assert _renders_exec_approval_buttons(type(adapter)) is True
