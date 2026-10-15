@@ -10,6 +10,12 @@ from __future__ import annotations
 from typing import Any
 
 
+def merge_routes(native: list[tuple[str, str, Any]], harso: list[tuple[str, str, Any]]) -> list[tuple[str, str, Any]]:
+    """Native table plus Harso routes; a Harso route with the same (method, path) replaces the native one."""
+    keys = {(m, p) for m, p, _ in harso}
+    return [r for r in native if (r[0], r[1]) not in keys] + harso
+
+
 def _http_routes(adapter: Any) -> list[tuple[str, str, Any]]:
     routes: list[tuple[str, str, Any]] = []
     # seam:s1:routes (native sessions: submit/events/approvals/clarify/append/credential/fork)
