@@ -99,7 +99,13 @@ def _screen_install(args) -> int:
     return 0
 
 
-SCREEN_ACTIONS = {"status": _screen_status, "start": _screen_start, "stop": _screen_stop, "install": _screen_install}
+def _screen_bridge(args) -> int:
+    from hermes_cli.live_view_bridge import run_bridge
+    return run_bridge(args.listen, args.secret_file, args.port_file)
+
+
+SCREEN_ACTIONS = {"status": _screen_status, "start": _screen_start, "stop": _screen_stop,
+                  "install": _screen_install, "bridge": _screen_bridge}
 
 
 def build_screen_parser(computer_use_sub, add_json_flag) -> None:
@@ -119,6 +125,11 @@ def build_screen_parser(computer_use_sub, add_json_flag) -> None:
     stop.add_argument("--force", action="store_true", help="Stop even while a human holds control from Hermes Desktop")
     inst = sub.add_parser("install", help="Install TigerVNC + Xfce core via the host package manager")
     inst.add_argument("-y", "--yes", action="store_true", help="Do not ask before running the package manager")
+
+    bridge = sub.add_parser("bridge", help="Serve the authenticated Harso live-view bridge on loopback")
+    bridge.add_argument("--listen", default="127.0.0.1:0")
+    bridge.add_argument("--secret-file", required=True)
+    bridge.add_argument("--port-file", required=True)
 
     def _cmd(args):
         handler = SCREEN_ACTIONS.get(str(getattr(args, "computer_use_screen_action", None) or ""))

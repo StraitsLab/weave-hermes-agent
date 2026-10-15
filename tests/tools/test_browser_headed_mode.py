@@ -106,6 +106,7 @@ class TestHeadedFlagInjection:
             '"- heading \\"Hi\\" [ref=e1]", "refs": {"e1": {}}}}'
         )
         with patch("subprocess.Popen", side_effect=capture_popen), \
+             patch("tools.bot_desktop.browser.disable_password_manager"), \
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("os.unlink"), \

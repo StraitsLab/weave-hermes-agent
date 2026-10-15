@@ -300,6 +300,8 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     except (TypeError, ValueError):
         safe_timeout = 30.0
     safe_timeout = max(1.0, min(safe_timeout, 300.0))
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    SUPERVISOR_REGISTRY.get(task_id or "default")  # apply live signing policy before raw CDP requests
     try:
         result = _run_async(_cdp_call(endpoint, method, call_params, target_id, safe_timeout))
     except TimeoutError as exc:
