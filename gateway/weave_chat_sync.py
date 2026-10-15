@@ -32,6 +32,7 @@ import collections
 import json
 import logging
 import queue
+import re
 import threading
 import time
 import urllib.request
@@ -160,9 +161,9 @@ class _Writer:
             if kind == "approval.request":
                 pattern = str(event.get("pattern_key") or "")
                 consent = pattern.removeprefix("plugin_rule:") if pattern.startswith("plugin_rule:") else None
-                # shortcut: a consent card offers once/deny here (its Always choice lives in the Ledger); the API
-                # answer route still decides. Upgrade when the card row carries the Ledger's choices.
-                body |= {"approval_ref": consent, "choices": ["once", "deny"]}
+                # A Ledger card owns Always; native Hermes still receives only Once when it resumes.
+                ledger_card = consent and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", consent)
+                body |= {"approval_ref": consent, "choices": ["once", "always", "deny"] if ledger_card else ["once", "deny"]}
             card = {"cell_key": f"{CARD_TYPES[kind]}:{card_id}", "role": "assistant",
                     "kind": CARD_TYPES[kind], "state": "pending", "body": body}
             live["cards"].append(card)

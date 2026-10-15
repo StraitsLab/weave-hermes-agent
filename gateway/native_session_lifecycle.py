@@ -3,7 +3,13 @@ async def run(runner, event, source, key, generation):
     adapter = runner._delivery_adapter_for(source)
     started = getattr(adapter, '_on_native_submit_started', None)
     finished = getattr(adapter, '_on_native_submit_finished', None)
-    native = bool((getattr(event, 'metadata', None) or {}).get('native_request_ref'))
+    metadata = getattr(event, 'metadata', None) or {}
+    native = bool(metadata.get('native_request_ref'))
+    from gateway.native_bot_admission import native_turn_context
+    token = native_turn_context.set(
+        {'session_id': metadata.get('gateway_session_id'), 'run_id': metadata.get('external_request_id')}
+        if native and metadata.get('native_submit_authenticated') is True else None
+    )
     try:
         if native and callable(started):
             await started(event, key)
@@ -16,6 +22,7 @@ async def run(runner, event, source, key, generation):
             event.metadata['native_submit_failed'] = True
         raise
     finally:
+        native_turn_context.reset(token)
         if native and callable(finished):
             await finished(event, key)
 
