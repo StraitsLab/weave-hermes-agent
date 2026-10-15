@@ -1689,7 +1689,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         routes.extend(_api_runs._http_routes(self))
         # Harso fork: the one core hook for fork-only routes (upstream has no plugin route seam).
         from gateway.platforms import api_server_harso as _harso
-        routes.extend(_harso._http_routes(self))
+        routes = _harso.merge_routes(routes, _harso._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
