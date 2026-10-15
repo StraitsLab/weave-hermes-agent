@@ -586,13 +586,13 @@ def list_executions(
                 claimed_at, execution_id = cursor.split("|")
                 if not claimed_at or not execution_id:
                     raise ValueError("malformed execution cursor")
-                datetime.fromisoformat(claimed_at.replace("Z", "+00:00"))
+                datetime.fromisoformat(claimed_at)
             except ValueError as exc:
                 raise ValueError("malformed execution cursor") from exc
             clauses.append("(julianday(claimed_at), claimed_at, id) < (julianday(?), ?, ?)")
             params.extend((claimed_at, claimed_at, execution_id))
         else:
-            datetime.fromisoformat(cursor.replace("Z", "+00:00"))
+            datetime.fromisoformat(cursor)
             clauses.append("(julianday(claimed_at), claimed_at) < (julianday(?), ?)")
             params.extend((cursor, cursor))
     where = " WHERE " + " AND ".join(clauses) if clauses else ""

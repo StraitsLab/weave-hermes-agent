@@ -4,7 +4,7 @@ The first non-None answer (a SessionCredential) replaces the run's api_key; a
 raising hook fails the run closed; with no plugin the runtime is untouched.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -55,12 +55,11 @@ def test_no_plugin_leaves_the_runtime_key_unchanged(tmp_path, hooks):
 
 
 def test_hook_credential_reaches_the_agent(tmp_path, hooks):
-    credential = SessionCredential("cron-bearer", datetime.now(timezone.utc) + timedelta(minutes=5))
+    credential = SessionCredential("cron-bearer", datetime.now(UTC) + timedelta(minutes=5))
     seen = []
 
     def narrow(job_id, session_id):
         seen.append(("narrow", job_id))
-        return None
 
     def answer(job_id, session_id, provider, base_url):
         seen.append(("answer", job_id, session_id.startswith("cron_cred-job_"), provider, base_url))

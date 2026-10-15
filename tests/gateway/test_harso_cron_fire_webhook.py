@@ -288,7 +288,7 @@ async def test_crashing_verifier_fails_closed_401(adapter, monkeypatch):
                               json={"job_id": "abc123"})
         assert resp.status == 401
 
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0)
     assert spy.fired == []
 
 
@@ -451,8 +451,7 @@ async def test_cancelled_fire_wrapper_keeps_reservation_until_worker_finishes(
         assert adapter._background_tasks
         worker_wrapper = next(iter(adapter._background_tasks))
         worker_wrapper.cancel()
-        await asyncio.sleep(0.05)
-        assert observed["cancel_event"].is_set()
+        assert await asyncio.to_thread(observed["cancel_event"].wait, 2)
         assert adapter.active_agent_work_count() == 1
         release.set()
         for _ in range(100):

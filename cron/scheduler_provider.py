@@ -306,14 +306,14 @@ class CronScheduler(ABC):
             kwargs = {"expected_fire_owner": owner} if owner else {}
             mark_job_run(claimed_job["id"], False, error, **kwargs)
         except Exception:
-            pass
+            logger.exception("failed to abort claimed job")
         execution_id = claimed_job.get("execution_id")
         if execution_id:
             try:
                 from cron.executions import finish_execution
                 finish_execution(str(execution_id), success=False, error=error)
             except Exception:
-                pass
+                logger.exception("failed to close aborted execution")
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (desired state). Built-in: no-op."""

@@ -29,8 +29,10 @@ async def _run_thread_until_terminal(target, *args, abort_event: Optional[thread
             abort_event.set()
         try:
             await worker
-        except BaseException:
+        except asyncio.CancelledError:
             pass
+        except Exception:
+            logger.exception("cron worker failed during cancellation")
         raise
 
 def _detach_api_task(adapter, reservation, awaitable):
@@ -85,7 +87,21 @@ def _abort_claimed_api_fire(provider, claimed_job, error):
     if callable(abort):
         abort(claimed_job, error)
 
-async def _handle_create_job(self, request: "web.Request") -> "web.Response":
+def _script_error(script, no_agent):
+    if not isinstance(no_agent, bool):
+        return "no_agent must be a boolean"
+    if no_agent and script is None:
+        return "no_agent=True requires a script"
+    if script is None:
+        return None
+    from cron.harso_scripts import PLATFORM_SCRIPT_PREFIX
+    from tools.cronjob_tools import _validate_cron_script_path
+    if not isinstance(script, str) or not script.startswith(PLATFORM_SCRIPT_PREFIX):
+        return "script must be a platform: reference"
+    return _validate_cron_script_path(script)
+
+
+async def _handle_create_job(self, request: web.Request) -> web.Response:
     """POST /api/jobs — create a new cron job."""
     _, error = self._cron_request_guard(request)
     if error is not None:
@@ -117,24 +133,9 @@ async def _handle_create_job(self, request: "web.Request") -> "web.Response":
             return prompt_error
         if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
             return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
-        if not isinstance(no_agent, bool):
-            return web.json_response({"error": "no_agent must be a boolean"}, status=400)
-        if no_agent and script is None:
-            return web.json_response({"error": "no_agent=True requires a script"}, status=400)
-        # Only platform-owned scripts come in over the API; tenant
-        # HERMES_HOME/scripts refs never do. Job payloads are immutable
-        # here (_UPDATE_ALLOWED_FIELDS has no script/no_agent).
-        if script is not None:
-            from cron.harso_scripts import PLATFORM_SCRIPT_PREFIX
-            from tools.cronjob_tools import _validate_cron_script_path
-
-            if not isinstance(script, str) or not script.startswith(PLATFORM_SCRIPT_PREFIX):
-                return web.json_response(
-                    {"error": "script must be a platform: reference"}, status=400,
-                )
-            script_error = _validate_cron_script_path(script)
-            if script_error:
-                return web.json_response({"error": script_error}, status=400)
+        script_error = _script_error(script, no_agent)
+        if script_error:
+            return web.json_response({"error": script_error}, status=400)
         kwargs = {
             "prompt": prompt,
             "schedule": schedule,
@@ -147,12 +148,9 @@ async def _handle_create_job(self, request: "web.Request") -> "web.Response":
                 kwargs[key] = body[key]
         if skills:
             kwargs["skills"] = skills
-        if repeat is not None:
-            kwargs["repeat"] = repeat
-        if dedup_key is not None:
-            kwargs["dedup_key"] = dedup_key
-        if script is not None:
-            kwargs["script"] = script
+        kwargs.update({key: value for key, value in (
+            ("repeat", repeat), ("dedup_key", dedup_key), ("script", script),
+        ) if value is not None})
         if no_agent:
             kwargs["no_agent"] = True
 
@@ -169,9 +167,10 @@ async def _handle_create_job(self, request: "web.Request") -> "web.Response":
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except Exception as e:
+        logger.exception("cron HTTP request failed")
         return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
-async def _handle_run_job(self, request: "web.Request") -> "web.Response":
+async def _handle_run_job(self, request: web.Request) -> web.Response:
     """POST /api/jobs/{job_id}/run — admit and dispatch one native run."""
     job_id, error = self._cron_request_guard(request, need_job_id=True, check_draining=True)
     if error is not None:
@@ -180,7 +179,7 @@ async def _handle_run_job(self, request: "web.Request") -> "web.Response":
     respect_pause = False
     try:
         body = await request.json()
-    except Exception:
+    except ValueError:
         body = None
     if isinstance(body, dict):
         # Opt-in non-forcing admission (arrival links): a paused job is
@@ -219,8 +218,8 @@ async def _handle_run_job(self, request: "web.Request") -> "web.Response":
                 claim_kwargs["manual"] = True
             try:
                 claimed_job = await asyncio.to_thread(provider.claim_fire, job_id, **claim_kwargs)
-            except Exception as admission_error:
-                logger.error("cron API run admission failed for %s: %s", job_id, admission_error)
+            except Exception:
+                logger.exception("cron API run admission failed for %s", job_id)
                 return web.json_response({"error": "cron run admission failed", "job_id": job_id}, status=503)
             execution_id = (claimed_job.get("execution_id") or
                             (claimed_job.get("execution") or {}).get("id")) if isinstance(claimed_job, dict) else None
@@ -268,9 +267,10 @@ async def _handle_run_job(self, request: "web.Request") -> "web.Response":
                 status=202,
             )
         except Exception as e:
+            logger.exception("cron HTTP dispatch failed")
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
-async def _handle_list_job_runs(self, request: "web.Request") -> "web.Response":
+async def _handle_list_job_runs(self, request: web.Request) -> web.Response:
     job_id, error = self._cron_request_guard(request, need_job_id=True)
     if error is not None:
         return error
@@ -292,6 +292,7 @@ async def _handle_list_job_runs(self, request: "web.Request") -> "web.Response":
     except ValueError:
         return web.json_response({"error": "Malformed execution cursor"}, status=400)
     except Exception as e:
+        logger.exception("cron HTTP request failed")
         return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
 async def _mutate(adapter, request, action):
@@ -340,7 +341,7 @@ async def _handle_cron_fire(self, request: web.Request) -> web.Response:
     from plugins.cron_providers.chronos.verify import get_fire_verifier
     auth = request.headers.get("Authorization", "")
     token = auth[7:].strip() if auth.startswith("Bearer ") else ""
-    cfg = load_config()
+    cfg = await asyncio.to_thread(load_config)
     verifier = get_fire_verifier()
     verify_kwargs = dict(
         token=token,
@@ -398,8 +399,8 @@ async def _handle_cron_fire(self, request: web.Request) -> web.Response:
         # is retryable and the reservation remains attached.
         try:
             claimed_job = await asyncio.to_thread(provider.claim_fire, job_id)
-        except Exception as exc:
-            logger.error("cron fire admission failed for %s: %s", job_id, exc)
+        except Exception:
+            logger.exception("cron fire admission failed for %s", job_id)
             return web.json_response({"error": "cron fire admission failed", "job_id": job_id}, status=503)
         if claimed_job is None:
             return web.json_response({"status": "duplicate", "job_id": job_id}, status=200)

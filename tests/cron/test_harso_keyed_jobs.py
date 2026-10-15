@@ -9,7 +9,7 @@ from cron.jobs import create_job, load_jobs
 
 @pytest.fixture
 def tmp_cron_dir(tmp_path, monkeypatch):
-    import cron.jobs as jobs
+    from cron import jobs
     home = tmp_path / "hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(jobs, "HERMES_DIR", home)
@@ -20,7 +20,7 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 class TestDedup:
     def test_create_dedup_key_returns_existing_job(self, tmp_cron_dir):
-        import cron.jobs as jobs_mod
+        from cron import jobs as jobs_mod
         first = create_job(prompt="one", schedule="30m", dedup_key="routine-1", attach_to_session=True)
         second = create_job(prompt="one", schedule="30m", dedup_key="routine-1", attach_to_session=True)
         assert second["id"] == first["id"]
@@ -35,7 +35,7 @@ class TestDedup:
 
     @pytest.mark.parametrize("key", ["", "space key", "\n", "x" * 129, 7])
     def test_create_rejects_invalid_dedup_key(self, tmp_cron_dir, key):
-        import cron.jobs as jobs_mod
+        from cron import jobs as jobs_mod
         with pytest.raises(jobs_mod.CronDedupKeyInvalid):
             create_job(prompt="one", schedule="30m", dedup_key=key)
 
@@ -55,7 +55,7 @@ class TestDedup:
 
     def test_keyed_create_fails_closed_without_durable_lock(self, tmp_cron_dir, monkeypatch):
         """A keyed retry must not mint a process-local duplicate."""
-        import cron.jobs as jobs_mod
+        from cron import jobs as jobs_mod
 
         monkeypatch.setattr(jobs_mod, "fcntl", None)
         monkeypatch.setattr(jobs_mod, "msvcrt", None)

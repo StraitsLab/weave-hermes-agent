@@ -457,7 +457,7 @@ def _normalize_dedup_key(value: Any) -> Optional[str]:
 
 
 _DEDUP_SEMANTIC_FIELDS = ("name", "prompt", "skills", "model", "provider", "base_url", "script", "no_agent", "monitor_script", "monitor_url", "context_from", "schedule", "repeat", "deliver", "enabled_toolsets", "workdir", "attach_to_session", "reasoning_effort", "failure_deliver", "interpreter")
-def _dedup_fingerprint(job: Dict[str, Any], schedule: Optional[str] = None) -> str:
+def _dedup_fingerprint(job: dict[str, Any], schedule: Optional[str] = None) -> str:
     payload = {key: job.get(key) for key in _DEDUP_SEMANTIC_FIELDS}
     origin = job.get("origin") or {}
     payload["origin"] = {key: origin.get(key) for key in ("platform", "chat_id", "thread_id", "user_id")}
