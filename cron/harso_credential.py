@@ -1,4 +1,9 @@
-"""Harso credential hook invoked only at cron agent construction."""
+"""Harso ``cron_run_credential`` plugin hook, invoked once per native cron run at agent construction.
+
+Kwargs (passed by signature): job_id, session_id, provider, base_url. Return an
+``agent.session_credential.SessionCredential`` to replace the run's api_key, or None.
+The first non-None answer wins; a raising hook fails the run closed.
+"""
 from __future__ import annotations
 
 
