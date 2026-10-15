@@ -1,5 +1,6 @@
 """Bounded Jev goals on Hermes's own browser backend."""
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -30,6 +31,27 @@ SCHEMA = {
         "additionalProperties": False,
     },
 }
+
+
+def _publish_activity(result, credentials):
+    try:
+        import httpx
+        from agent.vault_backends.weave import _bearer, _run_context
+
+        page = result.get("browser_page")
+        base = credentials.get("WEAVE_API_URL", "").rstrip("/")
+        if result.get("success") is not True or not isinstance(page, dict) or not base:
+            return
+        bearer = _bearer()
+        if not bearer:
+            return
+        body = {"session_id": _run_context()["session_id"],
+                **{key: page[key] for key in ("target", "url", "title")}}
+        with httpx.Client(timeout=3.0, follow_redirects=False) as client:
+            client.post(base + "/v1/browser/activity", json=body,
+                        headers={"Authorization": f"Bearer {bearer}"})
+    except Exception:  # health: allow BLE001 -- best-effort activity must never change the browser answer
+        logging.getLogger(__name__).warning("Browser activity could not be published")
 
 
 def browse(args, task_id=None, **kwargs):
@@ -88,6 +110,7 @@ def browse(args, task_id=None, **kwargs):
             return json.loads(proc.stdout)
 
         result = run_fenced({"features": {"local": True}}, dispatch) if local else dispatch()
+        _publish_activity(result, credentials)
     except subprocess.TimeoutExpired:
         result = {"success": False, "error_type": "timeout", "error":
                   "Jev exceeded 300 seconds. Inspect the current page before repeating any action."}

@@ -186,14 +186,30 @@ def test_registers_exactly_one_tool():
     assert set(plugin.SCHEMA["parameters"]["properties"]) == {"url", "goal", "expect", "allow_hosts", "target", "text_offset"}
 
 
-def test_handler_routes_existing_engine_and_keeps_credentials_off_argv(monkeypatch):
+@pytest.mark.parametrize("activity_failure", [False, True])
+def test_handler_routes_existing_engine_and_keeps_credentials_off_argv(monkeypatch, activity_failure):
     from agent import redact, secret_scope
+    from gateway.session_api_turn import api_execution
     from tools import browser_use_cli as engine, browser_tool_session
 
     observed = {}
     monkeypatch.setattr(redact, "redact_sensitive_text", lambda value, **kw: value)
-    monkeypatch.setattr(secret_scope, "get_secret", lambda key: {"WEAVE_API_URL": "https://api.test",
-                          "WEAVE_API_MCP_BEARER": "test-bearer", "WEAVE_HERMES_SESSION_ID": "test-session"}.get(key))
+    bearer = "wvc1_" + "V" * 43
+    monkeypatch.setattr(secret_scope, "get_secret", lambda key, *a: {"WEAVE_API_URL": "https://api.test/",
+                          "WEAVE_API_MCP_BEARER": bearer, "WEAVE_HERMES_SESSION_ID": "stale-session"}.get(key))
+
+    def post(request):
+        observed["activity"] = request
+        if activity_failure:
+            raise httpx.ReadTimeout("unreachable")
+        return httpx.Response(200, json={"ok": True})
+
+    client_class = httpx.Client
+    def client(**kwargs):
+        observed["http_options"] = kwargs
+        return client_class(transport=httpx.MockTransport(post), **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", client)
     monkeypatch.setattr(engine, "_code_url_verdict", lambda _: SimpleNamespace(blocked=None, local_sidecar=False))
     monkeypatch.setattr(engine, "_base_subprocess_env", lambda: {"BU_CDP_WS": "ws://cdp.test/", "WEAVE_API_MCP_BEARER": "remove"})
 
@@ -212,15 +228,25 @@ def test_handler_routes_existing_engine_and_keeps_credentials_off_argv(monkeypat
             "target": "A" * 32, "url": "https://example.com/", "title": "Example"}}))
 
     monkeypatch.setattr(engine, "_run_cli_killing_process_group", worker)
-    result = json.loads(plugin.browse({"url": "https://example.com/"}, task_id="task"))
-    assert result["browser_page"]["target"] == "A" * 32
+    token = api_execution.set({"relay_metadata": {"harso_native_v1": {
+        "session_id": "native-session", "run_id": "01990000-0000-7000-8000-000000000001"}}})
+    try:
+        result = json.loads(plugin.browse({"url": "https://example.com/"}, task_id="task"))
+    finally:
+        api_execution.reset(token)
+    assert result == {"success": True, "browser_page": {
+        "target": "A" * 32, "url": "https://example.com/", "title": "Example"}}
+    assert str(observed["activity"].url) == "https://api.test/v1/browser/activity"
+    assert observed["activity"].headers["authorization"] == f"Bearer {bearer}"
+    assert json.loads(observed["activity"].content) == {"session_id": "native-session", **result["browser_page"]}
+    assert observed["http_options"] == {"timeout": 3.0, "follow_redirects": False}
     assert observed["route"] == ("", "task", False)
     assert observed["supervisor"] == "task"
     assert observed["fence"] == {"features": {"local": True}}
     assert observed["env"]["BU_CDP_WS"] == "ws://cdp.test/"
     assert "WEAVE_API_MCP_BEARER" not in observed["env"]
-    assert "test-bearer" not in " ".join(observed["cmd"])
-    assert observed["payload"]["credentials"]["WEAVE_API_MCP_BEARER"] == "test-bearer"
+    assert bearer not in " ".join(observed["cmd"])
+    assert observed["payload"]["credentials"]["WEAVE_API_MCP_BEARER"] == bearer
     assert observed["timeout"] == 300
 
 

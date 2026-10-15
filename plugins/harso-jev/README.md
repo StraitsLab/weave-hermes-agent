@@ -36,31 +36,21 @@ now blocks `browse` while a vault-filled document is reachable. Complete the log
 with native page-blind tools; resume Jev only after a new document clears custody.
 Existing user approvals and restrictions still apply; do not supply secrets in goals.
 
-## Browser-card write: server prerequisite (not implemented)
+## Browser-card write
 
-The existing server has no native page-activity MCP tool/route.
-`ledger_mcp.bem_sprite_mcp` lines 757–769 writes the card only as a side effect of
-executing a legacy remote command. `page_read`, `page_transfer`, and the live-view
-routes cannot accept `{target,url,title}` and are not activity-write APIs. Calling
-legacy `terminal` just to manufacture this side effect would re-run commands on
-the wrong engine and defeat the port. Thus this branch returns `browser_page` but
-**does not yet create the app's chat card row**.
+After each successful page-bearing browse, the plugin best-effort POSTs to
+`/v1/browser/activity` using `WEAVE_API_URL` and the cell's `WEAVE_API_MCP_BEARER`.
+The JSON body is `{session_id,target,url,title}`. The session comes from native
+`harso_native_v1` tool context, not model arguments or a stale environment value.
+The request has a 3-second HTTP timeout, does not follow redirects, and never
+changes the browser answer on a network/server failure or missing native context.
 
-Minimal proposed server addition: `POST /v1/browser/activity`, with cell bearer in
-`Authorization`, `Weave-Hermes-Session` header, and JSON
-`{"page":{"target":"<32 uppercase hex>","url":"https://…","title":"…"}}`.
-Server-side only: resolve bearer owner and session conversation using the same
-`resolve_cell_bem_owner` / `resolve_cell_session_conversation` bindings as
-`bem_sprite_mcp`; verify the page target belongs to that owner's browser computer
-(using the existing target inventory check); validate/bound page fields; call
-`browser_activity.touch` with the bound organization/user/conversation/subject.
-No caller-supplied owner, organization or conversation. `touch` already deduplicates
-by conversation + target and currently does not use turn_id. Return an explicit
-ack/error. Restrict this first version to the cell bearer; attempt/JeV scoped-token
-support requires an explicit matching binding, not relaxed auth. Once available,
-the plugin needs one bounded best-effort POST after each page-bearing result,
-without changing the browser result on network failure. Until then card continuity
-is a known rollout blocker; no fake success flag or nonexistent endpoint call.
+The matching weave-cloud route resolves the cell owner and session conversation,
+refuses targets absent from that owner's BEM open pages, and uses live inventory
+metadata for `browser_activity.touch`. Cards retain conversation + target
+deduplication; `touch` does not use turn_id. No legacy command is replayed and no
+caller-supplied owner, organization or conversation is accepted. Attempt/JeV
+scoped-token callers are not supported by this cell-only seam.
 
 ## Focused verification
 
