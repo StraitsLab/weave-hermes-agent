@@ -511,3 +511,36 @@ def test_a_rewound_sequence_never_reissues_a_lineage_epoch(db):
     row = db.get_messages("child")[0]["id"]
     db._execute_write(lambda c: c.execute("UPDATE messages SET content = 'edited' WHERE id = ?", (row,)))
     assert db.get_transcript_epoch(SID) > public
+
+
+def test_v0221_runtime_ledger_is_retired_on_open(tmp_path):
+    """v0.22.1 left ledger tables plus a guard that refuses session deletion."""
+    path = tmp_path / "state.db"
+    first = SessionDB(path)
+    first.create_session(SID, "test")
+    first.close()
+    raw = sqlite3.connect(str(path))
+    raw.executescript(f"""
+        CREATE TABLE runtime_epoch (singleton INTEGER PRIMARY KEY, epoch INTEGER, instance_id TEXT);
+        CREATE TABLE session_admissions (seq INTEGER PRIMARY KEY,
+            target_session_id TEXT REFERENCES sessions(id) ON DELETE RESTRICT);
+        CREATE TABLE worker_executions (execution_id TEXT PRIMARY KEY,
+            session_id TEXT REFERENCES sessions(id) ON DELETE RESTRICT);
+        CREATE TABLE worker_receipts (execution_id TEXT REFERENCES worker_executions(execution_id) ON DELETE RESTRICT,
+            sequence INTEGER);
+        CREATE TRIGGER sessions_runtime_ledger_delete_guard BEFORE DELETE ON sessions
+        WHEN EXISTS (SELECT 1 FROM session_admissions WHERE target_session_id = old.id)
+        BEGIN SELECT RAISE(ABORT, 'Refused to delete'); END;
+        INSERT INTO session_admissions (target_session_id) VALUES ('{SID}');
+    """)
+    raw.close()
+    reopened = SessionDB(path)
+    try:
+        with reopened._lock:
+            left = reopened._conn.execute(
+                "SELECT name FROM sqlite_master WHERE name IN ('runtime_epoch', 'session_admissions', "
+                "'worker_executions', 'worker_receipts', 'sessions_runtime_ledger_delete_guard')").fetchall()
+        assert left == []
+        assert reopened.delete_session(SID)
+    finally:
+        reopened.close()
