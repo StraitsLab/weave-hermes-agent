@@ -73,7 +73,8 @@ PACKAGES = {
 
 
 def state_dir() -> Path:
-    return get_hermes_home() / "bot-desktop"
+    override = os.environ.get("HERMES_BD_STATE_DIR", "").strip()  # health: allow HX002 -- existing attempt socket path launcher contract
+    return Path(override) if override else get_hermes_home() / "bot-desktop"
 
 
 def is_supported_host() -> bool:

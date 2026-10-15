@@ -323,6 +323,7 @@ class TestEngineOverride:
 
         # We need to mock the file operations too
         with patch("subprocess.Popen", side_effect=capture_popen), \
+             patch("tools.bot_desktop.browser.disable_password_manager"), \
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("os.unlink"), \
@@ -371,6 +372,7 @@ class TestEngineOverride:
         # Return a substantive snapshot so the LP fallback does NOT trigger.
         mock_stdout = '{"success": true, "data": {"snapshot": "- heading \\"Hello\\" [ref=e1]", "refs": {"e1": {}}}}'
         with patch("subprocess.Popen", side_effect=capture_popen), \
+             patch("tools.bot_desktop.browser.disable_password_manager"), \
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("os.unlink"), \
@@ -430,6 +432,7 @@ class TestEngineOverride:
              patch("tools.browser_tool_cdp._get_cdp_override", return_value=""), \
              patch("tools.browser_tool._is_camofox_mode", return_value=False), \
              patch("subprocess.Popen", side_effect=capture_popen), \
+             patch("tools.bot_desktop.browser.disable_password_manager"), \
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("os.unlink"), \

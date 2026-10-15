@@ -754,6 +754,9 @@ def _spawn_and_collect(
                              "for Lightpanda command %s (agent-browser rejects them with --engine lightpanda)",
                              command)
     else:
+        from tools.bot_desktop import browser as desktop_browser
+        browser_env.setdefault("AGENT_BROWSER_PROFILE", os.path.join(task_socket_dir, "profile"))
+        desktop_browser.disable_password_manager(browser_env["AGENT_BROWSER_PROFILE"])
         _apply_chromium_sandbox_args(browser_env)
         # #64867: a local Chromium launch (no --cdp attach) must stay headless on
         # Windows; headed mode is the intentional opt-out (dispatch adds --headed).
@@ -851,6 +854,19 @@ def _dispatch_browser_command(
     # Cleanup stops the supervisor before closing the backend; keep it stopped.
     if command != "close" and session_info.get("cdp_url"):
         _cdp._ensure_cdp_supervisor(task_id)
+    elif command != "close" and args != ["cdp-url"]:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+        from tools.browser_web_bot_auth import request_signer
+
+        supervisor = SUPERVISOR_REGISTRY.get(task_id)
+        if (supervisor is None or not supervisor.snapshot().active) and request_signer() is not None:
+            _, res = _dispatch_browser_command(task_id, session_info, browser_cmd, "get", ["cdp-url"],
+                                               timeout, _engine_override)
+            endpoint = str((res.get("data") or {}).get("cdpUrl") or "") if res.get("success") else ""
+            if endpoint:
+                _cdp._ensure_cdp_supervisor(task_id, _cdp._resolve_cdp_override(endpoint))
+            else:
+                _bt.logger.warning("web bot auth: no local CDP endpoint; requests stay unsigned")
 
     # Every backend runs in this task's own daemon (``--session <name>``); Cloud/CDP adds
     # ``--cdp <ws_url>`` to attach it to the remote browser. Without --session every CDP task

@@ -194,6 +194,9 @@ def test_secret_write_re_admits_after_a_takeover_during_the_code_prompt(monkeypa
     evaluated = []
 
     class Sup:
+        def arm_vault(self):
+            pass  # This lease test supplies a guarded supervisor; custody has its own integration tests.
+
         def evaluate_runtime(self, expr):
             evaluated.append(expr)
             return {"ok": True, "result": "{}"}
