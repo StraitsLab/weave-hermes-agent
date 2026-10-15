@@ -32,7 +32,7 @@ def _shared(task_id):
 
 def protect(*, tool_name, args, next_call, task_id=None, **context):
     """Execution middleware can refuse; upstream request middleware only rewrites arguments."""
-    dangerous = tool_name in {"browser_exec", "browser_vision", "browser_cdp"} or (
+    dangerous = tool_name in {"browse", "browser_exec", "browser_vision", "browser_cdp"} or (
         tool_name == "browser_console" and args.get("expression") is not None)
     if not dangerous:
         return next_call(args)
