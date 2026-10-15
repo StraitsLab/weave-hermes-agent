@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.delegation_context import owned_kanban_task
 from agent.prompt_builder import (
-    DEFAULT_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    DEFAULT_AGENT_IDENTITY, NEUTRAL_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS, KANBAN_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE, PLATFORM_HINTS, SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE, STEER_CHANNEL_NOTE, TASK_COMPLETION_GUIDANCE, TELEGRAM_RICH_MESSAGES_HINT,
@@ -311,7 +311,8 @@ def _skills_prompt(agent: Any) -> str:
     except Exception:
         _compact_cats = frozenset()
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
-                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
+                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent),
+                                         **({} if _engine_identity(agent) else {"engine_identity": False}))
 
 
 def _auto_load_parts(agent: Any) -> list[str]:
@@ -510,7 +511,8 @@ def _timestamp_line(agent: Any) -> str:
         timestamp_line = f"Timezone: {', '.join(_bits)}" if _bits else ""
     trailer = (("Session ID", agent.session_id if agent.pass_session_id else None), ("Model", agent.model),
                ("Provider", agent.provider), ("Platform", agent.platform))
-    return timestamp_line + "".join(f"\n{label}: {value}" for label, value in trailer if value)
+    return timestamp_line + "".join(f"\n{label}: {value}" for label, value in trailer
+                                    if value and (_engine_identity(agent) or label not in {"Model", "Provider"}))
 
 
 def _memory_parts(agent: Any) -> list[str]:
@@ -541,13 +543,22 @@ def _memory_parts(agent: Any) -> list[str]:
     return parts
 
 
+def _engine_identity(agent: Any) -> bool:
+    if hasattr(agent, "_engine_identity"):
+        return agent._engine_identity is not False
+    from hermes_cli.config import load_config_readonly
+    config = load_config_readonly()
+    section = config.get("agent", {}) if isinstance(config, dict) else {}
+    return not (isinstance(section, dict) and section.get("engine_identity") is False)
+
+
 def _identity_parts(agent: Any, ctx_len: Optional[int]) -> tuple[list[str], bool]:
     """SOUL.md (primary identity; cron keeps the persona while skipping cwd
     instructions, scoped to the agent's OWN home) or the default identity.
     Returns ``(parts, soul_loaded)``."""
     wants_soul = agent.load_soul_identity or not agent.skip_context_files
     _soul_content = _pb.load_soul_md(ctx_len, home_override=_agent_home(agent)) if wants_soul else None
-    return ([_soul_content], True) if _soul_content else ([DEFAULT_AGENT_IDENTITY], False)
+    return ([_soul_content], True) if _soul_content else ([DEFAULT_AGENT_IDENTITY if _engine_identity(agent) else NEUTRAL_AGENT_IDENTITY], False)
 
 
 def _guidance_parts(agent: Any) -> list[str]:
@@ -564,7 +575,7 @@ def _guidance_parts(agent: Any) -> list[str]:
     if not agent.valid_tool_names:
         return parts
     # Steering only lands inside tool results, so only reachable with tools.
-    parts.append(STEER_CHANNEL_NOTE)
+    parts.append(STEER_CHANNEL_NOTE if _engine_identity(agent) else STEER_CHANNEL_NOTE.replace("Hermes", "The runtime"))
     # agent.tool_use_enforcement / agent.execution_guidance: "auto" (default)
     # matches the hardcoded model lists; true/false force; a list gives custom
     # model-name substrings.  Execution guidance is an independent gate so
@@ -582,7 +593,7 @@ def _guidance_parts(agent: Any) -> list[str]:
 def _alibaba_identity_part(agent: Any) -> list[str]:
     """Alibaba Coding Plan always reports "glm-4.7" as the model name; inject
     the real identity so the agent can answer correctly."""
-    if agent.provider != "alibaba":
+    if not _engine_identity(agent) or agent.provider != "alibaba":
         return []
     _model_short = agent.model.rsplit("/", 1)[-1]
     return [
@@ -744,12 +755,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # hermes-agent skill installed, so the variant is chosen after the skills
     # index is built; this slot holds its position.
     _help_guidance_slot = len(stable_parts)
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
+    if _engine_identity(agent):
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
     stable_parts.extend(_guidance_parts(agent))
     skills_prompt = _skills_prompt(agent)
     # Skill-pointer variant requires BOTH skill_view AND the hermes-agent skill
     # in the rendered index (pure string check — inherits the index's stability).
-    if "skill_view" in (agent.valid_tool_names or set()) and "- hermes-agent:" in skills_prompt:
+    if _engine_identity(agent) and "skill_view" in (agent.valid_tool_names or set()) and "- hermes-agent:" in skills_prompt:
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
     stable_parts.extend(_alibaba_identity_part(agent))
     # Pinned skills are per-agent constants (resolved once), so they live in the stable prefix.
@@ -757,7 +769,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Coding posture: the operating brief stays in the stable prefix. The
     # environment block contains the current cwd/backend and belongs after
     # project context, not ahead of a large shared AGENTS.md block.
-    environment_hints = _pb.build_environment_hints()
+    environment_hints = _pb.build_environment_hints(**({} if _engine_identity(agent) else {"engine_identity": False}))
     coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = _coding_parts(agent)
     stable_parts.extend(coding_prefix_parts)
     post_workspace_parts = _post_workspace_parts(agent)
@@ -782,7 +794,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     volatile_parts.extend(_plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory"))
     # The profile line names this home's path, so it rides in the volatile tier: the stable
     # prefix then stays byte-identical across every profile (and home) on the host.
-    volatile_parts.append(_active_profile_line(agent))
+    if _engine_identity(agent):
+        volatile_parts.append(_active_profile_line(agent))
     volatile_parts.append(_timestamp_line(agent))
     # Keep the renderer-owned runtime anchor after all user/plugin prose so quoted
     # host examples cannot shadow it during persisted-prompt validation.

@@ -82,7 +82,7 @@ def _locate_memory(node_id: str) -> tuple[Path, list[str], int]:
     return path, chunks, local
 
 
-def _mutate_memory(node_id: str, replacement: str | None) -> dict[str, Any]:
+def _mutate_memory(node_id: str, replacement: str | None, *, memory_manager=None, operation_id=None) -> dict[str, Any]:
     """Replace (or, with ``replacement=None``, remove) the entry *node_id* names, through
     ``MemoryStore._mutate`` — the memory tool's cross-process lock, re-read under lock and
     drift guard (``.bak`` snapshot + refusal when the file wouldn't round-trip). The file is
@@ -113,7 +113,39 @@ def _mutate_memory(node_id: str, replacement: str | None) -> dict[str, Any]:
                     "error": f"Replacement would put memory at {total:,}/{limit:,} chars. Shorten the new content."}
         return new_entries, message
 
-    result = load_on_disk_store()._mutate(_STORE_TARGETS[source], _apply)
+    store = load_on_disk_store()
+    owned_manager = False
+    if memory_manager is None:
+        from plugins.memory import _get_active_memory_provider
+        if _get_active_memory_provider() == "harso":
+            from agent.memory_manager import configured_memory_manager
+            memory_manager = configured_memory_manager()
+            owned_manager = True
+    if memory_manager is None:
+        result = store._mutate(_STORE_TARGETS[source], _apply)
+    else:
+        # Name the whole entry, then re-resolve it under the upstream store lock.
+        _, chunks, local = _locate_memory(node_id)
+        old_text = chunks[local].strip()
+        def writer():
+            import time
+            def checked_apply(entries, limit):
+                _, current, index = _locate_memory(node_id)
+                if current[index].strip() != old_text:
+                    return {"success": False, "error": "native_mutation_conflict"}
+                return _apply(entries, limit)
+            result = store._mutate(_STORE_TARGETS[source], checked_apply)
+            if result.get("success"):
+                result["revision"] = time.time_ns() // 1000
+            return result
+        from agent.harso_memory_ids import new_operation_id
+        try:
+            result = memory_manager.commit_native_mutation(
+                operation_id or new_operation_id(), "remove" if replacement is None else "patch",
+                _STORE_TARGETS[source], old_text if replacement is None else replacement, writer, old_text=old_text)
+        finally:
+            if owned_manager:
+                memory_manager.shutdown_all()
     if not result.get("success"):
         return {"ok": False, "message": result.get("error", f"{name} write failed")}
     return {"ok": True, "message": message}
@@ -161,8 +193,9 @@ def _skill_detail(node_id: str) -> dict[str, Any]:
 
 # ── Delete ──────────────────────────────────────────────────────────────────
 
-def delete_node(node_id: str) -> dict[str, Any]:
-    return _dispatch(node_id, _delete_memory, _delete_skill)
+def delete_node(node_id: str, *, memory_manager=None, operation_id=None) -> dict[str, Any]:
+    return _dispatch(node_id, lambda node: _mutate_memory(
+        node, None, memory_manager=memory_manager, operation_id=operation_id), _delete_skill)
 
 
 def _delete_skill(name: str) -> dict[str, Any]:
@@ -186,8 +219,9 @@ def _delete_memory(node_id: str) -> dict[str, Any]:
 
 # ── Edit ────────────────────────────────────────────────────────────────────
 
-def edit_node(node_id: str, content: str) -> dict[str, Any]:
-    return _dispatch(node_id, _edit_memory, _edit_skill, content)
+def edit_node(node_id: str, content: str, *, memory_manager=None, operation_id=None) -> dict[str, Any]:
+    return _dispatch(node_id, lambda node, text: _edit_memory(
+        node, text, memory_manager=memory_manager, operation_id=operation_id), _edit_skill, content)
 
 
 def _edit_skill(name: str, content: str) -> dict[str, Any]:
@@ -199,9 +233,9 @@ def _edit_skill(name: str, content: str) -> dict[str, Any]:
     return {"ok": False, "message": result.get("error", "edit failed")}
 
 
-def _edit_memory(node_id: str, content: str) -> dict[str, Any]:
+def _edit_memory(node_id: str, content: str, *, memory_manager=None, operation_id=None) -> dict[str, Any]:
     _parse_memory_id(node_id)  # id errors win over the empty-body message
     body = content.strip()
     if not body:
         return {"ok": False, "message": "empty memory — use delete to remove it"}
-    return _mutate_memory(node_id, body)
+    return _mutate_memory(node_id, body, memory_manager=memory_manager, operation_id=operation_id)
