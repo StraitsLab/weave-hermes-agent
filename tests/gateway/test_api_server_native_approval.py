@@ -185,7 +185,7 @@ async def test_always_and_session_are_refused_and_nothing_is_persisted(adapter, 
     saved = []
     monkeypatch.setattr(ap, "save_permanent_allowlist", lambda *a: saved.append(a))
     await adapter._on_native_submit_started(_event(), SESSION_KEY)
-    thread, outcome = _start_gate(adapter, asyncio.get_running_loop())
+    thread, _outcome = _start_gate(adapter, asyncio.get_running_loop())
     request_id = await _pending_request_id(adapter)
     client = await _client(adapter)
     try:
@@ -327,7 +327,7 @@ async def test_outer_admission_cannot_list_or_resolve_its_followups_approval(ada
 
 @pytest.mark.asyncio
 async def test_card_force_redacts_secrets_when_global_redaction_is_off(adapter, monkeypatch):
-    import agent.redact as redact
+    from agent import redact
 
     monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
     secret = "ghp_" + "A1b2C3d4E5" * 4  # synthetic, credential-shaped

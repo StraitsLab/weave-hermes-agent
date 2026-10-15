@@ -72,13 +72,3 @@ async def test_changed_revision_waits_for_owning_refresh_and_never_overlaps(monk
     assert count==1 and revisions.applied is None
     release.set();await revisions.task
     assert revisions.applied=="b"*64 and count==2 and maximum==1
-
-
-@pytest.fixture(autouse=True)
-def _native_test_store_selection(monkeypatch):
-    # v0.22 selects runtime-owned stores before explicit adapter overrides.
-    from gateway.platforms import api_server_store
-    original = api_server_store.selected_session_db
-    def selected(adapter, home):
-        return adapter._session_db if adapter._session_db is not None else original(adapter, home)
-    monkeypatch.setattr(api_server_store, "selected_session_db", selected)

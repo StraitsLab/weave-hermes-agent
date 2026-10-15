@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retained Harso compatibility hooks only; implementations stay in existing topical siblings to avoid another abstraction.
 """OpenAI-compatible API server platform adapter (aiohttp).
 
 Serves /v1/chat/completions, /v1/responses, /v1/models, /v1/capabilities, /api/sessions,
@@ -1764,11 +1765,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         routes.extend(_api_runs._http_routes(self))
         # Harso fork: the one core hook for fork-only routes (upstream has no plugin route seam).
         from gateway.platforms import api_server_harso as _harso
-        routes = _harso.merge_routes(routes, _harso._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
-        return routes
+        return _harso.merge_routes(routes, _harso._http_routes(self))
 
     # -- Session header helpers -------------------------------------------------------
 

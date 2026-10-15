@@ -116,7 +116,7 @@ class _McpStub:
         self.shutdown_calls += 1
 
     def discover(self):
-        import tools.mcp_tool as mcp_tool
+        from tools import mcp_tool
 
         with mcp_tool._lock:
             mcp_tool._servers.clear()

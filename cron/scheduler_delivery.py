@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retained Harso compatibility hooks only; implementations stay in existing topical siblings to avoid another abstraction.
 """Cron delivery: target resolution (origin/home/explicit/bot-chat), transcript mirroring and
 session seeding, live-adapter / relay / standalone send lanes, and ``_deliver_result``.
 

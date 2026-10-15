@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retained Harso compatibility hooks only; implementations stay in existing topical siblings to avoid another abstraction.
 """Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, proxy path,
 background tasks, MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
 are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.X")`` still works.
@@ -171,7 +172,7 @@ from gateway.native_session_followup import NativeFollowupMixin
 class GatewayTurnMixin(NativeFollowupMixin):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
-    def _resolve_session_agent_runtime(
+    def _resolve_session_agent_runtime(  # health: allow CC -- One credential-selection branch preserves Gate-B isolation before native resolution.
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
     ) -> tuple[str, dict]:

@@ -21,6 +21,17 @@ async def test_capabilities_advertise_native_consumer_contract(monkeypatch):
     assert data['features']['hub_revision_submit'] is True
 
 
+def test_cron_routes_use_retained_handlers():
+    from functools import partial
+    from gateway.platforms import api_server_harso_cron as cron
+    routes = _make_adapter()._http_route_table()
+    for method, path, expected in cron._http_routes(_make_adapter()):
+        matches = [handler for m, p, handler in routes if (m, p) == (method, path)]
+        assert len(matches) == 1
+        assert isinstance(matches[0], partial)
+        assert matches[0].func is expected.func
+
+
 def test_safe_fork_replaces_native_route():
     adapter = _make_adapter()
     routes = adapter._http_route_table()

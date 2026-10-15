@@ -1023,6 +1023,7 @@ class SessionMessagesMixin:
             # on_missing="raise": never commit against a vanished session row (caller keeps the original).
             patched_model_config = self._merge_model_config_json(
                 conn, session_id, model_config_patch, on_missing="raise") if patch else None
+            self._bump_transcript_epoch(conn, session_id)
             proved = self._proved_coverage(conn, session_id, covered_ids, unresolved_held, watermark)
             if proved is not None:
                 return self._archive_named_rows(
@@ -1598,13 +1599,11 @@ class SessionMessagesMixin:
             # The durable identity is part of the message, like ``timestamp``: restored on EVERY projection
             # (ACP, gateway, CLI, TUI, compression adoption), never opt-in like ``_row_id``.
             _restore_identity_columns(row, msg)
-            if row["api_content"]:
-                msg["api_content"] = row["api_content"]
-            if row["display_kind"] != "passive_append" or include_passive_metadata:
-                if row["display_kind"]:
-                    msg["display_kind"] = row["display_kind"]
-                if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
-                    msg["display_metadata"] = decoded
+            msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
+            if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
+                msg["display_metadata"] = decoded
+            from hermes_state_harso import strip_passive_metadata
+            strip_passive_metadata(msg, include_passive_metadata)
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
             msg.update(

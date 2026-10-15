@@ -29,9 +29,8 @@ def _make_adapter() -> APIServerAdapter:
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app["api_server_adapter"] = adapter
-    from functools import partial
-    from gateway.platforms.api_server_harso_cron import _handle_cron_fire
-    app.router.add_post("/api/cron/fire", partial(_handle_cron_fire, adapter))
+    handler = next(h for m, p, h in adapter._http_route_table() if (m, p) == ("POST", "/api/cron/fire"))
+    app.router.add_post("/api/cron/fire", handler)
     return app
 
 

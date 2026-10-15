@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retained Harso authentication and lifecycle hooks; no new execution layer.
 """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner.
 
 Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.

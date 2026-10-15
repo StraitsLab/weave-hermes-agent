@@ -55,8 +55,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app with jobs routes registered."""
     app = web.Application(middlewares=[cors_middleware])
     app["api_server_adapter"] = adapter
-    from gateway.platforms.api_server_harso_cron import merge_routes, _http_routes
-    for method, path, handler in merge_routes(adapter._http_route_table(), _http_routes(adapter)):
+    for method, path, handler in adapter._http_route_table():
         app.router.add_route(method, path, handler)
     return app
 

@@ -37,6 +37,35 @@ def mark_result(event, result):
         event.metadata['native_submit_failed'] = True
 
 
+def wire_tools(agent, adapter, session_key):
+    native_start = getattr(adapter, '_native_submit_tool_started', None)
+    native_complete = getattr(adapter, '_native_submit_tool_completed', None)
+    previous_start, previous_complete = agent.tool_start_callback, agent.tool_complete_callback
+    if callable(native_start):
+        def start(call_id, name, args):
+            if previous_start:
+                previous_start(call_id, name, args)
+            native_start(session_key, call_id, name)
+        agent.tool_start_callback = start
+    if callable(native_complete):
+        def complete(call_id, name, args, result):
+            if previous_complete:
+                previous_complete(call_id, name, args, result)
+            native_complete(session_key, call_id, name, result)
+        agent.tool_complete_callback = complete
+
+
+def wire_delta(adapter, session_key, previous):
+    native = getattr(adapter, '_native_submit_delta', None)
+    if not callable(native):
+        return previous
+    def delta(text):
+        if previous is not None:
+            previous(text)
+        native(session_key, text)
+    return delta
+
+
 def failed_result(result):
     return isinstance(result, dict) and bool(
         result.get('failed') or result.get('error') or result.get('interrupted')

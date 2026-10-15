@@ -162,7 +162,7 @@ class NativeSessionAPI:
                 while not wake.is_set():
                     try:
                         await asyncio.wait_for(wake.wait(), timeout=CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         await response.write(b": keepalive\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             pass

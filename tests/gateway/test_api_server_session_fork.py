@@ -1,7 +1,7 @@
 """Authenticated native safe-fork REST behavior."""
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 import threading
 
 import pytest
@@ -42,7 +42,7 @@ def setup(tmp_path, monkeypatch):
     db = runner._session_db._db
     db.create_session(PREDECESSOR, "api_server")
     db.append_message(PREDECESSOR, "user", "secret-free transcript")
-    expires = datetime.now(timezone.utc) + timedelta(minutes=5)
+    expires = datetime.now(UTC) + timedelta(minutes=5)
     assert runner.bind_session_credential(_source(), PREDECESSOR, "bearer-must-not-escape", expires, "route-a")
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-safe-fork-test"}))
     adapter._session_db = db
@@ -261,7 +261,7 @@ async def test_successor_can_bind_and_submit_while_predecessor_is_denied(setup, 
     credential = {
         "credential_slot": "GATE_B_API_KEY",
         "bearer": "successor-only-bearer",
-        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
         "provider_route_revision_id": "route-b",
     }
     submit = {

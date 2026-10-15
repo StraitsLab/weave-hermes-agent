@@ -3,7 +3,7 @@
 import asyncio
 import hashlib
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -872,7 +872,7 @@ async def _bind_internal_gateway(gateway):
                            chat_type="dm", user_id="api_server", user_name="API server")
     assert gateway.runner.bind_session_credential(
         source, SESSION_ID, "local-provider-key",
-        datetime.now(timezone.utc) + timedelta(minutes=5), "local-route")
+        datetime.now(UTC) + timedelta(minutes=5), "local-route")
     return gateway.runner.session_store._generate_session_key(source)
 
 
@@ -884,9 +884,8 @@ async def _submit_internal_gateway(gateway, request_id, message="Work result", *
 
 
 async def _wait_native_terminal(gateway, ref):
-    async with asyncio.timeout(20):
-        while ref not in gateway.adapter._native_submit_terminals:
-            await asyncio.sleep(0.01)
+    from tests.waiting import async_wait_until
+    await async_wait_until(lambda: ref in gateway.adapter._native_submit_terminals, timeout=20)
     rows = [row for row in gateway.db.get_messages(SESSION_ID) if row["role"] in {"user", "assistant"}]
     assert any(row["role"] == "assistant" for row in rows), rows
     return rows
@@ -932,9 +931,9 @@ async def test_internal_busy_submit_is_fifo_not_steer_or_interrupt(internal_gate
     await asyncio.wait_for(gateway.started.wait(), timeout=10)
     # Agent publication is asynchronous; the provider can be reached before
     # the gateway tracking task replaces its startup sentinel.
-    async with asyncio.timeout(10):
-        while (agent := gateway.adapter._native_submit_running_agent(gateway.runner, key)) is None:
-            await asyncio.sleep(0.01)
+    from tests.waiting import async_wait_until
+    await async_wait_until(lambda: gateway.adapter._native_submit_running_agent(gateway.runner, key) is not None, timeout=10)
+    agent = gateway.adapter._native_submit_running_agent(gateway.runner, key)
     receipts = []
     for index in range(2):
         status, receipt = await _submit_internal_gateway(
@@ -985,9 +984,8 @@ async def test_internal_submit_identical_retry_runs_one_real_turn(internal_gatew
 
 
 async def _wait_gateway_idle(gateway):
-    async with asyncio.timeout(20):
-        while gateway.adapter._background_tasks:
-            await asyncio.sleep(0.01)
+    from tests.waiting import async_wait_until
+    await async_wait_until(lambda: not gateway.adapter._background_tasks, timeout=20)
     return [row for row in gateway.db.get_messages(SESSION_ID)
             if row["role"] in {"user", "assistant"}]
 

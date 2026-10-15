@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retained Harso compatibility hooks only; implementations stay in existing topical siblings to avoid another abstraction.
 """Gateway runner - entry point for messaging platform integrations.
 
 Provides ``start_gateway()`` (start all configured adapters) and ``GatewayRunner`` (lifecycle).

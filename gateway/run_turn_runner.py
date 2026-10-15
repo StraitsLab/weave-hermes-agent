@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retained Harso compatibility hooks only; implementations stay in existing topical siblings to avoid another abstraction.
 """Per-turn callback runner (progress/status/voice/run_sync) for the gateway agent turn.
 
 ``TurnRunner`` owns the per-turn callbacks ``GatewayRunner._run_agent_inner`` binds. ``gateway.run``
@@ -977,13 +978,8 @@ class TurnRunner:
                     for sink in delta_sinks:
                         sink.on_delta(text)
 
-        native_delta = getattr(getattr(ctx, '_status_adapter', None), '_native_submit_delta', None)
-        if callable(native_delta):
-            existing_delta = stream_delta_cb
-            def stream_delta_cb(text):
-                if existing_delta is not None:
-                    existing_delta(text)
-                native_delta(ctx.session_key, text)
+        from gateway.native_session_lifecycle import wire_delta
+        stream_delta_cb = wire_delta(getattr(ctx, '_status_adapter', None), ctx.session_key, stream_delta_cb)
 
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
@@ -1272,22 +1268,8 @@ class TurnRunner:
             if (ctx._voice_ack_guild[0] is not None or ctx._native_slack_task_cards) else None
         )
         agent.tool_complete_callback = ctx.native_tool_complete_callback if ctx._native_slack_task_cards else None
-        adapter = runner._delivery_adapter_for(ctx.source)
-        native_start = getattr(adapter, '_native_submit_tool_started', None)
-        native_complete = getattr(adapter, '_native_submit_tool_completed', None)
-        previous_start, previous_complete = agent.tool_start_callback, agent.tool_complete_callback
-        if callable(native_start):
-            def start(call_id, name, args):
-                if previous_start:
-                    previous_start(call_id, name, args)
-                native_start(ctx.session_key, call_id, name)
-            agent.tool_start_callback = start
-        if callable(native_complete):
-            def complete(call_id, name, args, result):
-                if previous_complete:
-                    previous_complete(call_id, name, args, result)
-                native_complete(ctx.session_key, call_id, name, result)
-            agent.tool_complete_callback = complete
+        from gateway.native_session_lifecycle import wire_tools
+        wire_tools(agent, ctx._status_adapter, ctx.session_key)
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None

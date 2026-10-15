@@ -2,7 +2,7 @@
 
 import asyncio
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,7 +23,7 @@ BEARER = "test-bearer-never-log"
 
 
 def _expiry() -> str:
-    return (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat().replace(
+    return (datetime.now(UTC) + timedelta(minutes=5)).isoformat().replace(
         "+00:00", "Z"
     )
 
@@ -75,7 +75,7 @@ def adapter_and_runner(tmp_path, monkeypatch):
 @pytest.fixture
 def gate_b_agent(adapter_and_runner, tmp_path, monkeypatch):
     """Real provider selection and bind/run plumbing; stop at the LLM boundary."""
-    import yaml
+    import hermes_yaml as yaml
     import run_agent
 
     adapter, runner = adapter_and_runner
@@ -125,7 +125,7 @@ async def _finished_run(client, adapter, *, prefix="", **body):
 
 @pytest.mark.asyncio
 async def test_gate_b_run_uses_bound_callable_not_ambient_key(gate_b_agent):
-    adapter, runner, constructor = gate_b_agent
+    adapter, _runner, constructor = gate_b_agent
     client = await _client(adapter)
     headers = {"Authorization": f"Bearer {adapter.config.extra['key']}"}
     try:
@@ -155,7 +155,7 @@ async def test_gate_b_run_refuses_unusable_binding(gate_b_agent, state):
         user_id="api_server", user_name="API server",
     )
     if state != "missing":
-        expires = datetime.now(timezone.utc) + timedelta(minutes=5)
+        expires = datetime.now(UTC) + timedelta(minutes=5)
         if state == "expired":
             expires -= timedelta(minutes=10)
         assert runner.bind_session_credential(source, SESSION_ID, BEARER, expires, "revision")
@@ -182,7 +182,7 @@ async def test_gate_b_run_refuses_unusable_binding(gate_b_agent, state):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("update", ["refresh", "revoke", "expire"])
 async def test_gate_b_run_holder_refresh_and_revoke_are_live(gate_b_agent, update):
-    adapter, runner, constructor = gate_b_agent
+    adapter, _runner, constructor = gate_b_agent
     entered, proceed = threading.Event(), threading.Event()
     observed = []
 
@@ -215,7 +215,7 @@ async def test_gate_b_run_holder_refresh_and_revoke_are_live(gate_b_agent, updat
                 f"/api/sessions/{SESSION_ID}", headers=headers, json={"end_reason": "closed"},
             )).status == 200
         else:
-            assert holder.refresh(BEARER, datetime.now(timezone.utc) - timedelta(seconds=1))
+            assert holder.refresh(BEARER, datetime.now(UTC) - timedelta(seconds=1))
         proceed.set()
         result = await task
         if update == "refresh":
@@ -311,7 +311,7 @@ def test_gate_b_create_agent_refuses_route_escape(gate_b_agent, selection):
     adapter, runner, constructor = gate_b_agent
     source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm")
     assert runner.bind_session_credential(
-        source, SESSION_ID, BEARER, datetime.now(timezone.utc) + timedelta(minutes=5), "revision",
+        source, SESSION_ID, BEARER, datetime.now(UTC) + timedelta(minutes=5), "revision",
     )
     with pytest.raises(_ProviderAuthResolutionError, match="route mismatch"):
         adapter._create_agent(session_id=SESSION_ID, **selection)
@@ -322,7 +322,7 @@ def test_gate_b_create_agent_preserves_route_and_has_no_ambient_dependency(gate_
     adapter, runner, constructor = gate_b_agent
     source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm")
     assert runner.bind_session_credential(
-        source, SESSION_ID, BEARER, datetime.now(timezone.utc) + timedelta(minutes=5), "revision",
+        source, SESSION_ID, BEARER, datetime.now(UTC) + timedelta(minutes=5), "revision",
     )
     monkeypatch.delenv("GATE_B_API_KEY", raising=False)
     ambient = MagicMock(side_effect=RuntimeError("ambient resolution must not run"))
@@ -343,7 +343,7 @@ def test_non_gate_b_create_agent_keeps_upstream_credentials_and_fallback(gate_b_
     adapter, runner, constructor = gate_b_agent
     source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm")
     assert runner.bind_session_credential(
-        source, SESSION_ID, BEARER, datetime.now(timezone.utc) + timedelta(minutes=5), "revision",
+        source, SESSION_ID, BEARER, datetime.now(UTC) + timedelta(minutes=5), "revision",
     )
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"model": {"provider": "stock"}})
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {
@@ -364,7 +364,7 @@ def test_gate_b_create_agent_does_not_recover_an_unpinned_model(gate_b_agent, mo
     adapter, runner, constructor = gate_b_agent
     source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm")
     assert runner.bind_session_credential(
-        source, SESSION_ID, BEARER, datetime.now(timezone.utc) + timedelta(minutes=5), "revision",
+        source, SESSION_ID, BEARER, datetime.now(UTC) + timedelta(minutes=5), "revision",
     )
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: "")
     adapter._last_resolved_model["*"] = "another-sessions-model"
