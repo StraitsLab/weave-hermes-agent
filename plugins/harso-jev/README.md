@@ -14,8 +14,9 @@ an owned **new window** in that browser (`Target.createTarget` with `newWindow: 
 The harness's current tab is switched too, so subsequent native browser tools can
 continue there. Tabs remain open; the worker detaches its own CDP session.
 
-Required profile secrets/context: `WEAVE_API_URL`, `WEAVE_API_MCP_BEARER`, and
-`WEAVE_HERMES_SESSION_ID` for cell/attempt bearers. Model routes remain
+Required profile secrets: `WEAVE_API_URL` and `WEAVE_API_MCP_BEARER`. The chat
+session comes from the native run context of the current turn; outside a Harso app
+turn, `browse` is refused. Model routes remain
 `/v1/jev/systemone` and `/v1/jev/text/chat/completions`; the session header is sent
 only to the latter. Credentials enter the worker via stdin, not command-line args
 or the harness daemon's environment. `TYPESAFE_MODEL` and `TEXT_MODEL` retain the

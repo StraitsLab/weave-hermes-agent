@@ -247,7 +247,17 @@ def test_handler_routes_existing_engine_and_keeps_credentials_off_argv(monkeypat
     assert "WEAVE_API_MCP_BEARER" not in observed["env"]
     assert bearer not in " ".join(observed["cmd"])
     assert observed["payload"]["credentials"]["WEAVE_API_MCP_BEARER"] == bearer
+    assert observed["payload"]["credentials"]["WEAVE_HERMES_SESSION_ID"] == "native-session"  # never the static secret
     assert observed["timeout"] == 300
+
+
+def test_browse_outside_a_native_turn_is_refused(monkeypatch):
+    from tools import browser_use_cli as engine
+    monkeypatch.setattr(engine, "_code_url_verdict", lambda _: SimpleNamespace(blocked=None, local_sidecar=False))
+    monkeypatch.setattr(engine, "_base_subprocess_env", lambda: {"BU_CDP_WS": "ws://cdp.test/"})
+    monkeypatch.setattr(engine, "_route_backend", lambda *a, **kw: None)
+    monkeypatch.setattr(engine, "_run_cli_killing_process_group", lambda *a, **kw: pytest.fail("worker started"))
+    assert not json.loads(plugin.browse({"url": "https://example.com/"}, task_id="task"))["success"]
 
 
 @pytest.mark.parametrize("args", [{"url": "http://example.com"}, {"url": "https://user:pass@example.com"},

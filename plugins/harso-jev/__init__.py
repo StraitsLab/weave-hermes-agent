@@ -91,9 +91,11 @@ def browse(args, task_id=None, **kwargs):
         env.pop(engine._PRIVATE_BROWSER_SENTINEL, None)
         # Credentials travel only over the worker's stdin, never argv or the harness daemon's env.
         credentials = {key: get_secret(key) or "" for key in (
-            "WEAVE_API_URL", "WEAVE_API_MCP_BEARER", "WEAVE_HERMES_SESSION_ID",
-            "TYPESAFE_MODEL", "TEXT_MODEL",
+            "WEAVE_API_URL", "WEAVE_API_MCP_BEARER", "TYPESAFE_MODEL", "TEXT_MODEL",
         )}
+        # The active chat's session comes from the native run context, never config or model arguments.
+        from agent.vault_backends.weave import _run_context
+        credentials["WEAVE_HERMES_SESSION_ID"] = _run_context()["session_id"]
         payload = json.dumps({"args": args, "credentials": credentials})
         for key in ("WEAVE_API_MCP_BEARER", "TYPESAFE_API_KEY", "TEXT_MODEL_API_KEY"):
             env.pop(key, None)
