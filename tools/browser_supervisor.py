@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
 
     from tools.browser_supervisor_capture import CapturedCDP
+from tools.browser_supervisor_signing import RequestSigningMixin, _is_dialog_bridge
+from tools.browser_web_bot_auth import request_signer
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,12 @@ logger = logging.getLogger(__name__)
 # once its process exits; leave enough room for the former without leaking a
 # supervisor thread and warnings forever for the latter.
 MAX_POST_ATTACH_RECONNECT_FAILURES = 5
+
+
+def _pick_page_target(targets):
+    pages = [target for target in targets if target.get("type") == "page"]
+    return next((target for target in reversed(pages) if not target.get("url", "").startswith(
+        ("chrome://", "chrome-untrusted://", "devtools://"))), pages[0] if pages else None)
 
 
 def _redact_cdp_error_text(exc: object) -> str:
@@ -95,20 +103,28 @@ class SupervisorSnapshot:
         return out
 
 
-class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
+from tools.harso_vault_guard import VaultGuardMixin
+
+
+class CDPSupervisor(VaultGuardMixin, RequestSigningMixin, DialogSupervisionMixin, FrameTrackingMixin):
     """One supervisor per (task_id, cdp_url) pair. ``start()`` spawns a daemon thread
     running its own asyncio loop, connects, attaches to the first page target, enables
     domains and auto-attach. ``snapshot()`` / ``respond_to_dialog()`` / ``evaluate_runtime()``
     are sync, thread-safe bridges onto that loop; all CDP I/O lives on the loop."""
 
     def __init__(self, task_id: str, cdp_url: str, *, dialog_policy: str = DEFAULT_DIALOG_POLICY,
-                 dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S) -> None:
+                 dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, request_signer: Any = None) -> None:
         if dialog_policy not in _VALID_POLICIES:
             raise ValueError(f"Invalid dialog_policy {dialog_policy!r}; must be one of {sorted(_VALID_POLICIES)}")
         self.task_id = task_id
         self.cdp_url = cdp_url
         self.dialog_policy = dialog_policy
         self.dialog_timeout_s = float(dialog_timeout_s)
+        self.request_signer = request_signer
+        self._root_interception_applied = False
+        self._bridge_rebind_pending = False
+        self._signing_tasks: set[asyncio.Task] = set()
+        self._signing_sessions: set[str] = set()
 
         # State protected by ``_state_lock`` for cross-thread reads.
         self._state_lock = threading.Lock()
@@ -398,6 +414,9 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 # are deliberately kept — they reconcile as fresh events arrive (worst case a
                 # stale dialog entry is rejected with "no dialog is showing", logged only).
                 self._page_session_id = None
+                self._signing_sessions.clear()
+                self._root_interception_applied = False
+                self._bridge_rebind_pending = False
                 await self._attach_initial_page()
                 self._set_active(True)
                 last_success_at = time.time()
@@ -420,6 +439,11 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                     reader_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await reader_task
+                for task in self._signing_tasks:
+                    task.cancel()
+                if self._signing_tasks:
+                    await asyncio.gather(*self._signing_tasks, return_exceptions=True)
+                self._signing_tasks.clear()
                 for handle in self._dialog_watchdogs.values():
                     handle.cancel()
                 self._dialog_watchdogs.clear()
@@ -440,13 +464,19 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
     async def _attach_initial_page(self) -> None:
         """Find (or create) a page target, attach flattened, enable domains, install dialog bridge."""
         targets = (await self._cdp("Target.getTargets")).get("result", {}).get("targetInfos", [])
-        page_target = next((t for t in targets if t.get("type") == "page"), None)
+        page_target = _pick_page_target(targets)
         if page_target is None:
             page_target = (await self._cdp("Target.createTarget", {"url": "about:blank"}))["result"]
         attach = await self._cdp("Target.attachToTarget", {"targetId": page_target["targetId"], "flatten": True})
         self._page_session_id = sid = attach["result"]["sessionId"]
         await self._enable_page_domains(sid, timeout=10.0)
         await self._install_dialog_bridge(sid)
+        if self.request_signer is not None:
+            try:
+                await self._apply_request_interception()
+            except Exception as exc:  # health: allow BLE001 -- initial CDP signing failure stays retryable without logging request secrets
+                logger.warning("web bot auth: request interception failed (%s); retried at next command",
+                               type(exc).__name__)
 
     async def _cdp(self, method: str, params: Optional[dict[str, Any]] = None, *,
                    session_id: Optional[str] = None, timeout: Optional[float] = 10.0) -> dict[str, Any]:
@@ -494,8 +524,17 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
     # CDP event → handler(self, params, session_id). Async handlers return an
     # awaitable that ``_read_loop`` awaits; sync handlers return None.
     _EVENT_HANDLERS: dict[str, Callable[..., Any]] = {
-        **DialogSupervisionMixin.EVENT_HANDLERS, **FrameTrackingMixin.EVENT_HANDLERS
+        **DialogSupervisionMixin.EVENT_HANDLERS, **FrameTrackingMixin.EVENT_HANDLERS,
+        "Page.frameNavigated": VaultGuardMixin._on_vault_frame_navigated,
+        "Fetch.requestPaused": RequestSigningMixin._on_fetch_paused,
+        "Target.detachedFromTarget": RequestSigningMixin._on_target_detached,
     }
+
+
+def _reconcile_request_signer(supervisor):
+    # Never wait on a coroutine from its own loop thread.
+    if threading.current_thread() is not supervisor._thread:
+        supervisor.set_request_signer(request_signer())
 
 
 class _SupervisorRegistry:
@@ -507,7 +546,10 @@ class _SupervisorRegistry:
 
     def get(self, task_id: str) -> Optional[CDPSupervisor]:
         with self._lock:
-            return self._by_task.get(task_id)
+            supervisor = self._by_task.get(task_id)
+        if supervisor is not None:
+            _reconcile_request_signer(supervisor)
+        return supervisor
 
     def _pop(self, task_id: str) -> Optional[CDPSupervisor]:
         with self._lock:
@@ -526,17 +568,22 @@ class _SupervisorRegistry:
         different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced."""
         with self._lock:
             existing = self._by_task.get(task_id)
+            healthy = False
             if existing is not None:
                 thread, loop = existing._thread, existing._loop
-                healthy = thread is not None and thread.is_alive() and loop is not None and loop.is_running()
-                if existing.cdp_url == cdp_url and healthy:
-                    return existing
-                self._by_task.pop(task_id, None)
+                healthy = (existing.cdp_url == cdp_url and thread is not None and thread.is_alive()
+                           and loop is not None and loop.is_running())
+                if not healthy:
+                    self._by_task.pop(task_id, None)
+        if healthy:
+            _reconcile_request_signer(existing)
+            return existing
         if existing is not None:
             existing.stop()
 
         supervisor = CDPSupervisor(task_id=task_id, cdp_url=cdp_url,
-                                   dialog_policy=dialog_policy, dialog_timeout_s=dialog_timeout_s)
+                                   dialog_policy=dialog_policy, dialog_timeout_s=dialog_timeout_s,
+                                   request_signer=request_signer())
         supervisor.start(timeout=start_timeout)
         with self._lock:
             # Guard against a concurrent get_or_start from another thread.

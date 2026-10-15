@@ -31,7 +31,68 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # shutdown_all() drain bound; workers are daemon threads so a wedged provider never
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
-_EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+_EXTERNAL_PREFETCH_TIMEOUT_S = 1.0
+_EXTERNAL_PREFETCH_TIMEOUT_MAX_S = 30.0
+
+def _valid_prefetch_timeout(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if 0 < value <= _EXTERNAL_PREFETCH_TIMEOUT_MAX_S else None
+
+
+def configured_external_prefetch_timeout(config: Any) -> float:
+    """Validated ``memory.external_prefetch_timeout`` from a loaded config.
+
+    Missing keeps the default; an invalid value (non-numeric, non-finite,
+    <= 0 or above the ceiling) also falls back to the default, loudly.
+    """
+    section = config.get("memory") if isinstance(config, dict) else None
+    raw = section.get("external_prefetch_timeout") if isinstance(section, dict) else None
+    if raw is None:
+        return _EXTERNAL_PREFETCH_TIMEOUT_S
+    value = _valid_prefetch_timeout(raw)
+    if value is None:
+        logger.warning(
+            "memory.external_prefetch_timeout must be a number in (0, %.0f]; using %.1fs",
+            _EXTERNAL_PREFETCH_TIMEOUT_MAX_S, _EXTERNAL_PREFETCH_TIMEOUT_S,
+        )
+        return _EXTERNAL_PREFETCH_TIMEOUT_S
+    return value
+
+
+def configured_memory_manager(
+    *, native_journal=None, session_id: str = "", platform: str = "cli"
+) -> MemoryManager:
+    """Create the request-owned manager for an already-scoped profile."""
+    from hermes_constants import get_hermes_home
+    from hermes_cli.profiles import get_active_profile_name
+    from plugins.memory import _get_active_memory_provider, load_memory_provider
+
+    manager = MemoryManager(native_journal=native_journal)
+    name = _get_active_memory_provider()
+    if not name:
+        return manager
+    try:
+        provider = load_memory_provider(name)
+        available = provider is not None and provider.is_available()
+    except Exception:  # health: allow BLE001 -- a broken provider plugin falls back to built-in memory
+        available = False
+    if not available:
+        return manager
+    manager.add_provider(provider)
+    manager.initialize_all(
+        session_id=session_id,
+        platform=platform,
+        hermes_home=str(get_hermes_home()),
+        agent_context="primary",
+        agent_identity=get_active_profile_name(),
+        agent_workspace="hermes",
+    )
+    return manager
+
+
+
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -388,23 +449,30 @@ def build_memory_context_block(raw_context: str) -> str:
     )
 
 
-class MemoryManager:
+from agent.harso_memory_mutations import NativeMemoryMutations
+
+
+class MemoryManager(NativeMemoryMutations):
     """Builtin provider (always first) plus at most one external provider.
 
     Failures in one provider never block the other: every fan-out hook logs and
     swallows per-provider exceptions.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(self, *, external_prefetch_timeout: Optional[float] = None, native_journal=None) -> None:
         self._providers: list[MemoryProvider] = []
         self._tool_to_provider: dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[dict[str, Any]] = None
         self._has_external: bool = False
-        timeout = external_prefetch_timeout
-        timeout = _EXTERNAL_PREFETCH_TIMEOUT_S if timeout is None else float(timeout)
-        if timeout <= 0:
-            raise ValueError("external_prefetch_timeout must be positive")
-        self._external_prefetch_timeout = timeout
+        self._native_lock = threading.Lock()
+        self._native_completed = {}
+        self._native_inflight = {}
+        self._native_owners = {}
+        self._native_journal = native_journal
+        if external_prefetch_timeout is None:
+            from hermes_cli.config import load_config_readonly
+            external_prefetch_timeout = configured_external_prefetch_timeout(load_config_readonly())
+        self.set_external_prefetch_timeout(external_prefetch_timeout)
         self._external_prefetch_threads: dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
         # Single-worker background executor for end-of-turn sync/prefetch, created lazily so
@@ -418,6 +486,12 @@ class MemoryManager:
         self._shutdown_drain_state: dict[str, Any] = {
             "status": "not_started", "abandoned_writes": 0, "abandoned_prefetches": 0, "active_tasks": 0,
         }
+
+    def set_external_prefetch_timeout(self, seconds: Any) -> None:
+        value = _valid_prefetch_timeout(seconds)
+        if value is None:
+            raise ValueError("external_prefetch_timeout must be in (0, 30]")
+        self._external_prefetch_timeout = value
 
     def _each_provider(self, label: str, call: Callable[[MemoryProvider], Any], *, level: int = logging.DEBUG,
                        providers: Optional[list[MemoryProvider]] = None, exc_info: bool = False) -> list[Any]:
@@ -556,7 +630,7 @@ class MemoryManager:
         if "error" in result_box:
             raise result_box["error"]
         result = result_box.get("value", "")
-        if result and result.strip():
+        if result and result.strip() and provider.name != "harso":
             # Opt-in spill limits recall replayed with the user turn's api_content;
             # the registration snapshot leaves provider-ranked results intact by default.
             result = spill_if_oversized(
@@ -598,7 +672,7 @@ class MemoryManager:
 
     def sync_all(self, user_content: str, assistant_content: str, *, session_id: str = "",
                  messages: Optional[list[dict[str, Any]]] = None,
-                 turn_author: Optional[dict[str, Any]] = None) -> None:
+                 turn_author: Optional[dict[str, Any]] = None, turn_id: str = "") -> None:
         """Sync a completed turn to all providers on the background worker.
 
         Never inline: a provider's ``sync_turn`` may block for minutes, which kept ``run_conversation``
@@ -615,7 +689,7 @@ class MemoryManager:
             return
         clean_user_content, assistant_content, redacted_messages = _redact_for_provider(
             clean_user_content, assistant_content, messages)
-        optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author}
+        optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author, "turn_id": turn_id or None}
 
         def _sync(provider: MemoryProvider) -> None:
             kwargs: dict[str, Any] = {"session_id": session_id}
@@ -852,7 +926,7 @@ class MemoryManager:
         return "positional" if accepted >= 4 else "legacy"
 
     def on_memory_write(self, action: str, target: str, content: str,
-                        metadata: Optional[dict[str, Any]] = None) -> None:
+                        metadata: Optional[dict[str, Any]] = None) -> bool:
         """Notify external providers when the built-in memory tool writes (skips builtin, the source)."""
         content, metadata = _redact_for_provider(content, dict(metadata or {}))
 
@@ -866,7 +940,7 @@ class MemoryManager:
                 provider.on_memory_write(action, target, content, metadata=dict(metadata or {}))
 
         external = [p for p in self._providers if p.name != "builtin"]
-        self._each_provider("on_memory_write failed", _notify, providers=external)
+        return len(self._each_provider("on_memory_write failed", _notify, providers=external)) == len(external)
 
     # Actions mirrored to external providers; non-mutating results (errors, staged) are
     # filtered by ``notify_memory_tool_write`` first.
@@ -884,7 +958,7 @@ class MemoryManager:
         return isinstance(result, dict) and result.get("success") is True and result.get("staged") is not True
 
     def notify_memory_tool_write(self, tool_result: Any, tool_args: dict[str, Any], *,
-                                 build_metadata: Optional[Callable[[], dict[str, Any]]] = None) -> None:
+                                 build_metadata: Optional[Callable[[], dict[str, Any]]] = None) -> bool:
         """Mirror a built-in memory tool call to external providers.
 
         Gates on a committed write, expands single-op and batched ``operations`` shapes, keeps only
@@ -895,6 +969,7 @@ class MemoryManager:
         if not self._memory_tool_result_succeeded(tool_result):
             return
         result = json.loads(tool_result) if isinstance(tool_result, str) else tool_result
+        acknowledged = True
         target = str(tool_args.get("target") or "memory")
         operations = tool_args.get("operations")
         batched = isinstance(operations, list) and bool(operations)
@@ -905,6 +980,12 @@ class MemoryManager:
             try:
                 metadata = dict(build_metadata() if build_metadata else {})
                 metadata.pop("previous_content", None)
+                for key in ("operation_id", "revision"):
+                    if key in result:
+                        metadata[key] = result[key]
+                if batched and metadata.get("operation_id"):
+                    # The service key is (operation, revision); each atomic batch op gets a revision.
+                    metadata["revision"] = int(metadata.get("revision") or 1) + index
                 old_text = op.get("old_text")
                 if old_text:
                     metadata["old_text"] = str(old_text)
@@ -930,9 +1011,14 @@ class MemoryManager:
                     else:
                         after = result.get("patched_entry_after")
                     mirrored_action, content = "replace", str(after or "")
-                self.on_memory_write(mirrored_action, target, content, metadata=metadata)
+                if action == "patch" and any(p.name == "harso" for p in self._providers):
+                    mirrored_action = "patch"
+                    metadata["old_text"] = metadata.get("previous_content", old_text or "")
+                acknowledged = self.on_memory_write(mirrored_action, target, content, metadata=metadata) and acknowledged
             except Exception as e:
-                logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
+                acknowledged = False
+                logger.debug("notify_memory_tool_write failed for op %s: %s", action, type(e).__name__)
+        return acknowledged
 
     def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
         task, result = _redact_for_provider(task, result)

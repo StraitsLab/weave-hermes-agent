@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retained Harso authentication and lifecycle hooks; no new execution layer.
 """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner.
 
 Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.
@@ -234,7 +235,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             return None
         source = event.source
 
-        if not self._is_user_authorized_for_source(source):
+        native_authenticated = (
+            source.platform == Platform.API_SERVER
+            and (getattr(event, 'metadata', None) or {}).get('native_submit_authenticated') is True
+            and self._delivery_adapter_for(source) is not None
+        )
+        if not native_authenticated and not self._is_user_authorized_for_source(source):
             if source.user_id is None:
                 # No user identity (Telegram service messages, channel forwards, anonymous admin
                 # posts, sender_chat): can't be paired but may be authorized via a chat allowlist.
@@ -1365,7 +1371,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 if _consumed:
                     return _consumer_reply
             try:
-                _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+                from gateway.native_session_lifecycle import run
+                _agent_result = await run(self, event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
                 # A rejected message, not a completed turn: return before the /goal judge so it
                 # cannot consume the resend notice and enqueue a synthetic continuation loop.

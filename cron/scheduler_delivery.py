@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retained Harso compatibility hooks only; implementations stay in existing topical siblings to avoid another abstraction.
 """Cron delivery: target resolution (origin/home/explicit/bot-chat), transcript mirroring and
 session seeding, live-adapter / relay / standalone send lanes, and ``_deliver_result``.
 
@@ -36,7 +37,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
 # Gateway platforms whose adapter declares ``supports_async_delivery = False`` (request/response
 # only, ``send()`` is a stub) — a cron report can never reach them, so they are never a
 # deliver=origin destination.
-_NON_PUSH_ORIGIN_PLATFORMS = frozenset({"api_server"})
+_NON_PUSH_ORIGIN_PLATFORMS = frozenset()
 
 # Platforms supporting a cron/notification home target -> env var used by gateway config.
 _HOME_TARGET_ENV_VARS = {
@@ -2095,6 +2096,13 @@ def _deliver_result(
                     delivery_errors.append(bot_chat_error)
                 if receipt and receipt["status"] == "ambiguous":
                     unverified_targets.append(bot_chat_error)
+            continue
+
+        if target["platform"] == "api_server":
+            from cron.harso_delivery import append_brief
+            error = append_brief(target["chat_id"], cleaned_delivery_content, adapters)
+            if error:
+                delivery_errors.append(error)
             continue
 
         t = _prepare_target_delivery(

@@ -96,3 +96,12 @@ def test_cli_stdin_exit_codes_and_output(tmp_path, release, results, code, repor
     assert f"{key}={value}" in child.stdout
     for name, result in results.items():
         assert f"{name}: {result}" in child.stdout
+
+
+def test_harso_os_lane_failure_is_advisory_but_skip_still_blocks():
+    lanes = {"detect": {"result": "success", "outputs": {"python": "true"}}, "tests": {"result": "success"}}
+    failed = evaluate_gate({**lanes, "tests-os": {"result": "failure"}})
+    assert failed == {"ok": True, "failed": [], "allowed_skips": [], "advisory_failures": ["tests-os"]}
+    assert evaluate_gate({**lanes, "tests-os": {"result": "skipped"}})["failed"] == ["tests-os"]
+    assert evaluate_gate({**lanes, "tests-os": {"result": "cancelled"}})["failed"] == ["tests-os"]
+    assert evaluate_gate({**lanes, "tests": {"result": "failure"}, "tests-os": {"result": "success"}})["failed"] == ["tests"]

@@ -154,6 +154,10 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
         except _bd_lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
+    try:
+        supervisor.arm_vault()
+    except Exception:  # health: allow BLE001 -- never write a secret into an unguarded document
+        return {"success": False, "error_type": "vault_guard_required", "error": "Vault document guard unavailable"}
     sup = supervisor.evaluate_runtime(expression)
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
@@ -249,7 +253,9 @@ def browser_vault_list() -> str:
             items.append(entry)
     out: dict[str, Any] = {"success": True, "items": items}
     if not items:
-        out["hint"] = ("No saved logins. On a login page, call browser_vault action=save_login to ask the user to save one. "
+        out["hint"] = ("No saved logins. Save one in Harso Settings → Vault. Never ask for a password in chat."
+                       if any(not getattr(b, "can_save", True) for b in enabled_backends()) else
+                       "No saved logins. On a login page, call browser_vault action=save_login to ask the user to save one. "
                        "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
     if locked:
         out["locked"] = locked
@@ -292,6 +298,11 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     vault bound to that origin, and fill the password at once. The values never enter the conversation."""
     from agent.vault_backends.unlock import can_prompt_here, get_save_login_prompt_callback
     from agent.vault_store import get_vault_store
+
+    from agent.vault_backends import enabled_backends
+    if any(not getattr(b, "can_save", True) for b in enabled_backends()):
+        return json.dumps({"success": False, "error_type": "save_in_app",
+                           "error": "Save the login in Harso Settings → Vault. Never send a password in chat."})
 
     effective_task_id = task_id or "default"
     # The supervisor's default page session is whatever tab it attached to first (on Browser Use that is
@@ -364,9 +375,17 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     backend = backend_for_handle(handle) if handle else None
     if backend is not None:
         try:
-            code = backend.resolve_otp(handle)
-        except Exception:
-            code = None
+            code = backend.resolve_otp(handle, origin=origin) if getattr(backend, "requires_origin", False) else backend.resolve_otp(handle)
+        except Exception as exc:  # health: allow BLE001 -- external manager fallback; Harso authority fails closed
+            from agent.vault_backends.base import VaultUnavailable, VaultUseRefused
+            if isinstance(exc, VaultUseRefused) and exc.error_type == "otp_unavailable":
+                code = None
+            elif isinstance(exc, (VaultUnavailable, VaultUseRefused)):
+                return json.dumps({"success": False, "error_type": getattr(exc, "error_type", "vault_unavailable"), "error": str(exc)})
+            elif getattr(backend, "requires_origin", False):
+                return json.dumps({"success": False, "error_type": "vault_unavailable", "error": "The vault could not answer."})
+            else:
+                code = None
         if code:
             source = backend.name
     if not code:
@@ -396,6 +415,25 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                        "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
 
+def _vault_refusals(fill):
+    from functools import wraps
+    from agent.vault_backends.base import VaultUnavailable, VaultUseRefused
+
+    @wraps(fill)
+    def guarded(*args, **kwargs):
+        try:
+            return fill(*args, **kwargs)
+        except (VaultUnavailable, VaultUseRefused) as exc:
+            return json.dumps({"success": False, "error_type": getattr(exc, "error_type", "vault_unavailable"), "error": str(exc)})
+    return guarded
+
+
+def _password_for_page(backend, handle, origin):
+    return (backend.resolve_password(handle, origin=origin) if getattr(backend, "requires_origin", False)
+            else backend.resolve_password(handle))
+
+
+@_vault_refusals
 def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     """Fill the current page's password field from a vault handle.
 
@@ -504,7 +542,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     # ── Resolve secret and fill (secret never enters any logged string) ─────
     try:
         if meta.kind == "login":
-            secret = {"password": backend.resolve_password(handle)}
+            secret = {"password": _password_for_page(backend, handle, page_origin)}
             fills = select_password_fill(classified, secret["password"])
         else:
             secret = backend.resolve_secret(handle)

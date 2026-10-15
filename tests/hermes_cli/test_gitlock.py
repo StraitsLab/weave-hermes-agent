@@ -472,7 +472,9 @@ def test_a_git_elsewhere_exiting_mid_scan_is_gone_not_a_hidden_holder(repo: Path
     from tests.waiting import wait_until
 
     other = tmp_path / "other"
-    shutil.copytree(repo, other)
+    # Harso fork: the fixture's commits may leave a detached auto-maintenance running; its
+    # maintenance.lock appearing and vanishing mid-copy made this test flaky on CI (shutil.Error).
+    shutil.copytree(repo, other, ignore=shutil.ignore_patterns("*.lock"))
     lock = repo / ".git" / "index.lock"
     lock.write_bytes(b"")  # a killed git's: nothing holds it
     marker = "hermes.test=exits-mid-scan"

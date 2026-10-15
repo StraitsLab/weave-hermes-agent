@@ -132,6 +132,8 @@ dependencies = [
   # so it rides in the main venv and every install, Desktop bundle included,
   # ships it without a separate tool environment.
   "browser-harness==0.1.13; python_version >= '3.14'",
+  # Jev shares browser-harness; pin the audited upstream source, never a moving branch.
+  "jev-ultrafast @ git+https://github.com/browser-use/jev-ultrafast.git@1231850a0bf1a0c0341fe408ef1668dbbfdfac46 ; python_version >= '3.14'",
   # .gitignore-aware file matching for desktop build stamp.
   "pathspec==1.1.1; python_version >= '3.14'",
   "fastapi>=0.104.0,<1; python_version >= '3.14'",

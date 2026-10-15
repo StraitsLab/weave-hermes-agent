@@ -343,7 +343,7 @@ def _native_screenshot_result(result: dict[str, Any], path: str) -> Optional[dic
                                             max_dimension=_EMBED_MAX_DIMENSION, force_jpeg=True)
         text = json.dumps(result, ensure_ascii=False)
         attached = text + "\n\nThe screenshot from this call is attached — inspect it with your native vision."
-        return {"_multimodal": True, "text_summary": text, "meta": {"screenshot_path": path, "native_vision": True},
+        return {"_multimodal": True, "text_summary": text, "meta": {"screenshot_path": result.get("screenshot_path", path), "native_vision": True},
                 "content": [{"type": "text", "text": attached}, {"type": "image_url", "image_url": {"url": data_url}}]}
     except Exception as e:
         logger.debug("Native screenshot attach failed (falling back to text): %s", e)
@@ -789,7 +789,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         result["stderr"] = stderr
     screenshot = _find_screenshot(proc.stdout, started)
     if screenshot:
-        result["screenshot_path"] = screenshot
+        result["screenshot_path"] = redact_sensitive_text(screenshot, force=True)
         native = _native_screenshot_result(result, screenshot)
         if native is not None:
             return native

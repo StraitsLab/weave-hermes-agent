@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Retained Harso compatibility hooks only; implementations stay in existing topical siblings to avoid another abstraction.
 """Per-turn callback runner (progress/status/voice/run_sync) for the gateway agent turn.
 
 ``TurnRunner`` owns the per-turn callbacks ``GatewayRunner._run_agent_inner`` binds. ``gateway.run``
@@ -977,6 +978,9 @@ class TurnRunner:
                     for sink in delta_sinks:
                         sink.on_delta(text)
 
+        from gateway.native_session_lifecycle import wire_delta
+        stream_delta_cb = wire_delta(getattr(ctx, '_status_adapter', None), ctx.session_key, stream_delta_cb)
+
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
                 return
@@ -1264,6 +1268,8 @@ class TurnRunner:
             if (ctx._voice_ack_guild[0] is not None or ctx._native_slack_task_cards) else None
         )
         agent.tool_complete_callback = ctx.native_tool_complete_callback if ctx._native_slack_task_cards else None
+        from gateway.native_session_lifecycle import wire_tools
+        wire_tools(agent, ctx._status_adapter, ctx.session_key)
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
@@ -1926,10 +1932,10 @@ class TurnRunner:
                 # Quota cap with valid credentials: /login cannot help; name the reset window (#89401).
                 from gateway.run import _gateway_provider_error_reply
                 return {"final_response": _gateway_provider_error_reply(str(exc)),
-                        "messages": [], "api_calls": 0, "tools": []}
+                        "messages": [], "api_calls": 0, "tools": [], "failed": True, "completed": False}
             return {
                 "final_response": t("gateway.errors.no_credentials"),
-                "messages": [], "api_calls": 0, "tools": [],
+                "messages": [], "api_calls": 0, "tools": [], "failed": True, "completed": False,
             }
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
@@ -1952,6 +1958,9 @@ class TurnRunner:
         # returns, so early run_sync returns are also finalised.
         # See the outer finally/completion section below. See #60671.
         final_response = result.get("final_response")
+        native_final = getattr(getattr(ctx, '_status_adapter', None), '_native_submit_final', None)
+        if callable(native_final):
+            native_final(ctx.session_key, final_response)
         # Actual token counts from the agent instance used for this run.
         agent = ctx.agent_holder[0]
         has_comp = bool(agent) and hasattr(agent, "context_compressor")

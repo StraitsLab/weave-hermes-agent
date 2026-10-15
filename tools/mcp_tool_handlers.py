@@ -148,12 +148,9 @@ def _result_is_error(result) -> bool:
 
 
 def _record_call_outcome(server_name: str, result) -> Any:
-    """Breaker bookkeeping: an error payload from the tool itself still counts as a strike (#10447),
-    flagged as an application error so the open-breaker message stays truthful."""
-    if _result_is_error(result):
-        _core._bump_server_error(server_name, application=True)
-    else:
-        _core._reset_server_error(server_name)
+    """Only transport failures count toward the circuit breaker, not tool refusals."""
+    # A completed RPC proves reachability, even when the tool refuses its arguments.
+    _core._reset_server_error(server_name)
     return result
 
 

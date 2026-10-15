@@ -30,6 +30,7 @@ WANT_MANIFEST=false
 JSON=false
 NON_INTERACTIVE=false
 INCLUDE_DESKTOP=false
+NO_SKILLS=false
 VERBOSE=false
 SKIP_BROWSER=false
 SKIP_COMPUTER_USE=false
@@ -63,6 +64,9 @@ while [ $# -gt 0 ]; do
         --skip-browser|--no-playwright|-SkipBrowser) SKIP_BROWSER=true; shift ;;
         --skip-computer-use|-SkipComputerUse) SKIP_COMPUTER_USE=true; shift ;;
         --include-desktop|-IncludeDesktop) INCLUDE_DESKTOP=true; shift ;;
+        # Compatibility: --commit already checks out the pin while preserving local work.
+        --force-commit) shift ;;
+        --no-skills) NO_SKILLS=true; shift ;;
         --verbose|-Verbose) VERBOSE=true; shift ;;
         -h|--help)
             echo "Usage: install.sh [--branch NAME] [--commit SHA] [--dir PATH]"
@@ -923,6 +927,11 @@ wire_shell_path() {
 }
 
 stage_products() {
+    # Use upstream's persistent opt-out before completion can seed skills.
+    if [ "$NO_SKILLS" = true ]; then
+        mkdir -p "$HERMES_HOME"
+        touch "$HERMES_HOME/.no-bundled-skills"
+    fi
     # The whole tail in one place, by calling the completion an update calls:
     # publish the commands, build the products (tui/web, plus the desktop app),
     # then run the post-build maintenance that syncs bundled skills and migrates
