@@ -31,14 +31,14 @@ def test_non_push_session_stamps_no_origin_and_gets_creation_notice():
         clear_session_vars(tokens)
 
 
-def test_stamped_api_server_origin_falls_back_to_home_channel(monkeypatch):
+def test_stamped_api_server_origin_stays_in_api_conversation(monkeypatch):
     from cron import scheduler_delivery as sd
 
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "12345")
     job = {"id": "old", "deliver": "origin", "origin": {"platform": "api_server", "chat_id": "desk-1"}}
     targets = sd._resolve_delivery_targets(job)
     assert [(t["platform"], t["chat_id"], t["_resolved_from"]) for t in targets] == [
-        ("telegram", "12345", "origin_fallback")]
+        ("api_server", "desk-1", "origin")]
     # Control: a push-capable origin is delivered as written.
     job["origin"] = {"platform": "discord", "chat_id": "42"}
     assert sd._resolve_delivery_targets(job)[0]["platform"] == "discord"

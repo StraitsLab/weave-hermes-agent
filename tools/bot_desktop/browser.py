@@ -11,6 +11,7 @@ DevTools endpoint, so the dock exposes a debugging port and the agent ATTACHES t
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -31,7 +32,24 @@ def profile_dir() -> Path:
     override = os.path.expanduser(os.environ.get("AGENT_BROWSER_PROFILE", "").strip())
     if override:
         return Path(override) if os.path.isabs(override) else runtime.get_hermes_home() / override
-    return runtime.state_dir() / "browser-profile"
+    return runtime.state_dir() / ("profile" if os.environ.get("HERMES_BD_STATE_DIR", "").strip()  # health: allow HX002 -- existing attempt state/profile launcher contract
+                                  else "browser-profile")
+
+
+def disable_password_manager(user_data_dir: str) -> None:
+    """Keep Chrome from saving or autofilling secrets outside the vault authority."""
+    from utils import atomic_json_write
+
+    path = Path(user_data_dir) / "Default" / "Preferences"
+    prefs = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
+    before = json.dumps(prefs, sort_keys=True)
+    prefs["credentials_enable_service"] = False
+    prefs["credentials_enable_autosignin"] = False
+    prefs.setdefault("profile", {}).update(
+        password_manager_enabled=False, password_manager_leak_detection=False)
+    prefs.setdefault("password_manager", {})["password_manager_blocklist"] = ["*"]
+    if json.dumps(prefs, sort_keys=True) != before:
+        atomic_json_write(path, prefs, mode=0o600)
 
 
 def executable() -> Optional[str]:
@@ -83,6 +101,8 @@ def _userns_restricted() -> bool:
 def dock_launch() -> Optional[tuple[str, str]]:
     """``(executable, user_data_dir)`` for the dock's Browser icon, or ``None`` when no Chromium exists."""
     exe = executable()
+    if exe:
+        disable_password_manager(str(profile_dir()))
     return (exe, str(profile_dir())) if exe else None
 
 
@@ -101,7 +121,8 @@ def dock_argv(exe: str, user_data_dir: str, *, sandbox_bypass: Optional[bool] = 
     return [exe, f"--user-data-dir={user_data_dir}", "--remote-debugging-port=0", "--no-first-run",
             "--no-default-browser-check", "--test-type", f"--disk-cache-size={DISK_CACHE_BYTES}",
             *(CHROMIUM_SANDBOX_BYPASS_ARGS if (_needs_chromium_sandbox_bypass() if sandbox_bypass is None
-                                              else sandbox_bypass) else ())]
+                                              else sandbox_bypass) else ()),
+            *(arg.strip() for arg in os.environ.get("AGENT_BROWSER_ARGS", "").split(",") if arg.strip())]
 
 
 def dock_exec_line(exe: str, user_data_dir: str, *, sandbox_bypass: Optional[bool] = None) -> str:

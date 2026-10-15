@@ -78,6 +78,8 @@ class GatewayRuntimeInitMixin:
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect the pool.
         self._executor_closing = False
         # ALL per-session state lives here (gateway/session_state.py); use _session_state / _peek_session_state.
+        from gateway.native_session_credentials import install
+        install(self)
         self._sessions: Dict[str, SessionState] = {}
         # Per-SESSION_ID turn lease: serializes [load history → run → flush] when two ROUTING KEYS resolve
         # to one session_id (switch_session's many-to-one mapping), which routing-key guards cannot see.

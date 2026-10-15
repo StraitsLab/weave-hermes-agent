@@ -129,12 +129,16 @@ class MCPServerHealthMixin:
             if registry.get_toolset_for_tool(tool_name) == f"mcp-{self.name}":
                 _registration._deregister_mcp_tool_all_scopes(self, tool_name)
 
-    async def _refresh_tools(self):
+    async def _refresh_tools(self, *, require_ready: bool = False):
         """Re-fetch tools on ``tools/list_changed`` and update the registry. The lock serializes rapid-fire
         notifications; after the list_tools ``await`` all mutations are synchronous — atomic on the event loop."""
         if getattr(self, '_editor_frozen_manifest', None) is not None:
+            if require_ready:
+                raise RuntimeError('MCP editor manifest is frozen')
             return  # Editor tool policy changes apply only to a new canonical session.
         if not self._advertises_tools():
+            if require_ready:
+                raise RuntimeError("MCP server does not advertise tools")
             return  # tools/list would raise MCPError(-32601)
         async with self._refresh_lock:
             old_tool_names = set(self._registered_tool_names)
@@ -145,10 +149,14 @@ class MCPServerHealthMixin:
                 # (#109824). Skipping is correct — the reconnect's own discovery re-lists tools
                 # and the next tools/list_changed re-arms this refresh against the live session.
                 session = self.session
+                if require_ready and (session is None or not self._ready.is_set()):
+                    raise RuntimeError("MCP server is not ready")
                 if session is None:
                     logger.debug("MCP server '%s': skipping dynamic tool refresh; session not connected", self.name)
                     return
                 new_mcp_tools = await _core._paginate_full_list(session.list_tools, "tools", self.name)
+                if require_ready and (self.session is not session or not self._ready.is_set()):
+                    raise RuntimeError("MCP session changed during schema refresh")
             # Remove only stale names first — no nuke-and-repave: live turns may hold tool-call
             # IDs pointing at existing handlers; in-place replacement avoids "not connected" races.
             self._deregister_owned(old_tool_names - {mcp_prefixed_tool_name(self.name, tool.name) for tool in new_mcp_tools})

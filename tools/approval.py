@@ -934,7 +934,7 @@ def _presence(approval_callback=None) -> tuple:
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
     if _is_single_query_approval_context() or _is_cron_approval_context():
         is_cli = is_gateway = is_ask = False
-    elif is_ask and _is_unattended_platform_approval_context() \
+    elif _is_unattended_platform_approval_context() \
             and (_gateway_notify_cb(get_current_session_key()) is None
                  or _get_session_platform() in approval_context._NOTIFIER_BLIND_APPROVAL_PLATFORMS):
         # start_gateway() sets HERMES_EXEC_ASK process-wide, so an api_server/webhook turn
@@ -945,7 +945,7 @@ def _presence(approval_callback=None) -> tuple:
         # registers one for every turn while the adapter has no ``send_exec_approval`` and the
         # POST -> 202 lane has no reader, so a registered callback there answers nothing either
         # — resolve from approvals.unattended_mode, never a pending no one can answer.
-        is_ask = False
+        is_cli = is_gateway = is_ask = False
     return approval_callback, is_cli, is_gateway, is_ask
 
 
@@ -1256,3 +1256,19 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
 
 # Load permanent allowlist from config on module import
 load_permanent_allowlist()
+
+_attended_api_sessions = set()
+
+def native_submit_attended_enabled() -> bool:
+    """Read ``approvals.native_submit_attended`` (default True) at runtime."""
+    return is_truthy_value(approval_context._get_approval_config().get("native_submit_attended", True))
+
+def mark_api_session_attended(session_key: str, attended: bool = True) -> None:
+    """Mark or clear one api_server session key as having a human approval surface."""
+    if not session_key:
+        return
+    with _lock:
+        if attended:
+            _attended_api_sessions.add(session_key)
+        else:
+            _attended_api_sessions.discard(session_key)

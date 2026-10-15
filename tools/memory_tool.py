@@ -235,6 +235,13 @@ def memory_tool(action: str | None = None, target: str = "memory", content: str 
         FAILURE_CLASS.reset(token)
     from hermes_cli.observability.shared_metrics_loop import record_builtin_memory_call
     record_builtin_memory_call(action, operations, outcome=outcome, failure_class=failure_class)
+    if outcome == "success":
+        payload = json.loads(result)
+        import time
+        from agent.harso_memory_ids import new_operation_id
+        payload["revision"] = time.time_ns() // 1000
+        payload["operation_id"] = new_operation_id()
+        result = json.dumps(payload, ensure_ascii=False)
     return result
 
 

@@ -154,6 +154,10 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
         except _bd_lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
+    try:
+        supervisor.arm_vault()
+    except Exception:  # health: allow BLE001 -- never write a secret into an unguarded document
+        return {"success": False, "error_type": "vault_guard_required", "error": "Vault document guard unavailable"}
     sup = supervisor.evaluate_runtime(expression)
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}

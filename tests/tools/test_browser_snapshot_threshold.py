@@ -27,10 +27,11 @@ def isolated_snapshot_threshold(tmp_path, monkeypatch):
 
 
 def _write_threshold(hermes_home, value):
-    (hermes_home / "config.yaml").write_text(
-        f"browser:\n  snapshot_threshold: {value}\n",
-        encoding="utf-8",
-    )
+    # Equal-size in-place rewrites can share a stat signature on coarse Sprite filesystems.
+    # Atomic replacement matches config writes and makes cache invalidation deterministic.
+    staged = hermes_home / "config.yaml.new"
+    staged.write_text(f"browser:\n  snapshot_threshold: {value}\n", encoding="utf-8")
+    staged.replace(hermes_home / "config.yaml")
 
 
 def _long_snapshot(chars: int) -> str:

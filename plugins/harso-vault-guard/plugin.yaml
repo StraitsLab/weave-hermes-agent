@@ -1,0 +1,3 @@
+name: harso-vault-guard
+version: 0.1.0
+description: Block transformed browser reads while a native vault-filled document is reachable.

@@ -457,7 +457,10 @@ def _foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
 # one-shots, recovery flows, and read-only cross-profile opens use SessionDB() directly with their own close().
 
 
-class SessionDB(
+from hermes_state_harso import HarsoSessionMixin, SessionPassiveAppendError
+
+
+class SessionDB(HarsoSessionMixin,
     SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
     SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
@@ -819,6 +822,8 @@ class SessionDB(
         _secure_state_db_files(self.db_path, create_main=True)
         self._conn = self._open_writer_conn()
         self._init_schema()
+        from hermes_state_harso_schema import install
+        install(self)
 
     def _connect_and_init_with_lock_patience(self) -> None:
         """Open + init, waiting out a sibling's write lock with jittered patience:
@@ -1039,6 +1044,7 @@ class SessionDB(
                         except Exception:
                             pass
                         raise
+                self._commit_hub().publish()
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:

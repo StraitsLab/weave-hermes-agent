@@ -99,7 +99,7 @@ def _get_dialog_policy_config() -> tuple[str, float]:
         return DEFAULT_DIALOG_POLICY, DEFAULT_DIALOG_TIMEOUT_S
 
 
-def _ensure_cdp_supervisor(task_id: str) -> None:
+def _ensure_cdp_supervisor(task_id: str, cdp_url: str = "") -> None:
     """Start a CDP supervisor for ``task_id`` if an endpoint is reachable.
 
     Idempotent (``get_or_start`` skips an existing ``(task_id, cdp_url)`` and restarts on URL change), so safe on
@@ -108,7 +108,7 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
     snapshots just lack ``pending_dialogs`` / ``frame_tree``.
     """
     _bt = _origin()
-    cdp_url = _get_cdp_override()
+    cdp_url = cdp_url or _get_cdp_override()
     if not cdp_url:
         with _bt._cleanup_lock:
             session_info = _bt._active_sessions.get(task_id, {})

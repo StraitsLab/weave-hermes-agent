@@ -47,6 +47,7 @@ from hermes_constants import (
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home, get_process_hermes_home
 from utils import atomic_replace, fast_safe_load, file_signature, mkstemp_beside
+from hermes_cli.config_layers import load_config_strict, merge_managed_overlay as _merge_managed_overlay
 from hermes_cli.config_read_errors import (
     _CONFIG_PARSE_FAILURES, _FIX_PERMS, _FIX_YAML, FailedConfigRead, _backups_dir_display,
     _refuse_failed_read, _refuse_overwrite, _warn_config_parse_failure, _yaml_error_details,
@@ -2277,24 +2278,6 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         # normally, and a read error is re-probed on every hit (_load_config_cache_hit).
         _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, lkg_copy, {})
     return lkg_copy
-
-
-def _merge_managed_overlay(expanded: dict[str, Any]) -> tuple[dict[str, Any], Any]:
-    """Apply the managed-scope overlay; returns ``(merged, managed_config_or_falsy)``.
-    Managed wins at the leaf and is applied AFTER user expansion so a user ``${VAR}`` cannot shadow
-    a managed literal: managed values expand only against the process environment. This
-    deliberately inverts the usual env-over-config precedence for the keys the managed layer pins
-    (docs/design/managed-scope.md §4.1)."""
-    managed_config = managed_scope.load_managed_config()
-    if not managed_config:
-        return expanded, managed_config
-    # Same canonicalization as the user config BEFORE merging (parity with
-    # managed_scope.apply_managed_overlay) so the merged result never exposes a nested dict.
-    managed_normalized = _normalize_root_model_keys(managed_config)
-    if isinstance(managed_normalized.get("model"), str):
-        managed_normalized = dict(managed_normalized)
-        managed_normalized["model"] = {"default": managed_normalized["model"]}
-    return _deep_merge(expanded, _expand_env_vars(managed_normalized)), managed_config
 
 
 def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[dict[str, Any]]:

@@ -1191,6 +1191,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._metrics_latency_ms: list[float] = []
         self._metrics_last_request_at: Optional[float] = None
         self._metrics_last_heartbeat_at: Optional[float] = None
+        from gateway.platforms.api_server_harso_sessions import initialize
+        initialize(self)
 
     def active_agent_work_count(self) -> int:
         """All live agent work: pending admissions + in-flight turns + live /v1/runs tasks
@@ -2299,13 +2301,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from hermes_cli.tools_config import _get_platform_tools
         # RuntimeError is caught ONLY here (sole provider-auth raiser); the typed subclass keeps
         # run_conversation() errors distinct.
+        from gateway.native_session_credentials import for_api
+        native = for_api(self, session_id, requested_provider, route)
         try:
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            runtime_kwargs = dict(native[1]) if native else _resolve_runtime_agent_kwargs()
         except RuntimeError as exc:
             raise _ProviderAuthResolutionError(str(exc)) from exc
         # A fallback-provider runtime carries its own ``model``: pop it (overrides config, and
         # must not collide with the ``**runtime_kwargs`` spread).
-        model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
+        model = native[0] if native else runtime_kwargs.pop("model", None) or _resolve_gateway_model()
         runtime_kwargs.pop("_fallback_notice", None)  # raw API surface: the switch is already logged
         request_reasoning_config = _request_reasoning_config(model_options)
         request_service_tier = _request_service_tier(model_options)
@@ -2314,6 +2318,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             requested_model=requested_model, requested_provider=requested_provider, route=route,
             session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
             gateway_session_key=gateway_session_key, session_id=session_id)
+        if native:
+            runtime_kwargs.update(native[1])
+            confirmed_runtime_lock = True
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
         # Same gate the messaging gateway and TUI apply: ``display.interim_assistant_messages``
@@ -2456,12 +2463,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_capabilities(self, request: web.Request) -> web.Response:
         """GET /v1/capabilities — the stable, machine-readable API surface for external UIs."""
         runner = getattr(self, "gateway_runner", None)
+        from gateway.native_bot_admission import capabilities
         features = {
             "chat_completions": True, "chat_completions_streaming": True,
             "responses_api": True, "responses_streaming": True, "run_submission": True,
             "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),
             **_STATIC_FEATURE_FLAGS,
             "run_unknown_resolution": getattr(runner, "session_authority", None) is not None,
+            **capabilities(),
             "cors": bool(self._cors_origins),
             # Always advertised for feature-detection; enabled follows config.
             "browser_extension_control": {
@@ -3145,46 +3154,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_patch_session(self, request: web.Request) -> web.Response:
-        """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
-        session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
-        if err:
-            return err
-        body, err = await self._read_json_body(request)
-        if err:
-            return err
-        # pinned/archived/unread are durable desktop-sidebar flags.
-        unknown = sorted(set(body) - {"title", "end_reason", "pinned", "archived", "hidden", "unread"})
-        if unknown:
-            return _error_response(
-                f"Unsupported session fields: {', '.join(unknown)}", 400, code="unsupported_session_field")
-        for flag in ("pinned", "archived", "hidden", "unread"):
-            if flag in body and not isinstance(body[flag], bool):
-                return _error_response(f"'{flag}' must be a boolean", 400, code="invalid_session_field")
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return self._session_db_unavailable()
-        if "title" in body:
-            try:
-                await asyncio.to_thread(
-                    db.set_session_title, session_id, "" if body["title"] is None else str(body["title"]))
-            except ValueError as exc:
-                return _error_response(str(exc), 400, code="invalid_title")
-        # Pinned last: set_session_pinned clears hidden, so a pin in the same request
-        # wins over an explicit hidden (same order as the dashboard's _RENAME_FLAG_SETTERS).
-        for flag, setter in (("archived", db.set_session_archived), ("hidden", db.set_session_hidden),
-                             ("pinned", db.set_session_pinned)):
-            if flag in body:
-                await asyncio.to_thread(setter, session_id, body[flag])
-        if "unread" in body:
-            await asyncio.to_thread(db.set_session_read, session_id, read=not body["unread"])
-        if body.get("end_reason"):
-            await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
-        session = await asyncio.to_thread(db.get_session, session_id) or session
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        async with self._native_lifecycle_lock(request.match_info["session_id"]):
+            return await self._patch_session_unlocked(request)
+
+    async def _patch_session_unlocked(self, request: web.Request) -> web.Response:
+        from gateway.platforms.api_server_harso_metadata import patch_session
+        return await patch_session(self, request)
 
     @_require_auth
     async def _handle_delete_session(self, request: web.Request) -> web.Response:
+        async with self._native_lifecycle_lock(request.match_info["session_id"]):
+            return await self._delete_session_unlocked(request)
+
+    async def _delete_session_unlocked(self, request: web.Request) -> web.Response:
         """DELETE /api/sessions/{session_id}."""
         session_id = request.match_info["session_id"]
         _session, err = await self._get_existing_session_or_404(session_id)
@@ -3202,6 +3184,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except Exception:
             logger.debug("sessions dir unavailable for delete of %s", session_id, exc_info=True)
         try:
+            from gateway.native_session_credentials import revoke
+            revoke(self, session_id)
             deleted = await asyncio.to_thread(
                 db.delete_session, session_id, sessions_dir=sessions_dir, exclude_active_write_guards=True)
         except SessionActiveWriteGuardError as exc:
@@ -3536,6 +3520,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: web.Request) -> web.Response:
+        async with self._native_lifecycle_lock(request.match_info["session_id"]):
+            err = await self._native_chat_lifecycle_error(request)
+            return err if err is not None else await self._handle_session_chat_unlocked(request)
+
+    async def _handle_session_chat_unlocked(self, request: web.Request) -> web.Response:
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn (plus the delivery lanes'
         one bounded re-run of a transient failure; ``hermes peer dm`` is the client)."""
         from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
@@ -3582,6 +3571,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: web.Request) -> web.StreamResponse:
+        async with self._native_lifecycle_lock(request.match_info["session_id"]):
+            err = await self._native_chat_lifecycle_error(request)
+            return err if err is not None else await self._handle_session_chat_stream_unlocked(request)
+
+    async def _handle_session_chat_stream_unlocked(self, request: web.Request) -> web.StreamResponse:
         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
         limited = self._concurrency_limited_response()
         if limited is not None:
@@ -3707,8 +3701,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 run_id, task, interrupt_message="SSE task cancelled", shield_wait=True)
             logger.info("Session SSE task cancelled; drained live run %s", run_id)
             raise
-        except Exception as exc:
-            logger.debug("[api_server] session SSE stream error: %s", exc)
+        except Exception:  # health: allow BLE001 -- Credential-bearing SSE boundary: log no exception contents.
+            logger.debug("[api_server] session SSE stream failed")
         return response
 
     def _register_session_stream_approval(self, run_id: str, events: _SessionEventQueue, message_id: str):

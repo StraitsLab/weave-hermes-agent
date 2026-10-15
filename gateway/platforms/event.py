@@ -109,6 +109,8 @@ class MessageEvent:
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
         """One turn now answers *other* too: an addressed message wins, then an unknown one."""
+        from gateway.native_session_lifecycle import record_folded_refs
+        record_folded_refs(self, other)
         if self.reply_expected is not True and other.reply_expected is not False:
             self.reply_expected = other.reply_expected
 
