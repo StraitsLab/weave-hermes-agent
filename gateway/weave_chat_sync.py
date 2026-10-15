@@ -50,7 +50,7 @@ HUB = "mcp__weave_connectors__"  # the cell's name prefix for Harso hub tools
 CODE_CARDS = {HUB + "weather_now", HUB + "page_read"}  # hub tools whose own code builds a card
 
 
-def hub_card(tool_name: Any, result: Any) -> Optional[Dict[str, Any]]:
+def hub_card(tool_name: Any, result: Any) -> Optional[dict[str, Any]]:
     """WEV-3395: the answer card a Harso card tool returned (MCP structuredContent or result ``card``), else None.
 
     Only Harso's card tools count: ``show_<card>`` (weave-api fills and checks it) and CODE_CARDS. Every other hub
@@ -71,14 +71,14 @@ def hub_card(tool_name: Any, result: Any) -> Optional[Dict[str, Any]]:
     return card if isinstance(card, dict) and card.get("kind") == "output_blocks" else None
 
 
-def row_key(message: Dict[str, Any]) -> str:
+def row_key(message: dict[str, Any]) -> str:
     return f"{message['role']}:{message.get('timestamp')!r}"
 
 
 _LINKISH = ("http://", "https://", "](", "<artifact", "file://")
 
 
-def visible_reply(text: str, show_tag: str = "[SHOW]", show_over: int = 400) -> "tuple[str, bool]":
+def visible_reply(text: str, show_tag: str = "[SHOW]", show_over: int = 400) -> tuple[str, bool]:
     """(text without the show tag, whether the screen shows it on a call). DEC-415."""
     stripped = text.lstrip()
     if show_tag and stripped.startswith(show_tag):
@@ -86,7 +86,7 @@ def visible_reply(text: str, show_tag: str = "[SHOW]", show_over: int = 400) -> 
     return text, any(mark in text for mark in _LINKISH) or len(text) > show_over
 
 
-def visible_rows(messages: List[Dict[str, Any]], show_tag: str = "[SHOW]", show_over: int = 400) -> List[Dict[str, Any]]:
+def visible_rows(messages: list[dict[str, Any]], show_tag: str = "[SHOW]", show_over: int = 400) -> list[dict[str, Any]]:
     """The rows a person sees: what they said and what the assistant answered (no tool channel)."""
     out = []
     for m in messages:
@@ -98,7 +98,7 @@ def visible_rows(messages: List[Dict[str, Any]], show_tag: str = "[SHOW]", show_
         if m["role"] == "user" and content.lstrip().startswith(SCAFFOLDING):
             continue
         at = m.get("timestamp")
-        body: Dict[str, Any] = {"text": content}
+        body: dict[str, Any] = {"text": content}
         if m["role"] == "assistant":
             body["text"], body["visible"] = visible_reply(content, show_tag, show_over)
         out.append({"cell_key": row_key(m), "role": m["role"], "kind": "text", "state": "final",
@@ -110,8 +110,8 @@ def visible_rows(messages: List[Dict[str, Any]], show_tag: str = "[SHOW]", show_
 
 class _Writer:
     def __init__(self) -> None:
-        self.events: "queue.Queue[tuple]" = queue.Queue(maxsize=10_000)
-        self.live: Dict[str, Dict[str, Any]] = {}
+        self.events: queue.Queue[tuple] = queue.Queue(maxsize=10_000)
+        self.live: dict[str, dict[str, Any]] = {}
         threading.Thread(target=self._run, name="weave-chat-writer", daemon=True).start()
 
     def _run(self) -> None:
@@ -131,7 +131,7 @@ class _Writer:
                         self.live.pop(ref, None)
                         _ENDED.append(ref)
                         self._finish(live)
-                except Exception:  # noqa: BLE001 - Supabase down: keep going; the next turn end resyncs
+                except Exception:
                     logger.warning("chat writer: write failed", exc_info=True)
                     if ref in ended:
                         self.live.pop(ref, None)
@@ -140,7 +140,7 @@ class _Writer:
                     if ref in ended and live.get("on_finished"):
                         live["on_finished"]()
 
-    def _take(self, ref: str, event: Dict[str, Any]) -> bool:
+    def _take(self, ref: str, event: dict[str, Any]) -> bool:
         live, kind = self.live.get(ref), event.get("type")
         if live is None:
             return False
@@ -173,7 +173,7 @@ class _Writer:
             return True
         return False
 
-    def _flush(self, live: Dict[str, Any]) -> None:
+    def _flush(self, live: dict[str, Any]) -> None:
         cards, live["cards"] = live["cards"], []
         if cards:
             _call(live, cards)
@@ -191,7 +191,7 @@ class _Writer:
                                 "body": {"text": live["text"], "status": live["status"]}}])[0]
         live["sent"], live["rev"], live["shown"] = len(live["text"]), out["rev"], live["status"]
 
-    def _finish(self, live: Dict[str, Any]) -> None:
+    def _finish(self, live: dict[str, Any]) -> None:
         messages = live["read"]()
         rows = visible_rows(messages, live["show_tag"], live["show_over"])
         if live["session"] in _SYNCED:
@@ -217,7 +217,7 @@ class _Writer:
         _SYNCED.add(live["session"])  # first turn after boot copied the whole chat (backfill)
 
 
-def _call(live: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _call(live: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     body = json.dumps({"p_bearer": live["bearer"], "p_session_ref": live["session"], "p_items": items}).encode()
     request = urllib.request.Request(live["url"] + "/rest/v1/rpc/chat_cell_write", data=body, method="POST",
                                      headers={"apikey": live["key"], "Content-Type": "application/json"})
@@ -228,10 +228,10 @@ def _call(live: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[str, A
 _WRITER: Optional[_Writer] = None
 _LOCK = threading.Lock()
 _SYNCED: set = set()
-_ENDED: "collections.deque[str]" = collections.deque(maxlen=256)  # refs already finished: a late event reopens nothing
+_ENDED: collections.deque[str] = collections.deque(maxlen=256)  # refs already finished: a late event reopens nothing
 
 
-def publish(session_id: str, ref: str, event: Dict[str, Any], read_display: Callable[[], List[Dict[str, Any]]],
+def publish(session_id: str, ref: str, event: dict[str, Any], read_display: Callable[[], list[dict[str, Any]]],
             secret: Callable[[str], str], *, on_finished=None) -> bool:
     """Hand one live event to the writer. Never blocks and never raises into the gateway."""
     global _WRITER
@@ -262,5 +262,5 @@ def publish(session_id: str, ref: str, event: Dict[str, Any], read_display: Call
         return True
     except queue.Full:
         logger.warning("chat writer queue full; live piece dropped (the saved row still lands)")
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.debug("chat writer publish skipped", exc_info=True)

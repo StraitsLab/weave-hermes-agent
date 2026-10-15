@@ -952,7 +952,7 @@ class ToolRegistry:
                 result = entry.handler(args, **kwargs)
             from tools.harso_result_redaction import _scrub_vault_values
             return self._normalize_handler_result(name, _scrub_vault_values(result, tool=name))
-        except Exception as e:
+        except Exception as e:  # health: allow BLE001 -- upstream dispatch boundary; Harso only scrubs vault values from the text
             import traceback
             from tools.harso_result_redaction import _scrub_vault_values
             message = _scrub_vault_values(str(e))

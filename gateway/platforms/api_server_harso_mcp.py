@@ -43,7 +43,7 @@ async def change(adapter, request, *, refresh):
         try:
             result = await asyncio.to_thread(reload_tools, server)
             return web.json_response({'status': 'ok', **result})
-        except Exception:
+        except Exception:  # health: allow BLE001 -- HTTP boundary: transport errors can carry credentials, so every failure is one opaque 503
             # Transport errors can contain credentials; expose neither exception nor config.
             return web.json_response({'error': 'MCP reload failed'}, status=503)
         finally:

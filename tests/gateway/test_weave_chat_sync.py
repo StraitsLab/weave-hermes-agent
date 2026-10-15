@@ -146,10 +146,11 @@ def test_a_tool_card_lands_on_the_answer_row(server, monkeypatch):
 
 def test_off_without_settings_and_never_raises(server, monkeypatch):
     url, calls, _rows = server
-    sync.publish("weave-abc", "ref3", {"type": "turn.started"}, lambda: [], lambda name: "")
-    sync.publish("weave-abc", "ref3", {"type": "assistant.delta", "delta": "x"}, lambda: [], lambda name: "")
-    sync.publish("not-weave", "ref4", {"type": "turn.started"}, lambda: [], secrets(url))
-    time.sleep(0.2)
+    sync.publish("weave-abc", "ref3", {"type": "turn.started"}, list, lambda name: "")
+    sync.publish("weave-abc", "ref3", {"type": "assistant.delta", "delta": "x"}, list, lambda name: "")
+    sync.publish("not-weave", "ref4", {"type": "turn.started"}, list, secrets(url))
+    # Nothing was enqueued: the writer never started, or its queue is empty and idle.
+    assert sync._WRITER is None or sync._WRITER.events.empty()
     assert calls == []
 
 
@@ -184,12 +185,12 @@ def test_an_immediate_turn_without_turn_started_still_streams(server, monkeypatc
     assert rows[live_id]["text"] == "Hello"
     # A late event for a finished turn reopens nothing.
     sync.publish("weave-abc", "ref7", {"type": "assistant.delta", "delta": "x"}, lambda: saved, secrets(url))
-    time.sleep(0.2)
+    wait_for(lambda: sync._WRITER.events.empty())
     assert "ref7" not in sync._WRITER.live
 
 
 def test_terminal_callback_waits_for_final_write(server, monkeypatch):
-    url, calls, rows = server
+    url, _calls, _rows = server
     entered, proceed, completed = threading.Event(), threading.Event(), threading.Event()
     original = sync._Writer._finish
     def finish(self, live):
@@ -201,7 +202,7 @@ def test_terminal_callback_waits_for_final_write(server, monkeypatch):
     monkeypatch.setattr(sync, "_call", lambda live, items: real({**live, "url": live["url"].replace("https://", "http://")}, items))
     try:
         assert sync.publish("weave-callback", "callback-ref", {"type": "turn.completed"},
-                            lambda: [], secrets(url), on_finished=completed.set)
+                            list, secrets(url), on_finished=completed.set)
         assert entered.wait(2)
         assert not completed.is_set()
         proceed.set()
@@ -227,7 +228,7 @@ def test_show_tag_marks_a_reply_visible_and_leaves_the_tag_out():
 
 
 def test_show_settings_come_from_the_profile_secrets(server, monkeypatch):
-    url, calls, rows = server
+    url, calls, _rows = server
     now = time.time()
     values = {"WEAVE_CHAT_SUPABASE_URL": url.replace("http://", "https://"), "WEAVE_CHAT_SUPABASE_KEY": "k",
               "WEAVE_API_MCP_BEARER": "b", "WEAVE_CHAT_SHOW_TAG": "[READ]", "WEAVE_CHAT_SHOW_OVER_CHARS": "nope"}
