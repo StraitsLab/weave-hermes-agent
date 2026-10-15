@@ -74,6 +74,17 @@ def _commit_hub_for(db_path) -> _CommitWakeHub:
 
 class HarsoSessionMixin:
     _TRANSCRIPT_READ_ATTEMPTS = 8
+
+    def _archive_and_compact_on_conn(self, conn, session_id, *args, **kwargs):
+        result = super()._archive_and_compact_on_conn(conn, session_id, *args, **kwargs)
+        # Even an empty active transcript is replaced by the compaction summary.
+        # Fence its cursor inside the same transaction, without optional-column triggers.
+        from hermes_state_harso_schema import _transcript_bump_sql
+        advance, stamp, _ = _transcript_bump_sql("?").split(";")
+        conn.execute(advance)
+        conn.execute(stamp, (session_id,))
+        return result
+
     def safe_fork_session(self, parent_session_id: str, child_session_id: str, *, before_commit=None) -> str:
         """Atomically publish or replay one explicit native fork."""
         def _do(conn):

@@ -31,11 +31,13 @@ def _transcript_bump_sql(targets: str) -> str:
 
 # Columns /api/sessions/{id}/messages can render, plus the ones that decide
 # membership. api_content, display_metadata (reactions), platform_message_id
-# and observed are deliberately absent.
+# and observed are deliberately absent. _compressed_summary is model-only;
+# the compaction transaction explicitly advances its cursor, including on empty
+# history. Do not bind triggers to this optional migration column.
 _TRANSCRIPT_MESSAGE_COLUMNS = (
     "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
     "timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
-    "display_kind", "active", "compacted", "_compressed_summary",
+    "display_kind", "active", "compacted",
 )
 _TRANSCRIPT_SESSION_COLUMNS = (
     "parent_session_id", "ended_at", "end_reason", "model_config", "source", "started_at",
@@ -57,7 +59,6 @@ TRANSCRIPT_TRIGGERS = (
     "transcript_epoch_session_reinsert",
     "transcript_epoch_message_replace",
     "transcript_epoch_message_insert_below_head",
-    "transcript_epoch_compaction_summary",
     "transcript_epoch_message_update",
     "transcript_epoch_message_delete",
     "transcript_epoch_session_insert",
@@ -76,9 +77,6 @@ WHEN NEW.id > 0 AND EXISTS (SELECT 1 FROM messages _m WHERE _m.id = NEW.id)
 BEGIN {_transcript_bump_sql("(SELECT _m.session_id FROM messages _m WHERE _m.id = NEW.id), NEW.session_id")} END;
 CREATE TRIGGER IF NOT EXISTS transcript_epoch_message_insert_below_head AFTER INSERT ON messages
 WHEN EXISTS (SELECT 1 FROM messages _m WHERE _m.id > NEW.id)
-BEGIN {_transcript_bump_sql("NEW.session_id")} END;
-CREATE TRIGGER IF NOT EXISTS transcript_epoch_compaction_summary AFTER INSERT ON messages
-WHEN NEW._compressed_summary = 1
 BEGIN {_transcript_bump_sql("NEW.session_id")} END;
 CREATE TRIGGER IF NOT EXISTS transcript_epoch_message_update
 AFTER UPDATE OF {", ".join(_TRANSCRIPT_MESSAGE_COLUMNS)} ON messages

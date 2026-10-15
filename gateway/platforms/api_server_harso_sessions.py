@@ -1036,10 +1036,8 @@ class NativeSessionAPI:
         session_key: str, metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         """Expose the existing clarify waiter without inventing a prompt system."""
-        native_request_ref = self._native_submit_active_refs.get(session_key)
+        native_request_ref = self._native_submit_active_ref(session_key)
         if not native_request_ref:
-            return SendResult(success=False, error="native admission reference unavailable")
-        if not self._native_submit_active_ref(session_key):
             from gateway.platforms.api_server_authority_runs import send_clarify
             return await send_clarify(self, chat_id=chat_id, clarify_id=clarify_id)
         from tools.clarify_gateway import get_clarify_metadata

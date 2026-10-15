@@ -22,6 +22,9 @@ async def run(runner, event, source, key, generation):
 def record_folded_refs(survivor, incoming):
     meta = survivor.metadata
     refs = [incoming.metadata.get('native_request_ref'), *incoming.metadata.get('merged_native_request_refs', [])]
+    refs = [ref for ref in refs if isinstance(ref, str) and ref]
+    if not refs:
+        return
     own = meta.get('native_request_ref')
     folded = meta.setdefault('merged_native_request_refs', [])
     for ref in refs:

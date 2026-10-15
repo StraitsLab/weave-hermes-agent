@@ -39,7 +39,9 @@ class TurnFacadeMixin:
         from agent.background_review import cancel_background_review_for_live_turn
 
         cancel_background_review_for_live_turn(self)
-        self._open_steer_window()
+        open_steer_window = getattr(self, "_open_steer_window", None)
+        if callable(open_steer_window):
+            open_steer_window()
 
         from agent import relay_runtime
         from agent.aux_accounting import reset_accounting_context, set_accounting_context
