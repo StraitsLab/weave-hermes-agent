@@ -81,6 +81,12 @@ let
           hatchling = [ ];
         };
       });
+      # harso-jev locks jev-ultrafast as a git source; same hatchling gap as misaki.
+      jev-ultrafast = prev.jev-ultrafast.overrideAttrs (old: {
+        nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ final.resolveBuildSystem {
+          hatchling = [ ];
+        };
+      });
     };
 
   pythonPackageOverrides =
