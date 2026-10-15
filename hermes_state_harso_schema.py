@@ -141,3 +141,9 @@ def install(db):
         script = "".join(f"DROP TRIGGER IF EXISTS {name};" for name in changed + stale)
         script += "".join(wanted[name] + ";" for name in changed)
         conn.executescript("BEGIN IMMEDIATE;" + script + "COMMIT;")
+    # v0.22.1's runtime ledger was retired in v0.22.2; its guard otherwise blocks session deletion.
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'session_admissions'").fetchone():
+        conn.executescript(
+            "BEGIN IMMEDIATE;DROP TRIGGER IF EXISTS sessions_runtime_ledger_delete_guard;"
+            "DROP TABLE IF EXISTS worker_receipts;DROP TABLE IF EXISTS worker_executions;"
+            "DROP TABLE IF EXISTS session_admissions;DROP TABLE IF EXISTS runtime_epoch;COMMIT;")
