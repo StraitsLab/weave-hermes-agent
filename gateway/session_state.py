@@ -42,6 +42,8 @@ class TurnState:
 class ConversationState:
     """State scoped to one conversation (survives turns, not boundaries)."""
 
+    credential_holder: Any = None
+    credential_route_revision_id: Optional[str] = None
     model_override: Optional[dict[str, Any]] = None  # /model per-session override
     one_turn_restore: Optional[dict[str, Any]] = None  # /model --once snapshot
     reasoning_override: Optional[dict[str, Any]] = None  # /reasoning override
@@ -56,6 +58,8 @@ class ConversationState:
 
     def clear(self) -> None:
         """Reset every field to its default, so new fields are cleared automatically."""
+        if self.credential_holder is not None:
+            self.credential_holder.revoke()
         self.__dict__.update(ConversationState().__dict__)
 
 

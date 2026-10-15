@@ -1559,7 +1559,8 @@ class SessionMessagesMixin:
 
     def _rows_to_conversation(self, rows, *, session_id: str, include_ancestors: bool, repair_alternation: bool,
                               include_row_ids: bool = False,
-                              include_summary_markers: bool = False) -> list[dict[str, Any]]:
+                              include_summary_markers: bool = False,
+                              include_passive_metadata: bool = False) -> list[dict[str, Any]]:
         """Decode fetched rows (ordered by id, pre-filtered) into OpenAI format, stable key order. Every dict is
         stamped ``_DB_PERSISTED_MARKER_KEY`` (born durable) so an identity-losing handoff never re-appends the
         transcript on flush. Unaddressed live-replay projections also carry the stored-row CAS digest: if a later rewrite
@@ -1597,9 +1598,13 @@ class SessionMessagesMixin:
             # The durable identity is part of the message, like ``timestamp``: restored on EVERY projection
             # (ACP, gateway, CLI, TUI, compression adoption), never opt-in like ``_row_id``.
             _restore_identity_columns(row, msg)
-            msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
-            if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
-                msg["display_metadata"] = decoded
+            if row["api_content"]:
+                msg["api_content"] = row["api_content"]
+            if row["display_kind"] != "passive_append" or include_passive_metadata:
+                if row["display_kind"]:
+                    msg["display_kind"] = row["display_kind"]
+                if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
+                    msg["display_metadata"] = decoded
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
             msg.update(
@@ -1671,7 +1676,7 @@ class SessionMessagesMixin:
             include_ancestors=False, repair_alternation=True, include_row_ids=True, include_summary_markers=True)
         display_history = self._rows_to_conversation(
             self._dedupe_display_generations(rows), session_id=session_id,
-            include_ancestors=True, repair_alternation=False, include_row_ids=True)
+            include_ancestors=True, repair_alternation=False, include_row_ids=True, include_passive_metadata=True)
         return model_history, display_history
 
     def _resume_lineage_ids(self, session_id: str) -> list[str]:

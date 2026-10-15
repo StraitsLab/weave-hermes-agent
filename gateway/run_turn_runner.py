@@ -977,6 +977,14 @@ class TurnRunner:
                     for sink in delta_sinks:
                         sink.on_delta(text)
 
+        native_delta = getattr(getattr(ctx, '_status_adapter', None), '_native_submit_delta', None)
+        if callable(native_delta):
+            existing_delta = stream_delta_cb
+            def stream_delta_cb(text):
+                if existing_delta is not None:
+                    existing_delta(text)
+                native_delta(ctx.session_key, text)
+
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
                 return
@@ -1264,6 +1272,22 @@ class TurnRunner:
             if (ctx._voice_ack_guild[0] is not None or ctx._native_slack_task_cards) else None
         )
         agent.tool_complete_callback = ctx.native_tool_complete_callback if ctx._native_slack_task_cards else None
+        adapter = runner._delivery_adapter_for(ctx.source)
+        native_start = getattr(adapter, '_native_submit_tool_started', None)
+        native_complete = getattr(adapter, '_native_submit_tool_completed', None)
+        previous_start, previous_complete = agent.tool_start_callback, agent.tool_complete_callback
+        if callable(native_start):
+            def start(call_id, name, args):
+                if previous_start:
+                    previous_start(call_id, name, args)
+                native_start(ctx.session_key, call_id, name)
+            agent.tool_start_callback = start
+        if callable(native_complete):
+            def complete(call_id, name, args, result):
+                if previous_complete:
+                    previous_complete(call_id, name, args, result)
+                native_complete(ctx.session_key, call_id, name, result)
+            agent.tool_complete_callback = complete
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
@@ -1926,10 +1950,10 @@ class TurnRunner:
                 # Quota cap with valid credentials: /login cannot help; name the reset window (#89401).
                 from gateway.run import _gateway_provider_error_reply
                 return {"final_response": _gateway_provider_error_reply(str(exc)),
-                        "messages": [], "api_calls": 0, "tools": []}
+                        "messages": [], "api_calls": 0, "tools": [], "failed": True, "completed": False}
             return {
                 "final_response": t("gateway.errors.no_credentials"),
-                "messages": [], "api_calls": 0, "tools": [],
+                "messages": [], "api_calls": 0, "tools": [], "failed": True, "completed": False,
             }
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
@@ -1952,6 +1976,9 @@ class TurnRunner:
         # returns, so early run_sync returns are also finalised.
         # See the outer finally/completion section below. See #60671.
         final_response = result.get("final_response")
+        native_final = getattr(getattr(ctx, '_status_adapter', None), '_native_submit_final', None)
+        if callable(native_final):
+            native_final(ctx.session_key, final_response)
         # Actual token counts from the agent instance used for this run.
         agent = ctx.agent_holder[0]
         has_comp = bool(agent) and hasattr(agent, "context_compressor")

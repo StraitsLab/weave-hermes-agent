@@ -165,7 +165,10 @@ def hygiene_no_commit_reason(agent) -> str:
     return "in-place commit did not complete"
 
 
-class GatewayTurnMixin:
+from gateway.native_session_followup import NativeFollowupMixin
+
+
+class GatewayTurnMixin(NativeFollowupMixin):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
     def _resolve_session_agent_runtime(
@@ -186,6 +189,10 @@ class GatewayTurnMixin:
         # notice must never attach to another session's next turn (#74349).
         self._pre_agent_fallback_notice = None
 
+        from gateway.native_session_credentials import runtime
+        selected = runtime(self, source, session_key, user_config)
+        if selected is not None:
+            return selected
         model = _resolve_gateway_model(user_config)
         if skey:
             self._rehydrate_session_model_override(skey)
@@ -2210,6 +2217,8 @@ class GatewayTurnMixin:
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
+            from gateway.native_session_lifecycle import mark_result
+            mark_result(event, agent_result)
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -2265,6 +2274,8 @@ class GatewayTurnMixin:
             )
 
         except Exception as e:
+            from gateway.native_session_lifecycle import mark_result
+            mark_result(event, {"failed": True})
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
             # Restore session context variables to their pre-handler state
@@ -2567,6 +2578,10 @@ class GatewayTurnMixin:
                         refresh_agent_mcp_tools(_agent, quiet_mode=True)
         except Exception as _exc:
             logger.debug("Failed to update cached agent tools after MCP reload: %s", _exc)
+
+    async def _reload_mcp_toolset(self, *, server=None):
+        from gateway.platforms.api_server_harso_mcp import reload_tools
+        return await asyncio.to_thread(reload_tools, server)
 
     async def _execute_mcp_reload(self, event: MessageEvent) -> str:
         """Disconnect, reconnect, and notify MCP tool changes (shared by button / text / no-confirm paths).
@@ -3928,6 +3943,9 @@ class GatewayTurnMixin:
         # different profile's adapter, and only that instance holds the per-message reaction state.
         from gateway.run_turn_followup_ack import _followup_cancel_outcome, _run_followup_processing_hook
         _hook_adapter = self._intake_adapter_for(next_source) if pending_event is not None else None
+        native_token = await self._begin_native_followup(pending_event, next_session_key)
+        if self._native_followup_skipped(pending_event):
+            return response
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).
@@ -3947,15 +3965,19 @@ class GatewayTurnMixin:
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
             )
         except asyncio.CancelledError:
+            await self._end_native_followup(native_token, next_session_key, failed=True)
             await _run_followup_processing_hook(
                 _hook_adapter, pending_event, "on_processing_complete", _followup_cancel_outcome(_hook_adapter))
             raise
         except BaseException:
+            await self._end_native_followup(native_token, next_session_key, failed=True)
             await _run_followup_processing_hook(
                 _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.FAILURE)
             raise
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
+        from gateway.native_session_lifecycle import failed_result
+        await self._end_native_followup(native_token, next_session_key, failed=failed_result(followup_result))
         merged = _preserve_queued_followup_history_offset(result, followup_result)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal

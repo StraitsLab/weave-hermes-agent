@@ -286,3 +286,17 @@ def get_clarify_timeout() -> int:
         return resolve_clarify_timeout(load_config() or {})
     except Exception:
         return 3600
+
+
+def get_clarify_metadata(clarify_id: str) -> Optional[dict]:
+    """Return a stable, read-only description of one pending clarify waiter."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None:
+            return None
+        return {
+            "clarify_id": entry.clarify_id,
+            "question": entry.question,
+            "choices": list(entry.choices) if entry.choices else [],
+            "multi_select": bool(entry.multi_select),
+        }

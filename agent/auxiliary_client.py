@@ -2446,28 +2446,7 @@ def _refresh_nous_recommended_model(*, vision: bool, stale_model: Optional[str])
     return _NOUS_MODEL if _NOUS_MODEL.strip().lower() != stale else None
 
 
-def _read_main_field(field: str, *, readonly: bool, lower: bool = False) -> str:
-    """Main ``model.<field>``: runtime override (``set_runtime_main``) first, then config.yaml.
-
-    The override wins so "active main model" gates see the live CLI/gateway runtime, not the persisted
-    default. ``readonly`` picks ``load_config_readonly`` (model/provider) vs ``load_config`` (api_key/base_url).
-    """
-    override = _runtime_main_value(field)
-    if isinstance(override, str) and override.strip():
-        value = override.strip()
-        return value.lower() if lower else value
-    with contextlib.suppress(Exception):
-        from hermes_cli import config as _cfg_mod
-        cfg = (_cfg_mod.load_config_readonly if readonly else _cfg_mod.load_config)()
-        model_cfg = cfg.get("model", {})
-        if field == "model" and isinstance(model_cfg, str) and model_cfg.strip():
-            return model_cfg.strip()
-        if isinstance(model_cfg, dict):
-            value = model_cfg.get("default" if field == "model" else field, "")
-            if isinstance(value, str) and value.strip():
-                value = value.strip()
-                return value.lower() if lower else value
-    return ""
+from agent.auxiliary_main_config import read_main_field as _read_main_field
 
 
 # Module-level callables (tests patch them): model/provider (lowercased) read the readonly config;
@@ -2848,11 +2827,10 @@ def _resolve_custom_runtime() -> tuple[Optional[str], Optional[str], Optional[st
     # Local servers (Ollama, vLLM, ...) ignore auth but the SDK needs a non-empty key.
     # Use a placeholder key — the OpenAI SDK requires a non-empty string but local servers ignore the
     # Authorization header. Same fix as cli.py _ensure_runtime_credentials() (PR #2556).
-    if not isinstance(custom_key, str) or not custom_key.strip():
-        custom_key = "no-key-required"
+    custom_key = _normalize_api_key(custom_key) or "no-key-required"
     if not isinstance(custom_mode, str) or not custom_mode.strip():
         custom_mode = None
-    return custom_base, custom_key.strip(), custom_mode
+    return custom_base, custom_key, custom_mode
 
 
 def _current_custom_base_url() -> str:
@@ -4778,7 +4756,7 @@ def _named_custom_api_key(custom_entry: dict[str, Any], provider: str, custom_ba
     """Credential for a named custom provider: inline api_key → key_env → key_cmd → credential pool → placeholder.
     Aux resolves named custom providers here, not via _resolve_named_custom_runtime, so key_cmd must be
     honoured at the same precedence or every aux call 401s."""
-    custom_key: Any = (custom_entry.get("api_key") or "").strip()
+    custom_key: Any = _normalize_api_key(custom_entry.get("api_key"))
     custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
     if not custom_key and custom_key_env:
         custom_key = _scoped_key_env(custom_key_env)
@@ -4804,7 +4782,7 @@ def _named_custom_api_key(custom_entry: dict[str, Any], provider: str, custom_ba
                 if str(pool_api_key).strip():
                     custom_key = str(pool_api_key).strip()
                     break
-    return custom_key or "no-key-required"
+    return custom_key or _read_main_api_key_if_same_origin(custom_base) or "no-key-required"
 
 
 def _build_bedrock_client(provider: str, model: Optional[str], *, raw_codex: bool) -> tuple[Optional[Any], Optional[str]]:
@@ -6190,7 +6168,7 @@ def _resolve_task_provider_model(
         cfg_provider = str(task_config.get("provider", "")).strip() or None
         cfg_model = str(task_config.get("model", "")).strip() or None
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
-        cfg_api_key = str(task_config.get("api_key", "")).strip() or None
+        cfg_api_key = _normalize_api_key(task_config.get("api_key")) or None
         if not cfg_api_key:  # key_env → env var when api_key is not set directly
             cfg_key_env = str(task_config.get("key_env") or task_config.get("api_key_env") or "").strip()
             if cfg_key_env:

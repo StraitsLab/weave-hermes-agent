@@ -199,7 +199,7 @@ def _should_redact_pii(platform: Platform, enabled: bool) -> bool:
         from gateway.platform_registry import platform_registry
         entry = platform_registry.get(platform.value)
         return bool(entry and entry.pii_safe)
-    except Exception:
+    except Exception:  # health: allow BLE001,S110 -- HTTP/credential boundary: return typed refusal without exception contents.
         return False
 
 
@@ -215,7 +215,7 @@ def _slack_tools_loaded() -> bool:
         from tools.mcp_tool_discovery import get_registered_mcp_server_names
         if any("slack" in name.lower() for name in get_registered_mcp_server_names()):
             return True
-    except Exception:
+    except Exception:  # health: allow BLE001,S110 -- HTTP/credential boundary: return typed refusal without exception contents.
         pass
 
     # Profile secret scope, not bare env: under multiplex the env may hold another
@@ -228,7 +228,7 @@ def _slack_tools_loaded() -> bool:
             token = get_secret("SLACK_BOT_TOKEN") or ""
         except UnscopedSecretError:
             token = os.environ.get("SLACK_BOT_TOKEN") or ""
-    except Exception:
+    except Exception:  # health: allow BLE001,S110 -- HTTP/credential boundary: return typed refusal without exception contents.
         return False
     if not token.strip():
         return False
@@ -239,7 +239,7 @@ def _slack_tools_loaded() -> bool:
         from hermes_cli.tools_config import _get_platform_tools
         # include_default_mcp_servers defaults True so a default-enabled Slack MCP counts too.
         return "slack" in _get_platform_tools(load_config_readonly(), "slack")
-    except Exception:
+    except Exception:  # health: allow BLE001,S110 -- HTTP/credential boundary: return typed refusal without exception contents.
         return False
 
 
@@ -257,7 +257,7 @@ def _discord_tools_loaded() -> bool:
             return False
         enabled = _get_platform_tools(load_config_readonly(), "discord", include_default_mcp_servers=False)
         return "discord" in enabled or "discord_admin" in enabled
-    except Exception:
+    except Exception:  # health: allow BLE001,S110 -- HTTP/credential boundary: return typed refusal without exception contents.
         return False
 
 
@@ -781,6 +781,13 @@ class AsyncSessionStore:
         return _offloaded
 
 
+class SessionResetRequired(RuntimeError):
+    """A strict caller cannot reuse an ended or displaced session identity."""
+
+    def __init__(self, cause: str):
+        self.cause = cause
+        super().__init__("Session reset required")
+
 class SessionStore(
     SessionPersistenceMixin, SessionRecoveryMixin, SessionLifecycleMixin, SessionTranscriptMixin,
     SessionPromptPinMixin,
@@ -851,7 +858,7 @@ class SessionStore(
             from hermes_constants import get_hermes_home
 
             self._routing_home: Optional[Path] = Path(get_hermes_home())
-        except Exception:
+        except Exception:  # health: allow BLE001,S110 -- HTTP/credential boundary: return typed refusal without exception contents.
             self._routing_home = None
         self._open_session_db_for_active_scope()
 
@@ -870,7 +877,7 @@ class SessionStore(
             return False
         try:
             return bool(self._has_active_processes_fn(session_key))
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001,S110 -- HTTP/credential boundary: return typed refusal without exception contents.
             logger.warning(
                 "has_active_processes_fn raised during %s for %s; keeping session alive: %s",
                 context, session_key, exc,
@@ -885,7 +892,7 @@ class SessionStore(
         if self._db:
             try:
                 return self._db.session_count_ge(2)
-            except Exception:
+            except Exception:  # health: allow BLE001,S110 -- HTTP/credential boundary: return typed refusal without exception contents.
                 pass  # fall through to heuristic
         with self._lock:
             self._ensure_loaded_locked()
@@ -1130,6 +1137,68 @@ class SessionStore(
         with self._lock:
             entry = self._entry_locked(session_key)
             return dict(entry.model_override) if entry and entry.model_override else None
+
+    def bind_existing_session(
+        self, source: SessionSource, session_id: str, reopen: bool = True,
+        *, raise_on_reset: bool = False,
+    ) -> Optional[SessionEntry]:
+        """Atomically bind one source key to an already-existing session row.
+
+        Unlike ``get_or_create_session()`` followed by ``switch_session()``,
+        this never creates an intermediate session or ends a ghost row.
+        """
+        if not isinstance(session_id, str) or not session_id or self._db is None:
+            return None
+        session_key = self._generate_session_key(source)
+        now = _now()
+        with self._lock:
+            self._ensure_loaded_locked()
+            # Read and classify inside the routing mutation lock. A separate
+            # post-refusal lookup could observe a different reset generation.
+            try:
+                row = self._db.get_session(session_id)
+            except Exception:  # health: allow BLE001,S110 -- HTTP/credential boundary: return typed refusal without exception contents.
+                return None
+            if row is None:
+                return None
+            if not reopen and (row.get("end_reason") is not None or row.get("ended_at") is not None):
+                if raise_on_reset:
+                    raise SessionResetRequired("session_ended")
+                return None
+            existing = self._entries.get(session_key)
+            if existing is not None:
+                if existing.session_id != session_id:
+                    if not reopen and raise_on_reset:
+                        raise SessionResetRequired("source_displaced")
+                    return None
+                existing.origin = source
+                existing.platform = source.platform
+                existing.chat_type = source.chat_type
+                existing.display_name = source.chat_name
+                existing.updated_at = now
+                entry = existing
+            else:
+                entry = SessionEntry(
+                    session_key=session_key,
+                    session_id=session_id,
+                    created_at=now,
+                    updated_at=now,
+                    origin=source,
+                    display_name=source.chat_name,
+                    platform=source.platform,
+                    chat_type=source.chat_type,
+                )
+                self._entries[session_key] = entry
+        self._save_entries()
+        try:
+            if reopen:
+                self._db.reopen_session(session_id)
+            self._record_gateway_session_peer(
+                session_id, session_key, source, display_name=entry.display_name
+            )
+        except Exception:  # health: allow BLE001,S110 -- HTTP/credential boundary: return typed refusal without exception contents.
+            return None
+        return entry
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""

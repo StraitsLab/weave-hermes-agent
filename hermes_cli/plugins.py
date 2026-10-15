@@ -200,7 +200,7 @@ VALID_HOOKS: set[str] = {
     # Slash-command dispatch observer (#64204, observer-first per #64182 ground rule 3). Return values are
     # IGNORED in v1 — a plugin returning a directive-shaped dict gets a debug log so future block/rewrite
     # adopters are discoverable once the middleware variant ships against the #64231 taxonomy.
-    "pre_command",
+    "pre_command", "cron_run_credential",  # Harso fork: see cron/harso_credential.py
 }
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as

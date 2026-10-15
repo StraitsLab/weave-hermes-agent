@@ -778,6 +778,17 @@ def _run_agent_tool_execution_middleware(
     trace = middleware_trace if middleware_trace is not None else []
     state = _ManagedToolResult(result=None, args=function_args, middleware_trace=trace, blocked=False, dispatched=False)
     dispatch_lock = threading.Lock()
+    forwarded_started = False
+
+    def _forwarded_start(final_args=None):
+        nonlocal forwarded_started
+        with dispatch_lock:
+            if forwarded_started:
+                return
+            forwarded_started = True
+        _begin_tool_execution(agent, _ToolCallRef(
+            function_name, final_args if isinstance(final_args, dict) else function_args,
+            effective_task_id, tool_call_id, trace), display_index)
 
     def _authorized_dispatch(final_args: dict[str, Any]) -> Any:
         with dispatch_lock:
@@ -815,6 +826,7 @@ def _run_agent_tool_execution_middleware(
             request_args,
             lambda next_args: _authorized_dispatch(next_args if isinstance(next_args, dict) else request_args),
             original_args=function_args,
+            on_execution_started=_forwarded_start,
             **tool_hook_ids(agent, effective_task_id, tool_call_id),
         )
 
