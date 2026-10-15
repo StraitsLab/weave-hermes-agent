@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+import sys
 import shutil
 import subprocess
 import uuid
@@ -754,9 +755,10 @@ def _spawn_and_collect(
                              "for Lightpanda command %s (agent-browser rejects them with --engine lightpanda)",
                              command)
     else:
-        from tools.bot_desktop import browser as desktop_browser
-        browser_env.setdefault("AGENT_BROWSER_PROFILE", os.path.join(task_socket_dir, "profile"))
-        desktop_browser.disable_password_manager(browser_env["AGENT_BROWSER_PROFILE"])
+        if sys.platform != "win32":  # Harso cells are Linux; Windows keeps upstream's profile handling
+            from tools.bot_desktop import browser as desktop_browser
+            browser_env.setdefault("AGENT_BROWSER_PROFILE", os.path.join(task_socket_dir, "profile"))
+            desktop_browser.disable_password_manager(browser_env["AGENT_BROWSER_PROFILE"])
         _apply_chromium_sandbox_args(browser_env)
         # #64867: a local Chromium launch (no --cdp attach) must stay headless on
         # Windows; headed mode is the intentional opt-out (dispatch adds --headed).
