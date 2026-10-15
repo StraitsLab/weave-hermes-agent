@@ -36,10 +36,10 @@ def test_status_policy(job, result, ordinary, excluded, release):
 
 
 @pytest.mark.parametrize("lane,jobs", [
-    # Harso fork: tests-os is manual-dispatch only, so it is no longer a required consumer.
-    ("python", ("tests",)),
-    ("e2e", ("tests",)),
-    ("e2e_upgrade", ("tests",)),
+    ("python", ("tests", "tests-os")),
+    ("e2e", ("tests", "tests-os")),
+    ("e2e_upgrade", ("tests", "tests-os")),
+    ("desktop_updater", ("tests-os",)),
     ("e2e_desktop_update", ("e2e-desktop-update",)),
     ("remote_backends", ("remote-backends",)),
 ])
@@ -96,10 +96,3 @@ def test_cli_stdin_exit_codes_and_output(tmp_path, release, results, code, repor
     assert f"{key}={value}" in child.stdout
     for name, result in results.items():
         assert f"{name}: {result}" in child.stdout
-
-
-def test_harso_tests_os_skip_is_allowed_on_a_pr():
-    lanes = {"python": "true", "desktop_updater": "true", "e2e": "true", "e2e_upgrade": "true"}
-    verdict = evaluate_gate({"detect": {"result": "success", "outputs": lanes},
-                             "tests": {"result": "success"}, "tests-os": {"result": "skipped"}})
-    assert verdict["ok"] is True and verdict["allowed_skips"] == ["tests-os"]
