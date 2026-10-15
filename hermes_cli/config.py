@@ -2322,6 +2322,46 @@ def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[dict[str, 
     return None
 
 
+def load_config_strict() -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
+    """Read fresh policy layers, failing closed without consulting or seeding caches."""
+    with _CONFIG_LOCK:
+        user = _read_config_mapping_strict(get_config_path())
+        managed_dir = managed_scope.get_managed_dir()
+        managed = _read_config_mapping_strict(managed_dir / "config.yaml") if managed_dir else {}
+        from hermes_cli.moa_config import apply_user_moa_presets
+        config = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), copy.deepcopy(user))
+        apply_user_moa_presets(config, user)
+        expanded = _expand_env_vars(_canonicalize_config(config))
+        if managed:
+            normalized = _normalize_root_model_keys(copy.deepcopy(managed))
+            if isinstance(normalized.get("model"), str):
+                normalized["model"] = {"default": normalized["model"]}
+            expanded = _deep_merge(expanded, _expand_env_vars(normalized))
+        return expanded, (user, managed)
+
+
+def _read_config_mapping_strict(path: Path) -> dict[str, Any]:
+    """Missing/documentless files are empty; null, non-mapping or multiple roots refuse."""
+    from ruamel.yaml import YAML
+    from ruamel.yaml.nodes import MappingNode
+    try:
+        with open(path, encoding="utf-8-sig") as stream:
+            document = stream.read()
+        parser = YAML(typ="safe", pure=True)
+        parser.version = (1, 1)
+        node = parser.compose(document)
+        if node is None:
+            return {}
+        if not isinstance(node, MappingNode):
+            raise TypeError(f"{path}: top-level YAML must be a mapping")
+        loaded = yaml.safe_load(document)
+        if not isinstance(loaded, dict):
+            raise TypeError(f"{path}: top-level YAML must construct a mapping")
+        return loaded
+    except FileNotFoundError:
+        return {}
+
+
 def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
     snapshot = _worker_config_snapshot()
     if snapshot is not None:

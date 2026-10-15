@@ -182,6 +182,9 @@ DEFAULT_CONFIG = {
         # "Finish the job" prompt block for all models: don't stop at a stub, never fabricate output
         # when the real path is blocked. ~80 cached tokens. False disables.
         "task_completion_guidance": True,
+        # Embedders may supply their own identity while retaining upstream guidance.
+        "engine_identity": True,
+        "identity_epoch_rebuild": False,
         # Prompt block for all models steering independent tool calls (reads, searches, fetches,
         # read-only commands) into one batched turn; the runtime already runs them concurrently. ~70
         # cached tokens. False disables.
@@ -473,6 +476,7 @@ DEFAULT_CONFIG = {
         # CDP-capable backend (Browserbase, or local Chrome via /browser connect). See
         # website/docs/developer-guide/browser-supervisor.md.
         "dialog_policy": "must_respond",  # must_respond | auto_dismiss | auto_accept
+        "web_bot_auth": False,  # Opt-in request signing via the browser signer hook.
         "dialog_timeout_s": 300,  # safety auto-dismiss after N seconds under must_respond
         "camofox": {
             # true = send a stable profile-scoped userId so Camofox maps it to a persistent Firefox
@@ -1323,6 +1327,7 @@ DEFAULT_CONFIG = {
         # One external provider: bundled (retaindb, byterover) or catalog-installed (honcho,
         # hindsight, supermemory, mem0, openviking, holographic). Empty = built-in only.
         "provider": "",
+        "external_prefetch_timeout": 1.0,  # Harso provider's per-turn prefetch budget.
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
@@ -1798,6 +1803,10 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Platform scripts remain opt-in; the scheduler validates ownership and digests.
+        "allow_scripts": True,
+        "platform_script_root": "",
+        "platform_script_digests": {},
         "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
         # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
         # default: policy-denied in cron context to prevent unattended scheduling loops. Jobs
@@ -2012,6 +2021,7 @@ DEFAULT_CONFIG = {
             # Absolute cap on the embedded listing in tokens (chars/4), regardless of context size.
             # Range 200..60000.
             "listing_max_tokens": 4000,
+            "always_eager": [],  # Embedder tool names kept inline by the deferral bridge.
             # Tools replaced by the bridge by default. This list intentionally includes cold,
             # event-triggered built-ins; an explicit list replaces it wholesale and [] keeps every
             # tool eager. The runtime fallback in tools/tool_search.py derives from this value.
