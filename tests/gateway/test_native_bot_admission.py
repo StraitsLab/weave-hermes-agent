@@ -40,3 +40,27 @@ def test_internal_display_uses_admitted_provenance_not_transport_trust():
         assert internal_presentation(None) == 'internal_notification'
     finally:
         api_execution.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_native_admission_carries_vault_identity_not_model_arguments(monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+    from gateway import native_bot_admission as native, session_api_turn
+    from gateway import session_authorities
+    admitted = (None, None, None)
+    admit = AsyncMock(return_value=admitted)
+    authority = Mock()
+    authority.logical_owner.return_value = "session"
+    monkeypatch.setattr("hermes_state_runtime.list_session_admissions", lambda *a, **kw: [])
+    monkeypatch.setattr(session_authorities, "active_authority", lambda _: authority)
+    monkeypatch.setattr(session_api_turn, "admit_api_turn_async", admit)
+    async def observe(*args):
+        return None
+    monkeypatch.setattr(native, "_observe", observe)
+    adapter = SimpleNamespace(gateway_runner=object(), _native_submit_ref_sessions={},
+                              _native_submit_external_ids={}, _record_native_submit_handoff=Mock(),
+                              _native_submit_event=Mock())
+    run = "0199aaaa-0000-7000-8000-000000000001"
+    assert await native.admit(adapter, "default", "session", "sign in", "native-ref", run) == "streaming"
+    assert admit.call_args.kwargs["relay_metadata"]["harso_native_v1"] == dict(
+        internal=False, session_id="session", run_id=run)

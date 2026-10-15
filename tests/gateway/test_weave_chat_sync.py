@@ -240,3 +240,18 @@ def test_show_settings_come_from_the_profile_secrets(server, monkeypatch):
     wait_for(lambda: any(i.get("state") == "final" for c in calls for i in c["p_items"]))
     final = next(i for c in calls for i in c["p_items"] if i.get("state") == "final")
     assert final["body"] == {"text": "read me", "visible": True, "status": None}
+
+
+def test_ledger_vault_card_keeps_always_on_server(server, monkeypatch):
+    url, calls, rows = server
+    approval = "0199dddd-0000-7000-8000-000000000001"
+    run_turn(url, "weave-abc", "vault-ref", [
+        {"type": "approval.request", "request_id": "vault-waiter", "pattern_key": "plugin_rule:" + approval,
+         "description": "Use saved login", "choices": ["once", "deny"]},
+        {"type": "turn.completed"},
+    ], [], monkeypatch)
+    wait_for(lambda: rows.get("approval:vault-waiter", {}).get("state") == "resolved")
+    card = next(i for c in calls for i in c["p_items"] if i.get("cell_key") == "approval:vault-waiter")
+    assert card["body"]["approval_ref"] == approval
+    assert card["body"]["choices"] == ["once", "always", "deny"]
+    assert card["body"]["native_request_ref"] == "vault-ref"

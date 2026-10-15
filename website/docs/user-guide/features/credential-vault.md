@@ -67,6 +67,35 @@ origins; nothing is inferred beyond the URLs saved on the item.
 Prefer not to use a detected manager? `hermes vault sources --disable bitwarden`,
 or the switch in **Settings → Passwords & Logins**.
 
+## Harso server password source
+
+Harso cells can select the server as their **only** vault source:
+
+```yaml
+vault:
+  weave:
+    enabled: true
+    base_url: https://api-dev.harso.dev
+```
+
+This is an opt-in source, not a second vault. Local Fernet and detected managers
+are not offered while enabled, including when the server is unavailable. Save
+logins in **Harso Settings → Vault**; native save prompts are refused. Only saved
+logins (and their server-generated authenticator codes) are supported, not cards,
+addresses, standalone TOTP items or API keys.
+
+The cell uses its scoped `WEAVE_API_MCP_BEARER`. Metadata is password-free.
+Hermes checks the page's exact origin, then asks the server for one password or
+code for that origin. Harso retains Once/Always approvals, audit and limits;
+Hermes waits on the native approval keyed to the server card, then re-resolves
+once. A native allow alone never releases a value. This requires a Harso native
+admission with its session and external run identity; other sessions fail closed.
+
+Hermes injects the value through its native CDP supervisor, registers redaction,
+and arms the existing `harso-vault-guard`. That plugin must be active or fills
+fail closed. No value is stored locally. The cell-to-browser-computer Chrome
+link still needs a live acceptance check before this source can be enabled.
+
 ## Paying and filling addresses
 
 Cards and addresses work the same way as logins: saved once (**Settings →

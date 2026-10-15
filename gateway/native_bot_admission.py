@@ -55,7 +55,8 @@ async def admit(adapter, profile, session_id, message, ref, external_request_id=
             return 'steered'
     admitted = await admit_api_turn_async(adapter, session_id=target, user_message=message,
         conversation_history=[], history_from_session=True, request_id=ref,
-        relay_metadata={'harso_native_v1': {'internal': bool(internal)}})
+        relay_metadata={'harso_native_v1': {'internal': bool(internal),
+                                         'session_id': session_id, 'run_id': external_request_id}})
     adapter._native_submit_ref_sessions[ref] = (profile, session_id)
     adapter._native_submit_external_ids[ref] = external_request_id
     adapter.__dict__.setdefault('_native_authority_admissions', {})[ref] = admitted

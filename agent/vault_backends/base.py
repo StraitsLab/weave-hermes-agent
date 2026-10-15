@@ -25,6 +25,16 @@ class UnlockRequired(Exception):
         self.backend = backend
 
 
+class VaultUnavailable(RuntimeError):
+    """Content-free authority/transport failure."""
+
+
+class VaultUseRefused(RuntimeError):
+    def __init__(self, error_type: str, message: str):
+        super().__init__(message)
+        self.error_type = error_type
+
+
 class LoginBackend(ABC):
     name: str                # config key: local | onepassword | bitwarden
     display_name: str        # user-facing
@@ -127,6 +137,11 @@ def enabled_backends() -> list[LoginBackend]:
     from agent.vault_backends.local import LocalLoginBackend
 
     cfg = _cfg()
+    weave = cfg.get("weave") or {}
+    if isinstance(weave, dict) and weave.get("enabled") is True:
+        from agent.vault_backends.weave import WeaveLoginBackend
+        # One vault path on cells: never offer local Fernet or manager stores as fallback.
+        return [WeaveLoginBackend(str(weave.get("base_url") or ""))]
     out: list[LoginBackend] = [LocalLoginBackend()]
     for cls in external_backend_classes():
         if is_enabled(cls.name):
