@@ -1467,15 +1467,18 @@ def init_agent(
         # Runtime resolution uses api_key="aws-sdk" as the IAM-auth sentinel;
         # attach an httpx client that SigV4-signs every OpenAI SDK request.
         # No-op for non-Mantle base URLs.
-        try:
-            from agent.bedrock_adapter import configure_bedrock_openai_client_kwargs
-            configure_bedrock_openai_client_kwargs(
-                client_kwargs,
-                timeout=_provider_timeout,
-            )
-        except Exception:
-            if agent.provider == "bedrock" and "bedrock-mantle." in str(client_kwargs.get("base_url", "")):
-                raise
+        # Import only for a Bedrock host: importing the adapter lazy-installs boto3 (3 s on every cold start
+        # of a cell on a custom provider, WEV-3404 2026-10-15), and the function is a no-op elsewhere.
+        if "bedrock-mantle." in str(client_kwargs.get("base_url", "")):
+            try:
+                from agent.bedrock_adapter import configure_bedrock_openai_client_kwargs
+                configure_bedrock_openai_client_kwargs(
+                    client_kwargs,
+                    timeout=_provider_timeout,
+                )
+            except Exception:
+                if agent.provider == "bedrock" and "bedrock-mantle." in str(client_kwargs.get("base_url", "")):
+                    raise
         
         agent._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
