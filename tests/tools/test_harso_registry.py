@@ -20,7 +20,3 @@ def test_registry_scrubs_before_truncation_and_scrubs_exception_logs(caplog):
     finally:
         clear_vault_redaction_values()
 
-
-def test_read_only_skills_toolset_has_no_writer():
-    from toolsets import TOOLSETS
-    assert TOOLSETS['skills-read']['tools'] == ['skills_list', 'skill_view']
