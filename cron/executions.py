@@ -580,11 +580,23 @@ def list_executions(
         clauses.append("job_id=?")
         params.append(str(job_id))
     if before_claimed_at is not None:
-        # Same (instant, text) key as the ORDER BY, so a page never skips or repeats a row.
-        clauses.append("(julianday(claimed_at), claimed_at) < (julianday(?), ?)")
-        params.extend([str(before_claimed_at)] * 2)
+        cursor = str(before_claimed_at)
+        if "|" in cursor:
+            try:
+                claimed_at, execution_id = cursor.split("|")
+                if not claimed_at or not execution_id:
+                    raise ValueError("malformed execution cursor")
+                datetime.fromisoformat(claimed_at)
+            except ValueError as exc:
+                raise ValueError("malformed execution cursor") from exc
+            clauses.append("(julianday(claimed_at), claimed_at, id) < (julianday(?), ?, ?)")
+            params.extend((claimed_at, claimed_at, execution_id))
+        else:
+            datetime.fromisoformat(cursor)
+            clauses.append("(julianday(claimed_at), claimed_at) < (julianday(?), ?)")
+            params.extend((cursor, cursor))
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    params.append(max(1, min(int(limit), 500)))
+    params.append(max(1, min(int(limit), 501)))
     # Stamps carry the local offset, which changes at DST and on a timezone change, so text order
     # is not time order. julianday() compares instants (ms); the text breaks same-ms ties.
     with _transaction() as conn:
@@ -647,3 +659,30 @@ def latest_executions(job_ids: list[str]) -> dict[str, dict[str, Any]]:
             clean,
         ).fetchall()
     return {row["job_id"]: dict(row) for row in rows}
+
+
+def execution_identity(record: Optional[dict[str, Any]]) -> Optional[dict[str, str]]:
+    return None if not record else {key: str(record.get(key) or ("unknown" if key == "status" else "")) for key in ("id", "job_id", "source", "status")}
+
+
+def execution_projection(
+    execution_id: Optional[str] = None,
+    *,
+    job_id: Optional[str] = None,
+    source: str = "",
+    status: str = "unknown",
+) -> Optional[dict[str, str]]:
+    record = get_execution(execution_id) if execution_id else None
+    return execution_identity(record) or ({"id": str(execution_id), "job_id": str(job_id or ""), "source": str(source), "status": str(status)} if execution_id else None)
+
+
+def list_execution_page(
+    job_id: str, *, limit: int = 50, before_claimed_at: Optional[str] = None
+) -> tuple[list[dict[str, Any]], Optional[str], bool]:
+    page_limit = min(max(1, int(limit)), 500)
+    rows = list_executions(job_id=job_id, limit=page_limit + 1,
+                           before_claimed_at=before_claimed_at)
+    has_more = len(rows) > page_limit
+    last = rows[page_limit - 1] if has_more else None
+    return rows[:page_limit], (f"{last['claimed_at']}|{last['id']}"
+                  if last and last.get("claimed_at") and last.get("id") else None), has_more

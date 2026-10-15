@@ -67,6 +67,28 @@ from tools.cronjob_job_args import (
 from tools.registry import registry, tool_error
 
 
+_upstream_validate_cron_script_path = _validate_cron_script_path
+_upstream_origin_from_env = _origin_from_env
+
+
+def _origin_from_env(schedule=None):
+    from gateway.session_context import get_session_env
+    if get_session_env("HERMES_SESSION_PLATFORM") == "api_server":
+        session_id = get_session_env("HERMES_SESSION_ID") or get_session_env("HERMES_SESSION_CHAT_ID")
+        if session_id:
+            return {"platform": "api_server", "chat_id": session_id}
+    return _upstream_origin_from_env(schedule)
+
+
+def _validate_cron_script_path(script):
+    from cron.harso_scripts import PLATFORM_SCRIPT_PREFIX, resolve_platform_script, _tenant_scripts_allowed
+    if isinstance(script, str) and script.startswith(PLATFORM_SCRIPT_PREFIX):
+        return resolve_platform_script(script)[1]
+    if not _tenant_scripts_allowed():
+        return "Blocked: cron.allow_scripts is false or invalid; only platform: scripts may run"
+    return _upstream_validate_cron_script_path(script)
+
+
 def _dumps(payload: dict[str, Any]) -> str:
     return json.dumps(payload, indent=2)
 
@@ -128,7 +150,9 @@ def _forward_relay_fronted_run(job: dict[str, Any], extra_prompt: Optional[str] 
     has no standalone sender — the gateway's live relay adapter is the only path, reached via
     ``POST /api/jobs/{id}/run`` (marks the job due; ``extra_prompt`` rides in the body). Returns a
     JSON result string when forwarding engages, else None (normal in-process run)."""
-    if not _relay_fronted_delivery_platforms(job):
+    from cron.scheduler import _resolve_delivery_targets
+    is_api_server = any(t.get("platform") == "api_server" for t in _resolve_delivery_targets(job) or [])
+    if not is_api_server and not _relay_fronted_delivery_platforms(job):
         return None
     from agent.secret_scope import get_secret
     key = get_secret("API_SERVER_KEY", "") or ""

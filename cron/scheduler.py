@@ -2492,6 +2492,8 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
+    from cron.harso_credential import apply_credential
+    runtime = apply_credential(job, session_id, runtime, setup)
     pr = _cfg.get("provider_routing") or {}
     return AIAgent(
         model=setup.model,
@@ -3997,10 +3999,15 @@ class CronSchedulerRegistrationError(RuntimeError):
 
 def create_job_with_scheduler_registration(**kwargs) -> dict:
     """Persist one job and register its first trigger with the active provider."""
-    from cron.jobs import create_job
+    from cron.jobs import _create_job, create_job
     from cron.scheduler_provider import resolve_cron_scheduler
 
-    job = create_job(**kwargs)
+    if kwargs.get("dedup_key") is not None:
+        job, created = _create_job(_return_creation=True, **kwargs)
+        if not created:
+            return job
+    else:
+        job = create_job(**kwargs)
     if not job.get("enabled", True):
         return job
     try:

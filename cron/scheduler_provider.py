@@ -233,8 +233,87 @@ class CronScheduler(ABC):
         cooperatively (e.g. dashboard lifespan drain)."""
         from cron.scheduler import run_one_job
 
-        run_one_job(claimed_job, adapters=adapters, loop=loop, cancel_event=cancel_event)
+        run_one_job(claimed_job, adapters=adapters, loop=loop, cancel_event=cancel_event,
+                    extra_prompt=claimed_job.get("_cron_extra_prompt"))
         return True
+
+    def dispatch_claimed_fire(
+        self, claimed_job: dict, *, adapters=None, loop=None,
+        submit=None, cancel_event=None, extra_prompt=None,
+    ) -> bool:
+        """Run or hand off one already-admitted fire; callers own the rail."""
+        if extra_prompt:
+            claimed_job = dict(claimed_job, _cron_extra_prompt=extra_prompt)
+
+        def _run():
+            from cron.scheduler import release_running_job, try_register_running_job
+            if not try_register_running_job(claimed_job["id"]):
+                self.abort_claimed_fire(
+                    claimed_job,
+                    "Job is already running; execution was not started.",
+                )
+                return False
+            kwargs = {"adapters": adapters, "loop": loop}
+            if cancel_event is not None and provider_supports_fire_cancel(self):
+                kwargs["cancel_event"] = cancel_event
+            try:
+                try:
+                    result = self.fire_claimed(claimed_job, **kwargs)
+                except BaseException as exc:
+                    # The provider's fire hook is the first code that can
+                    # fail after admission. Close this exact owner-fenced
+                    # claim/attempt before returning a worker failure (or
+                    # propagating process-control signals). The abort is
+                    # deliberately idempotent: a provider that already wrote
+                    # a terminal row cannot be rewritten by this cleanup.
+                    self.abort_claimed_fire(
+                        claimed_job, str(exc) or type(exc).__name__
+                    )
+                    if not isinstance(exc, Exception):
+                        raise
+                    return False
+                if result is False:
+                    self.abort_claimed_fire(
+                        claimed_job, "Provider did not process the claimed fire."
+                    )
+                return result
+            finally:
+                release_running_job(claimed_job["id"])
+
+        if submit is None:
+            return bool(_run())
+        try:
+            handed_off = submit(_run)
+        except BaseException as exc:
+            self.abort_claimed_fire(claimed_job, str(exc) or type(exc).__name__)
+            if not isinstance(exc, Exception):
+                raise
+            return False
+        if handed_off is False:
+            self.abort_claimed_fire(
+                claimed_job, "Provider dispatch rail rejected the claimed fire."
+            )
+            return False
+        return True
+
+    @staticmethod
+    def abort_claimed_fire(claimed_job: dict, error: str) -> None:
+        """Close a claim when setup or submission fails before the worker."""
+        claim = claimed_job.get("fire_claim")
+        owner = claim.get("by") if isinstance(claim, dict) else None
+        try:
+            from cron.jobs import mark_job_run
+            kwargs = {"expected_fire_owner": owner} if owner else {}
+            mark_job_run(claimed_job["id"], False, error, **kwargs)
+        except Exception:
+            logger.exception("failed to abort claimed job")
+        execution_id = claimed_job.get("execution_id")
+        if execution_id:
+            try:
+                from cron.executions import finish_execution
+                finish_execution(str(execution_id), success=False, error=error)
+            except Exception:
+                logger.exception("failed to close aborted execution")
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (desired state). Built-in: no-op."""
@@ -672,3 +751,41 @@ class InProcessCronScheduler(CronScheduler):
                 # burst-firing zero-length sleep cycles (#114467).
                 next_tick = now + wait_for
             stop_event.wait(max(0.0, next_tick - now))
+
+
+def provider_supports_claim_force(provider: Any) -> bool:
+    try:
+        parameters = inspect.signature(provider.claim_fire).parameters.values()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD or
+               (p.name == "force" and p.kind in (
+                   inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                   inspect.Parameter.KEYWORD_ONLY)) for p in parameters)
+
+
+def provider_supports_fire_cancel(provider: Any) -> bool:
+    """Return whether ``fire_claimed`` accepts a ``cancel_event`` kwarg."""
+    try:
+        parameters = inspect.signature(provider.fire_claimed).parameters.values()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == "cancel_event"
+            and parameter.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
+        for parameter in parameters
+    )
+
+
+def provider_claim_accepts(provider, name):
+    try:
+        parameters = inspect.signature(provider.claim_fire).parameters.values()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD or
+               (p.name == name and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                             inspect.Parameter.KEYWORD_ONLY)) for p in parameters)
