@@ -213,6 +213,7 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
             ('+', 'runtime_revision', 'id'),
             ('+', 'runtime_generation', 'runtime_revision'),
         )),
+        ('32 2026-10-15T00:00Z harso-native-session', (('+', 'transcript_epoch', 'tool_names'),)),
         ),
     ),
     "messages": _TableHistory(
