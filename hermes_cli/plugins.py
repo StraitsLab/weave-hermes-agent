@@ -199,6 +199,11 @@ VALID_HOOKS: set[str] = {
     # IGNORED in v1 — a plugin returning a directive-shaped dict gets a debug log so future block/rewrite
     # adopters are discoverable once the middleware variant ships against the #64231 taxonomy.
     "pre_command",
+    # Harso fork: cron_run_credential, once per native cron run at agent construction
+    # (cron/harso_credential.py). Kwargs (by signature): job_id, session_id, provider, base_url.
+    # Return an agent.session_credential.SessionCredential to replace the run's api_key, or None.
+    # First non-None wins; a raising hook fails the run closed.
+    "cron_run_credential",
 }
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
