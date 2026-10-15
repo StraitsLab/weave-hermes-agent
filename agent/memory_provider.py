@@ -133,7 +133,7 @@ class MemoryProvider(ABC):
     def sync_turn(
         self, user_content: str, assistant_content: str, *,
         session_id: str = "", messages: Optional[list[dict[str, Any]]] = None,
-        turn_author: Optional[dict[str, Any]] = None,
+        turn_author: Optional[dict[str, Any]] = None, turn_id: str = "",
     ) -> None:
         """Persist a completed turn (non-blocking). ``messages`` is the OpenAI-style list so far.
         ``turn_author`` (``{"id", "name", "is_bot"}``) is who wrote the user side; the manager sends it only to signatures that accept it."""
