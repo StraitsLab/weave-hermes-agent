@@ -115,6 +115,20 @@ OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
 
+class CronStoreLockUnavailable(RuntimeError):
+    retryable = True
+
+
+class CronDedupKeyInvalid(ValueError):
+    pass
+
+
+class CronDedupConflict(ValueError):
+    def __init__(self, job_id: str):
+        self.job_id = job_id
+        super().__init__("dedup_key conflicts with an existing job")
+
+
 @dataclass(frozen=True)
 class _CronStorePaths:
     cron_dir: Path
@@ -287,7 +301,7 @@ def _release_flock(lock_fd) -> None:
 
 
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, require_cross_process: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
     threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
     otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
@@ -316,7 +330,10 @@ def _jobs_lock():
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8-sig")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                if require_cross_process and not acquired:
+                    raise CronStoreLockUnavailable("durable cron store lock unavailable; retry the keyed create")
+                if acquired is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
@@ -327,6 +344,11 @@ def _jobs_lock():
                         lock_fd.close()
                     lock_fd = None
             except OSError as e:
+                if require_cross_process:
+                    if lock_fd is not None:
+                        lock_fd.close()
+                        lock_fd = None
+                    raise CronStoreLockUnavailable("durable cron store lock unavailable; retry the keyed create") from e
                 # A locking failure must never take down cron writes — in-process lock still held.
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
@@ -336,6 +358,8 @@ def _jobs_lock():
                 if lock_fd is not None:
                     _release_flock(lock_fd)
         finally:
+            if lock_fd is not None and require_cross_process and not getattr(lock_fd, "closed", False):
+                lock_fd.close()
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
 
@@ -421,7 +445,25 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 
 # Fields that must never change after creation: ``id`` is a path component under OUTPUT_DIR, so an
 # update could leak ``../escape``/absolute/nested values into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "dedup_key"})
+
+
+def _normalize_dedup_key(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str) or re.fullmatch(r"[!-~]{1,128}", value) is None:
+        raise CronDedupKeyInvalid("dedup_key must be 1-128 printable ASCII characters without spaces")
+    return value
+
+
+_DEDUP_SEMANTIC_FIELDS = ("name", "prompt", "skills", "model", "provider", "base_url", "script", "no_agent", "monitor_script", "monitor_url", "context_from", "schedule", "repeat", "deliver", "enabled_toolsets", "workdir", "attach_to_session", "reasoning_effort", "failure_deliver", "interpreter")
+def _dedup_fingerprint(job: Dict[str, Any], schedule: Optional[str] = None) -> str:
+    payload = {key: job.get(key) for key in _DEDUP_SEMANTIC_FIELDS}
+    origin = job.get("origin") or {}
+    payload["origin"] = {key: origin.get(key) for key in ("platform", "chat_id", "thread_id", "user_id")}
+    payload["schedule"] = schedule.strip() if schedule is not None else payload["schedule"]
+    return uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)).hex
+
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -504,6 +546,7 @@ def _normalize_job_record(job: dict[str, Any]) -> dict[str, Any]:
     """Read-safe job shape: legacy/hand-edited records may have nullable ``prompt``, ``name``,
     ``schedule_display``. Storage is untouched; consumers never crash on formatting."""
     normalized = _apply_skill_fields(job)
+    normalized.pop("_dedup_fingerprint", None)
     job_id = normalized["id"] = _coerce_job_text(normalized.get("id"), "unknown")
     prompt = normalized["prompt"] = _coerce_job_text(normalized.get("prompt"))
     name = _coerce_job_text(normalized.get("name")).strip()
@@ -1785,7 +1828,7 @@ def _next_run_or_reject_past_oneshot(
     return next_run_at
 
 
-def create_job(
+def _create_job(
     prompt: Optional[str],
     schedule: str,
     name: Optional[str] = None,
@@ -1810,6 +1853,8 @@ def create_job(
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: bool = False,
+    dedup_key: Optional[str] = None,
+    _return_creation: bool = False,
     interpreter: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
@@ -1822,6 +1867,7 @@ def create_job(
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
     (a venv can be rebuilt or moved after creation)."""
+    normalized_dedup_key = _normalize_dedup_key(dedup_key)
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1913,9 +1959,25 @@ def create_job(
         if value is not None:
             job[key] = value
 
-    with _jobs_lock():
-        save_jobs(load_jobs() + [job])
-    return job
+    if normalized_dedup_key is not None:
+        job["dedup_key"] = normalized_dedup_key
+        job["_dedup_fingerprint"] = _dedup_fingerprint(job, schedule)
+    with _jobs_lock(require_cross_process=normalized_dedup_key is not None):
+        jobs = load_jobs()
+        for existing in jobs if normalized_dedup_key is not None else ():
+            if existing.get("dedup_key") == normalized_dedup_key:
+                if existing.get("_dedup_fingerprint") != job["_dedup_fingerprint"]:
+                    raise CronDedupConflict(str(existing.get("id") or ""))
+                replay = _normalize_job_record(existing)
+                return (replay, False) if _return_creation else replay
+        save_jobs(jobs + [job])
+    record = _normalize_job_record(job)
+    return (record, True) if _return_creation else record
+
+
+def create_job(*args, **kwargs) -> dict[str, Any]:
+    kwargs.pop("_return_creation", None)
+    return _create_job(*args, **kwargs)
 
 
 def get_job(job_id: str) -> Optional[dict[str, Any]]:
@@ -2125,9 +2187,9 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
     return _with_job(job_id, apply)
 
 
-def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[dict[str, Any]]:
+def pause_job(job_id: str, reason: Optional[str] = None, *, exact: bool = False) -> Optional[dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
-    job = resolve_job_ref(job_id)
+    job = get_job(job_id) if exact else resolve_job_ref(job_id)
     if not job:
         return None
     return update_job(job["id"], {
@@ -2138,7 +2200,7 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[dict[str, A
     })
 
 
-def resume_job(job_id: str) -> Optional[dict[str, Any]]:
+def resume_job(job_id: str, *, exact: bool = False) -> Optional[dict[str, Any]]:
     """Resume a paused job. Accepts a job ID or name.
 
     A recurring job paused across one of its slots must not lose that slot silently: the stored
@@ -2147,7 +2209,7 @@ def resume_job(job_id: str) -> Optional[dict[str, Any]]:
     fire or a logged skip, never a silent re-anchor past it (#113603). One-shots and future
     instants recompute from now as before.
     """
-    job = resolve_job_ref(job_id)
+    job = get_job(job_id) if exact else resolve_job_ref(job_id)
     if not job:
         return None
     stored_next = job.get("next_run_at")
@@ -2178,10 +2240,10 @@ def resume_job(job_id: str) -> Optional[dict[str, Any]]:
     })
 
 
-def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[dict[str, Any]]:
+def trigger_job(job_id: str, extra_prompt: Optional[str] = None, *, exact: bool = False) -> Optional[dict[str, Any]]:
     """Schedule a job for the next tick (ID or name). ``extra_prompt`` is stamped as
     ``manual_run_prompt`` for that single fire only; ``mark_job_run`` clears it."""
-    job = resolve_job_ref(job_id)
+    job = get_job(job_id) if exact else resolve_job_ref(job_id)
     if not job:
         return None
     if is_terminal_job(job):
@@ -2257,9 +2319,9 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[dict[str, Any]]:
     return _with_job(job_ref["id"], apply)
 
 
-def remove_job(job_id: str) -> bool:
+def remove_job(job_id: str, *, exact: bool = False) -> bool:
     """Remove a job by ID or name."""
-    job = resolve_job_ref(job_id)
+    job = get_job(job_id) if exact else resolve_job_ref(job_id)
     if not job:
         return False
     canonical_id = job["id"]
@@ -3482,3 +3544,9 @@ def rewrite_skill_refs(
             save_jobs(jobs)
             logger.info("Curator rewrote skill references in %d cron job(s)", len(rewrites))
         return {"rewrites": rewrites, "jobs_updated": len(rewrites), "jobs_scanned": len(jobs)}
+
+from functools import partial
+pause_job_exact = partial(pause_job, exact=True)
+resume_job_exact = partial(resume_job, exact=True)
+remove_job_exact = partial(remove_job, exact=True)
+trigger_job_exact = partial(trigger_job, exact=True)

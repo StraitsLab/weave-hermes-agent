@@ -444,12 +444,26 @@ def _run_job_script(
     instead of the scripts-dir parent. See #69396. interpreter: the job's optional Python for
     ``.py`` scripts (#8714).
     """
-    path, err = _resolve_script_path(script_path)
+    from cron.harso_scripts import (
+        PLATFORM_SCRIPT_PREFIX, _open_platform_script, _tenant_scripts_allowed,
+        _PLATFORM_SCRIPT_BOOTSTRAP,
+    )
+    platform_fd = None
+    if str(script_path).startswith(PLATFORM_SCRIPT_PREFIX):
+        platform_fd, path, err = _open_platform_script(str(script_path))
+    elif not _tenant_scripts_allowed():
+        return False, "Blocked: cron.allow_scripts is false or invalid; only platform: scripts may run"
+    else:
+        path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
     script_timeout = _get_script_timeout()
     try:
-        argv, env_overlay, err = _script_argv(path, interpreter)
+        if platform_fd is not None:
+            argv = [sys.executable, "-I", "-c", _PLATFORM_SCRIPT_BOOTSTRAP, str(platform_fd), str(path)]
+            env_overlay, err = {}, None
+        else:
+            argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
             return False, err
         from tools.environments.local import build_subprocess_env
@@ -480,6 +494,9 @@ def _run_job_script(
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        if platform_fd is not None:
+            popen_kwargs["pass_fds"] = (platform_fd,)
+            env = {k: v for k, v in env.items() if not k.startswith(("PYTHON", "LD_", "DYLD_"))}
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -534,6 +551,10 @@ def _run_job_script(
         return True, stdout
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+
+    finally:
+        if platform_fd is not None:
+            os.close(platform_fd)
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:
