@@ -816,7 +816,7 @@ class TestPlatformScriptJobs:
     def platform_home(self, tmp_path, monkeypatch):
         import os
 
-        import yaml
+        import hermes_yaml as yaml
 
         import cron.harso_scripts as scheduler
 

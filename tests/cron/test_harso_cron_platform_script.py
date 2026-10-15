@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 # uid ownership, mode bits and symlinks are POSIX semantics.
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX ownership checks")
