@@ -1,6 +1,8 @@
 """Behavior tests for the native authenticated passive session append."""
 
 import hashlib
+import json
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -648,3 +650,27 @@ def test_group_rejects_non_object_items_before_writing(session_db):
     with pytest.raises(SessionPassiveAppendError):
         session_db.append_passive_messages(SESSION_ID, [_item(CARD_ID, "user", "a"), "nope"])
     assert _rows(session_db) == []
+
+
+@pytest.mark.asyncio
+async def test_http_group_pushes_a_browser_card_to_the_chat_at_once(session_db, monkeypatch):
+    """The browser card row goes to the apps when it is appended, not at the end of the turn."""
+    from gateway.platforms import api_server_harso_sessions as native
+    pushed = []
+    monkeypatch.setattr(native, "weave_chat_sync", SimpleNamespace(
+        publish_rows=lambda session, rows, secret: pushed.append((session, [r["content"] for r in rows]))), raising=False)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-group"}))
+    adapter._session_db = session_db
+    app = web.Application()
+    app.router.add_post("/api/sessions/{session_id}/append/group", adapter._handle_session_append_group)
+    card = json.dumps({"kind": "browser", "major": 1, "card_id": "c", "target": "A" * 32,
+                       "title": None, "page_url": "https://x.test/", "started_at": "2026-10-16T00:00:00Z"})
+    url = f"/api/sessions/{SESSION_ID}/append/group"
+    async with TestClient(TestServer(app)) as client:
+        first = await client.post(url, headers={"Authorization": "Bearer sk-group"},
+                                  json=_group_body([_request(CARD_ID, role="assistant", content=card)]))
+        assert first.status == 201
+        other = await client.post(url, headers={"Authorization": "Bearer sk-group"},
+                                  json=_group_body([_request(OTHER_ID, role="assistant", content="plain")], predecessor=1))
+        assert other.status == 201
+    assert pushed == [(SESSION_ID, [card])]

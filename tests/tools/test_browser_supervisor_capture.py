@@ -144,3 +144,26 @@ def _raises(fn) -> BaseException | None:
     except BaseException as exc:
         return exc
     return None
+
+
+def test_registry_stop_returns_at_once_when_the_endpoint_holds_the_close(monkeypatch):
+    """A proxied wss endpoint can hold the WebSocket close for the whole 2 s + 5 s stop budget. Turn-end cleanup
+    calls registry.stop, so it must untrack and return at once; the close finishes in the background."""
+    import threading
+    from tools.browser_supervisor import _SupervisorRegistry
+    released = threading.Event()
+
+    class Slow:
+        _stop_requested = False
+
+        def stop(self):
+            released.wait(5)
+
+    registry = _SupervisorRegistry()
+    slow = Slow()
+    registry._by_task["t"] = slow
+    started = time.monotonic()
+    registry.stop("t")
+    assert time.monotonic() - started < 0.5
+    assert slow._stop_requested is True and registry.get("t") is None
+    released.set()

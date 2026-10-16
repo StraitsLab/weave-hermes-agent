@@ -96,6 +96,39 @@ class NativeLoginRequired(RuntimeError):
     pass
 
 
+ANNOUNCED: list = []  # targets whose card was published while the worker ran
+_ANNOUNCERS: list = []
+
+
+def announce(target, url):
+    """Publish the browser card the moment Jev owns a window (best effort, off the browsing thread).
+    The parent publishes again at the end only for a target not announced here."""
+    publish = getattr(announce, "publish", None)
+    if publish is None or not re.fullmatch(r"[0-9A-F]{32}", str(target or "")) or target in ANNOUNCED:
+        return
+    ANNOUNCED.append(target)
+    import threading
+    thread = threading.Thread(target=publish, args=(target, url), daemon=True)
+    thread.start()
+    _ANNOUNCERS.append(thread)
+
+
+def activity_publisher(raw: dict):
+    """POST /v1/browser/activity with the cell bearer; never raises, never logs the bearer."""
+    base, bearer = raw.get("WEAVE_API_URL", "").rstrip("/"), raw.get("WEAVE_API_MCP_BEARER", "")
+    session = raw.get("WEAVE_HERMES_SESSION_ID", "")
+    if not (base and bearer and session):
+        return None
+
+    def publish(target, url):
+        with contextlib.suppress(Exception):
+            import httpx
+            with httpx.Client(timeout=3.0, follow_redirects=False) as client:
+                client.post(base + "/v1/browser/activity", headers={"Authorization": f"Bearer {bearer}"},
+                            json={"session_id": session, "target": target, "url": url or "about:blank", "title": ""})
+    return publish
+
+
 def configure_runtime(args, creds, allow):
     """Adapt the pinned upstream at its browser and HTTP seams, not its action loop."""
     from browser_harness.admin import ensure_daemon
@@ -143,6 +176,7 @@ def configure_runtime(args, creds, allow):
                 navigation = self.call("Page.navigate", url=url)
                 if navigation.get("errorText"):
                     raise RuntimeError("Browser navigation failed; inspect the current page before retrying")
+                announce(self.target, url)  # the card appears now, while the page loads
                 deadline = time.monotonic() + args.navigation_timeout
                 while time.monotonic() < deadline:
                     if self.evaluate("document.readyState") == "complete" and self.evaluate("location.href") != "about:blank":
@@ -218,6 +252,7 @@ def configure_runtime(args, creds, allow):
             self.target = opened[0]["targetId"]
             switch_tab(self.target, activate=True)
             self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+            announce(self.target, opened[0].get("url", ""))
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline and self.evaluate("document.readyState") != "complete":
                 time.sleep(0.05)
@@ -293,7 +328,11 @@ def run(args, creds, max_ticks=10, navigation_timeout=60):
 if __name__ == "__main__":
     try:
         payload = json.load(sys.stdin)
+        announce.publish = activity_publisher(payload["credentials"])
         result = run(payload["args"], resolve_credentials(payload["credentials"]))
     except Exception as exc:  # health: allow BLE001 -- worker protocol boundary; parent applies mandatory output redaction
         result = {"success": False, "error_type": type(exc).__name__, "error": str(exc)}
+    for thread in _ANNOUNCERS:
+        thread.join(timeout=3.5)
+    result["_announced"] = ANNOUNCED
     print(json.dumps(result))

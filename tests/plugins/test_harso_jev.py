@@ -297,3 +297,40 @@ def test_real_plugin_discovery_exposes_browse(tmp_path, monkeypatch):
     manager = plugins.PluginManager()
     manager.discover_and_load()
     assert "browse" in manager._plugin_tool_names
+
+
+def test_card_is_announced_when_the_window_opens_not_when_jev_ends(runtime, monkeypatch):
+    """Abhi 2026-10-16: the browser card shows the moment the window opens, so it streams in real time."""
+    owned = "B" * 32
+    from browser_harness import helpers
+    from jev_ultrafast import browser
+    real = helpers.cdp
+    def cdp(method, session_id=None, **params):
+        if method == "Target.createTarget":
+            runtime.calls.append((method, params))
+            return {"targetId": owned}
+        return real(method, session_id, **params)
+    monkeypatch.setattr(helpers, "cdp", cdp)
+    monkeypatch.setattr(browser, "cdp", cdp)
+    seen = []
+    monkeypatch.setattr(runner, "ANNOUNCED", [])
+    monkeypatch.setattr(runner, "_ANNOUNCERS", [])
+    def publish(target, url):
+        seen.append((target, url, [m for m, _ in runtime.calls].count("Runtime.evaluate")))
+    monkeypatch.setattr(runner.announce, "publish", publish, raising=False)
+    result = runner.run({"url": runtime.url}, creds())
+    for thread in runner._ANNOUNCERS:
+        thread.join(1)
+    assert result["browser_page"]["target"] == owned
+    assert [(t, u) for t, u, _ in seen] == [(owned, runtime.url)]
+    assert runner.ANNOUNCED == [owned]
+    runtime.calls.clear()
+    seen.clear()
+    runner.run({"url": runtime.url}, creds())  # the same window again: one card, not two
+    assert seen == []
+
+
+def test_activity_publisher_needs_bearer_and_session():
+    assert runner.activity_publisher({"WEAVE_API_URL": "https://api.test"}) is None
+    assert callable(runner.activity_publisher({"WEAVE_API_URL": "https://api.test", "WEAVE_API_MCP_BEARER": "wvc1_x",
+                                               "WEAVE_HERMES_SESSION_ID": "s"}))

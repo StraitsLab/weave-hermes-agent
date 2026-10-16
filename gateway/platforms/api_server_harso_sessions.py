@@ -397,6 +397,11 @@ class NativeSessionAPI:
                     receipt["same_native_ref_on_identical_retry"] = True
             receipts.append(receipt)
         outcomes = {result["outcome"] for result in results}
+        if "inserted" in outcomes and weave_chat_sync is not None:
+            # A browser card must show while the turn still runs, not when it ends (the end-of-turn copy
+            # rewrites the same row by its key, so nothing doubles).
+            ids = [r["message_id"] for r in results if r["outcome"] == "inserted" and r.get("message_id")]
+            await asyncio.to_thread(self._push_browser_cards, db, session_id, ids)
         status = 201 if outcomes == {"inserted"} else 200 if outcomes == {"identical_retry"} else 409
         return web.json_response({"kind": "hermes_append_group_receipt", "receipts": receipts}, status=status)
 
@@ -1549,6 +1554,24 @@ class NativeSessionAPI:
                 self._native_submit_lock_refs.pop(key, None)
                 self._native_submit_locks.pop(key, None)
 
+
+    def _push_browser_cards(self, db, session_id, message_ids):
+        """Copy just-appended browser-card rows to the chat now. Best effort: never fails the append."""
+        try:
+            rows = []
+            for message_id in message_ids:
+                window = db.get_messages_around(session_id, message_id, 0)["window"]
+                for message in window:
+                    try:
+                        card = json.loads(message.get("content") or "")
+                    except ValueError:
+                        continue
+                    if message.get("role") == "assistant" and isinstance(card, dict) and card.get("kind") == "browser":
+                        rows.append(message)
+            if rows:
+                weave_chat_sync.publish_rows(session_id, rows, lambda name: _scoped_get_secret(name, "") or "")
+        except Exception:  # health: allow BLE001 -- the end-of-turn copy still lands the row
+            logger.debug("browser card push skipped", exc_info=True)
 
     def _native_submit_chat_sync(self, native_request_ref, event):
         terminal = event.get("type") in {"turn.completed", "turn.failed"}

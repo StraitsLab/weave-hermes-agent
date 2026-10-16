@@ -595,9 +595,13 @@ class _SupervisorRegistry:
         return supervisor
 
     def stop(self, task_id: str) -> None:
+        """Untrack now; close in the background. A remote CDP endpoint (a proxied wss URL) can hold the
+        WebSocket close for the full 2 s + 5 s budget, and the caller is usually turn-end cleanup: the
+        supervisor is already out of the registry and has ``_stop_requested`` set, so nothing waits on it."""
         supervisor = self._pop(task_id)
         if supervisor is not None:
-            supervisor.stop()
+            supervisor._stop_requested = True
+            threading.Thread(target=supervisor.stop, name=f"cdp-supervisor-stop-{task_id}", daemon=True).start()
 
     def stop_all(self) -> None:
         """Stop every running supervisor. For shutdown / test teardown."""
