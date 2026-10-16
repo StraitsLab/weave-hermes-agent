@@ -183,7 +183,7 @@ def test_registers_exactly_one_tool():
     registered = []
     plugin.register(SimpleNamespace(register_tool=lambda **kw: registered.append(kw)))
     assert [r["name"] for r in registered] == ["browse"]
-    assert set(plugin.SCHEMA["parameters"]["properties"]) == {"url", "goal", "expect", "allow_hosts", "target", "text_offset"}
+    assert set(plugin.SCHEMA["parameters"]["properties"]) == {"url", "goal", "expect", "allow_hosts", "target", "text_offset", "new_window"}
 
 
 @pytest.mark.parametrize("activity_failure", [False, True])
@@ -334,3 +334,67 @@ def test_activity_publisher_needs_bearer_and_session():
     assert runner.activity_publisher({"WEAVE_API_URL": "https://api.test"}) is None
     assert callable(runner.activity_publisher({"WEAVE_API_URL": "https://api.test", "WEAVE_API_MCP_BEARER": "wvc1_x",
                                                "WEAVE_HERMES_SESSION_ID": "s"}))
+
+
+REUSED, STALE = "C" * 32, "D" * 32
+
+
+def test_a_chat_keeps_working_in_its_window_and_idle_jev_windows_close(runtime):
+    """Abhi 2026-10-16: follow-up steps reuse the chat's window (same card); idle Jev windows close."""
+    runtime.targets += [{"type": "page", "targetId": REUSED, "url": "https://example.com/"},
+                        {"type": "page", "targetId": STALE, "url": "https://old.example/"}]
+    result = runner.run({"url": runtime.url, "reuse": REUSED, "close": [STALE, "E" * 32]}, creds())
+    assert result["browser_page"]["target"] == REUSED
+    assert not any(method == "Target.createTarget" for method, _ in runtime.calls)
+    assert ("Page.navigate", {"url": runtime.url}) in runtime.calls
+    assert [p["targetId"] for m, p in runtime.calls if m == "Target.closeTarget"] == [STALE]  # gone one: no call
+
+
+def test_a_vanished_chat_window_opens_a_new_one(runtime):
+    result = runner.run({"url": runtime.url, "reuse": REUSED}, creds())
+    assert result["browser_page"]["target"] == "owned"
+    assert ("Target.createTarget", {"url": "about:blank", "newWindow": True}) in runtime.calls
+
+
+def test_window_memory_reuses_per_chat_and_expires_idle_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin, "_windows_file", lambda: tmp_path / "windows.json")
+    plugin._remember_window("chat-a", REUSED, 1000)
+    plugin._remember_window("chat-b", STALE, 1000)
+    assert plugin._plan_windows("chat-a", 1000 + 60, 3600) == (REUSED, [])
+    assert plugin._plan_windows("chat-c", 1000 + 60, 3600) == ("", [])
+    plugin._remember_window("chat-a", REUSED, 5000)  # used again: its idle clock restarts
+    assert plugin._plan_windows("chat-a", 1000 + 3601, 3600) == (REUSED, [STALE])
+    assert json.loads((tmp_path / "windows.json").read_text()) == {"chats": {"chat-a": REUSED},
+                                                                    "windows": {REUSED: 5000}}
+
+
+def test_handler_hands_the_chat_window_to_the_worker_unless_new_window(tmp_path, monkeypatch):
+    from agent import redact, secret_scope
+    from gateway.native_bot_admission import native_turn_context
+    from tools import browser_use_cli as engine
+
+    monkeypatch.setattr(plugin, "_windows_file", lambda: tmp_path / "windows.json")
+    monkeypatch.setattr(redact, "redact_sensitive_text", lambda value, **kw: value)
+    monkeypatch.setattr(secret_scope, "get_secret", lambda key, *a: {"WEAVE_API_URL": ""}.get(key))
+    monkeypatch.setattr(engine, "_code_url_verdict", lambda _: SimpleNamespace(blocked=None, local_sidecar=False))
+    monkeypatch.setattr(engine, "_base_subprocess_env", lambda: {"BU_CDP_WS": "ws://cdp.test/"})
+    monkeypatch.setattr(engine, "_route_backend", lambda *a, **kw: None)
+    monkeypatch.setattr(engine, "_attach_vault_supervisor", lambda *a: None)
+    monkeypatch.setattr(engine, "_driven_daemons", set())
+    sent = []
+
+    def worker(cmd, payload, env, timeout):
+        sent.append(json.loads(payload)["args"])
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"success": True, "browser_page": {
+            "target": REUSED, "url": "https://example.com/", "title": ""}, "_announced": [REUSED]}))
+
+    monkeypatch.setattr(engine, "_run_cli_killing_process_group", worker)
+    token = native_turn_context.set({"session_id": "chat-a", "run_id": "01990000-0000-7000-8000-000000000001"})
+    try:
+        for args in ({"url": "https://example.com/"}, {"url": "https://example.com/next"},
+                     {"url": "https://other.test/", "new_window": True}):
+            assert json.loads(plugin.browse(args, task_id="task"))["success"]
+    finally:
+        native_turn_context.reset(token)
+    assert sent == [{"url": "https://example.com/"}, {"url": "https://example.com/next", "reuse": REUSED},
+                    {"url": "https://other.test/"}]

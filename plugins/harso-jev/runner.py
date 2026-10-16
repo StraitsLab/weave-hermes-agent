@@ -160,11 +160,18 @@ def configure_runtime(args, creds, allow):
             self.target = None
             ensure_daemon()
             try:
+                pages = {p["targetId"] for p in cdp("Target.getTargets")["targetInfos"] if p["type"] == "page"}
+                for stale in args.close:  # Jev windows idle past the limit; a window already gone is fine
+                    if stale in pages and stale != args.target:
+                        with contextlib.suppress(Exception):
+                            cdp("Target.closeTarget", targetId=stale)
                 if args.target:
-                    pages = cdp("Target.getTargets")["targetInfos"]
-                    if not any(p["targetId"] == args.target and p["type"] == "page" for p in pages):
+                    if args.target not in pages:
                         raise ValueError("Requested browser tab is unavailable")
                     self.target = args.target
+                elif args.reuse in pages and args.reuse not in args.close:
+                    # The chat's own Jev window carries on: same window, same live card.
+                    self.target = args.reuse
                 else:
                     # Never select the first shared page: it may belong to a sibling or the user.
                     self.target = cdp("Target.createTarget", url="about:blank", newWindow=True)["targetId"]
@@ -176,7 +183,8 @@ def configure_runtime(args, creds, allow):
                 navigation = self.call("Page.navigate", url=url)
                 if navigation.get("errorText"):
                     raise RuntimeError("Browser navigation failed; inspect the current page before retrying")
-                announce(self.target, url)  # the card appears now, while the page loads
+                if self.target != args.reuse:
+                    announce(self.target, url)  # the card appears now, while the page loads
                 deadline = time.monotonic() + args.navigation_timeout
                 while time.monotonic() < deadline:
                     if self.evaluate("document.readyState") == "complete" and self.evaluate("location.href") != "about:blank":
@@ -267,12 +275,18 @@ def configure_runtime(args, creds, allow):
     agent_module.Browser = HermesBrowser
 
 
+def _window_id(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9A-F]{32}", value) else ""
+
+
 def run(args, creds, max_ticks=10, navigation_timeout=60):
     from jev_ultrafast import Agent
 
     args = SimpleNamespace(url=args["url"], goal=args.get("goal", "").strip(), expect=args.get("expect", ""),
                            target=args.get("target", ""), text_offset=args.get("text_offset", 0),
-                           navigation_timeout=navigation_timeout, allow_hosts=args.get("allow_hosts", ""))
+                           navigation_timeout=navigation_timeout, allow_hosts=args.get("allow_hosts", ""),
+                           reuse=_window_id(args.get("reuse", "")),
+                           close=[t for t in args.get("close", []) if _window_id(t)][:64])
     allow = list(dict.fromkeys([urlparse(args.url).hostname or ""] + [
         h.strip().lower() for h in args.allow_hosts.split(",") if h.strip()
     ]))
