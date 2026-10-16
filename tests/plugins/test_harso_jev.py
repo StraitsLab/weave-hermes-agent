@@ -108,11 +108,16 @@ def test_allowlist_refuses_redirect_before_model_or_page_text(runtime):
     assert not any(method == "Runtime.evaluate" and params["expression"] == READ_STATE for method, params in runtime.calls)
 
 
-def test_allowlist_refuses_resume(runtime):
+def test_named_window_on_another_site_goes_to_the_requested_page(runtime, monkeypatch):
+    """Abhi 2026-10-17: target + a new url on another site failed with LeftAllowlist instead of opening it."""
+    announced = []
+    monkeypatch.setattr(runner.announce, "publish", lambda target, url: announced.append(target), raising=False)
     runtime.url = "https://other.test/"
-    with pytest.raises(runner.LeftAllowlist):
-        runner.run({"url": "https://example.com/", "target": "owned"}, creds())
-    assert runtime.decisions == 0
+    result = runner.run({"url": "https://example.com/", "target": "owned"}, creds())
+    assert result["success"] and result["browser_page"]["target"] == "owned"
+    assert ("Page.navigate", {"url": "https://example.com/"}) in runtime.calls
+    assert not any(method == "Target.createTarget" for method, _ in runtime.calls)
+    assert announced == []  # the window already has its card
 
 
 def test_tick_budget_stops_real_jev_loop(runtime):
@@ -398,3 +403,64 @@ def test_handler_hands_the_chat_window_to_the_worker_unless_new_window(tmp_path,
         native_turn_context.reset(token)
     assert sent == [{"url": "https://example.com/"}, {"url": "https://example.com/next", "reuse": REUSED},
                     {"url": "https://other.test/"}]
+
+
+def test_a_window_that_never_loaded_is_closed_not_left_blank(runtime):
+    runtime.targets = [{"type": "page", "targetId": "user-tab", "url": "https://user.example/"}]
+    runtime.navigate_to = "about:blank"
+    with pytest.raises(runner.LeftAllowlist):
+        runner.run({"url": "https://example.com/"}, creds(), navigation_timeout=0.01)
+    assert [p["targetId"] for m, p in runtime.calls if m == "Target.closeTarget"] == ["owned"]
+
+
+def test_a_failed_step_in_an_existing_window_never_closes_it(runtime):
+    runtime.navigate_to = "about:blank"
+    with pytest.raises(runner.LeftAllowlist):
+        runner.run({"url": "https://example.com/", "reuse": "A" * 32}, creds(), navigation_timeout=0.01)
+    runtime.calls.clear()
+    with pytest.raises(runner.LeftAllowlist):
+        runner.run({"url": "https://example.com/", "target": "owned"}, creds(), navigation_timeout=0.01)
+    assert not any(method == "Target.closeTarget" for method, _ in runtime.calls)
+
+
+@pytest.mark.parametrize("host,family", [
+    ("redmart.lazada.sg", "lazada.sg"), ("www.amazon.com", "amazon.com"), ("a.b.example.com", "b.example.com"),
+    ("lazada.sg", ""), ("www.bbc.co.uk", "bbc.co.uk"), ("bbc.co.uk", ""), ("shop.com.sg", ""),
+    ("www.gov.sg", ""), ("www.shopee.com.sg", "shopee.com.sg"),
+    ("the-internet.herokuapp.com", ""), ("me.github.io", ""), ("app.vercel.app", "")])
+def test_site_family_widens_to_the_owner_never_a_shared_parent(host, family):
+    assert runner.site_family(host) == family
+
+
+def test_sibling_hosts_of_the_start_site_are_allowed(runtime):
+    """RedMart sends the agent to www.lazada.sg; that failed with LeftAllowlist on every first try."""
+    runtime.navigate_to = "https://www.lazada.sg/catalog/?q=porcini"
+    result = runner.run({"url": "https://redmart.lazada.sg/"}, creds())
+    assert result["success"] and result["final_url"] == "https://www.lazada.sg/catalog/?q=porcini"
+
+
+def test_a_dns_blip_is_retried_before_the_url_is_blocked(monkeypatch):
+    import socket
+    from tools import url_safety
+    answers = [socket.gaierror(-3, "Temporary failure in name resolution"),
+               [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("47.246.167.3", 0))]]
+
+    def flaky(hostname, port=None):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(url_safety, "_getaddrinfo", flaky)
+    monkeypatch.setattr(url_safety.time, "sleep", lambda _: None)
+    assert url_safety.is_safe_url("https://redmart.lazada.sg/")
+
+
+def test_a_failed_lookup_says_so_instead_of_private_address(monkeypatch):
+    import socket
+    from tools import browser_use_cli as engine
+    monkeypatch.setattr(engine, "_code_url_verdict",
+                        lambda _: SimpleNamespace(blocked="Blocked: URL targets a private or internal address", local_sidecar=False))
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: (_ for _ in ()).throw(socket.gaierror(-3, "x")))
+    result = json.loads(plugin.browse({"url": "https://redmart.lazada.sg/"}, task_id="task"))
+    assert result["error"] == "Could not look up redmart.lazada.sg (DNS failed). Try again in a moment."

@@ -54,6 +54,23 @@ def host_allowed(url: str, allow_hosts: list[str]) -> bool:
     )
 
 
+# Parents shared by unrelated owners: a start host under these never widens to the parent.
+SHARED_PARENTS = {"github.io", "herokuapp.com", "vercel.app", "netlify.app", "pages.dev", "web.app",
+                  "firebaseapp.com", "appspot.com", "blogspot.com", "sprites.app", "fly.dev", "onrender.com",
+                  "azurewebsites.net", "cloudfront.net", "amazonaws.com", "workers.dev", "glitch.me"}
+
+
+def site_family(host: str) -> str:
+    """The start host's parent site (redmart.lazada.sg -> lazada.sg), so its sibling hosts are allowed.
+    Empty for a two-label host, a country second level (co.uk, com.sg) or a shared hosting parent."""
+    labels = host.split(".")
+    parent = ".".join(labels[1:])
+    country_second = len(labels[-1]) == 2 and len(labels[-2]) <= 3  # co.uk, com.sg, gov.sg
+    if len(labels) < 3 or parent in SHARED_PARENTS or len(labels) - country_second < 3:
+        return ""
+    return parent
+
+
 def page_excerpt(text: str, limit: int = PAGE_TEXT_LIMIT, offset: int = 0) -> str:
     """Visible page text, whitespace folded, one window of the budget."""
     folded = re.sub(r"[ \t\r\f\v]+", " ", text or "")
@@ -158,6 +175,7 @@ def configure_runtime(args, creds, allow):
         def __init__(self, url):
             self.session = None
             self.target = None
+            pages = set()
             ensure_daemon()
             try:
                 pages = {p["targetId"] for p in cdp("Target.getTargets")["targetInfos"] if p["type"] == "page"}
@@ -177,14 +195,14 @@ def configure_runtime(args, creds, allow):
                     self.target = cdp("Target.createTarget", url="about:blank", newWindow=True)["targetId"]
                 switch_tab(self.target, activate=True)
                 self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
-                if args.target:
-                    self.check_host()
-                    return
+                if args.target and host_allowed(self.evaluate("location.href") or "", allow):
+                    return  # resume the exact page (hand-back): no navigation
+                # A named window on another site goes to the requested page instead of failing (Abhi 2026-10-17).
                 navigation = self.call("Page.navigate", url=url)
                 if navigation.get("errorText"):
                     raise RuntimeError("Browser navigation failed; inspect the current page before retrying")
-                if self.target != args.reuse:
-                    announce(self.target, url)  # the card appears now, while the page loads
+                if self.target not in pages:
+                    announce(self.target, url)  # a new window: its card appears now, while the page loads
                 deadline = time.monotonic() + args.navigation_timeout
                 while time.monotonic() < deadline:
                     if self.evaluate("document.readyState") == "complete" and self.evaluate("location.href") != "about:blank":
@@ -195,6 +213,10 @@ def configure_runtime(args, creds, allow):
                     self.close()
                     raise NavigationTimeout("Browser navigation timed out; inspect the current page before retrying")
             except Exception:
+                if self.target and self.target not in pages:  # a window this call opened and never loaded
+                    with contextlib.suppress(Exception):
+                        if (self.evaluate("location.href") or "about:blank") == "about:blank":
+                            cdp("Target.closeTarget", targetId=self.target)
                 self.close()
                 raise
 
@@ -287,7 +309,8 @@ def run(args, creds, max_ticks=10, navigation_timeout=60):
                            navigation_timeout=navigation_timeout, allow_hosts=args.get("allow_hosts", ""),
                            reuse=_window_id(args.get("reuse", "")),
                            close=[t for t in args.get("close", []) if _window_id(t)][:64])
-    allow = list(dict.fromkeys([urlparse(args.url).hostname or ""] + [
+    start = urlparse(args.url).hostname or ""
+    allow = list(dict.fromkeys([h for h in (start, site_family(start)) if h] + [
         h.strip().lower() for h in args.allow_hosts.split(",") if h.strip()
     ]))
     if any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", h) for h in allow):

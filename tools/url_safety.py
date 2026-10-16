@@ -14,6 +14,7 @@ import ipaddress
 import logging
 import os
 import socket
+import time
 import asyncio
 import re
 from contextlib import contextmanager
@@ -302,7 +303,11 @@ def is_always_blocked_url(url: str) -> bool:
                 return True
             return False
         try:
-            addr_info = _getaddrinfo(hostname)
+            try:
+                addr_info = _getaddrinfo(hostname)
+            except socket.gaierror:
+                time.sleep(0.3)  # one retry: a resolver blip read as "private address" (Harso, 2026-10-16)
+                addr_info = _getaddrinfo(hostname)
         except socket.gaierror:
             return False  # DNS failure is not part of the floor; caller's path handles it
         for raw, ip_str, resolved in _iter_resolved_ips(addr_info):
@@ -358,7 +363,11 @@ def is_safe_url(url: str) -> bool:
         allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
         allow_private = allow_all_private or allow_private_ip
         try:
-            addr_info = _getaddrinfo(hostname)
+            try:
+                addr_info = _getaddrinfo(hostname)
+            except socket.gaierror:
+                time.sleep(0.3)  # one retry: a resolver blip read as "private address" (Harso, 2026-10-16)
+                addr_info = _getaddrinfo(hostname)
         except socket.gaierror:
             # Sandbox/proxy environments may block direct DNS; when a proxy is
             # configured, delegate resolution to it (metadata hostnames were already
