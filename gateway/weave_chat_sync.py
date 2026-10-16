@@ -194,7 +194,7 @@ class _Writer:
         if kind in ("turn.completed", "turn.failed"):
             live["ended"] = True
             live["on_finished"] = event.get("_on_finished")
-            live["outcome"] = kind.split(".")[1]
+            live["outcome"] = "stopped" if event.get("stopped") else kind.split(".")[1]
             return True
         return False
 
@@ -240,6 +240,10 @@ class _Writer:
             if live.get("card"):
                 answer["body"]["output"] = live["card"]
             last = answer
+        elif live.get("outcome") == "stopped" and live["text"].strip():  # Stop keeps what was written (WEV-3464)
+            last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
+                    "body": {"text": live["text"], "outcome": "stopped", "status": None,
+                             **({"output": live["card"]} if live.get("card") else {})}}
         else:  # no answer: hide any partial reply. Either way the live row tells the apps the turn ended.
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "removed",
                     "body": {"outcome": live.get("outcome") or "failed", "status": None}}

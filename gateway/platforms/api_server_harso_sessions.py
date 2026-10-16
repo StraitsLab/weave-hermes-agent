@@ -1012,9 +1012,14 @@ class NativeSessionAPI:
         runner = self.gateway_runner
         source = SessionSource(platform=Platform.API_SERVER, chat_id=request.match_info["session_id"], chat_type="dm",
                                user_id="api_server", user_name="API server", profile=_api_request_profile.get() or None)
-        agent = self._native_submit_running_agent(runner, runner.session_store._generate_session_key(source)) if runner else None
+        session_key = runner.session_store._generate_session_key(source) if runner else None
+        agent = self._native_submit_running_agent(runner, session_key) if runner else None
         stopped = False
         if agent is not None:
+            # The turn this Stop ends keeps what it already wrote (its end event says stopped, not failed).
+            ref = self._native_submit_active_ref(session_key)
+            if ref:
+                self.__dict__.setdefault("_native_submit_stopped_refs", set()).add(ref)
             from agent.interrupt_compat import request_hard_interrupt
             # No message: a hard-interrupt message is queued as the user's next turn (a fake "Stopped by the user." bubble).
             stopped = request_hard_interrupt(agent, None, tool_reason="stopped by the user")
@@ -1388,8 +1393,10 @@ class NativeSessionAPI:
                 self._native_submit_close(
                     steered, "turn.failed" if failed else "turn.completed", steered_into=native_request_ref,
                 )
+        stopped = native_request_ref in self.__dict__.get("_native_submit_stopped_refs", set())
+        self.__dict__.get("_native_submit_stopped_refs", set()).discard(native_request_ref)
         self._native_submit_close(
-            native_request_ref, "turn.failed" if failed else "turn.completed",
+            native_request_ref, "turn.failed" if failed else "turn.completed", **({"stopped": True} if stopped else {}),
         )
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
