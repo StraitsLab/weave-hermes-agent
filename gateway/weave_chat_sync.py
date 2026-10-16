@@ -194,9 +194,11 @@ class _Writer:
 
     def _finish(self, live: dict[str, Any]) -> None:
         messages = live["read"]()
-        rows = visible_rows(messages, live["show_tag"], live["show_over"])
-        if live["session"] in _SYNCED:
-            rows = rows[-40:]  # earlier rows are already in Supabase; compaction keeps their keys
+        # Only this turn's rows. Hermes saves the turn's own user message with its request ref as
+        # platform_message_id; everything from there on is this turn. Earlier rows are already in Supabase.
+        start = next((i for i, m in enumerate(messages) if m.get("platform_message_id") == live["ref"]), None)
+        turn = messages[start:] if start is not None else [m for m in messages if (m.get("timestamp") or 0) >= live["started"]]
+        rows = visible_rows(turn, live["show_tag"], live["show_over"])
         # This turn's answer: its last visible assistant message, saved after the turn started.
         mine = [m for m in messages if m.get("role") == "assistant" and isinstance(m.get("content"), str)
                 and m["content"].strip() and (m.get("timestamp") or 0) >= live["started"]]
@@ -213,9 +215,8 @@ class _Writer:
                     "body": {"outcome": live.get("outcome") or "failed", "status": None}}
         rows += [{"cell_key": key, "role": "assistant", "state": "resolved"} for key in live["card_keys"]]
         rows.append(last)  # last, so every saved row is in Supabase before the apps settle the turn
-        for start in range(0, len(rows), 100):
-            _call(live, rows[start:start + 100])
-        _SYNCED.add(live["session"])  # first turn after boot copied the whole chat (backfill)
+        for first in range(0, len(rows), 100):
+            _call(live, rows[first:first + 100])
 
 
 def _call(live: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -228,7 +229,6 @@ def _call(live: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, A
 
 _WRITER: Optional[_Writer] = None
 _LOCK = threading.Lock()
-_SYNCED: set = set()
 _ENDED: collections.deque[str] = collections.deque(maxlen=256)  # refs already finished: a late event reopens nothing
 
 
@@ -253,7 +253,7 @@ def publish(session_id: str, ref: str, event: dict[str, Any], read_display: Call
                 show_over = 400
             with _LOCK:
                 _WRITER = _WRITER or _Writer()
-            _WRITER.live[ref] = {"session": session_id, "url": url, "key": key, "bearer": bearer, "started": time.time() - 1,
+            _WRITER.live[ref] = {"session": session_id, "ref": ref, "url": url, "key": key, "bearer": bearer, "started": time.time() - 1,
                                  "read": read_display, "item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}")),
                                  "text": "", "sent": 0, "rev": None, "status": None, "shown": None,
                                  "cards": [], "card_keys": [], "show_tag": show_tag, "show_over": show_over}

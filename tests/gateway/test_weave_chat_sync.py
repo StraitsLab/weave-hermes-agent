@@ -46,7 +46,6 @@ def server(monkeypatch):
     httpd = HTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     monkeypatch.setattr(sync, "_WRITER", None)
-    monkeypatch.setattr(sync, "_SYNCED", set())
     monkeypatch.setattr(sync, "FLUSH_S", 0.05)
     yield f"http://127.0.0.1:{httpd.server_port}", calls, rows
     httpd.shutdown()
@@ -80,7 +79,7 @@ def test_reply_streams_into_one_row_and_is_saved_as_that_row(server, monkeypatch
     now = time.time()
     saved = [
         {"id": 5, "role": "assistant", "content": "an older answer", "timestamp": now - 500},
-        {"id": 7, "role": "user", "content": "hello", "timestamp": now + 0.5},
+        {"id": 7, "role": "user", "content": "hello", "timestamp": now + 0.5, "platform_message_id": "ref1"},
         {"id": 8, "role": "assistant", "content": "", "tool_calls": [{"id": "t"}], "timestamp": now + 1.0},
         {"id": 9, "role": "tool", "content": "secret tool output", "timestamp": now + 1.5},
         {"id": 10, "role": "assistant", "content": "Hi there", "timestamp": now + 2.0},
@@ -104,7 +103,7 @@ def test_reply_streams_into_one_row_and_is_saved_as_that_row(server, monkeypatch
     assert "secret tool output" not in json.dumps(calls)  # the tool channel never leaves the cell
     assert "[System:" not in json.dumps(calls)
     finals = [i.get("cell_key") for i in sent if i.get("state") == "final"]
-    assert set(finals) == {f"user:{now + 0.5!r}", f"assistant:{now - 500!r}", answer_key}
+    assert set(finals) == {f"user:{now + 0.5!r}", answer_key}  # an older answer is never re-sent
     assert finals[-1] == answer_key  # the turn's answer lands last: the apps settle on it
 
 
@@ -129,7 +128,7 @@ def test_a_tool_card_lands_on_the_answer_row(server, monkeypatch):
     url, calls, rows = server
     now = time.time()
     card = {"kind": "output_blocks", "major": 1, "header": {"title": "SQ 638"}, "fallback_text": "SQ 638 on time"}
-    saved = [{"id": 1, "role": "user", "content": "SQ 638?", "timestamp": now + 0.5},
+    saved = [{"id": 1, "role": "user", "content": "SQ 638?", "timestamp": now + 0.5, "platform_message_id": "ref-card"},
              {"id": 2, "role": "assistant", "content": "On time.", "timestamp": now + 2.0}]
     run_turn(url, "weave-abc", "ref-card", [
         {"type": "tool.completed", "tool_name": "mcp__weave_connectors__show_flight_status", "card": card},
@@ -166,7 +165,7 @@ def test_a_failed_turn_hides_its_partial_reply(server, monkeypatch):
 def test_a_turn_without_streamed_text_still_ends_on_its_live_row(server, monkeypatch):
     url, _calls, rows = server
     now = time.time()
-    saved = [{"id": 1, "role": "user", "content": "hi", "timestamp": now}, {"id": 2, "role": "assistant", "content": "Done.", "timestamp": now + 1}]
+    saved = [{"id": 1, "role": "user", "content": "hi", "timestamp": now, "platform_message_id": "ref6"}, {"id": 2, "role": "assistant", "content": "Done.", "timestamp": now + 1}]
     run_turn(url, "weave-abc", "ref6", [{"type": "turn.completed"}], saved, monkeypatch)
     live_id = str(sync.uuid.uuid5(sync.uuid.NAMESPACE_URL, "weave-chat:ref6"))
     wait_for(lambda: rows.get(live_id, {}).get("state") == "final")
@@ -177,7 +176,7 @@ def test_an_immediate_turn_without_turn_started_still_streams(server, monkeypatc
     # The gateway emits turn.started only for queued or steered submits; an immediate turn begins with its text.
     url, _calls, rows = server
     now = time.time()
-    saved = [{"id": 1, "role": "user", "content": "hi", "timestamp": now}, {"id": 2, "role": "assistant", "content": "Hello", "timestamp": now + 1}]
+    saved = [{"id": 1, "role": "user", "content": "hi", "timestamp": now, "platform_message_id": "ref7"}, {"id": 2, "role": "assistant", "content": "Hello", "timestamp": now + 1}]
     run_turn(url, "weave-abc", "ref7", [{"type": "assistant.delta", "delta": "Hel"}, {"type": "assistant.delta", "delta": "lo"},
                                          {"type": "turn.completed"}], saved, monkeypatch, started=False)
     live_id = str(sync.uuid.uuid5(sync.uuid.NAMESPACE_URL, "weave-chat:ref7"))
@@ -255,3 +254,20 @@ def test_ledger_vault_card_keeps_always_on_server(server, monkeypatch):
     assert card["body"]["approval_ref"] == approval
     assert card["body"]["choices"] == ["once", "always", "deny"]
     assert card["body"]["native_request_ref"] == "vault-ref"
+
+
+def test_a_turn_writes_only_its_own_rows_however_long_the_chat(server, monkeypatch):
+    """A finished turn writes the rows from its own user message on (Hermes stores the turn ref on it), never the
+    history before it: re-sending old rows re-stamped every one and flooded the apps and the call (2026-10-16)."""
+    url, calls, rows = server
+    now = time.time()
+    history = [{"id": i, "role": "user" if i % 2 else "assistant", "content": f"old {i}", "timestamp": now - 9000 + i,
+                "platform_message_id": f"old-{i}"} for i in range(150)]
+    saved = history + [{"id": 900, "role": "user", "content": "open redmart", "timestamp": now - 30, "platform_message_id": "ref-long"},
+                       {"id": 901, "role": "assistant", "content": "Opening it.", "timestamp": now + 1}]
+    run_turn(url, "weave-abc", "ref-long", [{"type": "assistant.delta", "delta": "Opening it."}, {"type": "turn.completed"}],
+             saved, monkeypatch)
+    live_id = str(sync.uuid.uuid5(sync.uuid.NAMESPACE_URL, "weave-chat:ref-long"))
+    wait_for(lambda: rows.get(live_id, {}).get("state") == "final")
+    finals = [i.get("cell_key") for c in calls for i in c["p_items"] if i.get("state") == "final"]
+    assert finals == [f"user:{now - 30!r}", f"assistant:{now + 1!r}"]  # a user row from before turn start still counts
