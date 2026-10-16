@@ -125,8 +125,9 @@ class MCPServerHealthMixin:
     def _deregister_owned(self, tool_names: Iterable[str]) -> None:
         """Deregister *tool_names* this server's toolset still owns (never a colliding name owned by another server)."""
         from tools.registry import registry
+        scope = _core._server_registry_scope(_registration._server_key_for_task(self))  # owner, not the loop's
         for tool_name in tool_names:
-            if registry.get_toolset_for_tool(tool_name) == f"mcp-{self.name}":
+            if getattr(registry.get_entry(tool_name, scope=scope), "toolset", None) == f"mcp-{self.name}":
                 _registration._deregister_mcp_tool_all_scopes(self, tool_name)
 
     async def _refresh_tools(self, *, require_ready: bool = False):

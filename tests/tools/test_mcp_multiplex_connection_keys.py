@@ -425,3 +425,30 @@ def test_adopter_scope_setup_failure_leaks_no_override_and_continues(two_profile
     assert get_hermes_home_override() is None
     assert ss.current_secret_scope() is None
     assert registered == [{"x": {"url": "https://mcp.example/x"}}]
+
+
+def test_refresh_off_the_profile_context_keeps_a_served_profiles_tools(two_profiles, monkeypatch):
+    """A schema refresh runs on the MCP loop, outside the served profile's context. It must read
+    ownership in the profile's own scope: an unscoped read sees the launch profile, so every tool
+    looked foreign and new tools (a provider's freshly enabled API) never reached the profile."""
+    import hermes_constants
+    from tools import mcp_tool_discovery as disc
+    from tools import mcp_tool_registration as reg
+    from tools.mcp_tool_health import MCPServerHealthMixin
+    from tools.registry import registry
+
+    monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: False)
+    cfg = {"url": "https://mcp.example/s", "headers": {"Authorization": "Bearer A"}}
+    scope_a = two_profiles("a")
+    srv = _server("s", cfg)
+    disc._adopt_server("s", srv)
+    srv._registered_tool_names = reg._register_server_tools("s", srv, cfg)
+    monkeypatch.setattr(hermes_constants, "get_hermes_home_override", lambda: None)  # the MCP loop
+
+    added = SimpleNamespace(**{**vars(_tool()), "name": "added"})
+    srv._tools = [_tool(), added]
+    assert reg._register_server_tools("s", srv, cfg) == ["mcp__s__t", "mcp__s__added"]
+    assert registry.get_entry("mcp__s__added", scope=scope_a).toolset == "mcp-s"
+
+    MCPServerHealthMixin._deregister_owned(srv, ["mcp__s__added"])
+    assert registry.get_entry("mcp__s__added", scope=scope_a) is None
