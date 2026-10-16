@@ -599,16 +599,20 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, submit: bool 
 
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
-    if meta.kind == "login" and isinstance(parsed, dict) and parsed.get("submitted"):
-        out["submitted"] = True
-        out["next"] = ("Submitted. Read the new page. If it asks for a verification code, call browser_vault action=enter_code with this handle"
-                       + (" (a code will be generated automatically)." if meta.has_otp else "."))
-    elif meta.kind == "login":
-        out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault action=enter_code with this handle"
-                       + (" (a code will be generated automatically)." if meta.has_otp else "."))
+    if meta.kind == "login":
+        out.update(_login_next(meta, isinstance(parsed, dict) and parsed.get("submitted") is True))
     if meta.kind != "login":
         out["fields"] = sorted(f["token"] for f in fills)  # which controls were targeted, never the values
     return json.dumps(out)
+
+
+def _login_next(meta, submitted: bool) -> dict:
+    """What the agent does after a login fill; a fill that submitted only has the new page left to read."""
+    code = ("call browser_vault action=enter_code with this handle"
+            + (" (a code will be generated automatically)." if meta.has_otp else "."))
+    if submitted:
+        return {"submitted": True, "next": "Submitted. Read the new page. If it asks for a verification code, " + code}
+    return {"next": "Submit. If the site then asks for a verification code, " + code}
 
 
 def _confirm_payment_fill(label: str, origin: str) -> bool:
