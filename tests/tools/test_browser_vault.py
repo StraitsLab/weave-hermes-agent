@@ -250,6 +250,22 @@ class TestClassifier:
         assert js.index("origin_changed") < js.index("querySelectorAll")
 
 
+    def test_login_fills_add_the_identifier_to_an_empty_field_of_the_same_form(self):
+        # WEV-3259: after a fill the page is guarded and the cell has no typing tool, so the saved identifier rides the
+        # same script, like browser autofill. Never a secret, never over a typed value, never into another form.
+        from agent.vault_login_classifier import LoginControl, classify_login_control, select_login_fills
+        raw = [{"autocomplete": "", "formIndex": 0, "index": 0, "label": "", "name": "username", "type": "text"},
+               {"autocomplete": "", "formIndex": 0, "index": 1, "label": "", "name": "password", "type": "password"},
+               {"autocomplete": "email", "formIndex": 1, "index": 2, "label": "", "name": "news", "type": "email"}]
+        classified = [c for c in (classify_login_control(LoginControl.from_dict(r)) for r in raw) if c]
+        fills = select_login_fills(classified, "pw", "tomsmith")
+        assert [(f["index"], f["token"], f.get("if_empty")) for f in fills] == [(0, "username", True), (1, "current-password", None)]
+        assert select_login_fills(classified, "pw", "") == [fills[1]]  # no saved identifier: password only
+        assert select_login_fills([c for c in classified if c.control.index != 0], "pw", "tomsmith") == [fills[1]]
+        js = build_fill_js(fills, expected_origin="https://example.com", submit=True)
+        assert "if (f.if_empty && el.value) continue;" in js
+        assert "if (submit && pw && form)" in js  # an identifier alone never submits
+
     def test_build_fill_js_submits_only_when_asked_and_after_a_fill(self):
         # WEV-3259: after a fill the vault guard blocks every page-reading tool, so a login the agent
         # cannot submit is stuck. submit=True submits the filled control's own form in the SAME script.
@@ -257,7 +273,7 @@ class TestClassifier:
         assert "const submit = false;" in build_fill_js(fills, expected_origin="https://example.com")
         js = build_fill_js(fills, expected_origin="https://example.com", submit=True)
         assert "const submit = true;" in js
-        assert "if (submit && filled && form)" in js and "form.requestSubmit()" in js
+        assert "if (submit && pw && form)" in js and "form.requestSubmit()" in js  # only once a password landed
         assert js.index("requestSubmit") > js.index("setter.set.call")  # never before the value lands
         assert js.index("requestSubmit") > js.index('removeAttribute("data-hermes-vault-slot")')
 
@@ -468,12 +484,11 @@ class TestBrowserVaultTools:
             "origin": "https://example.com",
         }
         assert "s3cret-pw" not in raw
-        # The secret expression only ever goes through the secret eval path,
-        # and it targets only the password field (index 1).
+        # The secret expression only ever goes through the secret eval path. Like browser autofill it also carries the
+        # saved identifier (not a secret) for the same form's email field, written only if that field is empty.
         assert len(secret_exprs) == 1
         assert "s3cret-pw" in secret_exprs[0]
-        assert '"index": 0' not in secret_exprs[0]
-        assert "user@example.com" not in secret_exprs[0]
+        assert '{"index": 0, "token": "email", "value": "user@example.com", "if_empty": true}' in secret_exprs[0]
 
     def test_fill_toctou_navigation_writes_nothing(self, store):
         """P1-2 schedule regression: inspection passes on the allowed origin,

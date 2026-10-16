@@ -451,7 +451,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, submit: bool 
         classify_checkout_control,
         classify_login_control,
         select_checkout_fills,
-        select_password_fill,
+        select_login_fills,
     )
     from agent.vault_backends import UnlockRequired, backend_for_handle
     from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
@@ -543,7 +543,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, submit: bool 
     try:
         if meta.kind == "login":
             secret = {"password": _password_for_page(backend, handle, page_origin)}
-            fills = select_password_fill(classified, secret["password"])
+            fills = select_login_fills(classified, secret["password"], meta.identifier or "")
         else:
             secret = backend.resolve_secret(handle)
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
