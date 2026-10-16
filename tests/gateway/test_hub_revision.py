@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 import pytest
@@ -72,3 +73,33 @@ async def test_changed_revision_waits_for_owning_refresh_and_never_overlaps(monk
     assert count==1 and revisions.applied is None
     release.set();await revisions.task
     assert revisions.applied=="b"*64 and count==2 and maximum==1
+
+
+@pytest.mark.asyncio
+async def test_refresh_runs_on_the_real_adapter_which_starts_without_the_reload_flag(monkeypatch,caplog):
+    # APIServerAdapter never initialises _mcp_reload_in_progress (only the HTTP route sets it), so a
+    # chat-turn refresh before any manual reload must not trip over the missing attribute.
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    monkeypatch.setattr(native_awake,"acquire",AsyncMock());monkeypatch.setattr(native_awake,"release",lambda lease:None)
+    adapter=APIServerAdapter(PlatformConfig(enabled=True,extra={}))
+    reload=AsyncMock(return_value={"schema_refreshed":"weave-connectors"})
+    adapter.gateway_runner=SimpleNamespace(_reload_mcp_toolset=reload)
+    revision=HubRevision(adapter)
+    with caplog.at_level(logging.WARNING):
+        revision.request(REV);await asyncio.wait_for(revision.task,3)
+    assert "refresh failure" not in caplog.text
+    reload.assert_awaited_once_with(server="weave-connectors")
+    assert revision.applied==REV and adapter._mcp_reload_in_progress is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_failure_logs_the_exception_type(monkeypatch,caplog):
+    monkeypatch.setattr(native_awake,"acquire",AsyncMock());monkeypatch.setattr(native_awake,"release",lambda lease:None)
+    adapter=SimpleNamespace(_mcp_reload_in_progress=False,gateway_runner=SimpleNamespace(
+        _reload_mcp_toolset=AsyncMock(side_effect=TimeoutError("token=secret"))))
+    revision=HubRevision(adapter)
+    with caplog.at_level(logging.WARNING):
+        revision.request(REV);await asyncio.wait_for(revision.task,3)
+    assert "hub revision pending after refresh failure (TimeoutError)" in caplog.text
+    assert "secret" not in caplog.text
