@@ -188,6 +188,23 @@ def test_a_failed_turn_hides_its_partial_reply(server, monkeypatch):
     assert rows[live_id]["outcome"] == "failed"  # an older answer is never adopted as this turn's
 
 
+def test_a_stopped_turn_keeps_what_it_wrote(server, monkeypatch):
+    url, _calls, rows = server
+    run_turn(url, "weave-abc", "ref5s", [{"type": "assistant.delta", "delta": "The port began"},
+                                          {"type": "turn.failed", "stopped": True}], [], monkeypatch)
+    live_id = str(sync.uuid.uuid5(sync.uuid.NAMESPACE_URL, "weave-chat:ref5s"))
+    wait_for(lambda: rows.get(live_id, {}).get("state") == "final")
+    assert rows[live_id]["text"] == "The port began" and rows[live_id]["outcome"] == "stopped"
+
+
+def test_a_stopped_turn_with_nothing_written_ends_hidden(server, monkeypatch):
+    url, _calls, rows = server
+    run_turn(url, "weave-abc", "ref5e", [{"type": "turn.failed", "stopped": True}], [], monkeypatch)
+    live_id = str(sync.uuid.uuid5(sync.uuid.NAMESPACE_URL, "weave-chat:ref5e"))
+    wait_for(lambda: rows.get(live_id, {}).get("state") == "removed")
+    assert rows[live_id]["outcome"] == "stopped"
+
+
 def test_a_turn_without_streamed_text_still_ends_on_its_live_row(server, monkeypatch):
     url, _calls, rows = server
     now = time.time()

@@ -51,6 +51,18 @@ async def test_stop_interrupts_the_running_answer():
 
 
 @pytest.mark.asyncio
+async def test_the_stopped_turn_ends_as_stopped():
+    adapter = _adapter(Agent())
+    adapter._native_submit_active_refs[f"key:{SESSION_ID}"] = "ref-1"
+    await _post(adapter)
+    closed = []
+    adapter._native_submit_close = lambda ref, kind, **fields: closed.append((ref, kind, fields))
+    event = SimpleNamespace(metadata={"native_request_ref": "ref-1", "native_submit_failed": True})
+    await adapter._on_native_submit_finished(event, f"key:{SESSION_ID}")
+    assert closed[-1] == ("ref-1", "turn.failed", {"stopped": True})
+
+
+@pytest.mark.asyncio
 async def test_stop_with_nothing_running_is_a_no_op():
     status, body = await _post(_adapter(None))
     assert (status, body) == (200, {"object": "hermes.session.stop", "stopped": False})
