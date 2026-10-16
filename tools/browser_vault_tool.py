@@ -434,7 +434,7 @@ def _password_for_page(backend, handle, origin):
 
 
 @_vault_refusals
-def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
+def browser_vault_fill(handle: str, task_id: Optional[str] = None, submit: bool = False) -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
@@ -564,7 +564,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     try:
         fill_result = _eval_js_secret(
-            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
+            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce,
+                                             submit=submit and meta.kind == "login")
         )
     except Exception as exc:
         # Strip any secret material from exception text before surfacing.
@@ -598,7 +599,11 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
-    if meta.kind == "login":
+    if meta.kind == "login" and isinstance(parsed, dict) and parsed.get("submitted"):
+        out["submitted"] = True
+        out["next"] = ("Submitted. Read the new page. If it asks for a verification code, call browser_vault action=enter_code with this handle"
+                       + (" (a code will be generated automatically)." if meta.has_otp else "."))
+    elif meta.kind == "login":
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault action=enter_code with this handle"
                        + (" (a code will be generated automatically)." if meta.has_otp else "."))
     if meta.kind != "login":
@@ -643,6 +648,8 @@ BROWSER_VAULT_SCHEMA = {
         "properties": {
             "action": {"type": "string", "enum": ["list", "fill", "save_login", "enter_code", "unlock"]},
             "handle": {"type": "string", "description": "fill / enter_code: a handle from list."},
+            "submit": {"type": "boolean", "description": ("fill (login) only: submit the form right after the password "
+                       "lands. Type the username first. Use it when the page is guarded after a fill.")},
             "backend": {"type": "string", "enum": ["onepassword", "bitwarden"], "description": "unlock only."},
             "label": {"type": "string", "description": "save_login only: short site name (default: the host)."},
         },
@@ -678,7 +685,7 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     if action == "unlock":
         return browser_vault_unlock(str(args.get("backend") or ""))
     page_ops = {
-        "fill": lambda: browser_vault_fill(handle=handle, task_id=tid),
+        "fill": lambda: browser_vault_fill(handle=handle, task_id=tid, submit=args.get("submit") is True),
         "save_login": lambda: browser_vault_save_login(label=label, task_id=tid),
         "enter_code": lambda: browser_vault_enter_code(handle=handle, task_id=tid),
     }
