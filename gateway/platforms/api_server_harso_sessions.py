@@ -574,9 +574,11 @@ class NativeSessionAPI:
         )
         if entry is None or entry.session_id != session_id:
             raise RuntimeError("native session binding was rejected")
-        # DEC-415: a spoken "yes"/"no" on a call arrives as a plain send. While the agent waits on an
-        # approval it answers it, with the gateway's own approval words (run_busy._plaintext_approval_words).
-        if not internal and self._native_submit_answers_approval(runner, entry.session_key, message):
+        # DEC-415: a spoken "yes"/"no" on a call reaches the cell as the call's handoff (an internal submit).
+        # While the agent waits on an approval it answers it, with the gateway's own approval words
+        # (run_busy._plaintext_approval_words). Only weave-api submits here; its other internal sends
+        # (work results) are never a bare approval word.
+        if self._native_submit_answers_approval(runner, entry.session_key, message):
             return "answered_approval"
         self._native_submit_ref_sessions[native_request_ref] = (
             _api_request_profile.get() or "default", session_id,
