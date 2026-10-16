@@ -162,7 +162,7 @@ def test_a_card_reaches_the_live_row_before_the_turn_ends(server, monkeypatch):
 
 def test_a_card_tool_starting_shows_its_card_name(server, monkeypatch):
     """WEV-3464: the model starting show_<card> sets the row status to that tool at once (the apps draw a placeholder)."""
-    url, calls, rows = server
+    url, calls, _rows = server
     run_turn(url, "weave-abc", "ref-gen", [
         {"type": "tool.generating", "tool_name": "mcp__weave_connectors__show_compare_products"},
     ], [], monkeypatch)
