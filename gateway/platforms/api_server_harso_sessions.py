@@ -981,6 +981,11 @@ class NativeSessionAPI:
                 tool_name=str(tool_name)[:256],
             )
 
+    def _native_submit_tool_generating(self, session_key: str, tool_name: Any) -> None:
+        native_request_ref = self._native_submit_active_ref(session_key)
+        if native_request_ref:
+            self._native_submit_event(native_request_ref, "tool.generating", tool_name=str(tool_name)[:256])
+
     def _native_submit_final(self, session_key: str, content: Any) -> None:
         native_request_ref = self._native_submit_active_ref(session_key)
         if native_request_ref and isinstance(content, str) and content:

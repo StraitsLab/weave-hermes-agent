@@ -60,6 +60,16 @@ def wire_tools(agent, adapter, session_key):
                 previous_complete(call_id, name, args, result)
             native_complete(session_key, call_id, name, result)
         agent.tool_complete_callback = complete
+    native_gen = getattr(adapter, '_native_submit_tool_generating', None)
+    if callable(native_gen):  # WEV-3464: a card tool being written shows its placeholder at once
+        previous_gen = agent.tool_gen_callback
+
+        def generating(name):
+            if previous_gen:
+                previous_gen(name)
+            if str(name).rsplit('__', 1)[-1].startswith('show_'):
+                native_gen(session_key, name)
+        agent.tool_gen_callback = generating
 
 
 def wire_delta(adapter, session_key, previous):

@@ -147,12 +147,13 @@ class _Writer:
             return False
         if kind == "assistant.delta" and isinstance(event.get("delta"), str):
             live["text"] += event["delta"]
-        elif kind == "tool.started":
+        elif kind in ("tool.started", "tool.generating"):  # generating: the model began writing the call (WEV-3464)
             live["status"] = str(event.get("tool_name") or "")[:120]
         elif kind in ("tool.completed", "tool.failed"):
             live["status"] = None
             if isinstance(event.get("card"), dict):  # WEV-3395: the turn's last card goes on its answer row
                 live["card"] = event["card"]
+                live["card_sent"] = False  # WEV-3464: and onto the live row at once
         elif kind in CARD_TYPES:
             card_id = event.get("request_id") or event.get("clarify_id") or ""
             body = {k: v for k, v in event.items()
@@ -179,6 +180,11 @@ class _Writer:
         if cards:
             _call(live, cards)
         piece = live["text"][live["sent"]:]
+        if live["rev"] is not None and live.get("card_sent") is False:
+            # A body-only write: the push trigger sends the whole body (card included) only when nothing is appended.
+            out = _call(live, [{"item_id": live["item"], "role": "assistant", "kind": "text", "state": "writing",
+                                "body": {"output": live["card"], "status": live["status"]}}])[0]
+            live["rev"], live["shown"], live["card_sent"] = out["rev"], live["status"], True
         if live["rev"] is not None and not piece and live["status"] == live["shown"]:
             return
         # One call carries the new text and the status line ("Searching the web"); the first one opens the row.
