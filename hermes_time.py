@@ -77,7 +77,15 @@ def _env_timezone() -> str:
 
 def _timezone_cache_identity() -> tuple[str, str]:
     tz_env = _env_timezone()
-    return ("environment", tz_env) if tz_env else ("config", str(get_config_path()))
+    if tz_env:
+        return ("environment", tz_env)
+    path = get_config_path()
+    try:  # a `hermes config set timezone` (or any edit) is picked up live, no restart
+        stat = os.stat(path)
+        version = f"{stat.st_mtime_ns}:{stat.st_size}:{stat.st_ino}"
+    except OSError:
+        version = ""
+    return ("config", f"{path}@{version}")
 
 
 def _resolve_timezone_name() -> str:

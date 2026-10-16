@@ -720,6 +720,10 @@ class HarsoMemoryProvider(MemoryProvider):
         # exclusion can never bind it to another turn.
         if turn_id:
             payload["native_turn_ref"] = turn_id
+        # WEV-3455: the agent's own zone (config `timezone`), so memory dates the turn as the user lives it.
+        from hermes_time import get_timezone_name
+        if zone := get_timezone_name():
+            payload["time_zone"] = zone
         response = self._post("/internal/harso/turns", payload)
         if response is None:
             raise HarsoWriteError("harso_turn_unacknowledged")

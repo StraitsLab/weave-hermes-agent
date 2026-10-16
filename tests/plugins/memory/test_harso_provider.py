@@ -606,6 +606,7 @@ class HarsoTurnInput(HarsoScopeInput):
     current_assistant_ref: Annotated[str, Field(pattern=r"^message:[1-9][0-9]{0,18}$")]
     finalized_items: Annotated[list[HarsoFinalizedItem], Field(min_length=2, max_length=10)]
     native_turn_ref: NativeTurnRef | None = None
+    time_zone: Annotated[str, Field(pattern=r"^(?:[A-Za-z][A-Za-z0-9_+/-]{0,63}|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$")] | None = None
 
 
 def _context_provider(monkeypatch):
@@ -1903,3 +1904,15 @@ def test_scheduled_job_runs_send_nothing_to_harso(monkeypatch):
     provider.sync_turn("u", "a", session_id=run, messages=_turn_messages())
     assert provider.prefetch("what is my marker", session_id=run) == ""
     assert seen == []
+
+
+def test_sync_turn_sends_the_configured_timezone(monkeypatch):
+    """WEV-3455: the cell's `timezone` setting rides on the turn; none configured sends no key."""
+    provider = _provider(monkeypatch)
+    seen = _capture_turn(monkeypatch)
+    monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Singapore")
+    provider.sync_turn("question", "answer", messages=_turn_messages())
+    monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "")
+    provider.sync_turn("question", "answer", messages=_turn_messages())
+    assert seen[0]["body"]["time_zone"] == "Asia/Singapore"
+    assert "time_zone" not in seen[1]["body"]

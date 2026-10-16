@@ -189,3 +189,20 @@ def test_stale_edit_without_manual_marker_still_reanchors(temp_home, monkeypatch
     after = get_job(jid)
     assert after["next_run_at"] != _SATURDAY_0700.isoformat()
     assert "manual_run_at" not in after
+
+
+def test_timezone_cache_follows_config_edits(tmp_path, monkeypatch):
+    """`hermes config set timezone` takes effect without a restart."""
+    import os
+    import hermes_time
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_TIMEZONE", raising=False)
+    config = tmp_path / "config.yaml"
+    config.write_text("timezone: UTC\n")
+    hermes_time.reset_cache()
+    assert hermes_time.get_timezone_name() == "UTC"
+    config.write_text("timezone: Asia/Singapore\n")
+    stat = config.stat()
+    os.utime(config, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+    assert hermes_time.get_timezone_name() == "Asia/Singapore"
