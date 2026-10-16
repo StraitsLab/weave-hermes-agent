@@ -280,7 +280,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
 })()"""
 
 
-def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
+def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "", submit: bool = False) -> str:
     """Build a JS expression that fills the selected controls and reports only a count. The
     returned expression never echoes the values back.
 
@@ -296,7 +296,8 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
         [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
     )
     return (_FILL_JS_TEMPLATE.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
-            .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce)))
+            .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce))
+            .replace("__SUBMIT__", "true" if submit else "false"))
 
 
 _FILL_JS_TEMPLATE = """(() => {
@@ -306,7 +307,8 @@ _FILL_JS_TEMPLATE = """(() => {
   }
   const fills = __FILLS__;
   const nonce = __NONCE__;
-  let filled = 0;
+  const submit = __SUBMIT__;
+  let filled = 0, form = null;
   const norm = (t) => String(t || "").trim().toLowerCase();
   for (const f of fills) {
     const el = document.querySelector('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]');
@@ -324,9 +326,14 @@ _FILL_JS_TEMPLATE = """(() => {
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
       el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      if (el.value.length > 0) filled += 1;
+      if (el.value.length > 0) { filled += 1; form = el.form || form; }
     } catch (e) { /* skip */ }
   }
   document.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
-  return JSON.stringify({ filled });
+  // Submit in the same script, like browser autofill: after a fill the page is guarded, so no other tool can.
+  let submitted = false;
+  if (submit && filled && form) {
+    try { if (form.requestSubmit) form.requestSubmit(); else form.submit(); submitted = true; } catch (e) { /* report unsent */ }
+  }
+  return JSON.stringify({ filled, submitted });
 })()"""

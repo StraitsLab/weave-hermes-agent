@@ -250,6 +250,18 @@ class TestClassifier:
         assert js.index("origin_changed") < js.index("querySelectorAll")
 
 
+    def test_build_fill_js_submits_only_when_asked_and_after_a_fill(self):
+        # WEV-3259: after a fill the vault guard blocks every page-reading tool, so a login the agent
+        # cannot submit is stuck. submit=True submits the filled control's own form in the SAME script.
+        fills = [{"index": 0, "token": "current-password", "value": "x"}]
+        assert "const submit = false;" in build_fill_js(fills, expected_origin="https://example.com")
+        js = build_fill_js(fills, expected_origin="https://example.com", submit=True)
+        assert "const submit = true;" in js
+        assert "if (submit && filled && form)" in js and "form.requestSubmit()" in js
+        assert js.index("requestSubmit") > js.index("setter.set.call")  # never before the value lands
+        assert js.index("requestSubmit") > js.index('removeAttribute("data-hermes-vault-slot")')
+
+
 # ---------------------------------------------------------------------------
 # Browser tool: origin binding + gating
 # ---------------------------------------------------------------------------
@@ -351,6 +363,42 @@ class TestBrowserVaultTools:
         assert "https://www.amazon.co.uk" in secret_exprs[0]
         assert "s3cret-pw" not in raw
         assert out["filled_fields"] == 1
+
+    def test_login_fill_submits_when_asked(self):
+        """WEV-3259: fill(submit=True) asks the same in-page script to submit and reports it; default fills do not."""
+        from tools import browser_vault_tool
+
+        meta = self._manager_meta()
+
+        class _ManagerBackend:
+            name, display_name, needs_unlock = "onepassword", "1Password", False
+
+            def is_unlocked(self):
+                return True
+
+            def get_meta(self, handle):
+                return meta if handle == meta.id else None
+
+            def resolve_password(self, handle):
+                return "s3cret-pw"
+
+        controls = [{"autocomplete": "current-password", "formIndex": 0, "index": 0, "label": "", "name": "pw",
+                     "type": "password"}]
+        secret_exprs = []
+
+        def fake_eval_secret(task_id, expression):
+            secret_exprs.append(expression)
+            return {"success": True, "result": json.dumps({"filled": 1, "submitted": "const submit = true;" in expression})}
+
+        with patch("agent.vault_backends.backend_for_handle", return_value=_ManagerBackend()), \
+             patch.object(browser_vault_tool, "_current_page_origin", return_value="https://www.amazon.co.uk"), \
+             patch.object(browser_vault_tool, "_eval_js", return_value={"success": True, "result": json.dumps(controls)}), \
+             patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_eval_secret):
+            plain = json.loads(browser_vault_tool.browser_vault_fill("op:multi"))
+            sent = json.loads(browser_vault_tool._handle_vault({"action": "fill", "handle": "op:multi", "submit": True}))
+        assert "const submit = false;" in secret_exprs[0] and "submitted" not in plain
+        assert "const submit = true;" in secret_exprs[1]
+        assert sent["success"] is True and sent["submitted"] is True and sent["next"].startswith("Submitted.")
 
     def test_fill_still_refused_on_origin_not_saved_on_the_item(self):
         """Multi-website items widen nothing: an unsaved origin — even a sibling
