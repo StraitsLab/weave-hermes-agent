@@ -15,7 +15,9 @@ SCHEMA = {
         "Open and read a page, or perform one narrow browser goal on Hermes's browser computer. "
         "Empty goal returns visible page text. expect is independently checked against the live page. "
         "allow_hosts adds comma-separated hosts (the starting host is always allowed). "
-        "Pass browser_page.target to resume that exact tab WITHOUT navigating; text_offset reads more text. "
+        "Pass browser_page.target to resume that exact tab WITHOUT navigating (it goes to url only when the tab "
+        "is on another site); text_offset reads more text. allow_hosts may be empty: the start site's sibling hosts "
+        "(www., other subdomains) are allowed already. "
         "Without a target, a chat keeps working in its last browser window (one live card); set new_window "
         "true only for separate parallel work that needs its own window and card. "
         "Never supply passwords, payment details or verification codes; use browser_vault tools directly. "
@@ -142,6 +144,8 @@ def browse(args, task_id=None, **kwargs):
             raise ValueError("new_window must be true or false")
         verdict = engine._code_url_verdict(json.dumps(url))
         if verdict.blocked:
+            if "private or internal" in verdict.blocked and _unresolvable(parsed.hostname):
+                raise ValueError(f"Could not look up {parsed.hostname} (DNS failed). Try again in a moment.")
             raise ValueError(verdict.blocked)
         env = engine._base_subprocess_env()
         error = engine._route_backend(env, "", task_id, False, force_local_sidecar=verdict.local_sidecar)
@@ -200,6 +204,15 @@ def browse(args, task_id=None, **kwargs):
     except Exception as exc:  # health: allow BLE001 -- tool boundary returns JSON; forced redaction protects exception text
         result = {"success": False, "error_type": type(exc).__name__, "error": str(exc)}
     return redact_sensitive_text(json.dumps(result), force=True)
+
+
+def _unresolvable(host):
+    import socket
+    try:
+        socket.getaddrinfo(host, 443)
+        return False
+    except socket.gaierror:
+        return True
 
 
 def register(ctx):
