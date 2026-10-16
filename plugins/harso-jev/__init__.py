@@ -112,7 +112,9 @@ def browse(args, task_id=None, **kwargs):
             return json.loads(proc.stdout)
 
         result = run_fenced({"features": {"local": True}}, dispatch) if local else dispatch()
-        _publish_activity(result, credentials)
+        announced = result.pop("_announced", [])
+        if (result.get("browser_page") or {}).get("target") not in announced:
+            _publish_activity(result, credentials)  # a resumed window: the worker opened nothing new
     except subprocess.TimeoutExpired:
         result = {"success": False, "error_type": "timeout", "error":
                   "Jev exceeded 300 seconds. Inspect the current page before repeating any action."}
