@@ -670,8 +670,10 @@ class NativeSessionAPI:
     @staticmethod
     def _native_submit_answers_approval(runner: Any, session_key: str, message: str) -> bool:
         from tools.approval import has_blocking_approval, resolve_gateway_approval
+        if not has_blocking_approval(session_key):
+            return False
         match = runner._plaintext_approval_words().get((message or "").strip().lower().rstrip(".!"))
-        if match is None or not has_blocking_approval(session_key):
+        if match is None:
             return False
         verb, args = match  # "always"/"session" words keep their choice, as /approve always does
         choice = "deny" if verb == "deny" else args or "once"
