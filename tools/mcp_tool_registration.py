@@ -336,8 +336,13 @@ def _register_candidates(name: str, candidates: list[_Candidate], *, check_fn: C
     scope_value = scope()
     if key is None:
         key = _server_key(name, scope_value, current=False)
+    # Read ownership in the scope being written: a refresh runs on the MCP loop, outside the
+    # profile's context, so an unscoped read would see the launch profile and reject every tool.
+    def owner(tool_name):
+        return getattr(registry.get_entry(tool_name, scope=scope_value), "toolset", None)
+
     for c in candidates:
-        existing_toolset = registry.get_toolset_for_tool(c.registry_name)
+        existing_toolset = owner(c.registry_name)
         if existing_toolset and existing_toolset != toolset_name:  # foreign owner: skip, preserve it
             if lazy:
                 if not c.is_utility:
@@ -353,7 +358,7 @@ def _register_candidates(name: str, candidates: list[_Candidate], *, check_fn: C
         registry.register(
             name=c.registry_name, toolset=toolset_name, schema=c.schema, handler=c.handler, check_fn=check_fn,
             is_async=False, description=c.schema.get("description") or "", scope=scope_value)
-        if registry.get_toolset_for_tool(c.registry_name) == toolset_name:
+        if owner(c.registry_name) == toolset_name:
             _track_mcp_tool_server(c.registry_name, name)
             if scope_value is not None:
                 with _core._lock:
