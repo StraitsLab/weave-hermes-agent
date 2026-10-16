@@ -363,6 +363,11 @@ def _date_prefix(occurred_at: Any) -> str:
         return ""
 
 
+def _routine_run(session_id: Any) -> bool:
+    """Stock cron names each run's session `cron_<job id>_<stamp>` (cron/scheduler.py run_job)."""
+    return isinstance(session_id, str) and session_id.startswith("cron_")
+
+
 class HarsoMemoryProvider(MemoryProvider):
     """Use the private Weave API as the Harso admission boundary."""
 
@@ -570,6 +575,10 @@ class HarsoMemoryProvider(MemoryProvider):
         timeout: float = _TIMEOUT_SECONDS,
         max_bytes: int | None = None,
     ) -> dict[str, Any] | None:
+        if _routine_run(payload.get("hermes_session_ref")):
+            # A scheduled-job run has no chat to bind: Harso scopes memory to a chat session
+            # (`weave-<conversation>`) and answers 422 for `cron_<job>_<stamp>`. Skip, quietly.
+            return None
         request = urllib.request.Request(
             f"{self._endpoint}{path}",
             data=json.dumps(payload).encode("utf-8"),
@@ -661,6 +670,9 @@ class HarsoMemoryProvider(MemoryProvider):
         turn_id: str = "",
     ) -> None:
         """Submit persisted turn evidence on MemoryManager's background thread."""
+        if _routine_run(session_id or self._session_id):
+            logger.debug("Harso turn skipped: scheduled-job run")
+            return
         if not self.is_available():
             logger.debug("Harso turn skipped: provider unavailable")
             return
