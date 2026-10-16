@@ -265,3 +265,19 @@ def publish(session_id: str, ref: str, event: dict[str, Any], read_display: Call
         logger.warning("chat writer queue full; live piece dropped (the saved row still lands)")
     except Exception:
         logger.debug("chat writer publish skipped", exc_info=True)
+
+
+def publish_rows(session_id: str, messages: list[dict[str, Any]], secret: Callable[[str], str]) -> bool:
+    """Copy finished rows that arrived outside a turn (a routine brief) into ``chat_items``. Never raises."""
+    try:
+        url = (secret("WEAVE_CHAT_SUPABASE_URL") or "").rstrip("/")
+        key, bearer = secret("WEAVE_CHAT_SUPABASE_KEY") or "", secret("WEAVE_API_MCP_BEARER") or ""
+        if not (url.startswith("https://") and key and bearer and session_id.startswith("weave-")):
+            return False
+        rows = visible_rows(messages, (secret("WEAVE_CHAT_SHOW_TAG") or "[SHOW]").strip())
+        if rows:
+            _call({"url": url, "key": key, "bearer": bearer, "session": session_id}, rows)
+        return True
+    except Exception:
+        logger.warning("chat rows copy failed", exc_info=True)
+        return False

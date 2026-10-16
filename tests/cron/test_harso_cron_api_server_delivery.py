@@ -359,3 +359,31 @@ def test_secondary_profile_brief_lands_in_that_profiles_state_db(tmp_path, gatew
         assert _rows(db)[-1] == ("assistant", DIGEST)
     with SessionDB(db_path=default_home / "state.db") as db:
         assert db.get_messages(SID) == []
+
+
+def test_weave_brief_is_copied_to_the_app_chat(adapter, gateway_loop):
+    """WEV-3451 live: the brief landed in the cell's transcript but the app (which reads Supabase chat_items) never
+    saw it. A weave-<conversation> brief is copied there with the same rows a chat turn writes."""
+    sid = "weave-01a142b0-6334-790c-9334-3bd76ff64817"
+    db = adapter._session_db
+    db.create_session(sid, "api_server")
+    db.append_message(sid, role="user", content="In 2 minutes, remind me to stretch")
+    sent = []
+    secrets = {"WEAVE_CHAT_SUPABASE_URL": "https://db.example.test", "WEAVE_CHAT_SUPABASE_KEY": "pub",
+               "WEAVE_API_MCP_BEARER": "cell-bearer"}
+    with patch("agent.secret_scope.get_secret", side_effect=lambda name, default=None: secrets.get(name, default)), \
+         patch("gateway.weave_chat_sync._call", side_effect=lambda live, items: sent.append((live, items)) or []):
+        assert _deliver(adapter, gateway_loop, sid=sid) is None
+
+    assert _rows(db, sid)[-1] == ("assistant", DIGEST)
+    assert len(sent) == 1
+    live, items = sent[0]
+    assert live["session"] == sid and live["bearer"] == "cell-bearer"
+    assert [(i["role"], i["state"], i["body"]["text"]) for i in items] == [("assistant", "final", DIGEST)]
+
+
+def test_non_weave_brief_is_not_copied(adapter, gateway_loop):
+    db = adapter._session_db
+    _seed_scheduling_turn(db)
+    with patch("gateway.weave_chat_sync._call", side_effect=AssertionError("copied")):
+        assert _deliver(adapter, gateway_loop) is None
