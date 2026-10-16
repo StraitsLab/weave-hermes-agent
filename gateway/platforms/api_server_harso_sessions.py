@@ -574,6 +574,12 @@ class NativeSessionAPI:
         )
         if entry is None or entry.session_id != session_id:
             raise RuntimeError("native session binding was rejected")
+        # DEC-415: a spoken "yes"/"no" on a call reaches the cell as the call's handoff (an internal submit).
+        # While the agent waits on an approval it answers it, with the gateway's own approval words
+        # (run_busy._plaintext_approval_words). Only weave-api submits here; its other internal sends
+        # (work results) are never a bare approval word.
+        if self._native_submit_answers_approval(runner, entry.session_key, message):
+            return "answered_approval"
         self._native_submit_ref_sessions[native_request_ref] = (
             _api_request_profile.get() or "default", session_id,
         )
@@ -660,6 +666,18 @@ class NativeSessionAPI:
         self._record_native_submit_handoff(native_request_ref, started)
         await self.handle_message(event)
         return await self._wait_native_submit_start(native_request_ref, started)
+
+    @staticmethod
+    def _native_submit_answers_approval(runner: Any, session_key: str, message: str) -> bool:
+        from tools.approval import has_blocking_approval, resolve_gateway_approval
+        if not has_blocking_approval(session_key):
+            return False
+        match = runner._plaintext_approval_words().get((message or "").strip().lower().rstrip(".!"))
+        if match is None:
+            return False
+        verb, args = match  # "always"/"session" words keep their choice, as /approve always does
+        choice = "deny" if verb == "deny" else args or "once"
+        return bool(resolve_gateway_approval(session_key, choice))
 
     @staticmethod
     def _native_submit_fingerprint(message: str, busy_mode: str, internal: bool = False) -> str:
