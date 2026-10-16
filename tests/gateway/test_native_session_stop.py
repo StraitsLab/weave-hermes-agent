@@ -77,7 +77,7 @@ async def test_stop_uses_the_hard_interrupt_of_a_real_agent():
     agent = HardAgent()
     status, body = await _post(_adapter(agent))
     assert (status, body) == (200, {"object": "hermes.session.stop", "stopped": True})
-    assert agent.calls == [("Stopped by the user.", "stopped by the user")]
+    assert agent.calls == [(None, "stopped by the user")]
 
 
 def test_stop_is_a_registered_harso_route():

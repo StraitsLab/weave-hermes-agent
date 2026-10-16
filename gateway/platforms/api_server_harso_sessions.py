@@ -1011,7 +1011,8 @@ class NativeSessionAPI:
         stopped = False
         if agent is not None:
             from agent.interrupt_compat import request_hard_interrupt
-            stopped = request_hard_interrupt(agent, "Stopped by the user.", tool_reason="stopped by the user")
+            # No message: a hard-interrupt message is queued as the user's next turn (a fake "Stopped by the user." bubble).
+            stopped = request_hard_interrupt(agent, None, tool_reason="stopped by the user")
         return web.json_response({"object": "hermes.session.stop", "stopped": bool(stopped)})
 
     def _native_submit_tool_generating(self, session_key: str, tool_name: Any) -> None:
