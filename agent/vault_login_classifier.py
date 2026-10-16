@@ -178,6 +178,23 @@ def select_password_fill(
     ]
 
 
+def select_login_fills(
+    classified: list[ClassifiedLoginControl], password: str, identifier: str = ""
+) -> list[dict[str, Any]]:
+    """The password fill plus, like browser autofill, the saved identifier into the best username/email/phone
+    control of the same form. The identifier is not a secret; it is written only into an EMPTY control, so a value
+    the agent or user already typed always wins. A page with no identifier control gets the password alone."""
+    fills = select_password_fill(classified, password)
+    if not fills or not identifier:
+        return fills
+    form = next(c.control.form_index for c in classified if c.control.index == fills[0]["index"])
+    names = [c for c in classified if c.token in ("username", "email", "tel") and c.control.form_index == form]
+    if names:
+        best = min(names, key=lambda c: (-c.score, c.control.index))
+        fills.insert(0, {"index": best.control.index, "token": best.token, "value": identifier, "if_empty": True})
+    return fills
+
+
 def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
     """Classify one control as a payment/address fill target (autocomplete token exact match 100,
     label/name heuristic 70), or None. Password/email inputs are never checkout targets."""
@@ -293,7 +310,8 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     left on filled controls so later model-driven DOM reads cannot address them deterministically.
     """
     payload = json.dumps(
-        [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
+        [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"],
+          "if_empty": bool(f.get("if_empty"))} for f in fills]
     )
     return (_FILL_JS_TEMPLATE.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
             .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce))
@@ -308,11 +326,12 @@ _FILL_JS_TEMPLATE = """(() => {
   const fills = __FILLS__;
   const nonce = __NONCE__;
   const submit = __SUBMIT__;
-  let filled = 0, form = null;
+  let filled = 0, form = null, pw = false;
   const norm = (t) => String(t || "").trim().toLowerCase();
   for (const f of fills) {
     const el = document.querySelector('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]');
     if (!el || (f.token === "current-password" && el.type !== "password")) continue;
+    if (f.if_empty && el.value) continue;  // never overwrite an identifier someone already typed
     try {
       if (el.tagName === "SELECT") {
         const want = norm(f.value);
@@ -326,13 +345,13 @@ _FILL_JS_TEMPLATE = """(() => {
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
       el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      if (el.value.length > 0) { filled += 1; form = el.form || form; }
+      if (el.value.length > 0) { filled += 1; form = el.form || form; if (f.token === "current-password") pw = true; }
     } catch (e) { /* skip */ }
   }
   document.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
   // Submit in the same script, like browser autofill: after a fill the page is guarded, so no other tool can.
   let submitted = false;
-  if (submit && filled && form) {
+  if (submit && pw && form) {
     try { if (form.requestSubmit) form.requestSubmit(); else form.submit(); submitted = true; } catch (e) { /* report unsent */ }
   }
   return JSON.stringify({ filled, submitted });
