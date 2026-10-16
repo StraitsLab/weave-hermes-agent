@@ -1891,3 +1891,15 @@ def test_manager_dispatch_passes_the_current_source_to_memory_propose(monkeypatc
         messages=[{"role": "user", "content": "remember my locker is 412", "_row_id": 41}]))
     assert result == {"noted": True}
     assert router.calls[-1]["body"]["current_user_ref"] == "message:41"
+
+
+def test_scheduled_job_runs_send_nothing_to_harso(monkeypatch):
+    # Live WEV-3451: every cron run's sync_turn got 422 (`cron_<job>_<stamp>` is not a chat session) and logged
+    # harso_turn_unacknowledged. A routine run has no chat to remember, so the provider makes no call at all.
+    provider = _provider(monkeypatch)
+    seen = _capture_turn(monkeypatch)
+    run = "cron_5f112ec6362c_20261015_183125"
+    provider.initialize(run)
+    provider.sync_turn("u", "a", session_id=run, messages=_turn_messages())
+    assert provider.prefetch("what is my marker", session_id=run) == ""
+    assert seen == []
