@@ -42,6 +42,8 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 FLUSH_S = 0.2  # live text cadence: Supabase bills each Broadcast, 5/s per reply
+FINAL_RETRY_S = 600  # bound retained turns during a sustained Supabase outage
+FINAL_BACKOFF_S = 30
 CARD_TYPES = {"approval.request": "approval", "clarify.request": "clarify"}
 SCAFFOLDING = ("[System:", "[IMPORTANT: Background", "[Your active task list", "[OUT-OF-BAND",
                "[CONTEXT COMPACTION", "[ASYNC DELEGATION", "[Planning state preserved")
@@ -117,33 +119,53 @@ class _Writer:
 
     def _run(self) -> None:
         while True:
-            deadline, ended = time.monotonic() + FLUSH_S, []
+            deadline = time.monotonic() + FLUSH_S
             while True:
                 try:
                     ref, event = self.events.get(timeout=max(0.0, deadline - time.monotonic()))
                 except queue.Empty:
                     break
-                if self._take(ref, event):
-                    ended.append(ref)
+                self._take(ref, event)
             for ref, live in list(self.live.items()):
-                try:
-                    self._flush(live)
-                    if ref in ended:
-                        self.live.pop(ref, None)
-                        _ENDED.append(ref)
-                        self._finish(live)
-                except Exception:
-                    logger.warning("chat writer: write failed", exc_info=True)
-                    if ref in ended:
-                        self.live.pop(ref, None)
-                        _ENDED.append(ref)
-                finally:
-                    if ref in ended and live.get("on_finished"):
-                        live["on_finished"]()
+                self._write(ref, live)
+
+    def _write(self, ref: str, live: dict[str, Any]) -> None:
+        ended = live.get("ended", False)
+        now = time.monotonic()
+        if ended and now >= live.get("retry_until", float("inf")):
+            logger.error("chat writer: final write retries exhausted for %s", ref)
+            self.live.pop(ref, None)
+            _ENDED.append(ref)
+            return
+        if now < live.get("retry_at", 0):
+            return
+        try:
+            if ended and "messages" not in live:
+                # Completion can admit another turn while we retry. Never adopt that turn's answer.
+                live["messages"] = live["read"]()
+            self._flush(live)
+            if ended:
+                self._finish(live)
+                self.live.pop(ref, None)
+                _ENDED.append(ref)
+        except Exception:
+            logger.warning("chat writer: write failed", exc_info=True)
+            if ended:
+                now = time.monotonic()
+                live.setdefault("retry_until", now + FINAL_RETRY_S)
+                delay = live.get("retry_delay", 1)
+                live["retry_at"] = now + delay
+                live["retry_delay"] = min(delay * 2, FINAL_BACKOFF_S)
+        finally:
+            # Completion releases the native awake lease. Retrying Supabase must not hold it.
+            if ended:
+                callback = live.pop("on_finished", None)
+                if callback:
+                    callback()
 
     def _take(self, ref: str, event: dict[str, Any]) -> bool:
         live, kind = self.live.get(ref), event.get("type")
-        if live is None:
+        if live is None or live.get("ended"):
             return False
         if kind == "assistant.delta" and isinstance(event.get("delta"), str):
             live["text"] += event["delta"]
@@ -170,15 +192,17 @@ class _Writer:
             live["cards"].append(card)
             live["card_keys"].append(card["cell_key"])
         if kind in ("turn.completed", "turn.failed"):
+            live["ended"] = True
             live["on_finished"] = event.get("_on_finished")
             live["outcome"] = kind.split(".")[1]
             return True
         return False
 
     def _flush(self, live: dict[str, Any]) -> None:
-        cards, live["cards"] = live["cards"], []
+        cards = live["cards"]
         if cards:
             _call(live, cards)
+            live["cards"] = []  # keep their cell keys queued until the upsert is acknowledged
         piece = live["text"][live["sent"]:]
         if live["rev"] is not None and live.get("card_sent") is False:
             # A body-only write: the push trigger sends the whole body (card included) only when nothing is appended.
@@ -199,7 +223,7 @@ class _Writer:
         live["sent"], live["rev"], live["shown"] = len(live["text"]), out["rev"], live["status"]
 
     def _finish(self, live: dict[str, Any]) -> None:
-        messages = live["read"]()
+        messages = live["messages"] if "messages" in live else live["read"]()
         # Only this turn's rows. Hermes saves the turn's own user message with its request ref as
         # platform_message_id; everything from there on is this turn. Earlier rows are already in Supabase.
         start = next((i for i, m in enumerate(messages) if m.get("platform_message_id") == live["ref"]), None)

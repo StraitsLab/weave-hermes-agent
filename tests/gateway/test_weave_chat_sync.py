@@ -236,6 +236,101 @@ def test_terminal_callback_waits_for_final_write(server, monkeypatch):
         proceed.set()
 
 
+@pytest.mark.parametrize("failure", ["flush", "committed_flush", "finish", "committed_finish"])
+def test_a_finished_turn_retries_its_write_without_delaying_completion(server, monkeypatch, failure):
+    """WEV-3480: a timeout must not strand the writing row or hold the awake lease for retries."""
+    from tests.waiting import wait_until
+
+    url, _calls, rows = server
+    ref = "retry-" + failure
+    now = time.time()
+    saved = [{"role": "user", "content": "hello", "timestamp": now, "platform_message_id": ref},
+             {"role": "assistant", "content": "Hello", "timestamp": now + 1}]
+    flushing = failure.endswith("flush")
+    original = sync._Writer._flush if flushing else sync._Writer._finish
+    attempts, callbacks = [], []
+    entered, proceed = threading.Event(), threading.Event()
+
+    def write(self, live):
+        if live.get("ref") != ref:
+            return  # earlier tests leave idle daemon writers alive
+        attempts.append(live)
+        if len(attempts) == 1:
+            if failure.startswith("committed"):
+                original(self, live)  # the server committed, but its response was lost
+                if flushing:
+                    live.update(sent=0, rev=None, shown=None)  # no acknowledgement reached the writer
+            raise TimeoutError("TLS handshake timed out")
+        entered.set()
+        assert proceed.wait(5)
+        original(self, live)
+
+    monkeypatch.setattr(sync._Writer, "_flush" if flushing else "_finish", write)
+    real = sync._call
+    monkeypatch.setattr(sync, "_call", lambda live, items: real({**live, "url": live["url"].replace("https://", "http://")}, items))
+    try:
+        sync.publish("weave-retry", ref, {"type": "assistant.delta", "delta": "Hello"}, lambda: list(saved), secrets(url))
+        sync.publish("weave-retry", ref, {"type": "turn.completed"}, lambda: list(saved), secrets(url),
+                     on_finished=lambda: callbacks.append(ref))
+        wait_until(lambda: callbacks, what="first attempt releases completion")
+        assert ref in sync._WRITER.live and ref not in sync._ENDED
+        # The next turn can run while this write retries. Its answer must not be adopted by the old turn.
+        saved.append({"role": "assistant", "content": "Next answer", "timestamp": now + 2})
+        sync.publish("weave-retry", ref, {"type": "assistant.delta", "delta": "late"}, lambda: list(saved), secrets(url))
+        assert entered.wait(5)
+        proceed.set()
+        wait_until(lambda: ref not in sync._WRITER.live, what="final write retires the turn")
+        item = str(sync.uuid.uuid5(sync.uuid.NAMESPACE_URL, "weave-chat:" + ref))
+        assert rows[item]["state"] == "final" and rows[item]["text"] == "Hello"
+        assert len(rows) == 2  # retries upsert the same user and assistant rows
+        assert len(attempts) == 2
+        assert list(sync._ENDED).count(ref) == 1
+        assert callbacks == [ref]
+    finally:
+        proceed.set()
+
+
+def test_final_write_backoff_is_capped_and_expires_without_holding_live_turns(monkeypatch, caplog):
+    """The writer waits 1, 2, 4…30 seconds, gives up after ten minutes, and leaves active retries alone."""
+    from collections import deque
+    from types import SimpleNamespace
+
+    clock, attempts, callbacks = [0.0], [], []
+    monkeypatch.setattr(sync, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(sync, "_ENDED", deque())
+    caplog.set_level("ERROR", logger=sync.__name__)
+    writer = sync._Writer.__new__(sync._Writer)
+    live = {"ended": True, "read": list, "on_finished": lambda: callbacks.append("done")}
+    active = {}
+    writer.live = {"ended": live, "active": active}
+
+    def fail(_self, turn):
+        attempts.append(clock[0])
+        raise TimeoutError("offline")
+
+    monkeypatch.setattr(sync._Writer, "_flush", fail)
+    writer._write("active", active)
+    writer._write("active", active)
+    assert attempts == [0, 0] and active == {} and writer.live["active"] is active
+    attempts.clear()
+    delays = []
+    while "ended" in writer.live:
+        writer._write("ended", live)
+        if "ended" not in writer.live:
+            break
+        delays.append(live["retry_at"] - clock[0])
+        count = len(attempts)
+        clock[0] = live["retry_at"] - 0.01
+        writer._write("ended", live)
+        assert len(attempts) == count  # no busy retries between scheduled attempts
+        clock[0] = min(live["retry_at"], sync.FINAL_RETRY_S)
+    assert delays[:6] == [1, 2, 4, 8, 16, 30]
+    assert all(delay == 30 for delay in delays[6:])
+    assert clock[0] == 600 and attempts[-1] < 600
+    assert list(sync._ENDED) == ["ended"] and callbacks == ["done"]
+    assert "final write retries exhausted" in caplog.text
+
+
 def test_show_tag_marks_a_reply_visible_and_leaves_the_tag_out():
     """DEC-415: the model decides what the screen shows on a call; the tag never reaches the row."""
     assert sync.visible_reply("[SHOW] Here is the table.") == ("Here is the table.", True)
