@@ -144,6 +144,32 @@ def test_a_tool_card_lands_on_the_answer_row(server, monkeypatch):
     assert "output" not in user["body"]
 
 
+def test_a_card_reaches_the_live_row_before_the_turn_ends(server, monkeypatch):
+    """WEV-3464: a card goes on the writing row when its tool completes, in a write of its own (no text append)."""
+    url, calls, rows = server
+    card = {"kind": "output_blocks", "major": 1, "header": {"title": "Weather"}, "fallback_text": "31 C"}
+    run_turn(url, "weave-abc", "ref-early", [
+        {"type": "assistant.delta", "delta": "Checking."},
+        {"type": "tool.completed", "tool_name": "mcp__weave_connectors__weather_now", "card": card},
+    ], [], monkeypatch)
+    live_id = str(sync.uuid.uuid5(sync.uuid.NAMESPACE_URL, "weave-chat:ref-early"))
+    wait_for(lambda: any(i.get("item_id") == live_id and (i.get("body") or {}).get("output") == card
+                         for c in calls for i in c["p_items"]))
+    write = next(i for c in calls for i in c["p_items"] if (i.get("body") or {}).get("output") == card)
+    assert write["state"] == "writing" and "append" not in write  # body-only write: the push carries the card
+    assert rows[live_id]["text"] == "Checking."  # the streamed text is untouched
+
+
+def test_a_card_tool_starting_shows_its_card_name(server, monkeypatch):
+    """WEV-3464: the model starting show_<card> sets the row status to that tool at once (the apps draw a placeholder)."""
+    url, calls, _rows = server
+    run_turn(url, "weave-abc", "ref-gen", [
+        {"type": "tool.generating", "tool_name": "mcp__weave_connectors__show_compare_products"},
+    ], [], monkeypatch)
+    wait_for(lambda: any((i.get("body") or {}).get("status") == "mcp__weave_connectors__show_compare_products"
+                         for c in calls for i in c["p_items"]))
+
+
 def test_off_without_settings_and_never_raises(server, monkeypatch):
     url, calls, _rows = server
     sync.publish("weave-abc", "ref3", {"type": "turn.started"}, list, lambda name: "")

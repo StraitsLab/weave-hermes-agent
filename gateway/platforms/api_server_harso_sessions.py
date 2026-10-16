@@ -981,6 +981,26 @@ class NativeSessionAPI:
                 tool_name=str(tool_name)[:256],
             )
 
+    async def _handle_session_stop(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{id}/stop: end the running answer (WEV-3464). Queues nothing; idle is a no-op."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        runner = self.gateway_runner
+        source = SessionSource(platform=Platform.API_SERVER, chat_id=request.match_info["session_id"], chat_type="dm",
+                               user_id="api_server", user_name="API server", profile=_api_request_profile.get() or None)
+        agent = self._native_submit_running_agent(runner, runner.session_store._generate_session_key(source)) if runner else None
+        stopped = False
+        if agent is not None:
+            from agent.interrupt_compat import request_hard_interrupt
+            stopped = request_hard_interrupt(agent, "Stopped by the user.", tool_reason="stopped by the user")
+        return web.json_response({"object": "hermes.session.stop", "stopped": bool(stopped)})
+
+    def _native_submit_tool_generating(self, session_key: str, tool_name: Any) -> None:
+        native_request_ref = self._native_submit_active_ref(session_key)
+        if native_request_ref:
+            self._native_submit_event(native_request_ref, "tool.generating", tool_name=str(tool_name)[:256])
+
     def _native_submit_final(self, session_key: str, content: Any) -> None:
         native_request_ref = self._native_submit_active_ref(session_key)
         if native_request_ref and isinstance(content, str) and content:
@@ -1586,4 +1606,5 @@ def _http_routes(adapter):
         ("GET", base + "/events", "_handle_session_events"),
         ("GET", base + "/events/stream", "_handle_session_events_stream"),
         ("POST", base + "/fork", "_handle_fork_session"),
+        ("POST", base + "/stop", "_handle_session_stop"),
     ]]
