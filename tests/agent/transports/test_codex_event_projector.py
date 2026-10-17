@@ -155,7 +155,7 @@ class TestAgentMessageProjection:
                                 "text": "hi there"}},
         })
         assert r.final_text == "hi there"
-        assert r.messages == [{"role": "assistant", "content": "hi there"}]
+        assert r.messages == [{"role": "assistant", "content": "hi there", "_codex_item_id": "x"}]
         assert r.is_tool_iteration is False
 
     def test_pending_reasoning_attaches_to_next_assistant_message(self) -> None:
