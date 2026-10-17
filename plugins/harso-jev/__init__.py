@@ -21,7 +21,9 @@ SCHEMA = {
         "Without a target, a chat keeps working in its last browser window (one live card); set new_window "
         "true only for separate parallel work that needs its own window and card. "
         "Never supply passwords, payment details or verification codes; use browser_vault tools directly. "
-        "Do not bypass approvals, CAPTCHA or site restrictions. Never place an order."
+        "Do not bypass approvals, CAPTCHA or site restrictions. "
+        "When a page shows a verification checkbox or CAPTCHA, stop and ask the user to tap the box on the "
+        "browser card in chat; use Take over only for payment or checkout. Never place an order."
     ),
     "parameters": {
         "type": "object",
@@ -97,20 +99,22 @@ def _remember_window(session, target, now):
     _with_windows(change)
 
 
-def _publish_activity(result, credentials):
+def _publish_activity(result, credentials, help_kind=None):
     try:
         import httpx
         from agent.vault_backends.weave import _bearer, _run_context
 
         page = result.get("browser_page")
         base = credentials.get("WEAVE_API_URL", "").rstrip("/")
-        if result.get("success") is not True or not isinstance(page, dict) or not base:
+        if (result.get("success") is not True and help_kind is None) or not isinstance(page, dict) or not base:
             return
         bearer = _bearer()
         if not bearer:
             return
         body = {"session_id": _run_context()["session_id"],
                 **{key: page[key] for key in ("target", "url", "title")}}
+        if help_kind:
+            body["help"] = help_kind
         with httpx.Client(timeout=3.0, follow_redirects=False) as client:
             client.post(base + "/v1/browser/activity", json=body,
                         headers={"Authorization": f"Bearer {bearer}"})
@@ -192,8 +196,10 @@ def browse(args, task_id=None, **kwargs):
 
         result = run_fenced({"features": {"local": True}}, dispatch) if local else dispatch()
         announced = result.pop("_announced", [])
-        if (result.get("browser_page") or {}).get("target") not in announced:
-            _publish_activity(result, credentials)  # a resumed window: the worker opened nothing new
+        help_kind = ("bot_check" if result.get("status") == "blocked"
+                     and result.get("error_type") not in ("NativeLoginRequired", "LeftAllowlist") else None)
+        if help_kind or (result.get("browser_page") or {}).get("target") not in announced:
+            _publish_activity(result, credentials, help_kind=help_kind)
         owned = (result.get("browser_page") or {}).get("target")
         if isinstance(owned, str) and re.fullmatch(r"[0-9A-F]{32}", owned):
             with contextlib.suppress(Exception):

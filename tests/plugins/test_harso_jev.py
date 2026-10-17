@@ -464,3 +464,39 @@ def test_a_failed_lookup_says_so_instead_of_private_address(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: (_ for _ in ()).throw(socket.gaierror(-3, "x")))
     result = json.loads(plugin.browse({"url": "https://redmart.lazada.sg/"}, task_id="task"))
     assert result["error"] == "Could not look up redmart.lazada.sg (DNS failed). Try again in a moment."
+
+
+def test_blocked_browse_publishes_bot_check_help_even_when_already_announced(tmp_path, monkeypatch):
+    from agent import redact, secret_scope
+    from gateway.native_bot_admission import native_turn_context
+    from tools import browser_use_cli as engine
+
+    assert "tap the box on the browser card in chat; use Take over only for payment or checkout" in plugin.SCHEMA["description"]
+    monkeypatch.setattr(plugin, "_windows_file", lambda: tmp_path / "windows.json")
+    monkeypatch.setattr(redact, "redact_sensitive_text", lambda value, **kw: value)
+    bearer = "wvc1_" + "V" * 43
+    monkeypatch.setattr(secret_scope, "get_secret", lambda key, *a: {"WEAVE_API_URL": "https://api.test/",
+                          "WEAVE_API_MCP_BEARER": bearer}.get(key))
+    posts = []
+    client_class = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kw: client_class(
+        transport=httpx.MockTransport(lambda req: posts.append(json.loads(req.content)) or httpx.Response(200, json={"ok": True})), **kw))
+    monkeypatch.setattr(engine, "_code_url_verdict", lambda _: SimpleNamespace(blocked=None, local_sidecar=False))
+    monkeypatch.setattr(engine, "_base_subprocess_env", lambda: {"BU_CDP_WS": "ws://cdp.test/"})
+    monkeypatch.setattr(engine, "_route_backend", lambda *a, **kw: None)
+    monkeypatch.setattr(engine, "_attach_vault_supervisor", lambda *a: None)
+    monkeypatch.setattr(engine, "_driven_daemons", set())
+
+    target = "A" * 32
+    outcomes = [
+        {"success": False, "status": "blocked", "error_type": None, "browser_page": {"target": target, "url": "https://www.microcenter.com/", "title": "Just a moment..."}, "_announced": [target]},
+        {"success": False, "status": "blocked", "error_type": "NativeLoginRequired", "browser_page": {"target": target, "url": "https://www.microcenter.com/login", "title": "Login"}, "_announced": [target]},
+    ]
+    monkeypatch.setattr(engine, "_run_cli_killing_process_group", lambda *a: SimpleNamespace(returncode=0, stdout=json.dumps(outcomes.pop(0))))
+    token = native_turn_context.set({"session_id": "chat-a", "run_id": "01990000-0000-7000-8000-000000000001"})
+    try:
+        plugin.browse({"url": "https://www.microcenter.com/", "goal": "Search"}, task_id="task")
+        plugin.browse({"url": "https://www.microcenter.com/login", "goal": "Sign in"}, task_id="task")
+    finally:
+        native_turn_context.reset(token)
+    assert posts == [{"session_id": "chat-a", "target": target, "url": "https://www.microcenter.com/", "title": "Just a moment...", "help": "bot_check"}]
