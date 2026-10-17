@@ -725,4 +725,63 @@ def test_publish_rows_delivers_even_after_queued_terminal(server, monkeypatch):
 
 
 
+def test_tool_status_flush_before_commentary_still_adopts_message_uid(server, monkeypatch):
+    """When tool.started flushes a status row (setting live['rev']) before the commentary delta arrives,
+    the row still adopts the delta's message_uid immediately and stamps cell_key='msg:<uid>' when closed."""
+    url, calls, rows = server
+    real = sync._call
+    monkeypatch.setattr(sync, "_call", lambda live, items: real({**live, "url": live["url"].replace("https://", "http://")}, items))
+    t0 = 1792231000.0
+    saved = [
+        {"role": "user", "content": "Run tool", "timestamp": t0, "platform_message_id": "ref-ts-uid"},
+        {"role": "assistant", "content": "Commentary after status.", "tool_calls": [{}], "timestamp": t0 + 2, "message_uid": "u-comm"},
+        {"role": "assistant", "content": "Final answer.", "timestamp": t0 + 4, "message_uid": "u-ans"},
+    ]
+    sec = secrets(url)
+    sync.publish("weave-ts-uid", "ref-ts-uid", {"type": "tool.started", "tool_name": "browse"}, lambda: saved, sec)
+    wait_for(lambda: len(calls) >= 1)
+    sync.publish("weave-ts-uid", "ref-ts-uid", {"type": "assistant.delta", "delta": "Commentary after status.", "message_uid": "u-comm", "at": t0 + 2}, lambda: saved, sec)
+    comm_id = sync._msg_item_id("u-comm")
+    wait_for(lambda: rows.get(comm_id, {}).get("text") == "Commentary after status.")
+    assert rows[comm_id].get("cell_key") == "msg:u-comm"
+    assert sync._WRITER.live["ref-ts-uid"]["uid"] == "u-comm"
+    sync.publish("weave-ts-uid", "ref-ts-uid", {"type": "tool.completed", "tool_name": "browse"}, lambda: saved, sec)
+    sync.publish("weave-ts-uid", "ref-ts-uid", {"type": "assistant.delta", "delta": "Final answer.", "message_uid": "u-ans", "at": t0 + 4}, lambda: saved, sec)
+    sync.publish("weave-ts-uid", "ref-ts-uid", {"type": "turn.completed"}, lambda: saved, sec)
+    wait_for(lambda: "ref-ts-uid" not in (sync._WRITER.live if sync._WRITER else {}))
+    assert rows[comm_id]["cell_key"] == "msg:u-comm" and rows[comm_id]["text"] == "Commentary after status."
+
+
+def test_on_committed_fires_only_after_finish_succeeds(server, monkeypatch):
+    """on_committed receives the committed item receipts only when _finish succeeds, while on_finished
+    fires even on a failed write so the native awake lease is never held across retries."""
+    url, calls, _rows = server
+    real = sync._call
+    attempts = 0
+
+    def flaky(live, items):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("temporary supabase outage")
+        return real({**live, "url": live["url"].replace("https://", "http://")}, items)
+
+    monkeypatch.setattr(sync, "_call", flaky)
+    monkeypatch.setattr(sync, "FINAL_BACKOFF_S", 0.05)
+    t0 = 1792232000.0
+    saved = [
+        {"role": "user", "content": "Hello", "timestamp": t0, "platform_message_id": "ref-commit"},
+        {"role": "assistant", "content": "World", "timestamp": t0 + 1, "message_uid": "u-world"},
+    ]
+    finished = []
+    committed = []
+    sync.publish("weave-commit", "ref-commit", {"type": "turn.completed"}, lambda: saved, secrets(url),
+                 on_finished=lambda: finished.append(attempts),
+                 on_committed=lambda items: committed.append(items))
+    wait_for(lambda: len(finished) == 1)
+    assert finished == [1]
+    wait_for(lambda: len(committed) == 1)
+    assert len(committed[0]) == 2 and all("item_id" in item for item in committed[0])
+
+
 
