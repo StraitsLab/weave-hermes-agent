@@ -171,14 +171,21 @@ class _Writer:
         if live is None or live.get("ended"):
             return False
         if kind == "assistant.delta" and isinstance(event.get("delta"), str):
-            if live.pop("split", False):
+            # Roll to a new row when text follows a tool, or when a status line opened this row before any text:
+            # created_at is fixed at the first write, so it must be the moment the text starts.
+            if live.pop("split", False) or (not live["text"] and live["rev"] is not None):
                 # Text after a tool is a new message: close this row and open the next one now, so every row's
                 # created_at follows the order the person saw it in (the apps sort by created_at).
-                live["segs"].append(live["item"])
-                live["closing"].append({"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
-                                        "body": {"text": live["text"], "status": None, "output": None},
-                                        **({"at": _iso(live["at"])} if live.get("at") else {})})
-                live["item"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}:{len(live['segs'])}"))
+                if live["text"].strip():
+                    live["segs"].append((live["item"], live["text"]))
+                    live["closing"].append({"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
+                                            "body": {"text": live["text"], "status": None, "output": None},
+                                            **({"at": _iso(live["at"])} if live.get("at") else {})})
+                else:  # a row a tool status opened before any text: anything saved since must sort above the text
+                    live["closing"].append({"item_id": live["item"], "role": "assistant", "kind": "text",
+                                            "state": "removed", "body": {"status": None, "output": None}})
+                live["item"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}:{live.setdefault('n', 0) + 1}"))
+                live["n"] += 1
                 live["text"], live["sent"], live["rev"], live["shown"] = "", 0, None, None
                 if live.get("card"):
                     live["card_sent"] = False  # the card moves to the row that is now writing
@@ -254,16 +261,23 @@ class _Writer:
         # This turn's answer: its last visible assistant message, saved after the turn started.
         mine = [m for m in messages if m.get("role") == "assistant" and isinstance(m.get("content"), str)
                 and m["content"].strip() and (m.get("timestamp") or 0) >= live["started"]]
-        # Rows a tool closed mid-turn adopt the saved messages in the same order, keeping their place on screen.
+        # Rows a tool closed mid-turn adopt the saved messages they streamed, matched by text, never by position:
+        # Hermes also saves rows nobody streamed (a browser card), and a positional pair shifts every row after it.
         said = [r for r in rows if r["role"] == "assistant" and any(r["cell_key"] == row_key(m) for m in mine)]
-        adopt = said[:-1] if live.get("outcome") == "completed" else said
-        for item, saved in zip(live["segs"], adopt):
+        adopt = []
+        for item, text in live["segs"]:
+            text = visible_reply(text, live["show_tag"], live["show_over"])[0].strip()  # saved text drops the tag
+            saved = next((r for r in said if r["body"]["text"].strip() == text
+                          and (live.get("outcome") != "completed" or r is not said[-1])), None)
+            if saved is None:  # streamed but never saved on its own: hide it, or its text shows twice
+                rows.append({"item_id": item, "role": "assistant", "kind": "text", "state": "removed",
+                             "body": {"status": None}})
+                continue
+            said.remove(saved)
             rows.remove(saved)
-            rows.append({**saved, "item_id": item, "body": {**saved["body"], "status": None, "output": None}})
+            adopt.append({**saved, "item_id": item, "body": {**saved["body"], "status": None, "output": None}})
             mine.remove(next(m for m in mine if row_key(m) == saved["cell_key"]))
-        # A closed row with no saved message of its own would show twice: hide it.
-        rows += [{"item_id": item, "role": "assistant", "kind": "text", "state": "removed", "body": {"status": None}}
-                 for item in live["segs"][len(adopt):]]
+        rows += adopt
         answer = next((r for r in rows if mine and r["cell_key"] == row_key(mine[-1]) and "item_id" not in r), None)
         if answer is not None and live.get("outcome") == "completed":
             rows.remove(answer)

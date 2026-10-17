@@ -24,7 +24,9 @@ def server(monkeypatch):
             out = []
             for item in body["p_items"]:
                 key = item.get("cell_key") or item.get("item_id")
-                row = rows.get(item.get("item_id")) or next((r for r in rows.values() if r.get("cell_key") == key), None)
+                # Same lookup order as chat_cell_write: a cell_key match wins over the item_id.
+                row = (next((r for r in rows.values() if item.get("cell_key") and r.get("cell_key") == item["cell_key"]), None)
+                       or rows.get(item.get("item_id")) or next((r for r in rows.values() if r.get("cell_key") == key), None))
                 if row is None:
                     row = rows.setdefault(item.get("item_id") or key, {"rev": 0, "text": "", "seq": len(rows), **item})
                     row["text"] = item.get("append", (item.get("body") or {}).get("text", ""))
@@ -161,6 +163,71 @@ def test_a_closed_row_without_a_saved_message_is_hidden(server, monkeypatch):
     wait_for(lambda: rows.get(live_id, {}).get("state") == "removed")
     shown = [r["text"] for r in rows.values() if r.get("role") == "assistant" and r.get("state") == "final"]
     assert shown == ["Hi there"]
+
+
+def _shown(rows):
+    return [r for r in sorted(rows.values(), key=lambda r: r["seq"]) if r.get("role") == "assistant" and r.get("state") == "final"]
+
+
+def test_a_browser_card_between_updates_never_shifts_which_update_a_row_keeps(server, monkeypatch):
+    """2026-10-17 16:00 SGT Micro Center turn: Hermes saves the browser card as an assistant message between two
+    updates. Pairing closed rows with saved messages by position gave the card's slot to an update, left that update's
+    streamed row on screen and saved it again as a second row."""
+    url, calls, rows = server
+    now = time.time()
+    card = json.dumps({"card_id": "c1", "kind": "browser", "major": 1, "page_url": "https://www.microcenter.com/"})
+    saved = [
+        {"id": 1, "role": "user", "content": "Open micro center", "timestamp": now + 0.1, "platform_message_id": "ref-mc"},
+        {"id": 2, "role": "assistant", "content": "", "tool_calls": [{"id": "a"}], "timestamp": now + 0.5},
+        {"id": 3, "role": "assistant", "content": "The browser didn't open. I'll retry.", "tool_calls": [{"id": "b"}],
+         "timestamp": now + 1.0},
+        {"id": 4, "role": "assistant", "content": card, "timestamp": now + 1.5},
+        {"id": 5, "role": "assistant", "content": "Cloudflare is checking. I'll wait.", "tool_calls": [{"id": "c"}],
+         "timestamp": now + 2.0},
+        {"id": 6, "role": "assistant", "content": "It is stuck on Cloudflare.", "timestamp": now + 3.0},
+    ]
+    def step(*events):
+        sent = len(calls)
+        run_turn(url, "weave-abc", "ref-mc", list(events), saved, monkeypatch, started=False)
+        wait_for(lambda: len(calls) > sent)
+
+    step({"type": "tool.started", "tool_name": "browse"})
+    step({"type": "tool.failed", "tool_name": "browse"}, {"type": "assistant.delta", "delta": "The browser didn't open. I'll retry."})
+    step({"type": "tool.started", "tool_name": "browse"})
+    sync.publish_rows("weave-abc", [saved[3]], secrets(url))  # the card row, pushed the moment it is saved
+    step({"type": "tool.completed", "tool_name": "browse"}, {"type": "assistant.delta", "delta": "\n\nCloudflare is checking. I'll wait."})
+    step({"type": "tool.started", "tool_name": "browse"})
+    step({"type": "tool.completed", "tool_name": "browse"}, {"type": "assistant.delta", "delta": "It is stuck on Cloudflare."})
+    step({"type": "turn.completed"})
+    wait_for(lambda: any(r.get("cell_key") == f"assistant:{now + 3.0!r}" for r in rows.values()))
+    texts = [r["text"].strip() for r in _shown(rows)]
+    assert texts == ["The browser didn't open. I'll retry.", card, "Cloudflare is checking. I'll wait.",
+                     "It is stuck on Cloudflare."], texts
+
+
+def test_the_answer_row_is_born_when_its_text_starts_not_when_a_tool_status_shows(server, monkeypatch):
+    """2026-10-17 12:16 SGT turn: the first flush showed only a tool status, which opened the answer row. The browser
+    card saved after it then sorted below the answer that followed the card."""
+    url, calls, rows = server
+    now = time.time()
+    card = json.dumps({"card_id": "c2", "kind": "browser", "major": 1, "page_url": "https://example.com/"})
+    saved = [
+        {"id": 1, "role": "user", "content": "Open example", "timestamp": now + 0.1, "platform_message_id": "ref-st"},
+        {"id": 2, "role": "assistant", "content": "", "tool_calls": [{"id": "a"}], "timestamp": now + 0.5},
+        {"id": 3, "role": "assistant", "content": card, "timestamp": now + 1.0},
+        {"id": 4, "role": "assistant", "content": "It is open.", "timestamp": now + 2.0},
+    ]
+    def step(*events):
+        sent = len(calls)
+        run_turn(url, "weave-abc", "ref-st", list(events), saved, monkeypatch, started=False)
+        wait_for(lambda: len(calls) > sent)
+
+    step({"type": "tool.started", "tool_name": "browse"})  # the status line shows at once
+    sync.publish_rows("weave-abc", [saved[2]], secrets(url))
+    step({"type": "tool.completed", "tool_name": "browse"}, {"type": "assistant.delta", "delta": "It is open."})
+    step({"type": "turn.completed"})
+    wait_for(lambda: any(r.get("cell_key") == f"assistant:{now + 2.0!r}" for r in rows.values()))
+    assert [r["text"].strip() for r in _shown(rows)] == [card, "It is open."]
 
 
 def test_cards_and_their_resolution_are_rows(server, monkeypatch):
