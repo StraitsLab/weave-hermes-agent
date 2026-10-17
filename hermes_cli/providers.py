@@ -203,6 +203,11 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
         for ev in ov.extra_env_vars:
             if ev not in env_vars:
                 env_vars.append(ev)
+        prof_pdef = _plugin_profile_pdef(canonical)
+        if prof_pdef is not None:
+            for ev in prof_pdef.api_key_env_vars:
+                if ev not in env_vars:
+                    env_vars.append(ev)
         return _overlay_pdef(canonical, ov, mdev_info.name, tuple(env_vars), ov.base_url_override or mdev_info.api,
                              mdev_info.doc, "models.dev")
     if overlay is not None:

@@ -80,8 +80,11 @@ class StreamDeliveryMixin:
         if ctx_scrubber is not None:
             deliver(ctx_scrubber.flush())
         self._current_streamed_assistant_text = ""
+        aborted_uid = getattr(self, "_current_stream_message_uid", None)
         self._current_stream_message_uid = None
         self._current_stream_timestamp = None
+        if isinstance(aborted_uid, str) and aborted_uid:
+            self._call_quietly(getattr(self, "_stream_retract_callback", None), aborted_uid)
 
     def _consume_stream_message_identity(self) -> tuple[str | None, float | None]:
         """Return and clear the ``(message_uid, timestamp)`` minted when the current stream started."""
@@ -256,8 +259,11 @@ class StreamDeliveryMixin:
         self._ensure_stream_writer_state()
         with self._stream_writer_lock:
             self._stream_writer_token = token = self._stream_writer_token + 1
+            aborted_uid = getattr(self, "_current_stream_message_uid", None)
             self._current_stream_message_uid = None
             self._current_stream_timestamp = None
+        if isinstance(aborted_uid, str) and aborted_uid:
+            self._call_quietly(getattr(self, "_stream_retract_callback", None), aborted_uid)
         self._stream_writer_tls.token = token
         return token
 

@@ -76,10 +76,14 @@ def wire_delta(adapter, session_key, previous, agent_holder=None):
     native = getattr(adapter, '_native_submit_delta', None)
     if not callable(native):
         return previous
+    if agent_holder and agent_holder[0] is not None:
+        agent_holder[0]._stream_retract_callback = lambda uid: native(session_key, "", message_uid=uid, retract=True)
     def delta(text):
         if previous is not None:
             previous(text)
         agent = agent_holder[0] if agent_holder else None
+        if agent is not None and getattr(agent, '_stream_retract_callback', None) is None:
+            agent._stream_retract_callback = lambda uid: native(session_key, "", message_uid=uid, retract=True)
         uid = getattr(agent, '_current_stream_message_uid', None)
         ts = getattr(agent, '_current_stream_timestamp', None)
         if uid is not None or ts is not None:

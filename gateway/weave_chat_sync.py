@@ -4,7 +4,8 @@ One daemon thread per gateway process. Two feeds:
 
 * live: ``APIServerAdapter._native_submit_event`` hands every live event here (``publish``).
   Each assistant message streams onto its own row keyed by its ``message_uid`` (when stamped at
-  stream onset) or its turn segment id; approvals and clarifications become ``pending`` card rows;
+  stream onset) or its turn segment id; tool status before text uses a dedicated ephemeral row
+  (``weave-chat:<ref>:status``); approvals and clarifications become ``pending`` card rows;
   browser cards and shared files queue through the same writer so buffered text flushes first.
   Pieces are flushed at most every ``FLUSH_S`` with monotonically increasing ``at`` timestamps so
   every row's ``created_at`` in Supabase reflects the exact causal order. A ``tool.completed``
@@ -209,11 +210,16 @@ class _Writer:
         return at
 
     @staticmethod
+    def _status_item_id(live: dict[str, Any]) -> str:
+        return live.get("status_item") or str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}:status"))
+
+    @staticmethod
     def _close_current_text(live: dict[str, Any]) -> None:
-        live["segs"].append((live["item"], live.get("uid")))
+        text, visible = visible_reply(live["text"], live.get("show_tag", "[SHOW]"), live.get("show_over", 400))
+        live["segs"].append((live["item"], live.get("uid"), text))
         row: dict[str, Any] = {
             "item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
-            "body": {"text": live["text"], "status": None, "output": None},
+            "body": {"text": text, "visible": visible, "status": None, "output": None},
             **({"cell_key": f"msg:{live['uid']}"} if live.get("uid") else {}),
             **({"at": _iso(live["at"])} if live.get("at") else {}),
         }
@@ -225,15 +231,38 @@ class _Writer:
         if live.get("card"):
             live["card_sent"] = False  # the card moves to the row that is now writing
 
+    @staticmethod
+    def _retract_current_text(live: dict[str, Any]) -> None:
+        if live["rev"] is not None:
+            live["closing"].append({
+                "item_id": live["item"], "role": "assistant", "kind": "text", "state": "removed",
+                "body": {"status": None},
+                **({"cell_key": f"msg:{live['uid']}"} if live.get("uid") else {}),
+            })
+        live["item"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}:{len(live['segs']) + len(live['closing'])}"))
+        live["uid"] = None
+        live["at"] = None
+        live["text"], live["sent"], live["rev"], live["shown"] = "", 0, None, None
+
+    def _take_delta(self, live: dict[str, Any], event: dict[str, Any]) -> None:
+        uid = event.get("message_uid") if isinstance(event.get("message_uid"), str) and event.get("message_uid") else None
+        if live.pop("split", False):
+            if live["text"].strip():
+                self._close_current_text(live)
+        elif uid and (live["text"] or live["rev"] is not None) and live.get("uid") != uid:
+            self._retract_current_text(live)
+        if uid and not live.get("uid") and (live["rev"] is None or not live["text"]):
+            live["uid"] = uid
+            if live["rev"] is None:
+                live["item"] = _msg_item_id(uid)
+        if not live["text"]:
+            live["at"] = self._next_at(live, event.get("at"))
+        live["text"] += event["delta"]
+
     def _take_out_rows(self, live: dict[str, Any], rows: Any) -> None:
         live.pop("split", None)
         if live["text"].strip():
             self._close_current_text(live)
-        elif live["rev"] is not None:
-            # A status-only row opened before any text was written would otherwise sit above this card/file row.
-            live["closing"].append({"item_id": live["item"], "role": "assistant", "kind": "text", "state": "removed", "body": {"status": None}})
-            live["item"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}:{len(live['segs']) + len(live['pushed_keys']) + 1}"))
-            live["uid"], live["at"], live["rev"], live["shown"] = None, None, None, None
         for raw in rows or ():
             if not isinstance(raw, dict):
                 continue
@@ -245,25 +274,24 @@ class _Writer:
             row["at"] = _iso(self._next_at(live, at_val))
             live["closing"].append(row)
             if row.get("cell_key"):
-                live["pushed_keys"].add(row["cell_key"])
+                live.setdefault("pushed_keys", set()).add(row["cell_key"])
 
     def _take(self, ref: str, event: dict[str, Any]) -> bool:
         live, kind = self.live.get(ref), event.get("type")
+        if kind == "out.rows":
+            if live is not None:
+                self._take_out_rows(live, event.get("rows"))
+            elif event.get("_conn"):
+                _call(event["_conn"], [dict(r) for r in (event.get("rows") or ()) if isinstance(r, dict)])
+            return False
         if live is None or live.get("ended"):
             return False
         if kind == "assistant.delta" and isinstance(event.get("delta"), str):
-            uid = event.get("message_uid") if isinstance(event.get("message_uid"), str) and event.get("message_uid") else None
-            if live.pop("split", False) or (uid and live.get("uid") and uid != live["uid"] and live["text"].strip()):
-                # Text after a tool (or with a new message_uid) is a new message: close this row and open the next one
-                # now, so every row's created_at follows the order the person saw it in (the apps sort by created_at).
-                self._close_current_text(live)
-            if uid and not live.get("uid") and (live["rev"] is None or not live["text"]):
-                live["uid"] = uid
-                if live["rev"] is None and live["item"] != str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}")):
-                    live["item"] = _msg_item_id(uid)
-            if not live["text"]:
-                live["at"] = self._next_at(live, event.get("at"))
-            live["text"] += event["delta"]
+            self._take_delta(live, event)
+        elif kind == "assistant.retract":
+            if event.get("message_uid") and event.get("message_uid") == live.get("uid"):
+                live.pop("split", None)
+                self._retract_current_text(live)
         elif kind in ("tool.started", "tool.generating"):  # generating: the model began writing the call (WEV-3464)
             live["status"] = str(event.get("tool_name") or "")[:120]
             if live["text"].strip():
@@ -275,8 +303,6 @@ class _Writer:
             if isinstance(event.get("card"), dict):  # WEV-3395: the turn's last card goes on its answer row
                 live["card"] = event["card"]
                 live["card_sent"] = False  # WEV-3464: and onto the live row at once
-        elif kind == "out.rows":
-            self._take_out_rows(live, event.get("rows"))
         elif kind in CARD_TYPES:
             card_id = event.get("request_id") or event.get("clarify_id") or ""
             body = {k: v for k, v in event.items()
@@ -301,23 +327,39 @@ class _Writer:
             return True
         return False
 
+    def _flush_idle_status(self, live: dict[str, Any]) -> None:
+        status_id = self._status_item_id(live)
+        if live["status"] != live["shown"]:
+            if live["status"] is not None:
+                live["closing"].append({"item_id": status_id, "role": "assistant", "kind": "text",
+                                        "state": "writing", "body": {"status": live["status"]}})
+                live["status_open"] = True
+            elif live.pop("status_open", False):
+                live["closing"].append({"item_id": status_id, "role": "assistant", "kind": "text",
+                                        "state": "removed", "body": {"status": None}})
+            live["shown"] = live["status"]
+        if live["closing"]:
+            _call(live, live["closing"])
+            live["closing"] = []
+
     def _flush(self, live: dict[str, Any]) -> None:
         cards = live["cards"]
         if cards:
             _call(live, cards)
             live["cards"] = []  # keep their cell keys queued until the upsert is acknowledged
         piece = live["text"][live["sent"]:]
+        if live["rev"] is None and not piece:
+            self._flush_idle_status(live)
+            return
+        if live.pop("status_open", False):
+            live["closing"].insert(0, {"item_id": self._status_item_id(live), "role": "assistant", "kind": "text",
+                                       "state": "removed", "body": {"status": None}})
         if live["rev"] is not None and live.get("card_sent") is False:
             # A body-only write: the push trigger sends the whole body (card included) only when nothing is appended.
             out = _call(live, [{"item_id": live["item"], "role": "assistant", "kind": "text", "state": "writing",
                                 "body": {"output": live["card"], "status": live["status"]}}])[0]
             live["rev"], live["shown"], live["card_sent"] = out["rev"], live["status"], True
         if live["rev"] is not None and not piece and live["status"] == live["shown"]:
-            if live["closing"]:
-                _call(live, live["closing"])
-                live["closing"] = []
-            return
-        if not piece and live["status"] is None and live["rev"] is None:
             if live["closing"]:
                 _call(live, live["closing"])
                 live["closing"] = []
@@ -342,6 +384,11 @@ class _Writer:
         live["sent"], live["rev"], live["shown"] = len(live["text"]), out["rev"], live["status"]
 
     def _finish(self, live: dict[str, Any]) -> None:
+        if live.pop("split", False) and live["text"].strip():
+            self._close_current_text(live)
+        if live["closing"]:
+            _call(live, live["closing"])
+            live["closing"] = []
         messages = live["messages"] if "messages" in live else live["read"]()
         # Only this turn's rows. Hermes saves the turn's own user message with its request ref as
         # platform_message_id; everything from there on is this turn. Earlier rows are already in Supabase.
@@ -364,13 +411,13 @@ class _Writer:
         remaining_adopt = list(adopt)
         matched_segs: list[tuple[str, dict[str, Any]]] = []
         unmatched_segs: list[str] = []
-        for seg_item, seg_uid in live["segs"]:
-            target = by_key.get(f"msg:{seg_uid}") if seg_uid else None
+        for entry in live["segs"]:
+            seg_item, seg_uid = entry[0], entry[1]
+            seg_text = entry[2] if len(entry) > 2 else None
+            target = by_key.get(f"msg:{seg_uid}") if seg_uid else next(
+                (r for r in remaining_adopt if r["body"]["text"] == seg_text), None)
             if target is not None and target in remaining_adopt:
                 remaining_adopt.remove(target)
-                matched_segs.append((seg_item, target))
-            elif not seg_uid and remaining_adopt:
-                target = remaining_adopt.pop(0)
                 matched_segs.append((seg_item, target))
             else:
                 unmatched_segs.append(seg_item)
@@ -381,10 +428,13 @@ class _Writer:
         # A closed row with no saved message of its own would show twice: hide it.
         rows += [{"item_id": item, "role": "assistant", "kind": "text", "state": "removed", "body": {"status": None}}
                  for item in unmatched_segs]
+        if live.pop("status_open", False):
+            rows.append({"item_id": self._status_item_id(live), "role": "assistant", "kind": "text",
+                         "state": "removed", "body": {"status": None}})
         answer = None
-        if live.get("uid") and f"msg:{live['uid']}" in {r.get("cell_key") for r in rows}:
+        if live.get("uid"):
             answer = next((r for r in rows if r.get("cell_key") == f"msg:{live['uid']}"), None)
-        if answer is None:
+        else:
             answer = next((r for r in reversed(rows) if r["role"] == "assistant"
                            and r.get("cell_key")
                            and any(r.get("cell_key") == row_key(m) for m in mine)
@@ -398,8 +448,9 @@ class _Writer:
                 answer["body"]["output"] = live["card"]
             last = answer
         elif live.get("outcome") == "stopped" and live["text"].strip():  # Stop keeps what was written (WEV-3464)
+            text, visible = visible_reply(live["text"], live["show_tag"], live["show_over"])
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
-                    "body": {"text": live["text"], "outcome": "stopped", "status": None,
+                    "body": {"text": text, "visible": visible, "outcome": "stopped", "status": None,
                              **({"output": live["card"]} if live.get("card") else {})}}
         else:  # no answer: hide any partial reply. Either way the live row tells the apps the turn ended.
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "removed",
@@ -448,7 +499,8 @@ def publish(session_id: str, ref: str, event: dict[str, Any], read_display: Call
                 _WRITER = _WRITER or _Writer()
             _WRITER.live[ref] = {"session": session_id, "ref": ref, "url": url, "key": key, "bearer": bearer, "started": time.time() - 1,
                                  "read": read_display, "item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}")),
-                                 "uid": None, "at": None, "last_at": 0.0,
+                                 "status_item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}:status")),
+                                 "status_open": False, "uid": None, "at": None, "last_at": 0.0,
                                  "text": "", "sent": 0, "rev": None, "status": None, "shown": None,
                                  "cards": [], "card_keys": [], "show_tag": show_tag, "show_over": show_over,
                                  "segs": [], "closing": [], "pushed_keys": set()}
@@ -478,13 +530,14 @@ def publish_rows(session_id: str, messages: list[dict[str, Any]], secret: Callab
         rows = list(raw_rows) if raw_rows is not None else visible_rows(messages, (secret("WEAVE_CHAT_SHOW_TAG") or "[SHOW]").strip())
         if not rows:
             return True
+        conn = {"url": url, "key": key, "bearer": bearer, "session": session_id}
         if _WRITER is not None:
             active_ref = next((ref for ref, live in list(_WRITER.live.items())
                                if live.get("session") == session_id and not live.get("ended")), None)
             if active_ref is not None:
-                _WRITER.events.put_nowait((active_ref, {"type": "out.rows", "rows": rows}))
+                _WRITER.events.put_nowait((active_ref, {"type": "out.rows", "rows": rows, "_conn": conn}))
                 return True
-        _call({"url": url, "key": key, "bearer": bearer, "session": session_id}, rows)
+        _call(conn, rows)
         return True
     except Exception:
         logger.warning("chat rows copy failed", exc_info=True)

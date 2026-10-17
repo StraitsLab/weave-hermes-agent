@@ -390,7 +390,7 @@ class TestRunTurn:
         assert client.responses == [("approval-1", {"decision": "accept"})]
         assert result.final_text == "parent after approval"
         assert result.projected_messages == [
-            {"role": "assistant", "content": "parent after approval", "_codex_item_id": "parent-message"}
+            {"role": "assistant", "content": "parent after approval"}
         ]
 
 
@@ -678,7 +678,7 @@ class TestCompactThread:
         assert result.turn_id == "compact-turn-1"
         assert result.final_text == "parent compacted"
         assert result.projected_messages == [
-            {"role": "assistant", "content": "parent compacted", "_codex_item_id": "parent-compact-message"}
+            {"role": "assistant", "content": "parent compacted"}
         ]
 
 
