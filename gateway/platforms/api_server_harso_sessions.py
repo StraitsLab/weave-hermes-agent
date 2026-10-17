@@ -985,11 +985,16 @@ class NativeSessionAPI:
         native_request_ref = self._native_submit_active_refs.get(session_key)
         return None if native_request_ref in self._native_submit_terminals else native_request_ref
 
-    def _native_submit_delta(self, session_key: str, delta: Any) -> None:
+    def _native_submit_delta(self, session_key: str, delta: Any, *, message_uid: Any = None, timestamp: Any = None) -> None:
         native_request_ref = self._native_submit_active_ref(session_key)
         if native_request_ref and isinstance(delta, str) and delta:
+            extra: dict[str, Any] = {}
+            if isinstance(message_uid, str) and message_uid:
+                extra["message_uid"] = message_uid[:128]
+            if isinstance(timestamp, (int, float)):
+                extra["at"] = float(timestamp)
             self._native_submit_event(
-                native_request_ref, "assistant.delta", delta=delta[:4_096],
+                native_request_ref, "assistant.delta", delta=delta[:4_096], **extra,
             )
 
     def _native_submit_tool_started(

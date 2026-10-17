@@ -10,7 +10,9 @@ from typing import Any, Dict, List
 
 from agent.memory_manager import sanitize_context
 from agent.message_content import flatten_message_text
+from agent.message_metadata import MESSAGE_UID, mint_uid
 from agent.history_commentary import visible_commentary
+import time
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
@@ -78,6 +80,16 @@ class StreamDeliveryMixin:
         if ctx_scrubber is not None:
             deliver(ctx_scrubber.flush())
         self._current_streamed_assistant_text = ""
+        self._current_stream_message_uid = None
+        self._current_stream_timestamp = None
+
+    def _consume_stream_message_identity(self) -> tuple[str | None, float | None]:
+        """Return and clear the ``(message_uid, timestamp)`` minted when the current stream started."""
+        uid = getattr(self, "_current_stream_message_uid", None)
+        ts = getattr(self, "_current_stream_timestamp", None)
+        self._current_stream_message_uid = None
+        self._current_stream_timestamp = None
+        return uid, ts
 
     @property
     def _current_streamed_assistant_text(self) -> str:
@@ -244,6 +256,8 @@ class StreamDeliveryMixin:
         self._ensure_stream_writer_state()
         with self._stream_writer_lock:
             self._stream_writer_token = token = self._stream_writer_token + 1
+            self._current_stream_message_uid = None
+            self._current_stream_timestamp = None
         self._stream_writer_tls.token = token
         return token
 
@@ -328,6 +342,9 @@ class StreamDeliveryMixin:
                 text = text.lstrip("\n")
         if not text:
             return
+        if not getattr(self, "_current_stream_message_uid", None):
+            self._current_stream_message_uid = mint_uid()
+            self._current_stream_timestamp = time.time()
         delivered = self._deliver_to_stream_callbacks(text)
         self._enqueue_stream_hook("on_stream_delta", delta=text, kind="text")
         if delivered:

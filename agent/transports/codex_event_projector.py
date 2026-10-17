@@ -75,7 +75,8 @@ class CodexEventProjector:
 
     def _project_agent_message(self, item: dict) -> ProjectionResult:
         text = item.get("text") or ""
-        return ProjectionResult(messages=[self._assistant_message(text)], final_text=text)
+        extra = {"_codex_item_id": str(item["id"])} if item.get("id") else {}
+        return ProjectionResult(messages=[self._assistant_message(text, **extra)], final_text=text)
 
     @staticmethod
     def _project_user_message(item: dict) -> ProjectionResult:

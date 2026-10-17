@@ -1,19 +1,22 @@
-"""Weave (WEV-3349): copy what the user sees in a chat into Supabase ``public.chat_items``.
+"""Weave (WEV-3349 / WEV-3483): copy what the user sees in a chat into Supabase ``public.chat_items``.
 
 One daemon thread per gateway process. Two feeds:
 
 * live: ``APIServerAdapter._native_submit_event`` hands every live event here (``publish``).
-  Text deltas of a turn grow ONE ``writing`` row; approvals and clarifications become
-  ``pending`` card rows. Pieces are flushed at most every ``FLUSH_S``. A ``tool.completed``
+  Each assistant message streams onto its own row keyed by its ``message_uid`` (when stamped at
+  stream onset) or its turn segment id; approvals and clarifications become ``pending`` card rows;
+  browser cards and shared files queue through the same writer so buffered text flushes first.
+  Pieces are flushed at most every ``FLUSH_S`` with monotonically increasing ``at`` timestamps so
+  every row's ``created_at`` in Supabase reflects the exact causal order. A ``tool.completed``
   that carries an answer card (WEV-3395) puts the turn's last card on its answer row as
   ``body.output``, the field the apps already draw.
-* saved: when a turn ends, the session's display rows (the set ``/messages`` serves,
-  compacted turns included) are upserted ``final``. The turn's assistant answer adopts
-  the live row, so the streamed text and the saved message are the same row.
+* saved: when a turn ends, the session's display rows from this turn are upserted ``final``.
+  Rows carrying ``message_uid`` match the streamed rows directly by ``cell_key`` and ``item_id``.
 
-Keys survive compaction (it copies rows with the same timestamp but a new SQLite id):
-every row is keyed ``<role>:<timestamp>``. A user message the app sent through Supabase is
-already a row there; the database matches the cell's copy to it by text and stamps the key.
+Keys survive compaction (it copies rows with the same ``message_uid`` and ``timestamp``):
+rows with ``message_uid`` are keyed ``<role>:<message_uid>`` (fallback ``<role>:<timestamp>``).
+A user message the app sent through Supabase is already a row there; the database matches the
+cell's copy to it by text and stamps the key.
 
 Credentials are read in the turn's own profile scope: WEAVE_CHAT_SUPABASE_URL and
 WEAVE_CHAT_SUPABASE_KEY (publishable key) switch it on; the cell proves itself to the
@@ -75,7 +78,14 @@ def hub_card(tool_name: Any, result: Any) -> Optional[dict[str, Any]]:
 
 
 def row_key(message: dict[str, Any]) -> str:
+    uid = message.get("message_uid") or message.get("_message_uid")
+    if isinstance(uid, str) and uid and message.get("role") == "assistant":
+        return f"msg:{uid}"
     return f"{message['role']}:{message.get('timestamp')!r}"
+
+
+def _msg_item_id(uid: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:msg:{uid}"))
 
 
 _LINKISH = ("http://", "https://", "](", "<artifact", "file://")
@@ -93,6 +103,19 @@ def _iso(at: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(at)) + f".{int(at % 1 * 1e6):06d}Z"
 
 
+def _is_browser_card(message: dict[str, Any]) -> bool:
+    if message.get("role") != "assistant":
+        return False
+    content = message.get("content")
+    if not isinstance(content, str) or not content.lstrip().startswith("{"):
+        return False
+    try:
+        card = json.loads(content)
+    except ValueError:
+        return False
+    return isinstance(card, dict) and card.get("kind") == "browser"
+
+
 def visible_rows(messages: list[dict[str, Any]], show_tag: str = "[SHOW]", show_over: int = 400) -> list[dict[str, Any]]:
     """The rows a person sees: what they said and what the assistant answered (no tool channel)."""
     out = []
@@ -105,12 +128,17 @@ def visible_rows(messages: list[dict[str, Any]], show_tag: str = "[SHOW]", show_
         if m["role"] == "user" and content.lstrip().startswith(SCAFFOLDING):
             continue
         at = m.get("timestamp")
+        is_card = _is_browser_card(m)
+        uid = (m.get("message_uid") or m.get("_message_uid")) if (m["role"] == "assistant" and not is_card) else None
         body: dict[str, Any] = {"text": content}
         if m["role"] == "assistant":
             body["text"], body["visible"] = visible_reply(content, show_tag, show_over)
         out.append({"cell_key": row_key(m), "role": m["role"], "kind": "text", "state": "final",
                     "body": body,
-                    **({"at": _iso(at)} if isinstance(at, (int, float)) else {})})
+                    **({"item_id": _msg_item_id(uid)} if isinstance(uid, str) and uid else {}),
+                    **({"at": _iso(at)} if isinstance(at, (int, float)) else {}),
+                    **({"_ts": float(at)} if isinstance(at, (int, float)) else {}),
+                    **({"_card": True} if is_card else {})})
     return out
 
 
@@ -166,24 +194,69 @@ class _Writer:
                 if callback:
                     callback()
 
+    @staticmethod
+    def _next_at(live: dict[str, Any], candidate: Optional[float] = None) -> float:
+        raw = float(candidate) if isinstance(candidate, (int, float)) else time.time()
+        floor = live.get("last_at") or 0.0
+        at = max(raw, floor + 1e-6)
+        live["last_at"] = at
+        return at
+
+    @staticmethod
+    def _close_current_text(live: dict[str, Any]) -> None:
+        live["segs"].append((live["item"], live.get("uid")))
+        row: dict[str, Any] = {
+            "item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
+            "body": {"text": live["text"], "status": None, "output": None},
+            **({"cell_key": f"msg:{live['uid']}"} if live.get("uid") else {}),
+            **({"at": _iso(live["at"])} if live.get("at") else {}),
+        }
+        live["closing"].append(row)
+        live["item"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}:{len(live['segs'])}"))
+        live["uid"] = None
+        live["at"] = None
+        live["text"], live["sent"], live["rev"], live["shown"] = "", 0, None, None
+        if live.get("card"):
+            live["card_sent"] = False  # the card moves to the row that is now writing
+
+    def _take_out_rows(self, live: dict[str, Any], rows: Any) -> None:
+        live.pop("split", None)
+        if live["text"].strip():
+            self._close_current_text(live)
+        elif live["rev"] is not None:
+            # A status-only row opened before any text was written would otherwise sit above this card/file row.
+            live["closing"].append({"item_id": live["item"], "role": "assistant", "kind": "text", "state": "removed", "body": {"status": None}})
+            live["item"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}:{len(live['segs']) + len(live['pushed_keys']) + 1}"))
+            live["uid"], live["at"], live["rev"], live["shown"] = None, None, None, None
+        for raw in rows or ():
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            row.pop("_card", None)
+            at_val = row.pop("_ts", None)
+            if at_val is None and isinstance(row.get("at"), (int, float)):
+                at_val = float(row["at"])
+            row["at"] = _iso(self._next_at(live, at_val))
+            live["closing"].append(row)
+            if row.get("cell_key"):
+                live["pushed_keys"].add(row["cell_key"])
+
     def _take(self, ref: str, event: dict[str, Any]) -> bool:
         live, kind = self.live.get(ref), event.get("type")
         if live is None or live.get("ended"):
             return False
         if kind == "assistant.delta" and isinstance(event.get("delta"), str):
-            if live.pop("split", False):
-                # Text after a tool is a new message: close this row and open the next one now, so every row's
-                # created_at follows the order the person saw it in (the apps sort by created_at).
-                live["segs"].append(live["item"])
-                live["closing"].append({"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
-                                        "body": {"text": live["text"], "status": None, "output": None},
-                                        **({"at": _iso(live["at"])} if live.get("at") else {})})
-                live["item"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}:{len(live['segs'])}"))
-                live["text"], live["sent"], live["rev"], live["shown"] = "", 0, None, None
-                if live.get("card"):
-                    live["card_sent"] = False  # the card moves to the row that is now writing
+            uid = event.get("message_uid") if isinstance(event.get("message_uid"), str) and event.get("message_uid") else None
+            if live.pop("split", False) or (uid and live.get("uid") and uid != live["uid"] and live["text"].strip()):
+                # Text after a tool (or with a new message_uid) is a new message: close this row and open the next one
+                # now, so every row's created_at follows the order the person saw it in (the apps sort by created_at).
+                self._close_current_text(live)
+            if uid and not live.get("uid") and live["rev"] is None:
+                live["uid"] = uid
+                if live["item"] != str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}")):
+                    live["item"] = _msg_item_id(uid)
             if not live["text"]:
-                live["at"] = time.time()
+                live["at"] = self._next_at(live, event.get("at"))
             live["text"] += event["delta"]
         elif kind in ("tool.started", "tool.generating"):  # generating: the model began writing the call (WEV-3464)
             live["status"] = str(event.get("tool_name") or "")[:120]
@@ -191,9 +264,13 @@ class _Writer:
                 live["split"] = True
         elif kind in ("tool.completed", "tool.failed"):
             live["status"] = None
+            if live["text"].strip():
+                live["split"] = True
             if isinstance(event.get("card"), dict):  # WEV-3395: the turn's last card goes on its answer row
                 live["card"] = event["card"]
                 live["card_sent"] = False  # WEV-3464: and onto the live row at once
+        elif kind == "out.rows":
+            self._take_out_rows(live, event.get("rows"))
         elif kind in CARD_TYPES:
             card_id = event.get("request_id") or event.get("clarify_id") or ""
             body = {k: v for k, v in event.items()
@@ -206,7 +283,8 @@ class _Writer:
                 ledger_card = consent and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", consent)
                 body |= {"approval_ref": consent, "choices": ["once", "always", "deny"] if ledger_card else ["once", "deny"]}
             card = {"cell_key": f"{CARD_TYPES[kind]}:{card_id}", "role": "assistant",
-                    "kind": CARD_TYPES[kind], "state": "pending", "body": body}
+                    "kind": CARD_TYPES[kind], "state": "pending", "body": body,
+                    "at": _iso(self._next_at(live))}
             live["cards"].append(card)
             live["card_keys"].append(card["cell_key"])
         if kind in ("turn.completed", "turn.failed"):
@@ -228,11 +306,23 @@ class _Writer:
                                 "body": {"output": live["card"], "status": live["status"]}}])[0]
             live["rev"], live["shown"], live["card_sent"] = out["rev"], live["status"], True
         if live["rev"] is not None and not piece and live["status"] == live["shown"]:
+            if live["closing"]:
+                _call(live, live["closing"])
+                live["closing"] = []
+            return
+        if not piece and live["status"] is None and live["rev"] is None:
+            if live["closing"]:
+                _call(live, live["closing"])
+                live["closing"] = []
             return
         # One call carries the new text and the status line ("Searching the web"); the first one opens the row.
         # Rows closed by a tool go first in the same call, so they stay earlier than the row now writing.
-        item = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "writing",
-                "append": piece, "body": {"status": live["status"]}}
+        if live["rev"] is None and not live.get("at"):
+            live["at"] = self._next_at(live)
+        item: dict[str, Any] = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "writing",
+                                "append": piece, "body": {"status": live["status"]}}
+        if live.get("uid"):
+            item["cell_key"] = f"msg:{live['uid']}"
         if live["rev"] is not None:
             item["rev"] = live["rev"]
         elif live.get("at"):  # the row is born when its text started, so a row a tool closed always sorts first
@@ -251,20 +341,48 @@ class _Writer:
         start = next((i for i, m in enumerate(messages) if m.get("platform_message_id") == live["ref"]), None)
         turn = messages[start:] if start is not None else [m for m in messages if (m.get("timestamp") or 0) >= live["started"]]
         rows = visible_rows(turn, live["show_tag"], live["show_over"])
-        # This turn's answer: its last visible assistant message, saved after the turn started.
-        mine = [m for m in messages if m.get("role") == "assistant" and isinstance(m.get("content"), str)
-                and m["content"].strip() and (m.get("timestamp") or 0) >= live["started"]]
-        # Rows a tool closed mid-turn adopt the saved messages in the same order, keeping their place on screen.
-        said = [r for r in rows if r["role"] == "assistant" and any(r["cell_key"] == row_key(m) for m in mine)]
+        # This turn's visible assistant messages (excluding browser cards, which are pushed as passive appends).
+        mine = [m for m in (messages[start + 1:] if start is not None else [m for m in messages if (m.get("timestamp") or 0) >= live["started"]])
+                if m.get("role") == "assistant" and isinstance(m.get("content"), str)
+                and m["content"].strip() and not _is_browser_card(m)]
+        pushed = live.get("pushed_keys") or set()
+        for r in list(rows):
+            r.pop("_ts", None)
+            if r.pop("_card", False) and r.get("cell_key") in pushed:
+                rows.remove(r)  # already written in causal order via out.rows
+        said = [r for r in rows if r["role"] == "assistant"
+                and any(r["cell_key"] == row_key(m) for m in mine)]
         adopt = said[:-1] if live.get("outcome") == "completed" else said
-        for item, saved in zip(live["segs"], adopt):
+        by_key = {r["cell_key"]: r for r in adopt}
+        remaining_adopt = list(adopt)
+        matched_segs: list[tuple[str, dict[str, Any]]] = []
+        unmatched_segs: list[str] = []
+        for seg_item, seg_uid in live["segs"]:
+            target = by_key.get(f"msg:{seg_uid}") if seg_uid else None
+            if target is not None and target in remaining_adopt:
+                remaining_adopt.remove(target)
+                matched_segs.append((seg_item, target))
+            elif not seg_uid and remaining_adopt:
+                target = remaining_adopt.pop(0)
+                matched_segs.append((seg_item, target))
+            else:
+                unmatched_segs.append(seg_item)
+        for seg_item, saved in matched_segs:
             rows.remove(saved)
-            rows.append({**saved, "item_id": item, "body": {**saved["body"], "status": None, "output": None}})
-            mine.remove(next(m for m in mine if row_key(m) == saved["cell_key"]))
+            rows.append({**saved, "item_id": seg_item, "body": {**saved["body"], "status": None, "output": None}})
+            mine = [m for m in mine if row_key(m) != saved["cell_key"]]
         # A closed row with no saved message of its own would show twice: hide it.
         rows += [{"item_id": item, "role": "assistant", "kind": "text", "state": "removed", "body": {"status": None}}
-                 for item in live["segs"][len(adopt):]]
-        answer = next((r for r in rows if mine and r["cell_key"] == row_key(mine[-1]) and "item_id" not in r), None)
+                 for item in unmatched_segs]
+        answer = None
+        if live.get("uid") and f"msg:{live['uid']}" in {r.get("cell_key") for r in rows}:
+            answer = next((r for r in rows if r.get("cell_key") == f"msg:{live['uid']}"), None)
+        if answer is None:
+            answer = next((r for r in reversed(rows) if r["role"] == "assistant"
+                           and r.get("cell_key")
+                           and any(r.get("cell_key") == row_key(m) for m in mine)
+                           and r not in [s for _, s in matched_segs]
+                           and r.get("cell_key") not in pushed), None)
         if answer is not None and live.get("outcome") == "completed":
             rows.remove(answer)
             answer["item_id"] = live["item"]  # the streamed row becomes the saved answer
@@ -321,9 +439,10 @@ def publish(session_id: str, ref: str, event: dict[str, Any], read_display: Call
                 _WRITER = _WRITER or _Writer()
             _WRITER.live[ref] = {"session": session_id, "ref": ref, "url": url, "key": key, "bearer": bearer, "started": time.time() - 1,
                                  "read": read_display, "item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}")),
+                                 "uid": None, "at": None, "last_at": 0.0,
                                  "text": "", "sent": 0, "rev": None, "status": None, "shown": None,
                                  "cards": [], "card_keys": [], "show_tag": show_tag, "show_over": show_over,
-                                 "segs": [], "closing": []}
+                                 "segs": [], "closing": [], "pushed_keys": set()}
             if event.get("type") == "turn.started":
                 return
         _WRITER.events.put_nowait((ref, {**event, "_on_finished": on_finished} if on_finished else event))
@@ -334,16 +453,28 @@ def publish(session_id: str, ref: str, event: dict[str, Any], read_display: Call
         logger.debug("chat writer publish skipped", exc_info=True)
 
 
-def publish_rows(session_id: str, messages: list[dict[str, Any]], secret: Callable[[str], str]) -> bool:
-    """Copy finished rows that arrived outside a turn (a routine brief) into ``chat_items``. Never raises."""
+def publish_rows(session_id: str, messages: list[dict[str, Any]], secret: Callable[[str], str],
+                 *, raw_rows: Optional[list[dict[str, Any]]] = None) -> bool:
+    """Copy finished rows (browser cards, shared files, routine briefs) into ``chat_items``.
+
+    When a turn is active for ``session_id`` on ``_WRITER``, enqueue the rows onto that turn's
+    writer queue so any buffered commentary text is flushed first and timestamps stay monotonic.
+    """
     try:
         url = (secret("WEAVE_CHAT_SUPABASE_URL") or "").rstrip("/")
         key, bearer = secret("WEAVE_CHAT_SUPABASE_KEY") or "", secret("WEAVE_API_MCP_BEARER") or ""
         if not (url.startswith("https://") and key and bearer and session_id.startswith("weave-")):
             return False
-        rows = visible_rows(messages, (secret("WEAVE_CHAT_SHOW_TAG") or "[SHOW]").strip())
-        if rows:
-            _call({"url": url, "key": key, "bearer": bearer, "session": session_id}, rows)
+        rows = list(raw_rows) if raw_rows is not None else visible_rows(messages, (secret("WEAVE_CHAT_SHOW_TAG") or "[SHOW]").strip())
+        if not rows:
+            return True
+        if _WRITER is not None:
+            active_ref = next((ref for ref, live in list(_WRITER.live.items())
+                               if live.get("session") == session_id and not live.get("ended")), None)
+            if active_ref is not None:
+                _WRITER.events.put_nowait((active_ref, {"type": "out.rows", "rows": rows}))
+                return True
+        _call({"url": url, "key": key, "bearer": bearer, "session": session_id}, rows)
         return True
     except Exception:
         logger.warning("chat rows copy failed", exc_info=True)

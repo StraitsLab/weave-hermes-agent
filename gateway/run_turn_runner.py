@@ -979,7 +979,7 @@ class TurnRunner:
                         sink.on_delta(text)
 
         from gateway.native_session_lifecycle import wire_delta
-        stream_delta_cb = wire_delta(getattr(ctx, '_status_adapter', None), ctx.session_key, stream_delta_cb)
+        stream_delta_cb = wire_delta(getattr(ctx, '_status_adapter', None), ctx.session_key, stream_delta_cb, ctx.agent_holder)
 
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
