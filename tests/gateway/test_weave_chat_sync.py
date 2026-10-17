@@ -653,5 +653,76 @@ def test_stream_delivery_mints_message_uid_and_build_assistant_message_consumes_
     assert msg["message_uid"] == uid1 and msg["timestamp"] == ts1
     assert agent._current_stream_message_uid is None and agent._current_stream_timestamp is None
 
+    # A superseded stream attempt fires _stream_retract_callback with the aborted message_uid.
+    retracted = []
+    agent._stream_retract_callback = retracted.append
+    agent._fire_stream_delta("Partial ")
+    aborted_uid = agent._current_stream_message_uid
+    assert isinstance(aborted_uid, str)
+    agent._claim_stream_writer()
+    assert retracted == [aborted_uid]
+
+
+def test_dedicated_status_row_approval_order_and_single_final_revision(server, monkeypatch):
+    """WEV-3483: (1) status uses a dedicated row so silent tool -> approval card -> answer keeps the answer after
+    the approval card and adopts its message_uid; (2) completed commentary has identical body on close and finish
+    so it never emits a second final revision; (3) superseded partial text is retracted, never published final."""
+    url, calls, rows = server
+    real = sync._call
+    monkeypatch.setattr(sync, "_call", lambda live, items: real({**live, "url": live["url"].replace("https://", "http://")}, items))
+    t0 = 1792240000.0
+    saved = [
+        {"role": "user", "content": "Buy it", "timestamp": t0, "platform_message_id": "ref-stat"},
+        {"role": "assistant", "content": "Checking stock.", "tool_calls": [{}], "timestamp": t0 + 2, "message_uid": "u-comm"},
+        {"role": "assistant", "content": "Purchased.", "timestamp": t0 + 10, "message_uid": "u-ans"},
+    ]
+    sec = secrets(url)
+    # Silent tool status flushed first
+    sync.publish("weave-stat", "ref-stat", {"type": "tool.started", "tool_name": "browse"}, lambda: saved, sec)
+    wait_for(lambda: len(calls) >= 1)
+    sync.publish("weave-stat", "ref-stat", {"type": "tool.completed", "tool_name": "browse"}, lambda: saved, sec)
+    # Commentary streams and closes before approval tool
+    sync.publish("weave-stat", "ref-stat", {"type": "assistant.delta", "delta": "Checking stock.", "message_uid": "u-comm", "at": t0 + 2}, lambda: saved, sec)
+    sync.publish("weave-stat", "ref-stat", {"type": "tool.started", "tool_name": "purchase"}, lambda: saved, sec)
+    sync.publish("weave-stat", "ref-stat", {"type": "approval.request", "request_id": "req-1", "description": "Approve purchase?"}, lambda: saved, sec)
+    wait_for(lambda: any(r.get("cell_key") == "approval:req-1" for r in rows.values()))
+    sync.publish("weave-stat", "ref-stat", {"type": "tool.completed", "tool_name": "purchase"}, lambda: saved, sec)
+    # Aborted partial stream before real answer
+    sync.publish("weave-stat", "ref-stat", {"type": "assistant.delta", "delta": "Wrong partial.", "message_uid": "u-bad", "at": t0 + 8}, lambda: saved, sec)
+    wait_for(lambda: any(r.get("cell_key") == "msg:u-bad" for r in rows.values()))
+    sync.publish("weave-stat", "ref-stat", {"type": "assistant.retract", "message_uid": "u-bad"}, lambda: saved, sec)
+    sync.publish("weave-stat", "ref-stat", {"type": "assistant.delta", "delta": "Purchased.", "message_uid": "u-ans", "at": t0 + 10}, lambda: saved, sec)
+    sync.publish("weave-stat", "ref-stat", {"type": "turn.completed"}, lambda: saved, sec)
+
+    wait_for(lambda: "ref-stat" not in (sync._WRITER.live if sync._WRITER else {}))
+    visible = [r.get("cell_key") for r in sorted(rows.values(), key=lambda r: (r["created_at"], r.get("item_id") or ""))
+               if r.get("state") != "removed"]
+    assert visible == [f"user:{t0!r}", "msg:u-comm", "approval:req-1", "msg:u-ans"]
+    # Superseded partial was never sent with state == 'final'
+    assert not [i for c in calls for i in c["p_items"] if i.get("cell_key") == "msg:u-bad" and i.get("state") == "final"]
+    # Completed commentary emitted identical body on both close and finish
+    comm_finals = [i["body"] for c in calls for i in c["p_items"] if i.get("cell_key") == "msg:u-comm" and i.get("state") == "final"]
+    assert len(comm_finals) >= 1 and all(b == comm_finals[0] for b in comm_finals)
+
+
+def test_publish_rows_delivers_even_after_queued_terminal(server, monkeypatch):
+    """WEV-3483: if publish_rows queues an out.rows event right behind a queued turn.completed event, the writer
+    still delivers the row using the attached connection fallback instead of dropping it."""
+    url, _calls, rows = server
+    real = sync._call
+    monkeypatch.setattr(sync, "_call", lambda live, items: real({**live, "url": live["url"].replace("https://", "http://")}, items))
+    t0 = 1792250000.0
+    saved = [{"role": "user", "content": "hi", "timestamp": t0, "platform_message_id": "ref-late"},
+             {"role": "assistant", "content": "done", "timestamp": t0 + 1, "message_uid": "u-done"}]
+    sec = secrets(url)
+    monkeypatch.setattr(sync, "FLUSH_S", 0.5)
+    sync.publish("weave-late", "ref-late", {"type": "turn.completed"}, lambda: saved, sec)
+    file_row = {"item_id": "0199late-0000-7000-8000-000000000001", "role": "assistant", "kind": "text", "state": "final",
+                "body": {"text": "Late.pdf"}}
+    assert sync.publish_rows("weave-late", [], sec, raw_rows=[file_row])
+    wait_for(lambda: "0199late-0000-7000-8000-000000000001" in rows)
+    assert rows["0199late-0000-7000-8000-000000000001"]["text"] == "Late.pdf"
+
+
 
 
