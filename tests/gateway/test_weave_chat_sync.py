@@ -26,7 +26,7 @@ def server(monkeypatch):
                 key = item.get("cell_key") or item.get("item_id")
                 row = rows.get(item.get("item_id")) or next((r for r in rows.values() if r.get("cell_key") == key), None)
                 if row is None:
-                    row = rows.setdefault(item.get("item_id") or key, {"rev": 0, "text": "", **item})
+                    row = rows.setdefault(item.get("item_id") or key, {"rev": 0, "text": "", "seq": len(rows), **item})
                     row["text"] = item.get("append", (item.get("body") or {}).get("text", ""))
                 else:
                     if "append" in item and item.get("rev") != row["rev"]:
@@ -86,9 +86,9 @@ def test_reply_streams_into_one_row_and_is_saved_as_that_row(server, monkeypatch
         {"id": 11, "role": "user", "content": "[System: Continue now.]", "timestamp": now + 3.0},
     ]
     run_turn(url, "weave-abc", "ref1", [
-        {"type": "assistant.delta", "delta": "Hi"},
         {"type": "tool.started", "tool_name": "web_search"},
         {"type": "tool.completed", "tool_name": "web_search"},
+        {"type": "assistant.delta", "delta": "Hi"},
         {"type": "assistant.delta", "delta": " there"},
         {"type": "turn.completed"},
     ], saved, monkeypatch)
@@ -105,6 +105,62 @@ def test_reply_streams_into_one_row_and_is_saved_as_that_row(server, monkeypatch
     finals = [i.get("cell_key") for i in sent if i.get("state") == "final"]
     assert set(finals) == {f"user:{now + 0.5!r}", answer_key}  # an older answer is never re-sent
     assert finals[-1] == answer_key  # the turn's answer lands last: the apps settle on it
+
+
+def test_text_between_tools_streams_into_its_own_row_in_order(server, monkeypatch):
+    """Mid-turn updates and the answer are separate rows, each created when its text starts (2026-10-17 RedMart turn).
+
+    One live row for the whole turn was created first, then took the answer at the end, so the apps (which
+    order by created_at) showed the answer above the updates it came after.
+    """
+    url, calls, rows = server
+    now = time.time()
+    saved = [
+        {"id": 1, "role": "user", "content": "Add it", "timestamp": now + 0.1, "platform_message_id": "ref-seg"},
+        {"id": 2, "role": "assistant", "content": "Signed in. Searching.", "tool_calls": [{"id": "a"}], "timestamp": now + 1.0},
+        {"id": 3, "role": "tool", "content": "page", "timestamp": now + 1.5},
+        {"id": 4, "role": "assistant", "content": "Found it. Adding.", "tool_calls": [{"id": "b"}], "timestamp": now + 2.0},
+        {"id": 5, "role": "tool", "content": "added?", "timestamp": now + 2.5},
+        {"id": 6, "role": "assistant", "content": "I can't confirm it was added.", "timestamp": now + 3.0},
+    ]
+    def step(*events):  # one flush per step, as when the model pauses for a tool
+        sent = len(calls)
+        run_turn(url, "weave-abc", "ref-seg", list(events), saved, monkeypatch, started=False)
+        wait_for(lambda: len(calls) > sent)
+
+    step({"type": "assistant.delta", "delta": "Signed in. Searching."})
+    step({"type": "tool.started", "tool_name": "browse"})
+    step({"type": "tool.completed", "tool_name": "browse"}, {"type": "assistant.delta", "delta": "Found it. Adding."})
+    step({"type": "tool.started", "tool_name": "browse"})
+    step({"type": "tool.completed", "tool_name": "browse"}, {"type": "assistant.delta", "delta": "I can't confirm it was added."})
+    step({"type": "turn.completed"})
+    live_id = str(sync.uuid.uuid5(sync.uuid.NAMESPACE_URL, "weave-chat:ref-seg"))
+    wait_for(lambda: sum(r.get("state") == "final" and r.get("role") == "assistant" for r in rows.values()) >= 3)
+    shown = [r["text"] for r in sorted(rows.values(), key=lambda r: r["seq"])
+             if r.get("role") == "assistant" and r.get("state") == "final"]
+    assert shown == ["Signed in. Searching.", "Found it. Adding.", "I can't confirm it was added."]
+    assert rows[live_id]["text"] == "Signed in. Searching."  # the first row keeps only its own text
+    assert [r["cell_key"] for r in sorted(rows.values(), key=lambda r: r["seq"]) if r.get("role") == "assistant"] == [
+        f"assistant:{now + 1.0!r}", f"assistant:{now + 2.0!r}", f"assistant:{now + 3.0!r}"]  # each adopts its saved row
+
+
+def test_a_closed_row_without_a_saved_message_is_hidden(server, monkeypatch):
+    """Streamed text before a tool that Hermes did not save on its own never shows twice next to the answer."""
+    url, calls, rows = server
+    now = time.time()
+    saved = [{"id": 1, "role": "user", "content": "hi", "timestamp": now + 0.1, "platform_message_id": "ref-gap"},
+             {"id": 2, "role": "assistant", "content": "", "tool_calls": [{"id": "a"}], "timestamp": now + 1.0},
+             {"id": 3, "role": "assistant", "content": "Hi there", "timestamp": now + 2.0}]
+    for events in ([{"type": "assistant.delta", "delta": "Hi"}, {"type": "tool.started", "tool_name": "x"}],
+                   [{"type": "tool.completed", "tool_name": "x"}, {"type": "assistant.delta", "delta": " there"}],
+                   [{"type": "turn.completed"}]):
+        sent = len(calls)
+        run_turn(url, "weave-abc", "ref-gap", events, saved, monkeypatch, started=False)
+        wait_for(lambda: len(calls) > sent)
+    live_id = str(sync.uuid.uuid5(sync.uuid.NAMESPACE_URL, "weave-chat:ref-gap"))
+    wait_for(lambda: rows.get(live_id, {}).get("state") == "removed")
+    shown = [r["text"] for r in rows.values() if r.get("role") == "assistant" and r.get("state") == "final"]
+    assert shown == ["Hi there"]
 
 
 def test_cards_and_their_resolution_are_rows(server, monkeypatch):

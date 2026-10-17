@@ -89,6 +89,10 @@ def visible_reply(text: str, show_tag: str = "[SHOW]", show_over: int = 400) -> 
     return text, any(mark in text for mark in _LINKISH) or len(text) > show_over
 
 
+def _iso(at: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(at)) + f".{int(at % 1 * 1e6):06d}Z"
+
+
 def visible_rows(messages: list[dict[str, Any]], show_tag: str = "[SHOW]", show_over: int = 400) -> list[dict[str, Any]]:
     """The rows a person sees: what they said and what the assistant answered (no tool channel)."""
     out = []
@@ -106,8 +110,7 @@ def visible_rows(messages: list[dict[str, Any]], show_tag: str = "[SHOW]", show_
             body["text"], body["visible"] = visible_reply(content, show_tag, show_over)
         out.append({"cell_key": row_key(m), "role": m["role"], "kind": "text", "state": "final",
                     "body": body,
-                    **({"at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(at)) + f".{int(at % 1 * 1e6):06d}Z"}
-                       if isinstance(at, (int, float)) else {})})
+                    **({"at": _iso(at)} if isinstance(at, (int, float)) else {})})
     return out
 
 
@@ -168,9 +171,24 @@ class _Writer:
         if live is None or live.get("ended"):
             return False
         if kind == "assistant.delta" and isinstance(event.get("delta"), str):
+            if live.pop("split", False):
+                # Text after a tool is a new message: close this row and open the next one now, so every row's
+                # created_at follows the order the person saw it in (the apps sort by created_at).
+                live["segs"].append(live["item"])
+                live["closing"].append({"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
+                                        "body": {"text": live["text"], "status": None, "output": None},
+                                        **({"at": _iso(live["at"])} if live.get("at") else {})})
+                live["item"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}:{len(live['segs'])}"))
+                live["text"], live["sent"], live["rev"], live["shown"] = "", 0, None, None
+                if live.get("card"):
+                    live["card_sent"] = False  # the card moves to the row that is now writing
+            if not live["text"]:
+                live["at"] = time.time()
             live["text"] += event["delta"]
         elif kind in ("tool.started", "tool.generating"):  # generating: the model began writing the call (WEV-3464)
             live["status"] = str(event.get("tool_name") or "")[:120]
+            if live["text"].strip():
+                live["split"] = True
         elif kind in ("tool.completed", "tool.failed"):
             live["status"] = None
             if isinstance(event.get("card"), dict):  # WEV-3395: the turn's last card goes on its answer row
@@ -212,11 +230,15 @@ class _Writer:
         if live["rev"] is not None and not piece and live["status"] == live["shown"]:
             return
         # One call carries the new text and the status line ("Searching the web"); the first one opens the row.
+        # Rows closed by a tool go first in the same call, so they stay earlier than the row now writing.
         item = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "writing",
                 "append": piece, "body": {"status": live["status"]}}
         if live["rev"] is not None:
             item["rev"] = live["rev"]
-        out = _call(live, [item])[0]
+        elif live.get("at"):  # the row is born when its text started, so a row a tool closed always sorts first
+            item["at"] = _iso(live["at"])
+        out = _call(live, live["closing"] + [item])[-1]
+        live["closing"] = []
         if out.get("conflict"):  # the row moved under us: send the whole text once
             out = _call(live, [{"item_id": live["item"], "role": "assistant", "kind": "text", "state": "writing",
                                 "body": {"text": live["text"], "status": live["status"]}}])[0]
@@ -232,7 +254,17 @@ class _Writer:
         # This turn's answer: its last visible assistant message, saved after the turn started.
         mine = [m for m in messages if m.get("role") == "assistant" and isinstance(m.get("content"), str)
                 and m["content"].strip() and (m.get("timestamp") or 0) >= live["started"]]
-        answer = next((r for r in rows if mine and r["cell_key"] == row_key(mine[-1])), None)
+        # Rows a tool closed mid-turn adopt the saved messages in the same order, keeping their place on screen.
+        said = [r for r in rows if r["role"] == "assistant" and any(r["cell_key"] == row_key(m) for m in mine)]
+        adopt = said[:-1] if live.get("outcome") == "completed" else said
+        for item, saved in zip(live["segs"], adopt):
+            rows.remove(saved)
+            rows.append({**saved, "item_id": item, "body": {**saved["body"], "status": None, "output": None}})
+            mine.remove(next(m for m in mine if row_key(m) == saved["cell_key"]))
+        # A closed row with no saved message of its own would show twice: hide it.
+        rows += [{"item_id": item, "role": "assistant", "kind": "text", "state": "removed", "body": {"status": None}}
+                 for item in live["segs"][len(adopt):]]
+        answer = next((r for r in rows if mine and r["cell_key"] == row_key(mine[-1]) and "item_id" not in r), None)
         if answer is not None and live.get("outcome") == "completed":
             rows.remove(answer)
             answer["item_id"] = live["item"]  # the streamed row becomes the saved answer
@@ -290,7 +322,8 @@ def publish(session_id: str, ref: str, event: dict[str, Any], read_display: Call
             _WRITER.live[ref] = {"session": session_id, "ref": ref, "url": url, "key": key, "bearer": bearer, "started": time.time() - 1,
                                  "read": read_display, "item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}")),
                                  "text": "", "sent": 0, "rev": None, "status": None, "shown": None,
-                                 "cards": [], "card_keys": [], "show_tag": show_tag, "show_over": show_over}
+                                 "cards": [], "card_keys": [], "show_tag": show_tag, "show_over": show_over,
+                                 "segs": [], "closing": []}
             if event.get("type") == "turn.started":
                 return
         _WRITER.events.put_nowait((ref, {**event, "_on_finished": on_finished} if on_finished else event))
