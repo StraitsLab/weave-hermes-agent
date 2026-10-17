@@ -271,3 +271,14 @@ def append_message(
     """Stamp and append one live transcript message."""
     messages.append(stamp_message_timestamp(message, timestamp=timestamp))
     return message
+
+
+def stamp_stream_message_identity(agent: Any, message: _Message) -> _Message:
+    """Stamp an assistant message with the ``(message_uid, timestamp)`` minted when its stream began."""
+    consume = getattr(agent, "_consume_stream_message_identity", None)
+    pair = consume() if callable(consume) else None
+    uid, ts = pair if isinstance(pair, tuple) and len(pair) == 2 else (None, None)
+    if isinstance(uid, str) and uid:
+        message[MESSAGE_UID] = uid
+    return stamp_message_timestamp(message, timestamp=ts)
+

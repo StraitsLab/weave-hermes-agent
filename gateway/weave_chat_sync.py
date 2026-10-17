@@ -219,6 +219,28 @@ class _Writer:
         if live.get("card"):
             live["card_sent"] = False  # the card moves to the row that is now writing
 
+    def _take_out_rows(self, live: dict[str, Any], rows: Any) -> None:
+        live.pop("split", None)
+        if live["text"].strip():
+            self._close_current_text(live)
+        elif live["rev"] is not None:
+            # A status-only row opened before any text was written would otherwise sit above this card/file row.
+            live["closing"].append({"item_id": live["item"], "role": "assistant", "kind": "text", "state": "removed", "body": {"status": None}})
+            live["item"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}:{len(live['segs']) + len(live['pushed_keys']) + 1}"))
+            live["uid"], live["at"], live["rev"], live["shown"] = None, None, None, None
+        for raw in rows or ():
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            row.pop("_card", None)
+            at_val = row.pop("_ts", None)
+            if at_val is None and isinstance(row.get("at"), (int, float)):
+                at_val = float(row["at"])
+            row["at"] = _iso(self._next_at(live, at_val))
+            live["closing"].append(row)
+            if row.get("cell_key"):
+                live["pushed_keys"].add(row["cell_key"])
+
     def _take(self, ref: str, event: dict[str, Any]) -> bool:
         live, kind = self.live.get(ref), event.get("type")
         if live is None or live.get("ended"):
@@ -248,26 +270,7 @@ class _Writer:
                 live["card"] = event["card"]
                 live["card_sent"] = False  # WEV-3464: and onto the live row at once
         elif kind == "out.rows":
-            live.pop("split", None)
-            if live["text"].strip():
-                self._close_current_text(live)
-            elif live["rev"] is not None:
-                # A status-only row opened before any text was written would otherwise sit above this card/file row.
-                live["closing"].append({"item_id": live["item"], "role": "assistant", "kind": "text", "state": "removed", "body": {"status": None}})
-                live["item"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}:{len(live['segs']) + len(live['pushed_keys']) + 1}"))
-                live["uid"], live["at"], live["rev"], live["shown"] = None, None, None, None
-            for raw in event.get("rows") or ():
-                if not isinstance(raw, dict):
-                    continue
-                row = dict(raw)
-                row.pop("_card", None)
-                at_val = row.pop("_ts", None)
-                if at_val is None and isinstance(row.get("at"), (int, float)):
-                    at_val = float(row["at"])
-                row["at"] = _iso(self._next_at(live, at_val))
-                live["closing"].append(row)
-                if row.get("cell_key"):
-                    live["pushed_keys"].add(row["cell_key"])
+            self._take_out_rows(live, event.get("rows"))
         elif kind in CARD_TYPES:
             card_id = event.get("request_id") or event.get("clarify_id") or ""
             body = {k: v for k, v in event.items()
