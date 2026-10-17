@@ -382,6 +382,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     without display hooks. Every callback is guarded so a buggy display hook cannot tear down the turn loop."""
     # item_id -> (tool_name, args, started_monotonic); duration even when codex omits durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
+    agent._codex_stream_identities = {}
 
     def agent_cb(attr: str, fail_msg: str, *fail_args: Any, args: tuple = (), kwargs: dict | None = None) -> None:
         _call_guarded(getattr(agent, attr, None), fail_msg, *fail_args, args=args, kwargs=kwargs)
@@ -431,6 +432,13 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         # against ITS deltas, so drop them before the next item's deltas arrive. Otherwise the buffer
         # holds "commentary + final", the final agentMessage no longer prefix-matches, and it is
         # re-delivered with already_streamed=False as a second copy (#74248 boundary 2).
+        consume = getattr(agent, "_consume_stream_message_identity", None)
+        pair = consume() if callable(consume) else None
+        uid, ts = pair if isinstance(pair, tuple) and len(pair) == 2 else (None, None)
+        if item_id := item.get("id"):
+            identities = getattr(agent, "_codex_stream_identities", None)
+            if isinstance(identities, dict) and isinstance(uid, str) and uid:
+                identities[str(item_id)] = (uid, ts)
         agent._current_streamed_assistant_text = ""
 
     def _on_item(params: dict, completed: bool) -> None:
@@ -672,8 +680,9 @@ def _persist_projected_messages(agent, turn, messages: list[dict[str, Any]]) -> 
     gateway re-write would re-INSERT the user turn."""
     if not turn.projected_messages:
         return False
-    from agent.message_metadata import append_message
+    from agent.message_metadata import MESSAGE_UID, append_message, stamp_message_timestamp
     projected_messages = turn.projected_messages
+    identities = getattr(agent, "_codex_stream_identities", None)
     # Turn-start persistence owns the accepted input. Codex's leading user item
     # only echoes its coerced wire text; later/nonmatching events remain real.
     submitted_user_text = getattr(turn, "submitted_user_text", None)
@@ -682,6 +691,12 @@ def _persist_projected_messages(agent, turn, messages: list[dict[str, Any]]) -> 
             and first.get("content") == submitted_user_text):
         projected_messages = projected_messages[1:]
     for projected_message in projected_messages:
+        item_id = projected_message.pop("_codex_item_id", None)
+        if isinstance(identities, dict) and item_id in identities:
+            uid, ts = identities.pop(item_id)
+            if uid:
+                projected_message[MESSAGE_UID] = uid
+            stamp_message_timestamp(projected_message, timestamp=ts)
         append_message(messages, projected_message)
     if getattr(agent, "_session_db", None) is None:
         return False

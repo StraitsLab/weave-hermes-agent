@@ -23,10 +23,14 @@ def server(monkeypatch):
             calls.append({"path": self.path, "apikey": self.headers.get("apikey"), **body})
             out = []
             for item in body["p_items"]:
-                key = item.get("cell_key") or item.get("item_id")
-                row = rows.get(item.get("item_id")) or next((r for r in rows.values() if r.get("cell_key") == key), None)
+                cell_key = item.get("cell_key")
+                item_id = item.get("item_id")
+                row = rows.get(item_id) if item_id else None
+                if row is None and cell_key:
+                    row = next((r for r in rows.values() if r.get("cell_key") == cell_key), None)
                 if row is None:
-                    row = rows.setdefault(item.get("item_id") or key, {"rev": 0, "text": "", "seq": len(rows), **item})
+                    pk = item_id or cell_key
+                    row = rows.setdefault(pk, {"rev": 0, "text": "", "seq": len(rows), "created_at": item.get("at") or f"9999-{len(rows):04d}", **item})
                     row["text"] = item.get("append", (item.get("body") or {}).get("text", ""))
                 else:
                     if "append" in item and item.get("rev") != row["rev"]:
@@ -376,8 +380,11 @@ def test_final_write_backoff_is_capped_and_expires_without_holding_live_turns(mo
     live = {"ended": True, "read": list, "on_finished": lambda: callbacks.append("done")}
     active = {}
     writer.live = {"ended": live, "active": active}
+    monkeypatch.setattr(sync, "_WRITER", None)
 
     def fail(_self, turn):
+        if turn is not live and turn is not active:
+            return
         attempts.append(clock[0])
         raise TimeoutError("offline")
 
@@ -430,7 +437,7 @@ def test_show_settings_come_from_the_profile_secrets(server, monkeypatch):
     saved = [{"id": 1, "role": "assistant", "content": "[READ] read me", "timestamp": now + 1.0}]
     for event in ({"type": "assistant.delta", "delta": "[READ] read me"}, {"type": "turn.completed"}):
         sync.publish("weave-show", "ref-show", event, lambda: saved, lambda name: values.get(name, ""))
-    wait_for(lambda: any(i.get("state") == "final" for c in calls for i in c["p_items"]))
+    wait_for(lambda: any(i.get("state") == "final" for c in calls for i in c["p_items"]) and "ref-show" not in (sync._WRITER.live if sync._WRITER else {}))
     final = next(i for c in calls for i in c["p_items"] if i.get("state") == "final")
     assert final["body"] == {"text": "read me", "visible": True, "status": None}
 
@@ -465,3 +472,186 @@ def test_a_turn_writes_only_its_own_rows_however_long_the_chat(server, monkeypat
     wait_for(lambda: rows.get(live_id, {}).get("state") == "final")
     finals = [i.get("cell_key") for c in calls for i in c["p_items"] if i.get("state") == "final"]
     assert finals == [f"user:{now - 30!r}", f"assistant:{now + 1!r}"]  # a user row from before turn start still counts
+
+
+def test_micro_center_turn_with_browser_card_and_message_uids_keeps_exact_order(server, monkeypatch):
+    """WEV-3483: a browser card passive append arriving while commentary is buffered flushes the commentary
+    first, never duplicates the second update, and keeps every row in causal created_at order."""
+    url, _calls, rows = server
+    real = sync._call
+    monkeypatch.setattr(sync, "_call", lambda live, items: real({**live, "url": live["url"].replace("https://", "http://")}, items))
+    t0 = 1792224000.4678
+    u1 = "The browser didn't open in a new window. I'll retry in the current window."
+    card_json = '{"card_id":"98d1d290","kind":"browser","major":1,"page_url":"https://www.microcenter.com/"}'
+    u2 = "The Micro Center page is showing a Cloudflare security check. I'll wait a moment."
+    ans = "I opened microcenter.com in your browser, but it's stuck on a Cloudflare page."
+    saved = [
+        {"role": "user", "content": "Open micro center website in browser.", "timestamp": t0, "platform_message_id": "ref-mc"},
+        {"role": "assistant", "content": "", "tool_calls": [{}], "timestamp": t0 + 6, "message_uid": "u-empty"},
+        {"role": "assistant", "content": u1, "tool_calls": [{}], "timestamp": t0 + 26, "message_uid": "u-1"},
+        {"role": "assistant", "content": card_json, "timestamp": t0 + 30, "message_uid": "u-card"},
+        {"role": "assistant", "content": u2, "tool_calls": [{}], "timestamp": t0 + 32, "message_uid": "u-2"},
+        {"role": "assistant", "content": ans, "timestamp": t0 + 36, "message_uid": "u-ans"},
+    ]
+    sec = secrets(url)
+    sync.publish("weave-mc", "ref-mc", {"type": "tool.started", "tool_name": "browse"}, lambda: saved, sec)
+    sync.publish("weave-mc", "ref-mc", {"type": "tool.failed", "tool_name": "browse"}, lambda: saved, sec)
+    sync.publish("weave-mc", "ref-mc", {"type": "assistant.delta", "delta": u1, "message_uid": "u-1", "at": t0 + 26}, lambda: saved, sec)
+    sync.publish("weave-mc", "ref-mc", {"type": "tool.started", "tool_name": "browse"}, lambda: saved, sec)
+    # Browser card arrives via publish_rows while the turn is running (even before FLUSH_S ticks).
+    assert sync.publish_rows("weave-mc", [saved[3]], sec)
+    sync.publish("weave-mc", "ref-mc", {"type": "tool.completed", "tool_name": "browse"}, lambda: saved, sec)
+    sync.publish("weave-mc", "ref-mc", {"type": "assistant.delta", "delta": "\n\n" + u2, "message_uid": "u-2", "at": t0 + 32}, lambda: saved, sec)
+    sync.publish("weave-mc", "ref-mc", {"type": "tool.started", "tool_name": "browse"}, lambda: saved, sec)
+    sync.publish("weave-mc", "ref-mc", {"type": "tool.completed", "tool_name": "browse"}, lambda: saved, sec)
+    sync.publish("weave-mc", "ref-mc", {"type": "assistant.delta", "delta": ans, "message_uid": "u-ans", "at": t0 + 36}, lambda: saved, sec)
+    sync.publish("weave-mc", "ref-mc", {"type": "turn.completed"}, lambda: saved, sec)
+
+    wait_for(lambda: "ref-mc" not in (sync._WRITER.live if sync._WRITER else {}))
+    shown = [r["text"].strip() for r in sorted(rows.values(), key=lambda r: (r["created_at"], r.get("item_id") or ""))
+             if r.get("state") != "removed"]
+    assert shown == ["Open micro center website in browser.", u1, card_json, u2, ans]
+
+
+def test_shared_file_row_flushes_buffered_commentary_first(server, monkeypatch):
+    """WEV-3483: a shared file row routed through publish_rows(raw_rows=...) during a turn flushes buffered
+    commentary before writing the file row, with monotonic created_at timestamps."""
+    url, _calls, rows = server
+    real = sync._call
+    monkeypatch.setattr(sync, "_call", lambda live, items: real({**live, "url": live["url"].replace("https://", "http://")}, items))
+    t0 = 1792225000.0
+    saved = [
+        {"role": "user", "content": "Send the PDF", "timestamp": t0, "platform_message_id": "ref-file"},
+        {"role": "assistant", "content": "Uploading the report now.", "tool_calls": [{}], "timestamp": t0 + 1, "message_uid": "u-pre"},
+        {"role": "assistant", "content": "Sent the report.", "timestamp": t0 + 3, "message_uid": "u-post"},
+    ]
+    sec = secrets(url)
+    sync.publish("weave-file", "ref-file", {"type": "assistant.delta", "delta": "Uploading the report now.", "message_uid": "u-pre", "at": t0 + 1}, lambda: saved, sec)
+    sync.publish("weave-file", "ref-file", {"type": "tool.started", "tool_name": "share_file"}, lambda: saved, sec)
+    file_row = {"item_id": "0199file-0000-7000-8000-000000000001", "role": "assistant", "kind": "text", "state": "final",
+                "body": {"text": "Report.pdf", "attachments": [{"path": "c1/i1/Report.pdf", "media_type": "application/pdf"}]}}
+    assert sync.publish_rows("weave-file", [], sec, raw_rows=[file_row])
+    sync.publish("weave-file", "ref-file", {"type": "tool.completed", "tool_name": "share_file"}, lambda: saved, sec)
+    sync.publish("weave-file", "ref-file", {"type": "assistant.delta", "delta": "Sent the report.", "message_uid": "u-post", "at": t0 + 3}, lambda: saved, sec)
+    sync.publish("weave-file", "ref-file", {"type": "turn.completed"}, lambda: saved, sec)
+
+    wait_for(lambda: "ref-file" not in (sync._WRITER.live if sync._WRITER else {}))
+    shown = [r["text"].strip() for r in sorted(rows.values(), key=lambda r: (r["created_at"], r.get("item_id") or ""))
+             if r.get("state") != "removed"]
+    assert shown == ["Send the PDF", "Uploading the report now.", "Report.pdf", "Sent the report."]
+
+
+def test_tool_status_before_browser_card_before_answer_keeps_card_above_answer(server, monkeypatch):
+    """WEV-3483 (12:16 SGT shape): tool.started flushes a status-only row before any text; then a browser card
+    arrives, then the answer streams. The status row is removed so the card stays above the answer."""
+    url, calls, rows = server
+    real = sync._call
+    monkeypatch.setattr(sync, "_call", lambda live, items: real({**live, "url": live["url"].replace("https://", "http://")}, items))
+    t0 = 1792210562.7432
+    card_json = '{"card_id":"c716beba","kind":"browser","major":1,"page_url":"https://www.microcenter.com/"}'
+    ans = "I couldn't get the Micro Center homepage to load. Cloudflare is showing a check."
+    saved = [
+        {"role": "user", "content": "Open micro center website in the browser", "timestamp": t0, "platform_message_id": "ref-1216"},
+        {"role": "assistant", "content": "", "tool_calls": [{}], "timestamp": t0 + 4},
+        {"role": "assistant", "content": card_json, "timestamp": t0 + 9, "message_uid": "u-card1"},
+        {"role": "assistant", "content": "", "tool_calls": [{}], "timestamp": t0 + 13},
+        {"role": "assistant", "content": ans, "timestamp": t0 + 24, "message_uid": "u-ans1"},
+    ]
+    sec = secrets(url)
+    sync.publish("weave-1216", "ref-1216", {"type": "tool.started", "tool_name": "browse"}, lambda: saved, sec)
+    wait_for(lambda: len(calls) >= 1)  # status-only row flushed to Supabase first
+    assert sync.publish_rows("weave-1216", [saved[2]], sec)
+    sync.publish("weave-1216", "ref-1216", {"type": "tool.completed", "tool_name": "browse"}, lambda: saved, sec)
+    sync.publish("weave-1216", "ref-1216", {"type": "assistant.delta", "delta": ans, "message_uid": "u-ans1", "at": t0 + 24}, lambda: saved, sec)
+    sync.publish("weave-1216", "ref-1216", {"type": "turn.completed"}, lambda: saved, sec)
+
+    wait_for(lambda: "ref-1216" not in (sync._WRITER.live if sync._WRITER else {}))
+    shown = [r["text"].strip() for r in sorted(rows.values(), key=lambda r: (r["created_at"], r.get("item_id") or ""))
+             if r.get("state") != "removed"]
+    assert shown == ["Open micro center website in the browser", card_json, ans]
+
+
+def test_identical_commentary_and_retry_supersede_match_by_message_uid(server, monkeypatch):
+    """WEV-3483: two identical commentary messages keep their own rows by message_uid, and an aborted stream
+    attempt whose message_uid is not saved in state.db is marked removed."""
+    url, _calls, rows = server
+    real = sync._call
+    monkeypatch.setattr(sync, "_call", lambda live, items: real({**live, "url": live["url"].replace("https://", "http://")}, items))
+    t0 = 1792230000.0
+    same = "Still waiting for the page to settle."
+    ans = "Done."
+    saved = [
+        {"role": "user", "content": "Check status", "timestamp": t0, "platform_message_id": "ref-dup"},
+        {"role": "assistant", "content": same, "tool_calls": [{}], "timestamp": t0 + 1, "message_uid": "u-first"},
+        {"role": "assistant", "content": same, "tool_calls": [{}], "timestamp": t0 + 3, "message_uid": "u-second"},
+        {"role": "assistant", "content": ans, "timestamp": t0 + 5, "message_uid": "u-final"},
+    ]
+    sec = secrets(url)
+    # Stream first identical commentary
+    sync.publish("weave-dup", "ref-dup", {"type": "assistant.delta", "delta": same, "message_uid": "u-first", "at": t0 + 1}, lambda: saved, sec)
+    sync.publish("weave-dup", "ref-dup", {"type": "tool.started", "tool_name": "browse"}, lambda: saved, sec)
+    sync.publish("weave-dup", "ref-dup", {"type": "tool.completed", "tool_name": "browse"}, lambda: saved, sec)
+    # Aborted stream attempt (u-aborted never saved to state.db) followed by retry (u-second)
+    sync.publish("weave-dup", "ref-dup", {"type": "assistant.delta", "delta": "Half stream...", "message_uid": "u-aborted", "at": t0 + 2}, lambda: saved, sec)
+    sync.publish("weave-dup", "ref-dup", {"type": "assistant.delta", "delta": same, "message_uid": "u-second", "at": t0 + 3}, lambda: saved, sec)
+    sync.publish("weave-dup", "ref-dup", {"type": "tool.started", "tool_name": "browse"}, lambda: saved, sec)
+    sync.publish("weave-dup", "ref-dup", {"type": "tool.completed", "tool_name": "browse"}, lambda: saved, sec)
+    sync.publish("weave-dup", "ref-dup", {"type": "assistant.delta", "delta": ans, "message_uid": "u-final", "at": t0 + 5}, lambda: saved, sec)
+    sync.publish("weave-dup", "ref-dup", {"type": "turn.completed"}, lambda: saved, sec)
+
+    wait_for(lambda: "ref-dup" not in (sync._WRITER.live if sync._WRITER else {}))
+    shown = [r["text"].strip() for r in sorted(rows.values(), key=lambda r: (r["created_at"], r.get("item_id") or ""))
+             if r.get("state") != "removed"]
+    assert shown == ["Check status", same, same, ans]
+
+
+def test_stream_delivery_mints_message_uid_and_build_assistant_message_consumes_it():
+    """WEV-3483: StreamDeliveryMixin mints (message_uid, timestamp) at first delta and build_assistant_message
+    stamps that exact pair onto the saved assistant message dict."""
+    from types import SimpleNamespace
+    from agent.chat_completion_helpers import build_assistant_message
+    from agent.stream_delivery import StreamDeliveryMixin
+
+    class DummyAgent(StreamDeliveryMixin):
+        def __init__(self):
+            self.quiet_mode = False
+            self.show_commentary = True
+            self.session_id = "weave-test"
+            self.model = "m"
+            self.provider = "p"
+            self.platform = "api_server"
+            self._stream_callback = None
+            self.stream_delta_callback = None
+            self.interim_assistant_callback = None
+            self.reasoning_callback = None
+            self._reset_stream_delivery_tracking()
+
+        def _needs_thinking_reasoning_pad(self):
+            return False
+
+        @staticmethod
+        def _extract_reasoning(_msg):
+            return None
+
+        @staticmethod
+        def _strip_think_blocks(text):
+            return text
+
+    agent = DummyAgent()
+    captured = []
+    agent.stream_delta_callback = lambda chunk: captured.append((chunk, agent._current_stream_message_uid, agent._current_stream_timestamp))
+    agent._fire_stream_delta("Hello ")
+    agent._fire_stream_delta("world")
+    assert len(captured) == 2
+    uid1, ts1 = captured[0][1], captured[0][2]
+    assert isinstance(uid1, str) and len(uid1) == 32 and isinstance(ts1, float)
+    assert captured[1][1] == uid1 and captured[1][2] == ts1
+
+    sdk_msg = SimpleNamespace(content="Hello world", tool_calls=None, reasoning_content=None,
+                              reasoning_details=None, codex_reasoning_items=None, codex_message_items=None)
+    msg = build_assistant_message(agent, sdk_msg, "stop")
+    assert msg["message_uid"] == uid1 and msg["timestamp"] == ts1
+    assert agent._current_stream_message_uid is None and agent._current_stream_timestamp is None
+
+
+

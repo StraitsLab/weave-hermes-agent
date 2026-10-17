@@ -72,14 +72,20 @@ def wire_tools(agent, adapter, session_key):
         agent.tool_gen_callback = generating
 
 
-def wire_delta(adapter, session_key, previous):
+def wire_delta(adapter, session_key, previous, agent_holder=None):
     native = getattr(adapter, '_native_submit_delta', None)
     if not callable(native):
         return previous
     def delta(text):
         if previous is not None:
             previous(text)
-        native(session_key, text)
+        agent = agent_holder[0] if agent_holder else None
+        uid = getattr(agent, '_current_stream_message_uid', None)
+        ts = getattr(agent, '_current_stream_timestamp', None)
+        if uid is not None or ts is not None:
+            native(session_key, text, message_uid=uid, timestamp=ts)
+        else:
+            native(session_key, text)
     return delta
 
 
