@@ -177,9 +177,15 @@ class _Writer:
                 live["messages"] = live["read"]()
             self._flush(live)
             if ended:
-                self._finish(live)
+                committed = self._finish(live)
                 self.live.pop(ref, None)
                 _ENDED.append(ref)
+                on_committed = live.pop("on_committed", None)
+                if on_committed:
+                    try:
+                        on_committed(committed)
+                    except Exception:
+                        logger.debug("chat writer on_committed failed", exc_info=True)
         except Exception:
             logger.warning("chat writer: write failed", exc_info=True)
             if ended:
@@ -245,9 +251,10 @@ class _Writer:
                 self._close_current_text(live)
         elif uid and (live["text"] or live["rev"] is not None) and live.get("uid") != uid:
             self._retract_current_text(live)
-        if uid and not live.get("uid") and live["rev"] is None:
+        if uid and not live.get("uid") and (live["rev"] is None or not live["text"]):
             live["uid"] = uid
-            live["item"] = _msg_item_id(uid)
+            if live["rev"] is None:
+                live["item"] = _msg_item_id(uid)
         if not live["text"]:
             live["at"] = self._next_at(live, event.get("at"))
         live["text"] += event["delta"]
@@ -315,6 +322,7 @@ class _Writer:
         if kind in ("turn.completed", "turn.failed"):
             live["ended"] = True
             live["on_finished"] = event.get("_on_finished")
+            live["on_committed"] = event.get("_on_committed")
             live["outcome"] = "stopped" if event.get("stopped") else kind.split(".")[1]
             return True
         return False
@@ -449,8 +457,10 @@ class _Writer:
                     "body": {"outcome": live.get("outcome") or "failed", "status": None}}
         rows += [{"cell_key": key, "role": "assistant", "state": "resolved"} for key in live["card_keys"]]
         rows.append(last)  # last, so every saved row is in Supabase before the apps settle the turn
+        committed: list[dict[str, Any]] = []
         for first in range(0, len(rows), 100):
-            _call(live, rows[first:first + 100])
+            committed.extend(_call(live, rows[first:first + 100]))
+        return committed
 
 
 def _call(live: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -467,7 +477,7 @@ _ENDED: collections.deque[str] = collections.deque(maxlen=256)  # refs already f
 
 
 def publish(session_id: str, ref: str, event: dict[str, Any], read_display: Callable[[], list[dict[str, Any]]],
-            secret: Callable[[str], str], *, on_finished=None) -> bool:
+            secret: Callable[[str], str], *, on_finished=None, on_committed=None) -> bool:
     """Hand one live event to the writer. Never blocks and never raises into the gateway."""
     global _WRITER
     try:
@@ -496,7 +506,8 @@ def publish(session_id: str, ref: str, event: dict[str, Any], read_display: Call
                                  "segs": [], "closing": [], "pushed_keys": set()}
             if event.get("type") == "turn.started":
                 return
-        _WRITER.events.put_nowait((ref, {**event, "_on_finished": on_finished} if on_finished else event))
+        extra = {k: v for k, v in (("_on_finished", on_finished), ("_on_committed", on_committed)) if v}
+        _WRITER.events.put_nowait((ref, {**event, **extra} if extra else event))
         return True
     except queue.Full:
         logger.warning("chat writer queue full; live piece dropped (the saved row still lands)")
