@@ -159,6 +159,18 @@ class TestEndpointConfig:
         assert openai_plugin._resolve_endpoint() == ("https://gw.example/v1", "image-token")
         (tmp_path / "config.yaml").write_text(yaml.safe_dump({"image_gen": {"openai": {"provider": "no-such"}}}))
         assert openai_plugin._resolve_endpoint() == ("", "")
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+            "providers": {"weave-gate-b": {
+                "base_url": "https://models-dev.harso.dev/v1",
+                "api_key": "no-key-required",
+                "key_cmd": "printf '{\"access_token\":\"minted-bot-tok\",\"expires_in\":300}'",
+            }},
+            "image_gen": {"openai": {"provider": "weave-gate-b", "model": "gpt-image-2.5-sunburst"}},
+        }))
+        assert openai_plugin.OpenAIImageGenProvider().is_available() is True
+        assert openai_plugin._resolve_endpoint() == ("https://models-dev.harso.dev/v1", "minted-bot-tok")
+        assert openai_plugin._resolve_model()[0] == "gpt-image-2.5-sunburst"
+        assert openai_plugin._resolve_model()[1]["quality"] == "auto"
 
     def test_custom_base_url_ignores_system_proxy(self, monkeypatch, tmp_path):
         """httpx only sees macOS system proxies via ``getproxies()`` (bound at import in
