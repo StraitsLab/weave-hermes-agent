@@ -755,7 +755,7 @@ def test_tool_status_flush_before_commentary_still_adopts_message_uid(server, mo
 def test_on_committed_fires_only_after_finish_succeeds(server, monkeypatch):
     """on_committed receives the committed item receipts only when _finish succeeds, while on_finished
     fires even on a failed write so the native awake lease is never held across retries."""
-    url, calls, _rows = server
+    url, _calls, _rows = server
     real = sync._call
     attempts = 0
 
