@@ -47,7 +47,10 @@ def _resolve_model() -> tuple[str, dict[str, Any]]:
         MODELS, DEFAULT_MODEL, env_var="OPENAI_IMAGE_MODEL", config_key="openai", passthrough=True)
 
 
-def _named_endpoint(name: str) -> tuple[str, str]:
+_KEY_CMD_SOURCES: dict[tuple[str, str], Any] = {}
+
+
+def _named_endpoint(name: str, *, materialize: bool = True) -> tuple[str, str]:
     """``(base_url, api_key)`` of the user-declared custom endpoint *name* (``providers:`` /
     ``custom_providers:``), so image generation reuses a chat endpoint's URL and credential without
     duplicating the key into OpenAI variables (#83080). Unknown name → ``("", "")`` with a warning."""
@@ -57,18 +60,37 @@ def _named_endpoint(name: str) -> tuple[str, str]:
     if not entry:
         logger.warning("image_gen.openai.provider %r matches no custom endpoint in providers:", name)
         return "", ""
+    base_url = str(entry.get("base_url") or "").strip().rstrip("/")
+    key_cmd = str(entry.get("key_cmd") or "").strip()
+    if key_cmd:
+        if not materialize:
+            return base_url, f"cmd:{key_cmd}"
+        from agent.command_token_source import build_command_token_provider, materialize_probe_api_key
+
+        cache_key = (os.environ.get("HERMES_HOME", ""), key_cmd)
+        source = _KEY_CMD_SOURCES.get(cache_key)
+        if source is None:
+            source = build_command_token_provider(key_cmd, str(entry.get("name") or name))
+            if source is not None:
+                _KEY_CMD_SOURCES[cache_key] = source
+        minted = materialize_probe_api_key(source) if source is not None else ""
+        if minted:
+            return base_url, minted
     key_env = str(entry.get("key_env") or "").strip()
-    api_key = str(entry.get("api_key") or "").strip() or (get_secret(key_env) if key_env else None) or ""
-    return str(entry.get("base_url") or "").strip().rstrip("/"), api_key
+    raw_key = str(entry.get("api_key") or "").strip()
+    if raw_key == "no-key-required":
+        raw_key = ""
+    api_key = raw_key or (get_secret(key_env) if key_env else None) or ""
+    return base_url, api_key
 
 
-def _resolve_endpoint() -> tuple[str, str]:
+def _resolve_endpoint(*, materialize: bool = True) -> tuple[str, str]:
     """``(base_url, api_key)`` — ``image_gen.openai.base_url`` → ``OPENAI_BASE_URL`` → ``""`` (SDK default);
     the env var named by ``image_gen.openai.key_env`` → ``OPENAI_API_KEY``. Only the var NAME lives in
     config.yaml; ``is_available()`` and ``generate()`` share this so they cannot disagree (#65309)."""
     cfg = load_image_gen_config("openai")
     named = str(cfg.get("provider") or "").strip()
-    named_base, named_key = _named_endpoint(named) if named else ("", "")
+    named_base, named_key = _named_endpoint(named, materialize=materialize) if named else ("", "")
     base_url = (str(cfg.get("base_url") or "").strip().rstrip("/") or named_base
                 or get_secret_str("OPENAI_BASE_URL").strip())
     key_env = str(cfg.get("key_env") or "").strip()
@@ -142,7 +164,7 @@ class OpenAIImageGenProvider(StaticImageGenProvider):
         key="OPENAI_API_KEY", prompt="OpenAI API key", url="https://platform.openai.com/api-keys")
 
     def is_available(self) -> bool:
-        return bool(_resolve_endpoint()[1]) and openai_importable()
+        return bool(_resolve_endpoint(materialize=False)[1]) and openai_importable()
 
     def capabilities(self) -> dict[str, Any]:
         # images.edit() accepts up to 16 source images.
