@@ -418,7 +418,8 @@ def quiet_writer(monkeypatch):
     import queue
 
     writer = sync._Writer.__new__(sync._Writer)
-    writer.live, writer.events = {}, queue.Queue()
+    writer.live, writer.events, writer.last_at_us = {}, queue.Queue(), {}
+    monkeypatch.setattr(sync, "_ENDED", sync.collections.deque())
     monkeypatch.setattr(sync, "_WRITER", writer)
     calls = []
 
@@ -553,6 +554,123 @@ def test_status_replacement_waits_for_saved_answer_when_no_text_streams(quiet_wr
     removed = [batch for batch in calls if any(row.get("state") == "removed" for row in batch)]
     assert len(removed) == 1
     assert removed[0][-1]["body"]["text"] == "Done."
+
+
+def test_saved_only_replies_with_equal_source_times_keep_message_order(quiet_writer):
+    writer, live, calls = quiet_writer
+    now = time.time()
+    live["messages"] = [{"role": "user", "content": "Hi", "timestamp": now,
+                         "platform_message_id": live["ref"]},
+                        {"role": "assistant", "content": "First", "timestamp": now + 1, "message_uid": "saved-first"},
+                        {"role": "assistant", "content": "Second", "timestamp": now + 1, "message_uid": "saved-second"}]
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._write(live["ref"], live)
+    stamps = [row["at"] for row in calls[-1]]
+    assert all(a < b for a, b in zip(stamps, stamps[1:])), stamps
+
+
+@pytest.mark.parametrize("existing_writer", [False, True])
+def test_separate_passive_calls_share_conversation_timestamp_floor(quiet_writer, monkeypatch, existing_writer):
+    writer, live, calls = quiet_writer
+    writer.live.clear()
+    if not existing_writer:
+        monkeypatch.setattr(sync, "_WRITER", None)
+    monkeypatch.setattr(sync.time, "time", lambda: 1760875200.123456)
+    sec = secrets("https://supabase.example")
+    for uid in ("passive-first", "passive-second"):
+        assert sync.publish_rows(live["session"], [{"role": "assistant", "content": uid, "message_uid": uid}], sec)
+    stamps = [row["at"] for batch in calls for row in batch]
+    assert stamps[0] < stamps[1], stamps
+
+
+def test_next_turn_shares_timestamp_floor_but_other_conversations_do_not(quiet_writer, monkeypatch):
+    writer, live, calls = quiet_writer
+    monkeypatch.setattr(sync.time, "time", lambda: 1760875200.123456)
+    ref = live["ref"]
+    writer._take(ref, {"type": "assistant.delta", "delta": "First"})
+    writer._flush(live)
+    first = calls[-1][-1]["at"]
+    writer._take(ref, {"type": "turn.completed"})
+    writer._write(ref, live)
+    for session, ref in ((live["session"], "next-floor-turn"), ("weave-other", "other-floor-turn")):
+        sync.publish(session, ref, {"type": "turn.started"}, list, secrets("https://supabase.example"))
+        writer._take(ref, {"type": "assistant.delta", "delta": ref})
+        writer._flush(writer.live[ref])
+    assert first < calls[-2][-1]["at"]
+    assert first == calls[-1][-1]["at"]
+
+
+@pytest.mark.parametrize("text_arrives", [False, True])
+def test_status_cleanup_recovers_after_final_retry_expiry(quiet_writer, monkeypatch, text_arrives):
+    writer, live, calls = quiet_writer
+    ref = live["ref"]
+    clock, finished, committed = [0.0], [], []
+    monkeypatch.setattr(sync.time, "monotonic", lambda: clock[0])
+    writer._take(ref, {"type": "tool.started", "tool_name": "browse"})
+    writer._flush(live)
+    writer._take(ref, {"type": "tool.completed"})
+    writer._flush(live)
+    status_id = writer._status_item_id(live)
+    assert calls[-1][0]["body"]["status"] == "Thinking"
+    if text_arrives:
+        writer._take(ref, {"type": "assistant.delta", "delta": "Done"})
+    writer._take(ref, {"type": "turn.completed", "_on_finished": lambda: finished.append(ref),
+                       "_on_committed": lambda items: committed.append(items)})
+    call = sync._call
+
+    def offline(*_):
+        raise TimeoutError("offline")
+
+    monkeypatch.setattr(sync, "_call", offline)
+    writer._write(ref, live)
+    assert finished == [ref] and not committed
+    clock[0] = sync.FINAL_RETRY_S + 1
+    writer._write(ref, live)
+    assert ref in writer.live, "the outstanding status retirement must not expire"
+    assert live.get("status_cleanup") and "messages" not in live and "read" not in live
+    assert finished == [ref] and not committed
+    clock[0] += sync.FINAL_BACKOFF_S + 1
+    writer._write(ref, live)  # cleanup itself can also fail; it must keep backing off
+    assert ref in writer.live and live["retry_at"] > clock[0]
+    monkeypatch.setattr(sync, "_call", call)
+    conn = {key: live[key] for key in ("url", "key", "bearer", "session")}
+    writer._take(ref, {"type": "out.rows", "_conn": conn,
+                       "rows": [{"role": "assistant", "body": {"text": "Late file"}}]})
+    assert calls[-1][-1]["body"]["text"] == "Late file"
+    clock[0] += sync.FINAL_BACKOFF_S + 1
+    writer._write(ref, live)
+    assert ref not in writer.live
+    status_writes = [row for batch in calls for row in batch if row.get("item_id") == status_id]
+    assert status_writes[-1]["state"] == "removed" and status_writes[-1]["body"]["status"] is None
+    assert finished == [ref] and not committed
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_failed_first_status_write_is_retired_after_queued_write(quiet_writer, monkeypatch, committed):
+    writer, live, calls = quiet_writer
+    ref = live["ref"]
+    status_id = writer._status_item_id(live)
+    call = sync._call
+
+    def timeout(conn, items):
+        if committed:
+            call(conn, items)  # the database committed but its acknowledgement was lost
+        raise TimeoutError("status write timed out")
+
+    monkeypatch.setattr(sync, "_call", timeout)
+    writer._take(ref, {"type": "tool.started", "tool_name": "browse"})
+    writer._write(ref, live)
+    monkeypatch.setattr(sync, "_call", call)
+    writer._take(ref, {"type": "assistant.delta", "delta": "Done", "message_uid": "retry-status-answer"})
+    writer._write(ref, live)
+    live["messages"] = [{"role": "assistant", "content": "Done", "message_uid": "retry-status-answer",
+                         "timestamp": time.time()}]
+    writer._take(ref, {"type": "turn.completed"})
+    writer._write(ref, live)
+    status_writes = [row for batch in calls for row in batch if row.get("item_id") == status_id]
+    assert status_writes[-1]["state"] == "removed", status_writes
+    assert status_writes[-1]["body"]["status"] is None
+    assert ref not in writer.live
 
 
 def test_show_tag_marks_a_reply_visible_and_leaves_the_tag_out():

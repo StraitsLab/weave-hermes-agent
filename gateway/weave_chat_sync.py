@@ -46,7 +46,7 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 FLUSH_S = 0.2  # live text cadence: Supabase bills each Broadcast, 5/s per reply
-FINAL_RETRY_S = 600  # bound retained turns during a sustained Supabase outage
+FINAL_RETRY_S = 600  # bound retained transcript data; status retirement keeps retrying
 FINAL_BACKOFF_S = 30
 CARD_TYPES = {"approval.request": "approval", "clarify.request": "clarify"}
 SCAFFOLDING = ("[System:", "[IMPORTANT: Background", "[Your active task list", "[OUT-OF-BAND",
@@ -148,6 +148,7 @@ class _Writer:
     def __init__(self) -> None:
         self.events: queue.Queue[tuple] = queue.Queue(maxsize=10_000)
         self.live: dict[str, dict[str, Any]] = {}
+        self.last_at_us: dict[str, int] = {}
         threading.Thread(target=self._run, name="weave-chat-writer", daemon=True).start()
 
     def _run(self) -> None:
@@ -167,12 +168,29 @@ class _Writer:
         now = time.monotonic()
         if ended and now >= live.get("retry_until", float("inf")):
             logger.error("chat writer: final write retries exhausted for %s", ref)
-            self.live.pop(ref, None)
-            _ENDED.append(ref)
-            return
+            status_id = self._status_item_id(live) if live.get("ref") else None
+            if live.get("status_open") or any(row.get("item_id") == status_id for row in live.get("closing", ())):
+                # Bound retained transcript data, but never abandon a possibly committed status row.
+                cleanup = {key: live[key] for key in ("url", "key", "bearer", "session", "ref")}
+                cleanup.update(ended=True, status_cleanup=True, retry_at=live.get("retry_at", 0),
+                               retry_delay=live.get("retry_delay", FINAL_BACKOFF_S),
+                               closing=[{"item_id": status_id, "role": "assistant", "kind": "text",
+                                         "state": "removed", "body": {"status": None},
+                                         "at": _iso(self._next_at(live))}])
+                live.clear()
+                live.update(cleanup)
+            else:
+                self.live.pop(ref, None)
+                _ENDED.append(ref)
+                return
         if now < live.get("retry_at", 0):
             return
         try:
+            if live.get("status_cleanup"):
+                _call(live, live["closing"])
+                self.live.pop(ref, None)
+                _ENDED.append(ref)
+                return
             if ended and "messages" not in live:
                 # Completion can admit another turn while we retry. Never adopt that turn's answer.
                 live["messages"] = live["read"]()
@@ -191,7 +209,8 @@ class _Writer:
             logger.warning("chat writer: write failed", exc_info=True)
             if ended:
                 now = time.monotonic()
-                live.setdefault("retry_until", now + FINAL_RETRY_S)
+                if not live.get("status_cleanup"):
+                    live.setdefault("retry_until", now + FINAL_RETRY_S)
                 delay = live.get("retry_delay", 1)
                 live["retry_at"] = now + delay
                 live["retry_delay"] = min(delay * 2, FINAL_BACKOFF_S)
@@ -202,12 +221,12 @@ class _Writer:
                 if callback:
                     callback()
 
-    @staticmethod
-    def _next_at(live: dict[str, Any], candidate: Optional[float] = None) -> float:
+    def _next_at(self, live: dict[str, Any], candidate: Optional[float] = None) -> float:
         raw = float(candidate) if isinstance(candidate, (int, float)) else time.time()
-        # Step in the same integer microsecond domain that _iso emits, not float seconds.
-        at_us = max(round(raw * 1_000_000), live.get("last_at_us", 0) + 1)
-        live["last_at_us"] = at_us
+        # Passive publishers and the writer thread share the conversation's microsecond floor.
+        with _LOCK:
+            at_us = max(round(raw * 1_000_000), self.last_at_us.get(live["session"], 0) + 1)
+            self.last_at_us[live["session"]] = at_us
         return at_us / 1_000_000
 
     @staticmethod
@@ -262,8 +281,7 @@ class _Writer:
             live["at"] = self._next_at(live, event.get("at"))
         live["text"] += event["delta"]
 
-    @staticmethod
-    def _stamp_rows(live: dict[str, Any], rows: Any) -> list[dict[str, Any]]:
+    def _stamp_rows(self, live: dict[str, Any], rows: Any) -> list[dict[str, Any]]:
         stamped = []
         for raw in rows or ():
             if not isinstance(raw, dict):
@@ -273,7 +291,7 @@ class _Writer:
             at_val = row.pop("_ts", None)
             if at_val is None and isinstance(row.get("at"), (int, float)):
                 at_val = float(row["at"])
-            row["at"] = _iso(_Writer._next_at(live, at_val))
+            row["at"] = _iso(self._next_at(live, at_val))
             stamped.append(row)
         return stamped
 
@@ -289,7 +307,7 @@ class _Writer:
     def _take(self, ref: str, event: dict[str, Any]) -> bool:
         live, kind = self.live.get(ref), event.get("type")
         if kind == "out.rows":
-            if live is not None:
+            if live is not None and not live.get("status_cleanup"):
                 self._take_out_rows(live, event.get("rows"))
             elif event.get("_conn"):
                 _call(event["_conn"], self._stamp_rows(event["_conn"], event.get("rows")))
@@ -359,7 +377,7 @@ class _Writer:
             self._flush_idle_status(live)
             return
         if live.pop("status_open", False):
-            live["closing"].insert(0, {"item_id": self._status_item_id(live), "role": "assistant", "kind": "text",
+            live["closing"].append({"item_id": self._status_item_id(live), "role": "assistant", "kind": "text",
                                        "state": "removed", "body": {"status": None}})
         if live["rev"] is not None and live.get("card_sent") is False:
             # A body-only write: the push trigger sends the whole body (card included) only when nothing is appended.
@@ -408,11 +426,12 @@ class _Writer:
                 and m["content"].strip() and not _is_browser_card(m)]
         pushed = live.get("pushed_keys") or set()
         for r in list(rows):
-            r.pop("_ts", None)
+            candidate = r.pop("_ts", None)
             if r.pop("_card", False) and r.get("cell_key") in pushed:
                 rows.remove(r)  # already written in causal order via out.rows
-            elif "at" not in r:
-                r["at"] = _iso(self._next_at(live))  # a saved row without a timestamp can be new
+            elif r["role"] == "assistant" or "at" not in r:
+                r["at"] = _iso(self._next_at(live, candidate))
+            # Timestamped user rows already exist in the app; retain their original place.
         said = [r for r in rows if r["role"] == "assistant"
                 and any(r["cell_key"] == row_key(m) for m in mine)]
         adopt = said[:-1] if live.get("outcome") == "completed" else said
@@ -518,7 +537,7 @@ def publish(session_id: str, ref: str, event: dict[str, Any], read_display: Call
             _WRITER.live[ref] = {"session": session_id, "ref": ref, "url": url, "key": key, "bearer": bearer, "started": time.time() - 1,
                                  "read": read_display, "item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}")),
                                  "status_item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}:status")),
-                                 "status_open": False, "uid": None, "at": None, "last_at_us": 0,
+                                 "status_open": False, "uid": None, "at": None,
                                  "text": "", "sent": 0, "rev": None, "status": None, "shown": None,
                                  "cards": [], "card_keys": [], "show_tag": show_tag, "show_over": show_over,
                                  "segs": [], "closing": [], "pushed_keys": set()}
@@ -540,6 +559,7 @@ def publish_rows(session_id: str, messages: list[dict[str, Any]], secret: Callab
     When a turn is active for ``session_id`` on ``_WRITER``, enqueue the rows onto that turn's
     writer queue so any buffered commentary text is flushed first and timestamps stay monotonic.
     """
+    global _WRITER
     try:
         url = (secret("WEAVE_CHAT_SUPABASE_URL") or "").rstrip("/")
         key, bearer = secret("WEAVE_CHAT_SUPABASE_KEY") or "", secret("WEAVE_API_MCP_BEARER") or ""
@@ -549,13 +569,14 @@ def publish_rows(session_id: str, messages: list[dict[str, Any]], secret: Callab
         if not rows:
             return True
         conn = {"url": url, "key": key, "bearer": bearer, "session": session_id}
-        if _WRITER is not None:
-            active_ref = next((ref for ref, live in list(_WRITER.live.items())
-                               if live.get("session") == session_id and not live.get("ended")), None)
-            if active_ref is not None:
-                _WRITER.events.put_nowait((active_ref, {"type": "out.rows", "rows": rows, "_conn": conn}))
-                return True
-        _call(conn, _Writer._stamp_rows(conn, rows))
+        with _LOCK:
+            _WRITER = _WRITER or _Writer()
+        active_ref = next((ref for ref, live in list(_WRITER.live.items())
+                           if live.get("session") == session_id and not live.get("ended")), None)
+        if active_ref is not None:
+            _WRITER.events.put_nowait((active_ref, {"type": "out.rows", "rows": rows, "_conn": conn}))
+            return True
+        _call(conn, _WRITER._stamp_rows(conn, rows))
         return True
     except Exception:
         logger.warning("chat rows copy failed", exc_info=True)
