@@ -124,6 +124,38 @@ async def _stream_events(adapter):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind,secret", [("vault_code", {"code": "synthetic-gateway-code"}),
+    ("vault_save_login", {"username": "test@example.com", "password": "synthetic-gateway-password"})])
+async def test_masked_answer_never_reaches_events_rows_or_logs(adapter, monkeypatch, caplog, kind, secret):
+    from gateway.platforms import api_server_harso_sessions as native
+    rows = []
+    monkeypatch.setattr(native.weave_chat_sync, "publish_rows", lambda *a, **kw: rows.extend(kw["raw_rows"]))
+    await adapter._on_native_submit_started(_event(), SESSION_KEY)
+    stream = await _stream_events(adapter)
+    thread, outcome = _start_gate(adapter, asyncio.get_running_loop(), lambda: ap.request_vault_secret(kind, "example.com"))
+    request_id = await _pending_request_id(adapter)
+    card = stream.get_nowait()
+    assert card["kind"] == kind
+    client = await _client(adapter)
+    try:
+        path = f"/api/sessions/{SESSION_ID}/submit/{REF}/approval/{request_id}"
+        rejected = await client.post(path, headers=HEADERS, json={"choice": "deny", "secret": secret})
+        assert rejected.status == 400
+        response = await client.post(path, headers=HEADERS, json={"choice": "once", "secret": secret})
+        assert response.status == 200
+        text = await response.text()
+        assert (await client.post(path, headers=HEADERS, json={"choice": "once", "secret": secret})).status == 409
+    finally:
+        await client.close()
+    await asyncio.to_thread(thread.join, 30)
+    assert outcome["result"] == secret
+    assert set(rows[0]["body"]) == {"state", "answered_at"}
+    persisted = str(rows) + str(card) + str(adapter._native_submit_events) + text + caplog.text
+    for value in secret.values():
+        assert value not in persisted
+
+
+@pytest.mark.asyncio
 async def test_attended_turn_raises_card_and_once_runs_the_action(adapter):
     await adapter._on_native_submit_started(_event(), SESSION_KEY)
     stream = await _stream_events(adapter)

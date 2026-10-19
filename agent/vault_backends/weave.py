@@ -99,7 +99,7 @@ class WeaveLoginBackend(LoginBackend):
     display_name = "Harso vault"
     prefix = "wv:"
     protects_all_values = True
-    can_save = False
+    can_save = True
     requires_origin = True
 
     def __init__(self, base_url: str, timeout_s: float = _DEFAULT_TIMEOUT_S):
@@ -131,6 +131,16 @@ class WeaveLoginBackend(LoginBackend):
         if isinstance(code, str) and code in refusals:
             raise VaultUseRefused(*refusals[code])
         raise VaultUnavailable(f"the Harso vault answered HTTP {response.status_code}")
+
+    def save_login(self, origin: str, label: str, username: str, password: str) -> VaultItemMeta:
+        # The server enforces the same exact-origin grammar and owner limits as Settings.
+        body = {"origin": origin, "label": label, "username": username, "password": password}
+        try:
+            return _meta(self._call("POST", "/v1/vault/runtime/items", body))
+        except Exception:
+            raise VaultUnavailable("The login could not be saved to the Harso vault") from None
+        finally:
+            body.clear()
 
     # -- metadata --------------------------------------------------------------------------------------------
 

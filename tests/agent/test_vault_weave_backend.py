@@ -49,7 +49,7 @@ def test_config_selects_only_weave_and_never_constructs_local(source):
     with patch("agent.vault_backends.local.LocalLoginBackend", side_effect=AssertionError("local store opened")):
         sources = base.enabled_backends()
     assert [b.name for b in sources] == ["weave"]
-    assert sources[0].can_save is False and sources[0].protects_all_values is True
+    assert sources[0].can_save is True and sources[0].protects_all_values is True
     assert base.backend_for_handle("vault_old") is None
 
 
@@ -204,12 +204,18 @@ def test_guard_failure_never_injects(source):
     supervisor.evaluate_runtime.assert_not_called()
 
 
-def test_harso_save_never_opens_prompt_or_local_store(source):
+def test_harso_save_uses_prompt_and_server_never_local_store(source):
     from tools.browser_vault_tool import browser_vault_save_login
-    with patch("agent.vault_backends.unlock.get_save_login_prompt_callback") as bridge:
+    backend, calls, answer = source
+    answer.clear(); answer.update(META)
+    with page(backend), patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+         patch("agent.vault_backends.unlock.get_save_login_prompt_callback", return_value=lambda *_: {"identifier": "user@example.com", "password": PASSWORD}), \
+         patch("agent.vault_store.get_vault_store", side_effect=AssertionError("local store opened")), \
+         patch("tools.browser_vault_tool.browser_vault_fill", return_value='{"success":true}') as fill:
         result = json.loads(browser_vault_save_login())
-    assert result["error_type"] == "save_in_app"
-    bridge.assert_not_called()
+    assert result["success"] and PASSWORD not in json.dumps(result)
+    assert json.loads(calls[-1].content) == {"origin": ORIGIN, "label": "site.example", "username": "user@example.com", "password": PASSWORD}
+    fill.assert_called_once_with(HANDLE, task_id="default")
 
 
 @pytest.mark.parametrize("kind", ["login", "totp", "address", "payment", "api_key"])
@@ -283,6 +289,35 @@ def test_standalone_totp_is_listed_and_enters_server_code(source, monkeypatch):
     assert json.loads(calls[-1].content)["action"] == "enter_otp"
     redact.assert_called_once_with("123456")
     supervisor.arm_vault.assert_called_once()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_prompted_code_failure_never_echoes_supervisor_secret(source, monkeypatch, caplog, raises):
+    from tools.browser_vault_tool import browser_vault_enter_code
+    backend, calls, _ = source
+    with page(backend) as (supervisor, _), \
+         patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+         patch("agent.vault_backends.unlock.get_code_prompt_callback", return_value=lambda *_: PASSWORD):
+        if raises:
+            supervisor.evaluate_runtime.side_effect = RuntimeError(PASSWORD)
+        else:
+            supervisor.evaluate_runtime.return_value = {"ok": False, "error": PASSWORD}
+        raw = browser_vault_enter_code()
+    assert PASSWORD not in raw + caplog.text
+    assert not calls
+    assert not json.loads(raw)["success"]
+
+
+def test_save_failure_never_echoes_or_opens_local_store(source, caplog):
+    from tools.browser_vault_tool import browser_vault_save_login
+    backend, _, _ = source
+    with page(backend), patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+         patch("agent.vault_backends.unlock.get_save_login_prompt_callback", return_value=lambda *_: {"identifier": "user@example.com", "password": PASSWORD}), \
+         patch("agent.vault_store.get_vault_store", side_effect=AssertionError("local store opened")), \
+         patch.object(backend, "save_login", side_effect=RuntimeError(PASSWORD)):
+        raw = browser_vault_save_login()
+    assert PASSWORD not in raw + caplog.text
+    assert json.loads(raw)["error_type"] == "save_failed"
 
 
 def test_harso_missing_code_keeps_prompt_unavailable(source):

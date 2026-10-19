@@ -1221,6 +1221,7 @@ class NativeSessionAPI:
             return redact_sensitive_text(str(approval.get(key) or ""), force=True)[:4096]
 
         return {
+            **({"kind": approval["kind"], "site": visible("site")} if approval.get("kind") in {"vault_code", "vault_save_login"} else {}),
             "request_id": str(approval.get("request_id") or "")[:256],
             "pattern_key": str(approval.get("pattern_key") or "")[:512],
             "description": visible("description"),
@@ -1303,7 +1304,7 @@ class NativeSessionAPI:
         if err:
             return err
         choice = body.get("choice")
-        if set(body) != {"choice"} or choice not in self._NATIVE_APPROVAL_CHOICES:
+        if set(body) - {"choice", "secret"} or choice not in self._NATIVE_APPROVAL_CHOICES:
             return web.json_response(_openai_error(
                 "Invalid approval choice; expected one of: once, deny",
                 code="invalid_native_approval_choice",
@@ -1316,8 +1317,21 @@ class NativeSessionAPI:
             return web.json_response(_openai_error("Native approval is not pending", code="native_approval_not_pending"), status=409)
         from tools.approval import resolve_gateway_approval
 
-        if not resolve_gateway_approval(session_key, choice, request_id=request_id):
+        pending = next((item for item in self._native_submit_pending_approvals(native_request_ref)
+                        if item["request_id"] == request_id), {})
+        from tools.approval import valid_vault_secret
+        secret = body.get("secret")
+        masked = pending.get("kind") in {"vault_code", "vault_save_login"}
+        if (("secret" in body and not valid_vault_secret(pending.get("kind"), choice, secret))
+                or (masked and choice == "once" and secret is None)):
+            return web.json_response(_openai_error("Invalid masked answer", code="invalid_native_approval_choice"), status=400)
+        if not resolve_gateway_approval(session_key, choice, request_id=request_id, secret=secret):
             return web.json_response(_openai_error("Native approval is not pending", code="native_approval_not_pending"), status=409)
+        if masked and weave_chat_sync is not None:
+            from datetime import UTC, datetime
+            weave_chat_sync.publish_rows(session_id, [], lambda name: _scoped_get_secret(name, "") or "", raw_rows=[{
+                "cell_key": "approval:" + request_id, "role": "assistant", "state": "resolved",
+                "body": {"state": "resolved", "answered_at": datetime.now(UTC).isoformat()}}])
         return web.json_response({"object": "hermes.session.approval.response", "resolved": True, "choice": choice})
 
     async def _on_native_submit_started(self, event: MessageEvent, session_key: str) -> None:

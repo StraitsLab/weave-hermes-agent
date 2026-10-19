@@ -136,10 +136,31 @@ def unregister_gateway_notify(session_key: str) -> None:
             entry.event.set()
 
 
+def valid_vault_secret(kind, choice, secret) -> bool:
+    fields = {"vault_code": {"code": 256}, "vault_save_login": {"username": 320, "password": 4096}}.get(kind)
+    return bool(fields and choice == "once" and isinstance(secret, dict) and set(secret) == set(fields)
+                and all(isinstance(secret[k], str) and 0 < len(secret[k]) <= limit and "\0" not in secret[k]
+                        for k, limit in fields.items()))
+
+
+def request_vault_secret(kind: str, site: str) -> Optional[dict]:
+    """Masked Harso prompt on the existing bounded approval channel; never an approval grant."""
+    from tools.approval_gateway_wait import _await_gateway_decision
+    session = approval_context.get_current_session_key()
+    with _lock:
+        notify = _gateway_notify_cbs.get(session)
+    if approval_context._no_user_can_answer() or not notify or kind not in {"vault_code", "vault_save_login"}:
+        return None
+    description = "Enter the code sent to you" if kind == "vault_code" else f"Save a login for {site}"
+    result = _await_gateway_decision(session, notify, {"kind": kind, "command": "browser_vault",
+        "description": description, "pattern_key": "", "site": site})
+    return result.pop("secret", None) if result.get("choice") == "once" else None
+
+
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None,
-                             request_id: Optional[str] = None) -> int:
+                             request_id: Optional[str] = None, secret: Optional[dict] = None) -> int:
     """Unblock waiting agent thread(s) from the gateway's /approve or /deny handler.
 
     *resolve_all* resolves every pending approval (``/approve all``); otherwise the oldest
@@ -150,6 +171,10 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
+        if secret is not None:
+            target = next((e for e in queue if e.data.get("request_id") == request_id), None)
+            if not target or not valid_vault_secret(target.data.get("kind"), choice, secret):
+                return 0
         if request_id:
             targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
             if not targets:
@@ -166,6 +191,7 @@ def resolve_gateway_approval(session_key: str, choice: str,
         # ``_drop_entry`` reads ``entry.result`` under this same lock after its deadline check, so a
         # choice acked to the client here can never be popped-and-lost as a timeout (#112548).
         for entry in targets:
+            entry.secret = dict(secret) if secret is not None else None
             entry.result = choice
             if reason:
                 entry.reason = reason
