@@ -419,6 +419,7 @@ def quiet_writer(monkeypatch):
 
     writer = sync._Writer.__new__(sync._Writer)
     writer.live, writer.events, writer.last_at_us = {}, queue.Queue(), {}
+    writer.floor_prune_at_us = 0
     monkeypatch.setattr(sync, "_ENDED", sync.collections.deque())
     monkeypatch.setattr(sync, "_WRITER", writer)
     calls = []
@@ -598,6 +599,61 @@ def test_next_turn_shares_timestamp_floor_but_other_conversations_do_not(quiet_w
         writer._flush(writer.live[ref])
     assert first < calls[-2][-1]["at"]
     assert first == calls[-1][-1]["at"]
+
+
+def test_inactive_conversation_timestamp_floors_expire_without_reordering(quiet_writer, monkeypatch):
+    writer, live, _calls = quiet_writer
+    clock = [1760875200.123456]
+    monkeypatch.setattr(sync.time, "time", lambda: clock[0])
+    for i in range(10_000):
+        writer._next_at({"session": f"weave-idle-{i}"})
+    previous = writer._next_at(live)
+    clock[0] += 24 * 60 * 60 + 1
+    writer._next_at({"session": "weave-new"})
+    assert len(writer.last_at_us) == 1
+    assert live["session"] not in writer.last_at_us
+    # Even delayed rows with old source timestamps sort after the evicted floor.
+    assert sync._iso(writer._next_at(live, previous - 10)) > sync._iso(previous)
+    assert len(writer.last_at_us) == 2
+
+
+@pytest.mark.parametrize("text_arrives", [False, True])
+def test_permanently_failed_status_cleanup_expires(quiet_writer, monkeypatch, caplog, text_arrives):
+    writer, live, _calls = quiet_writer
+    ref = live["ref"]
+    clock, attempts, finished, committed = [0.0], [], [], []
+    monkeypatch.setattr(sync.time, "monotonic", lambda: clock[0])
+    caplog.set_level("ERROR", logger=sync.__name__)
+    writer._take(ref, {"type": "tool.started", "tool_name": "browse"})
+    writer._flush(live)
+    if text_arrives:
+        writer._take(ref, {"type": "assistant.delta", "delta": "Done"})
+    writer._take(ref, {"type": "turn.completed", "_on_finished": lambda: finished.append(ref),
+                       "_on_committed": lambda items: committed.append(items)})
+
+    def offline(*_):
+        attempts.append(clock[0])
+        raise TimeoutError("permanently offline")
+
+    monkeypatch.setattr(sync, "_call", offline)
+    writer._write(ref, live)
+    clock[0] = sync.FINAL_RETRY_S
+    writer._write(ref, live)
+    assert live.get("status_cleanup") and "read" not in live and "messages" not in live
+    cleanup_start = clock[0]
+    for _ in range(100):
+        if ref not in writer.live:
+            break
+        clock[0] = min(live["retry_at"], cleanup_start + sync.FINAL_RETRY_S)
+        writer._write(ref, live)
+    assert ref not in writer.live, "permanent cleanup failure must release its credentials"
+    assert clock[0] == cleanup_start + sync.FINAL_RETRY_S
+    assert attempts[-1] < clock[0]  # deadline wins even if the next retry is due
+    assert list(sync._ENDED) == [ref]
+    assert finished == [ref] and not committed
+    errors = [record.message for record in caplog.records if record.levelname == "ERROR"]
+    assert sum("final write retries exhausted" in message for message in errors) == 1
+    assert sum("status cleanup retries exhausted" in message for message in errors) == 1
 
 
 @pytest.mark.parametrize("text_arrives", [False, True])

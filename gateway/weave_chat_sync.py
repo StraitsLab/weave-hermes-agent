@@ -46,8 +46,9 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 FLUSH_S = 0.2  # live text cadence: Supabase bills each Broadcast, 5/s per reply
-FINAL_RETRY_S = 600  # bound retained transcript data; status retirement keeps retrying
+FINAL_RETRY_S = 600  # bound each of the transcript and status-cleanup retry phases
 FINAL_BACKOFF_S = 30
+TIMESTAMP_FLOOR_S = 24 * 60 * 60
 CARD_TYPES = {"approval.request": "approval", "clarify.request": "clarify"}
 SCAFFOLDING = ("[System:", "[IMPORTANT: Background", "[Your active task list", "[OUT-OF-BAND",
                "[CONTEXT COMPACTION", "[ASYNC DELEGATION", "[Planning state preserved")
@@ -149,6 +150,7 @@ class _Writer:
         self.events: queue.Queue[tuple] = queue.Queue(maxsize=10_000)
         self.live: dict[str, dict[str, Any]] = {}
         self.last_at_us: dict[str, int] = {}
+        self.floor_prune_at_us = 0
         threading.Thread(target=self._run, name="weave-chat-writer", daemon=True).start()
 
     def _run(self) -> None:
@@ -167,12 +169,15 @@ class _Writer:
         ended = live.get("ended", False)
         now = time.monotonic()
         if ended and now >= live.get("retry_until", float("inf")):
-            logger.error("chat writer: final write retries exhausted for %s", ref)
+            phase = "status cleanup" if live.get("status_cleanup") else "final write"
+            logger.error("chat writer: %s retries exhausted for %s", phase, ref)
             status_id = self._status_item_id(live) if live.get("ref") else None
-            if live.get("status_open") or any(row.get("item_id") == status_id for row in live.get("closing", ())):
-                # Bound retained transcript data, but never abandon a possibly committed status row.
+            if not live.get("status_cleanup") and (live.get("status_open") or any(
+                    row.get("item_id") == status_id for row in live.get("closing", ()))):
+                # Shed transcript data while giving status retirement one bounded retry window.
                 cleanup = {key: live[key] for key in ("url", "key", "bearer", "session", "ref")}
-                cleanup.update(ended=True, status_cleanup=True, retry_at=live.get("retry_at", 0),
+                cleanup.update(ended=True, status_cleanup=True, retry_until=now + FINAL_RETRY_S,
+                               retry_at=live.get("retry_at", 0),
                                retry_delay=live.get("retry_delay", FINAL_BACKOFF_S),
                                closing=[{"item_id": status_id, "role": "assistant", "kind": "text",
                                          "state": "removed", "body": {"status": None},
@@ -209,8 +214,7 @@ class _Writer:
             logger.warning("chat writer: write failed", exc_info=True)
             if ended:
                 now = time.monotonic()
-                if not live.get("status_cleanup"):
-                    live.setdefault("retry_until", now + FINAL_RETRY_S)
+                live.setdefault("retry_until", now + FINAL_RETRY_S)
                 delay = live.get("retry_delay", 1)
                 live["retry_at"] = now + delay
                 live["retry_delay"] = min(delay * 2, FINAL_BACKOFF_S)
@@ -222,10 +226,17 @@ class _Writer:
                     callback()
 
     def _next_at(self, live: dict[str, Any], candidate: Optional[float] = None) -> float:
-        raw = float(candidate) if isinstance(candidate, (int, float)) else time.time()
+        now_us = round(time.time() * 1_000_000)
+        raw_us = round(float(candidate) * 1_000_000) if isinstance(candidate, (int, float)) else now_us
+        cutoff_us = now_us - TIMESTAMP_FLOOR_S * 1_000_000
         # Passive publishers and the writer thread share the conversation's microsecond floor.
         with _LOCK:
-            at_us = max(round(raw * 1_000_000), self.last_at_us.get(live["session"], 0) + 1)
+            if now_us >= self.floor_prune_at_us:
+                for session in [session for session, at in self.last_at_us.items() if at < cutoff_us]:
+                    del self.last_at_us[session]
+                self.floor_prune_at_us = now_us + 60 * 1_000_000
+            # A day exceeds clock ties/skew; clamping stale candidates above evicted floors preserves order.
+            at_us = max(raw_us, cutoff_us, self.last_at_us.get(live["session"], 0) + 1)
             self.last_at_us[live["session"]] = at_us
         return at_us / 1_000_000
 
