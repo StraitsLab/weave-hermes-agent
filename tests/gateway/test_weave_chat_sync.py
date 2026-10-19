@@ -1,4 +1,5 @@
 """WEV-3349: the cell writer streams a reply into Supabase chat_items and saves it as the same row."""
+import itertools
 import json
 import threading
 import time
@@ -409,6 +410,324 @@ def test_final_write_backoff_is_capped_and_expires_without_holding_live_turns(mo
     assert clock[0] == 600 and attempts[-1] < 600
     assert list(sync._ENDED) == ["ended"] and callbacks == ["done"]
     assert "final write retries exhausted" in caplog.text
+
+
+@pytest.fixture
+def quiet_writer(monkeypatch):
+    """Drive the real writer synchronously, recording each RPC batch."""
+    import copy
+    import queue
+
+    writer = sync._Writer.__new__(sync._Writer)
+    writer.live, writer.events, writer.last_at_us = {}, queue.Queue(), {}
+    writer.floor_prune_at_us = 0
+    monkeypatch.setattr(sync, "_ENDED", sync.collections.deque())
+    monkeypatch.setattr(sync, "_WRITER", writer)
+    calls = []
+
+    def call(_live, items):
+        calls.append(copy.deepcopy(items))
+        return [{"item_id": item.get("item_id"), "rev": 1} for item in items]
+
+    monkeypatch.setattr(sync, "_call", call)
+    sync.publish("weave-regression", "writer-regression", {"type": "turn.started"}, list,
+                 secrets("https://supabase.example"))
+    return writer, writer.live["writer-regression"], calls
+
+
+def test_same_clock_burst_has_strictly_increasing_formatted_timestamps(quiet_writer, monkeypatch):
+    writer, live, calls = quiet_writer
+    clock = 1760875200.123456
+    monkeypatch.setattr(sync.time, "time", lambda: clock)
+    for candidate in (clock, 1760875200.999999, clock - 100):
+        stamps = [sync._iso(writer._next_at(live, candidate)) for _ in range(100)]
+        assert all(a < b for a, b in itertools.pairwise(stamps))
+    writer._take_out_rows(live, [{"role": "assistant", "kind": "text", "state": "final",
+                                  "body": {"text": str(i)}} for i in range(6)])
+    writer._flush(live)
+    stamps = [row["at"] for row in calls[-1]]
+    assert all(a < b for a, b in itertools.pairwise(stamps))
+
+
+@pytest.mark.parametrize("queued_fallback", [False, True])
+def test_passive_insert_burst_has_ordered_timestamps_without_active_turn(quiet_writer, queued_fallback):
+    writer, live, calls = quiet_writer
+    writer.live.clear()
+    rows = [{"role": "assistant", "kind": "text", "state": "final", "body": {"text": str(i)}}
+            for i in range(6)]
+    if queued_fallback:
+        writer._take(live["ref"], {"type": "out.rows", "rows": rows, "_conn": live})
+    else:
+        assert sync.publish_rows(live["session"], [], secrets("https://supabase.example"), raw_rows=rows)
+    stamps = [row.get("at") for row in calls[-1]]
+    assert all(stamps), stamps
+    assert all(a < b for a, b in itertools.pairwise(stamps))
+
+
+def test_saved_rows_without_source_timestamps_get_ordered_insert_times(quiet_writer):
+    writer, live, calls = quiet_writer
+    live["messages"] = [{"role": "user", "content": "Hi", "platform_message_id": live["ref"]},
+                        {"role": "assistant", "content": "Hello"}]
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._finish(live)
+    stamps = [row.get("at") for row in calls[-1]]
+    assert all(stamps), stamps
+    assert all(a < b for a, b in itertools.pairwise(stamps))
+
+
+def test_new_status_and_terminal_rows_never_rely_on_database_now(quiet_writer):
+    writer, live, calls = quiet_writer
+    writer._take(live["ref"], {"type": "tool.started", "tool_name": "browse"})
+    writer._flush(live)
+    status = calls[-1][0]
+    assert status.get("at"), "a new status row must not use transaction now()"
+    writer._take(live["ref"], {"type": "turn.failed"})
+    writer._finish(live)
+    terminal = calls[-1][-1]
+    assert terminal.get("at") > status["at"], "a terminal row may be an insert without streamed text"
+
+
+@pytest.mark.parametrize("with_text", [False, True])
+@pytest.mark.parametrize("terminal", ["tool.completed", "tool.failed"])
+def test_status_survives_tool_gaps_until_answer_replaces_it(quiet_writer, with_text, terminal):
+    writer, live, calls = quiet_writer
+    ref = live["ref"]
+    if with_text:
+        writer._take(ref, {"type": "assistant.delta", "delta": "Checking.", "message_uid": "checking"})
+    writer._take(ref, {"type": "tool.started", "tool_name": "search"})
+    writer._flush(live)
+    count = len(calls)
+    writer._take(ref, {"type": terminal, "tool_name": "search"})
+    writer._flush(live)
+    gap = [row for batch in calls[count:] for row in batch]
+    assert not [row for row in gap if row.get("state") == "removed"
+                or ("status" in row.get("body", {}) and not row["body"]["status"])], gap
+    assert live["status"]
+    writer._take(ref, {"type": "tool.generating", "tool_name": "browse"})
+    writer._flush(live)
+    writer._take(ref, {"type": terminal, "tool_name": "browse"})
+    writer._flush(live)
+    assert live["status"]
+    count = len(calls)
+    writer._take(ref, {"type": "assistant.delta", "delta": "Done.", "message_uid": "done"})
+    writer._flush(live)
+    for batch in calls[count:]:
+        if any(row.get("state") == "removed" or row.get("body", {}).get("status", True) is None for row in batch):
+            assert any(row.get("append") == "Done." for row in batch), batch
+    live["messages"] = [{"role": "assistant", "content": "Done.", "message_uid": "done", "timestamp": time.time()}]
+    writer._take(ref, {"type": "turn.completed"})
+    writer._finish(live)
+    assert calls[-1][-1]["body"]["status"] is None
+
+
+def test_retracted_text_keeps_a_working_status_in_the_same_batch(quiet_writer):
+    writer, live, calls = quiet_writer
+    writer._take(live["ref"], {"type": "assistant.delta", "delta": "Partial", "message_uid": "partial"})
+    writer._flush(live)
+    writer._take(live["ref"], {"type": "assistant.retract", "message_uid": "partial"})
+    writer._flush(live)
+    assert any(row.get("state") == "writing" and row.get("body", {}).get("status") for row in calls[-1])
+
+
+def test_status_and_saved_answer_share_the_last_batch_even_for_large_turns(quiet_writer):
+    writer, live, calls = quiet_writer
+    writer._take(live["ref"], {"type": "tool.started", "tool_name": "browse"})
+    writer._flush(live)
+    now = time.time()
+    live["messages"] = [{"role": "assistant", "content": str(i), "timestamp": now + i} for i in range(100)]
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._finish(live)
+    removal = next(batch for batch in calls if any(row.get("state") == "removed" for row in batch))
+    assert any(row.get("body", {}).get("text") == "99" for row in removal)
+    assert all(len(batch) <= 100 for batch in calls)
+
+
+def test_status_replacement_waits_for_saved_answer_when_no_text_streams(quiet_writer):
+    writer, live, calls = quiet_writer
+    writer._take(live["ref"], {"type": "tool.started", "tool_name": "browse"})
+    writer._flush(live)
+    writer._take(live["ref"], {"type": "tool.completed"})
+    writer._flush(live)
+    assert not any(row.get("state") == "removed" for batch in calls for row in batch)
+    live["messages"] = [{"role": "assistant", "content": "Done.", "timestamp": time.time()}]
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._flush(live)
+    writer._finish(live)
+    removed = [batch for batch in calls if any(row.get("state") == "removed" for row in batch)]
+    assert len(removed) == 1
+    assert removed[0][-1]["body"]["text"] == "Done."
+
+
+def test_saved_only_replies_with_equal_source_times_keep_message_order(quiet_writer):
+    writer, live, calls = quiet_writer
+    now = time.time()
+    live["messages"] = [{"role": "user", "content": "Hi", "timestamp": now,
+                         "platform_message_id": live["ref"]},
+                        {"role": "assistant", "content": "First", "timestamp": now + 1, "message_uid": "saved-first"},
+                        {"role": "assistant", "content": "Second", "timestamp": now + 1, "message_uid": "saved-second"}]
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._write(live["ref"], live)
+    stamps = [row["at"] for row in calls[-1]]
+    assert all(a < b for a, b in itertools.pairwise(stamps)), stamps
+
+
+@pytest.mark.parametrize("existing_writer", [False, True])
+def test_separate_passive_calls_share_conversation_timestamp_floor(quiet_writer, monkeypatch, existing_writer):
+    writer, live, calls = quiet_writer
+    writer.live.clear()
+    if not existing_writer:
+        monkeypatch.setattr(sync, "_WRITER", None)
+    monkeypatch.setattr(sync.time, "time", lambda: 1760875200.123456)
+    sec = secrets("https://supabase.example")
+    for uid in ("passive-first", "passive-second"):
+        assert sync.publish_rows(live["session"], [{"role": "assistant", "content": uid, "message_uid": uid}], sec)
+    stamps = [row["at"] for batch in calls for row in batch]
+    assert stamps[0] < stamps[1], stamps
+
+
+def test_next_turn_shares_timestamp_floor_but_other_conversations_do_not(quiet_writer, monkeypatch):
+    writer, live, calls = quiet_writer
+    monkeypatch.setattr(sync.time, "time", lambda: 1760875200.123456)
+    ref = live["ref"]
+    writer._take(ref, {"type": "assistant.delta", "delta": "First"})
+    writer._flush(live)
+    first = calls[-1][-1]["at"]
+    writer._take(ref, {"type": "turn.completed"})
+    writer._write(ref, live)
+    for session, ref in ((live["session"], "next-floor-turn"), ("weave-other", "other-floor-turn")):
+        sync.publish(session, ref, {"type": "turn.started"}, list, secrets("https://supabase.example"))
+        writer._take(ref, {"type": "assistant.delta", "delta": ref})
+        writer._flush(writer.live[ref])
+    assert first < calls[-2][-1]["at"]
+    assert first == calls[-1][-1]["at"]
+
+
+def test_inactive_conversation_timestamp_floors_expire_without_reordering(quiet_writer, monkeypatch):
+    writer, live, _calls = quiet_writer
+    clock = [1760875200.123456]
+    monkeypatch.setattr(sync.time, "time", lambda: clock[0])
+    for i in range(10_000):
+        writer._next_at({"session": f"weave-idle-{i}"})
+    previous = writer._next_at(live)
+    clock[0] += 24 * 60 * 60 + 1
+    writer._next_at({"session": "weave-new"})
+    assert len(writer.last_at_us) == 1
+    assert live["session"] not in writer.last_at_us
+    # Even delayed rows with old source timestamps sort after the evicted floor.
+    assert sync._iso(writer._next_at(live, previous - 10)) > sync._iso(previous)
+    assert len(writer.last_at_us) == 2
+
+
+@pytest.mark.parametrize("text_arrives", [False, True])
+def test_permanently_failed_status_cleanup_expires(quiet_writer, monkeypatch, caplog, text_arrives):
+    writer, live, _calls = quiet_writer
+    ref = live["ref"]
+    clock, attempts, finished, committed = [0.0], [], [], []
+    monkeypatch.setattr(sync.time, "monotonic", lambda: clock[0])
+    caplog.set_level("ERROR", logger=sync.__name__)
+    writer._take(ref, {"type": "tool.started", "tool_name": "browse"})
+    writer._flush(live)
+    if text_arrives:
+        writer._take(ref, {"type": "assistant.delta", "delta": "Done"})
+    writer._take(ref, {"type": "turn.completed", "_on_finished": lambda: finished.append(ref),
+                       "_on_committed": lambda items: committed.append(items)})
+
+    def offline(*_):
+        attempts.append(clock[0])
+        raise TimeoutError("permanently offline")
+
+    monkeypatch.setattr(sync, "_call", offline)
+    writer._write(ref, live)
+    clock[0] = sync.FINAL_RETRY_S
+    writer._write(ref, live)
+    assert live.get("status_cleanup") and "read" not in live and "messages" not in live
+    cleanup_start = clock[0]
+    for _ in range(100):
+        if ref not in writer.live:
+            break
+        clock[0] = min(live["retry_at"], cleanup_start + sync.FINAL_RETRY_S)
+        writer._write(ref, live)
+    assert ref not in writer.live, "permanent cleanup failure must release its credentials"
+    assert clock[0] == cleanup_start + sync.FINAL_RETRY_S
+    assert attempts[-1] < clock[0]  # deadline wins even if the next retry is due
+    assert list(sync._ENDED) == [ref]
+    assert finished == [ref] and not committed
+    errors = [record.message for record in caplog.records if record.levelname == "ERROR"]
+    assert sum("final write retries exhausted" in message for message in errors) == 1
+    assert sum("status cleanup retries exhausted" in message for message in errors) == 1
+
+
+@pytest.mark.parametrize("text_arrives", [False, True])
+def test_status_cleanup_recovers_after_final_retry_expiry(quiet_writer, monkeypatch, text_arrives):
+    writer, live, calls = quiet_writer
+    ref = live["ref"]
+    clock, finished, committed = [0.0], [], []
+    monkeypatch.setattr(sync.time, "monotonic", lambda: clock[0])
+    writer._take(ref, {"type": "tool.started", "tool_name": "browse"})
+    writer._flush(live)
+    writer._take(ref, {"type": "tool.completed"})
+    writer._flush(live)
+    status_id = writer._status_item_id(live)
+    assert calls[-1][0]["body"]["status"] == "Thinking"
+    if text_arrives:
+        writer._take(ref, {"type": "assistant.delta", "delta": "Done"})
+    writer._take(ref, {"type": "turn.completed", "_on_finished": lambda: finished.append(ref),
+                       "_on_committed": lambda items: committed.append(items)})
+    call = sync._call
+
+    def offline(*_):
+        raise TimeoutError("offline")
+
+    monkeypatch.setattr(sync, "_call", offline)
+    writer._write(ref, live)
+    assert finished == [ref] and not committed
+    clock[0] = sync.FINAL_RETRY_S + 1
+    writer._write(ref, live)
+    assert ref in writer.live, "the outstanding status retirement must not expire"
+    assert live.get("status_cleanup") and "messages" not in live and "read" not in live
+    assert finished == [ref] and not committed
+    clock[0] += sync.FINAL_BACKOFF_S + 1
+    writer._write(ref, live)  # cleanup itself can also fail; it must keep backing off
+    assert ref in writer.live and live["retry_at"] > clock[0]
+    monkeypatch.setattr(sync, "_call", call)
+    conn = {key: live[key] for key in ("url", "key", "bearer", "session")}
+    writer._take(ref, {"type": "out.rows", "_conn": conn,
+                       "rows": [{"role": "assistant", "body": {"text": "Late file"}}]})
+    assert calls[-1][-1]["body"]["text"] == "Late file"
+    clock[0] += sync.FINAL_BACKOFF_S + 1
+    writer._write(ref, live)
+    assert ref not in writer.live
+    status_writes = [row for batch in calls for row in batch if row.get("item_id") == status_id]
+    assert status_writes[-1]["state"] == "removed" and status_writes[-1]["body"]["status"] is None
+    assert finished == [ref] and not committed
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_failed_first_status_write_is_retired_after_queued_write(quiet_writer, monkeypatch, committed):
+    writer, live, calls = quiet_writer
+    ref = live["ref"]
+    status_id = writer._status_item_id(live)
+    call = sync._call
+
+    def timeout(conn, items):
+        if committed:
+            call(conn, items)  # the database committed but its acknowledgement was lost
+        raise TimeoutError("status write timed out")
+
+    monkeypatch.setattr(sync, "_call", timeout)
+    writer._take(ref, {"type": "tool.started", "tool_name": "browse"})
+    writer._write(ref, live)
+    monkeypatch.setattr(sync, "_call", call)
+    writer._take(ref, {"type": "assistant.delta", "delta": "Done", "message_uid": "retry-status-answer"})
+    writer._write(ref, live)
+    live["messages"] = [{"role": "assistant", "content": "Done", "message_uid": "retry-status-answer",
+                         "timestamp": time.time()}]
+    writer._take(ref, {"type": "turn.completed"})
+    writer._write(ref, live)
+    status_writes = [row for batch in calls for row in batch if row.get("item_id") == status_id]
+    assert status_writes[-1]["state"] == "removed", status_writes
+    assert status_writes[-1]["body"]["status"] is None
+    assert ref not in writer.live
 
 
 def test_show_tag_marks_a_reply_visible_and_leaves_the_tag_out():
