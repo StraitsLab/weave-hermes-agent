@@ -411,6 +411,150 @@ def test_final_write_backoff_is_capped_and_expires_without_holding_live_turns(mo
     assert "final write retries exhausted" in caplog.text
 
 
+@pytest.fixture
+def quiet_writer(monkeypatch):
+    """Drive the real writer synchronously, recording each RPC batch."""
+    import copy
+    import queue
+
+    writer = sync._Writer.__new__(sync._Writer)
+    writer.live, writer.events = {}, queue.Queue()
+    monkeypatch.setattr(sync, "_WRITER", writer)
+    calls = []
+
+    def call(_live, items):
+        calls.append(copy.deepcopy(items))
+        return [{"item_id": item.get("item_id"), "rev": 1} for item in items]
+
+    monkeypatch.setattr(sync, "_call", call)
+    sync.publish("weave-regression", "writer-regression", {"type": "turn.started"}, list,
+                 secrets("https://supabase.example"))
+    return writer, writer.live["writer-regression"], calls
+
+
+def test_same_clock_burst_has_strictly_increasing_formatted_timestamps(quiet_writer, monkeypatch):
+    writer, live, calls = quiet_writer
+    clock = 1760875200.123456
+    monkeypatch.setattr(sync.time, "time", lambda: clock)
+    for candidate in (clock, 1760875200.999999, clock - 100):
+        stamps = [sync._iso(writer._next_at(live, candidate)) for _ in range(100)]
+        assert all(a < b for a, b in zip(stamps, stamps[1:]))
+    writer._take_out_rows(live, [{"role": "assistant", "kind": "text", "state": "final",
+                                  "body": {"text": str(i)}} for i in range(6)])
+    writer._flush(live)
+    stamps = [row["at"] for row in calls[-1]]
+    assert all(a < b for a, b in zip(stamps, stamps[1:]))
+
+
+@pytest.mark.parametrize("queued_fallback", [False, True])
+def test_passive_insert_burst_has_ordered_timestamps_without_active_turn(quiet_writer, queued_fallback):
+    writer, live, calls = quiet_writer
+    writer.live.clear()
+    rows = [{"role": "assistant", "kind": "text", "state": "final", "body": {"text": str(i)}}
+            for i in range(6)]
+    if queued_fallback:
+        writer._take(live["ref"], {"type": "out.rows", "rows": rows, "_conn": live})
+    else:
+        assert sync.publish_rows(live["session"], [], secrets("https://supabase.example"), raw_rows=rows)
+    stamps = [row.get("at") for row in calls[-1]]
+    assert all(stamps), stamps
+    assert all(a < b for a, b in zip(stamps, stamps[1:]))
+
+
+def test_saved_rows_without_source_timestamps_get_ordered_insert_times(quiet_writer):
+    writer, live, calls = quiet_writer
+    live["messages"] = [{"role": "user", "content": "Hi", "platform_message_id": live["ref"]},
+                        {"role": "assistant", "content": "Hello"}]
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._finish(live)
+    stamps = [row.get("at") for row in calls[-1]]
+    assert all(stamps), stamps
+    assert all(a < b for a, b in zip(stamps, stamps[1:]))
+
+
+def test_new_status_and_terminal_rows_never_rely_on_database_now(quiet_writer):
+    writer, live, calls = quiet_writer
+    writer._take(live["ref"], {"type": "tool.started", "tool_name": "browse"})
+    writer._flush(live)
+    status = calls[-1][0]
+    assert status.get("at"), "a new status row must not use transaction now()"
+    writer._take(live["ref"], {"type": "turn.failed"})
+    writer._finish(live)
+    terminal = calls[-1][-1]
+    assert terminal.get("at") > status["at"], "a terminal row may be an insert without streamed text"
+
+
+@pytest.mark.parametrize("with_text", [False, True])
+@pytest.mark.parametrize("terminal", ["tool.completed", "tool.failed"])
+def test_status_survives_tool_gaps_until_answer_replaces_it(quiet_writer, with_text, terminal):
+    writer, live, calls = quiet_writer
+    ref = live["ref"]
+    if with_text:
+        writer._take(ref, {"type": "assistant.delta", "delta": "Checking.", "message_uid": "checking"})
+    writer._take(ref, {"type": "tool.started", "tool_name": "search"})
+    writer._flush(live)
+    count = len(calls)
+    writer._take(ref, {"type": terminal, "tool_name": "search"})
+    writer._flush(live)
+    gap = [row for batch in calls[count:] for row in batch]
+    assert not [row for row in gap if row.get("state") == "removed"
+                or ("status" in row.get("body", {}) and not row["body"]["status"])], gap
+    assert live["status"]
+    writer._take(ref, {"type": "tool.generating", "tool_name": "browse"})
+    writer._flush(live)
+    writer._take(ref, {"type": terminal, "tool_name": "browse"})
+    writer._flush(live)
+    assert live["status"]
+    count = len(calls)
+    writer._take(ref, {"type": "assistant.delta", "delta": "Done.", "message_uid": "done"})
+    writer._flush(live)
+    for batch in calls[count:]:
+        if any(row.get("state") == "removed" or row.get("body", {}).get("status", True) is None for row in batch):
+            assert any(row.get("append") == "Done." for row in batch), batch
+    live["messages"] = [{"role": "assistant", "content": "Done.", "message_uid": "done", "timestamp": time.time()}]
+    writer._take(ref, {"type": "turn.completed"})
+    writer._finish(live)
+    assert calls[-1][-1]["body"]["status"] is None
+
+
+def test_retracted_text_keeps_a_working_status_in_the_same_batch(quiet_writer):
+    writer, live, calls = quiet_writer
+    writer._take(live["ref"], {"type": "assistant.delta", "delta": "Partial", "message_uid": "partial"})
+    writer._flush(live)
+    writer._take(live["ref"], {"type": "assistant.retract", "message_uid": "partial"})
+    writer._flush(live)
+    assert any(row.get("state") == "writing" and row.get("body", {}).get("status") for row in calls[-1])
+
+
+def test_status_and_saved_answer_share_the_last_batch_even_for_large_turns(quiet_writer):
+    writer, live, calls = quiet_writer
+    writer._take(live["ref"], {"type": "tool.started", "tool_name": "browse"})
+    writer._flush(live)
+    now = time.time()
+    live["messages"] = [{"role": "assistant", "content": str(i), "timestamp": now + i} for i in range(100)]
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._finish(live)
+    removal = next(batch for batch in calls if any(row.get("state") == "removed" for row in batch))
+    assert any(row.get("body", {}).get("text") == "99" for row in removal)
+    assert all(len(batch) <= 100 for batch in calls)
+
+
+def test_status_replacement_waits_for_saved_answer_when_no_text_streams(quiet_writer):
+    writer, live, calls = quiet_writer
+    writer._take(live["ref"], {"type": "tool.started", "tool_name": "browse"})
+    writer._flush(live)
+    writer._take(live["ref"], {"type": "tool.completed"})
+    writer._flush(live)
+    assert not any(row.get("state") == "removed" for batch in calls for row in batch)
+    live["messages"] = [{"role": "assistant", "content": "Done.", "timestamp": time.time()}]
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._flush(live)
+    writer._finish(live)
+    removed = [batch for batch in calls if any(row.get("state") == "removed" for row in batch)]
+    assert len(removed) == 1
+    assert removed[0][-1]["body"]["text"] == "Done."
+
+
 def test_show_tag_marks_a_reply_visible_and_leaves_the_tag_out():
     """DEC-415: the model decides what the screen shows on a call; the tag never reaches the row."""
     assert sync.visible_reply("[SHOW] Here is the table.") == ("Here is the table.", True)
