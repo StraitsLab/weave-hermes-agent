@@ -21,6 +21,8 @@ from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.platforms.api_server import (_openai_error, _api_request_profile,
     _sse_frame, CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS, redact_sensitive_text, _project_client_message)
 _NATIVE_SUBMIT_BUSY_MODES = {"queue", "steer", "interrupt"}
+_NATIVE_SUBMIT_ANSWERS = {"answered_approval", "answered_clarify"}
+_NATIVE_SUBMIT_REPLAYABLE = {"streaming", "queued", "steered"} | _NATIVE_SUBMIT_ANSWERS
 logger = logging.getLogger("gateway.platforms.api_server")
 
 class NativeSessionAPI:
@@ -585,6 +587,12 @@ class NativeSessionAPI:
         # (work results) are never a bare approval word.
         if self._native_submit_answers_approval(runner, entry.session_key, message):
             return "answered_approval"
+        # The same for a pending clarify: the running turn is blocked in the tool, so a steer would
+        # wait behind it and a queued turn would run after the call, answering a stale question.
+        if internal:
+            from gateway.platforms.api_server_harso_clarify import answer_pending_clarify
+            if answer_pending_clarify(self, entry.session_key, message):
+                return "answered_clarify"
         self._native_submit_ref_sessions[native_request_ref] = (
             _api_request_profile.get() or "default", session_id,
         )
@@ -773,7 +781,8 @@ class NativeSessionAPI:
                     _openai_error("external_request_id was reused with different input", code="native_submit_idempotency_conflict"), status=409
                 )
             native_request_ref = result["native_request_ref"]
-            if outcome == "identical_retry" and result.get("admission") in {"streaming", "queued", "steered"}:
+            if outcome == "identical_retry" and result.get("admission") in _NATIVE_SUBMIT_REPLAYABLE:
+                # A replay returns the first outcome; an answer is never applied to a later prompt.
                 admission = result["admission"]
             else:
                 owns_hold = False
@@ -797,18 +806,12 @@ class NativeSessionAPI:
                         self._release_native_awake(native_request_ref)
                         await asyncio.to_thread(db.remove_native_session_submit, external_request_id=external_request_id, native_request_ref=native_request_ref)
                         return web.json_response(_openai_error("Active turn changed", code="native_submit_target_changed"), status=409)
-                    if admission == "answered_approval":
-                        # DEC-415: the send answered the running turn's approval; no turn of its own, so the
+                    self._record_native_submit_handoff(native_request_ref, admission)
+                    if admission in _NATIVE_SUBMIT_ANSWERS:
+                        # DEC-415: the send answered the running turn's prompt; no turn of its own, so the
                         # running turn's hold keeps the Sprite awake and this ref owns nothing.
                         self._release_native_awake(native_request_ref)
-                        await asyncio.to_thread(db.set_native_session_submit_admission,
-                                                native_request_ref=native_request_ref, admission=admission)
-                        return web.json_response({"object": "hermes.session.admission", "session_id": session_id,
-                                                  "external_request_id": external_request_id, "admission": admission,
-                                                  "native_request_ref": native_request_ref}, status=202)
-                    # A positive admission is owned by execution, not this HTTP task.
-                    self._record_native_submit_handoff(native_request_ref, admission)
-                    if admission == "queued":
+                    elif admission == "queued":
                         self.__dict__.setdefault("_native_queued_submit_refs", set()).add(native_request_ref)
                     await asyncio.to_thread(
                         db.set_native_session_submit_admission,
