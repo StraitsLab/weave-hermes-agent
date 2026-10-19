@@ -1,4 +1,5 @@
 """WEV-3349: the cell writer streams a reply into Supabase chat_items and saves it as the same row."""
+import itertools
 import json
 import threading
 import time
@@ -440,12 +441,12 @@ def test_same_clock_burst_has_strictly_increasing_formatted_timestamps(quiet_wri
     monkeypatch.setattr(sync.time, "time", lambda: clock)
     for candidate in (clock, 1760875200.999999, clock - 100):
         stamps = [sync._iso(writer._next_at(live, candidate)) for _ in range(100)]
-        assert all(a < b for a, b in zip(stamps, stamps[1:]))
+        assert all(a < b for a, b in itertools.pairwise(stamps))
     writer._take_out_rows(live, [{"role": "assistant", "kind": "text", "state": "final",
                                   "body": {"text": str(i)}} for i in range(6)])
     writer._flush(live)
     stamps = [row["at"] for row in calls[-1]]
-    assert all(a < b for a, b in zip(stamps, stamps[1:]))
+    assert all(a < b for a, b in itertools.pairwise(stamps))
 
 
 @pytest.mark.parametrize("queued_fallback", [False, True])
@@ -460,7 +461,7 @@ def test_passive_insert_burst_has_ordered_timestamps_without_active_turn(quiet_w
         assert sync.publish_rows(live["session"], [], secrets("https://supabase.example"), raw_rows=rows)
     stamps = [row.get("at") for row in calls[-1]]
     assert all(stamps), stamps
-    assert all(a < b for a, b in zip(stamps, stamps[1:]))
+    assert all(a < b for a, b in itertools.pairwise(stamps))
 
 
 def test_saved_rows_without_source_timestamps_get_ordered_insert_times(quiet_writer):
@@ -471,7 +472,7 @@ def test_saved_rows_without_source_timestamps_get_ordered_insert_times(quiet_wri
     writer._finish(live)
     stamps = [row.get("at") for row in calls[-1]]
     assert all(stamps), stamps
-    assert all(a < b for a, b in zip(stamps, stamps[1:]))
+    assert all(a < b for a, b in itertools.pairwise(stamps))
 
 
 def test_new_status_and_terminal_rows_never_rely_on_database_now(quiet_writer):
@@ -567,7 +568,7 @@ def test_saved_only_replies_with_equal_source_times_keep_message_order(quiet_wri
     writer._take(live["ref"], {"type": "turn.completed"})
     writer._write(live["ref"], live)
     stamps = [row["at"] for row in calls[-1]]
-    assert all(a < b for a, b in zip(stamps, stamps[1:])), stamps
+    assert all(a < b for a, b in itertools.pairwise(stamps)), stamps
 
 
 @pytest.mark.parametrize("existing_writer", [False, True])
