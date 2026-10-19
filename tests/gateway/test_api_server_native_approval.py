@@ -59,7 +59,10 @@ def _event():
 
 
 async def _client(adapter):
+    from gateway.platforms.api_server import _vault_no_store
+
     app = web.Application()
+    app.on_response_prepare.append(_vault_no_store)
     app.router.add_get(
         "/api/sessions/{session_id}/submit/{native_request_ref}/approvals",
         adapter._handle_native_submit_approval_events,
@@ -144,7 +147,10 @@ async def test_masked_answer_never_reaches_events_rows_or_logs(adapter, monkeypa
         response = await client.post(path, headers=HEADERS, json={"choice": "once", "secret": secret})
         assert response.status == 200
         text = await response.text()
-        assert (await client.post(path, headers=HEADERS, json={"choice": "once", "secret": secret})).status == 409
+        replay = await client.post(path, headers=HEADERS, json={"choice": "once", "secret": secret})
+        assert replay.status == 409
+        for result in (rejected, response, replay):
+            assert result.headers.get("Cache-Control") == "no-store"
     finally:
         await client.close()
     await asyncio.to_thread(thread.join, 30)
@@ -153,6 +159,56 @@ async def test_masked_answer_never_reaches_events_rows_or_logs(adapter, monkeypa
     persisted = str(rows) + str(card) + str(adapter._native_submit_events) + text + caplog.text
     for value in secret.values():
         assert value not in persisted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["", "/p/default"])
+@pytest.mark.parametrize("failure,status", [
+    ("malformed", 400), ("validation", 400), ("unauthorized", 401),
+    ("denied", 403), ("missing", 404), ("stale", 409), ("native", 409),
+    ("unavailable", 503), ("unexpected", 500),
+])
+async def test_masked_answer_failure_responses_are_not_cacheable(adapter, monkeypatch, prefix, failure, status):
+    from gateway.platforms.api_server import _vault_no_store
+
+    async def fail_body(_request):
+        if failure == "unavailable":
+            raise web.HTTPServiceUnavailable()
+        raise RuntimeError("synthetic failure")
+
+    path = prefix + f"/api/sessions/{SESSION_ID}/submit/{REF}/approval/request"
+    app = web.Application()
+    app.on_response_prepare.append(_vault_no_store)
+    app.router.add_post(prefix + "/api/sessions/{session_id}/submit/{native_request_ref}/approval/{request_id}",
+                        adapter._handle_native_submit_approval_response)
+    headers = HEADERS
+    kwargs = {"json": {"choice": "once", "secret": {"code": "synthetic-code"}}}
+    if failure == "malformed":
+        kwargs = {"data": '{"secret":"synthetic-code'}
+    elif failure == "validation":
+        kwargs = {"json": {"choice": "invalid"}}
+    elif failure == "unauthorized":
+        headers = {}
+    elif failure == "denied":
+        monkeypatch.setattr(adapter, "_check_auth", lambda _: web.json_response({}, status=403))
+    elif failure == "missing":
+        adapter._native_submit_ref_sessions.clear()
+    elif failure == "native":
+        adapter._native_submit_approval_keys[REF] = SESSION_KEY
+        monkeypatch.setattr(adapter, "_native_submit_pending_approvals",
+                            lambda _: [{"request_id": "request", "kind": "vault_code"}])
+        monkeypatch.setattr(ap, "resolve_gateway_approval", lambda *a, **kw: False)
+    elif failure in {"unavailable", "unexpected"}:
+        monkeypatch.setattr(adapter, "_read_json_body", fail_body)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post(path, headers=headers, **kwargs)
+        assert response.status == status
+        assert response.headers.get("Cache-Control") == "no-store"
+        assert "synthetic-code" not in await response.text()
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

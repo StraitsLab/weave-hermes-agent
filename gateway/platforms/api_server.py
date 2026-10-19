@@ -807,6 +807,16 @@ _SECURITY_HEADERS = {
     "X-XSS-Protection": "0",
     "Referrer-Policy": "no-referrer"}
 
+async def _vault_no_store(request, response):
+    """Set custody headers at response preparation, including aiohttp-generated 5xx.
+
+    Match the path, not a parsed secret/card kind: auth and JSON failures happen
+    before the handler can identify a masked answer. Include profile mirrors.
+    """
+    if re.fullmatch(r"(?:/p/[^/]+)?/api/sessions/[^/]+/submit/[^/]+/approval/[^/]+/?", request.path):
+        response.headers["Cache-Control"] = "no-store"
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def cors_middleware(request, handler):
@@ -4478,6 +4488,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 self._make_profile_prefix_middleware(), cors_middleware, body_limit_middleware,
                 security_headers_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
+            self._app.on_response_prepare.append(_vault_no_store)
             assert self._app is not None
             # Native routes + multiplex /p/<profile>/ mirrors (the prefix middleware validates and
             # scopes config/credentials when multiplexing is on).
