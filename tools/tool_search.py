@@ -189,9 +189,14 @@ def classify_tools(tool_defs: list[dict[str, Any]], defer_tools: Optional[frozen
 
 
 def _deferrable_in(tool_defs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Deferrable subset of pre-assembly ``tool_defs`` under the read-only user config."""
+    """Discovery-eligible subset of the session's pre-assembly tool definitions.
+
+    ``always_eager`` pins schemas into the model's direct tool list; it must not
+    hide those same available tools from metadata reads. Session scope and
+    deferral eligibility still apply, so this does not expose other tools.
+    """
     config = load_config_readonly()
-    return classify_tools(tool_defs, config.effective_defer_tools, config.always_eager)[1]
+    return classify_tools(tool_defs, config.effective_defer_tools)[1]
 
 
 def estimate_tokens_from_schemas(tool_defs: Iterable[dict[str, Any]]) -> int:
