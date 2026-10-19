@@ -169,6 +169,24 @@ async def test_a_failed_answer_record_answers_nothing_so_a_retry_after_restart_i
 
 
 @pytest.mark.asyncio
+async def test_a_card_tap_during_the_record_keeps_the_spoken_yes_off_the_next_approval(native, monkeypatch):
+    """Re-review F3: the card denied the approval while the spoken "yes" was being recorded, and the
+    deferred "yes" then approved the next one. The answer is bound to the approval pending when it arrived."""
+    client, queued = native
+    first, second = _ApprovalEntry({"request_id": "first"}), _ApprovalEntry({"request_id": "second"})
+    approval._gateway_queues[KEY] = [first, second]
+    db = SessionDB.set_native_session_submit_admission
+
+    def tap_then_write(self, **kw):
+        approval.resolve_gateway_approval(KEY, "deny", request_id="first")  # the card wins the race
+        return db(self, **kw)
+    monkeypatch.setattr(SessionDB, "set_native_session_submit_admission", tap_then_write)
+    status, body = await _send(client, "r1", "yes")
+    assert (status, body["admission"]) == (202, "answered_approval")
+    assert (first.result, second.result, queued) == ("deny", None, [])
+
+
+@pytest.mark.asyncio
 async def test_skills_endpoint_reads_the_real_skill_catalog(tmp_path):
     """Regression: /v1/skills passed an argument _find_all_skills does not take, so every call
     was a 500 and the desktop kept a permanent workspace-setup banner."""

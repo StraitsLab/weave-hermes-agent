@@ -689,16 +689,18 @@ class NativeSessionAPI:
 
     @staticmethod
     def _native_submit_answers_approval(runner: Any, session_key: str, message: str) -> Optional[Callable[[], bool]]:
-        """A resolver that answers the blocking approval with ``message``, or None if it is no answer."""
-        from tools.approval import has_blocking_approval, resolve_gateway_approval
+        """A resolver that answers the blocking approval with ``message``, or None if it is no answer.
+        It answers only the approval pending now: if that one is settled first (a card tap), it does nothing."""
+        from tools.approval import has_blocking_approval, list_gateway_approvals, resolve_gateway_approval
         if not has_blocking_approval(session_key):
             return None
         match = runner._plaintext_approval_words().get((message or "").strip().lower().rstrip(".!"))
-        if match is None:
+        pending = list_gateway_approvals(session_key)
+        if match is None or not pending or not pending[0].get("request_id"):
             return None
         verb, args = match  # "always"/"session" words keep their choice, as /approve always does
-        choice = "deny" if verb == "deny" else args or "once"
-        return lambda: bool(resolve_gateway_approval(session_key, choice))
+        choice, request_id = "deny" if verb == "deny" else args or "once", pending[0]["request_id"]
+        return lambda: bool(resolve_gateway_approval(session_key, choice, request_id=request_id))
 
     @staticmethod
     def _native_submit_fingerprint(message: str, busy_mode: str, internal: bool = False) -> str:
