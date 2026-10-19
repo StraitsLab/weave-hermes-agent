@@ -13,7 +13,7 @@ import re
 import threading
 import uuid
 from contextlib import suppress, asynccontextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from aiohttp import web
 from gateway.config import Platform
 from gateway.session import SessionSource
@@ -583,16 +583,23 @@ class NativeSessionAPI:
             raise RuntimeError("native session binding was rejected")
         # DEC-415: a spoken "yes"/"no" on a call reaches the cell as the call's handoff (an internal submit).
         # While the agent waits on an approval it answers it, with the gateway's own approval words
-        # (run_busy._plaintext_approval_words). Only weave-api submits here; its other internal sends
-        # (work results) are never a bare approval word.
-        if self._native_submit_answers_approval(runner, entry.session_key, message):
-            return "answered_approval"
-        # The same for a pending clarify: the running turn is blocked in the tool, so a steer would
-        # wait behind it and a queued turn would run after the call, answering a stale question.
-        if internal:
-            from gateway.platforms.api_server_harso_clarify import answer_pending_clarify
-            if answer_pending_clarify(self, entry.session_key, message):
-                return "answered_clarify"
+        # (run_busy._plaintext_approval_words). A pending clarify is answered the same way: the running
+        # turn is blocked in the tool, so a steer would wait behind it and a queued turn would run after
+        # the call. Only weave-api submits here; its other internal sends are never caller replies.
+        answer = self._native_submit_answers_approval(runner, entry.session_key, message)
+        admission = "answered_approval"
+        if answer is None and internal:
+            from gateway.platforms.api_server_harso_clarify import pending_clarify_answer
+            answer, admission = pending_clarify_answer(self, entry.session_key, message), "answered_clarify"
+        if answer is not None:
+            # Record before resolving: if the write fails nothing was answered, and once it lands a
+            # retry replays it, so one request can never answer a second prompt. A prompt answered
+            # first by a card tap keeps that answer; the spoken reply is not run as a turn of its own.
+            db = await self._ensure_session_db_async()
+            await asyncio.to_thread(db.set_native_session_submit_admission,
+                                    native_request_ref=native_request_ref, admission=admission)
+            answer()
+            return admission
         self._native_submit_ref_sessions[native_request_ref] = (
             _api_request_profile.get() or "default", session_id,
         )
@@ -681,16 +688,17 @@ class NativeSessionAPI:
         return await self._wait_native_submit_start(native_request_ref, started)
 
     @staticmethod
-    def _native_submit_answers_approval(runner: Any, session_key: str, message: str) -> bool:
+    def _native_submit_answers_approval(runner: Any, session_key: str, message: str) -> Optional[Callable[[], bool]]:
+        """A resolver that answers the blocking approval with ``message``, or None if it is no answer."""
         from tools.approval import has_blocking_approval, resolve_gateway_approval
         if not has_blocking_approval(session_key):
-            return False
+            return None
         match = runner._plaintext_approval_words().get((message or "").strip().lower().rstrip(".!"))
         if match is None:
-            return False
+            return None
         verb, args = match  # "always"/"session" words keep their choice, as /approve always does
         choice = "deny" if verb == "deny" else args or "once"
-        return bool(resolve_gateway_approval(session_key, choice))
+        return lambda: bool(resolve_gateway_approval(session_key, choice))
 
     @staticmethod
     def _native_submit_fingerprint(message: str, busy_mode: str, internal: bool = False) -> str:

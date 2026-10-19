@@ -16,8 +16,8 @@ def test_a_bare_yes_answers_the_blocking_approval(monkeypatch):
     monkeypatch.setattr("tools.approval.resolve_gateway_approval",
                         lambda key, choice, **kw: resolved.append((key, choice)) or 1)
     answer = NativeSessionAPI._native_submit_answers_approval
-    assert answer(_runner(), "k1", "Yes.") is True
-    assert answer(_runner(), "k1", "no") is True
-    assert answer(_runner(), "k1", "yes but make it two") is False  # not a bare answer: a normal send
-    assert answer(_runner(), "k2", "yes") is False  # nothing pending: a conversational yes
+    assert answer(_runner(), "k1", "Yes.")()
+    assert answer(_runner(), "k1", "no")()
+    assert answer(_runner(), "k1", "yes but make it two") is None  # not a bare answer: a normal send
+    assert answer(_runner(), "k2", "yes") is None  # nothing pending: a conversational yes
     assert resolved == [("k1", "once"), ("k1", "deny")]

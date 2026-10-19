@@ -4,7 +4,6 @@ Regression for the 19 Oct 2026 call: the caller's follow-ups queued behind a cla
 could not read out, then ran as extra turns after hang-up.
 """
 import asyncio
-import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -30,31 +29,23 @@ CHOICES = ["Best route and destinations (Recommended)", "Business-class flights"
 @pytest.mark.parametrize("said, value", [
     ("Business-class flights", "Business-class flights"),
     ("business class flights.", "Business-class flights"),
-    ("Let's do the business class flights", "Business-class flights"),
+    ("Not business class flights; research trains instead.", "Not business class flights; research trains instead."),
     ("2", "Business-class flights"),
     ("two", "Business-class flights"),
     ("the second one", "Business-class flights"),
     ("Best route and destinations", "Best route and destinations (Recommended)"),
     ("Skip.", SKIPPED),
     ("Something else entirely, research trains", "Something else entirely, research trains"),
-    ("flights or hotels, whichever is quicker", "flights or hotels, whichever is quicker"),
+    ("Skip the hotels, do flights", "Skip the hotels, do flights"),
 ])
 def test_spoken_reply_names_a_choice_or_is_the_callers_own_answer(said, value):
-    assert spoken_answer(said, CHOICES, multi_select=False) == value
+    """A rejection or a redirect is never turned into the choice it names."""
+    assert spoken_answer(said, CHOICES) == value
 
 
-def test_spoken_multi_select_names_every_choice_it_mentions():
-    picked = spoken_answer("business class flights and luxury hotels and ryokans", CHOICES, multi_select=True)
-    assert json.loads(picked) == ["Business-class flights", "Luxury hotels and ryokans"]
-
-
-@pytest_asyncio.fixture
-async def native(tmp_path):
-    db = SessionDB(tmp_path / "state.db")
-    db.create_session(SESSION, "api_server")
+def _adapter(db, queued):
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "spoken-test"}))
     adapter._session_db = db
-    queued = []
     adapter.gateway_runner = SimpleNamespace(
         _running=True, _draining=False, _startup_restore_in_progress=False,
         async_session_store=SimpleNamespace(bind_existing_session=AsyncMock(
@@ -65,17 +56,29 @@ async def native(tmp_path):
         _plaintext_approval_words=GatewayBusySessionMixin()._plaintext_approval_words,
     )
     adapter._active_sessions[KEY] = asyncio.Event()
-    acquire, release = native_awake.acquire, native_awake.release
-    native_awake.acquire, native_awake.release = AsyncMock(), lambda ref: None
+    return adapter
+
+
+async def _serve(adapter):
     app = web.Application()
     app.router.add_post("/api/sessions/{session_id}/submit", adapter._handle_session_submit)
     client = TestClient(TestServer(app))
     await client.start_server()
+    return client
+
+
+@pytest_asyncio.fixture
+async def native(tmp_path, monkeypatch):
+    monkeypatch.setattr(native_awake, "acquire", AsyncMock())
+    monkeypatch.setattr(native_awake, "release", lambda ref: None)
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(SESSION, "api_server")
+    queued = []
+    client = await _serve(_adapter(db, queued))
     try:
         yield client, queued
     finally:
         await client.close()
-        native_awake.acquire, native_awake.release = acquire, release
         approval._gateway_queues.pop(KEY, None)
         clarify_gateway.clear_session(KEY)
         db.close()
@@ -124,6 +127,45 @@ async def test_with_nothing_pending_a_handoff_still_queues_its_own_turn(native):
     client, queued = native
     status, body = await _send(client, "w1", "Work result: done")
     assert (status, body["admission"], queued) == (202, "queued", ["Work result: done"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind, said", [("approval", "yes"), ("clarify", "two")])
+async def test_a_failed_answer_record_answers_nothing_so_a_retry_after_restart_is_safe(
+        tmp_path, monkeypatch, kind, said):
+    """Review F1: the answer was applied before its record was written; after a failed write and a
+    restart, the retry answered the next prompt. Record first, and a failed write answers nothing."""
+    monkeypatch.setattr(native_awake, "acquire", AsyncMock())
+    monkeypatch.setattr(native_awake, "release", lambda ref: None)
+    path, queued = tmp_path / "state.db", []
+    db = SessionDB(path)
+    db.create_session(SESSION, "api_server")
+    first = (_ApprovalEntry({"request_id": "a"}) if kind == "approval"
+             else clarify_gateway.register("c1", KEY, "Research first?", CHOICES))
+    if kind == "approval":
+        approval._gateway_queues[KEY] = [first]
+
+    def fail(**kw):
+        raise OSError("disk full")
+    monkeypatch.setattr(db, "set_native_session_submit_admission", fail)
+    client = await _serve(_adapter(db, queued))
+    try:
+        status, _ = await _send(client, "r1", said)
+        assert status == 503
+        assert (first.result if kind == "approval" else first.response) is None  # nothing was answered
+        await client.close()
+        db.close()
+        db = SessionDB(path)
+        client = await _serve(_adapter(db, queued))
+        status, body = await _send(client, "r1", said)  # the retry answers the prompt still waiting
+        assert (status, body["admission"]) == (202, f"answered_{kind}")
+        assert (first.result if kind == "approval" else first.response) == ("once" if kind == "approval" else CHOICES[1])
+        assert queued == []
+    finally:
+        await client.close()
+        approval._gateway_queues.pop(KEY, None)
+        clarify_gateway.clear_session(KEY)
+        db.close()
 
 
 @pytest.mark.asyncio
