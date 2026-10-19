@@ -58,6 +58,28 @@ def test_reported_beach_turn_replays_as_clear_failure_without_tool_output(quiet_
     assert "attachments" not in answer["body"]  # no image was actually made
 
 
+@pytest.mark.parametrize("absorbed_key", ["merged_into", "steered_into"])
+def test_absorbed_turn_without_saved_answer_retires_silently(quiet_writer, absorbed_key):
+    writer, live, calls = quiet_writer
+    ref = live["ref"]
+    live["messages"] = [
+        {"role": "user", "content": "Also make it a beach", "platform_message_id": ref},
+    ]
+    writer._take(ref, {"type": "tool.started", "tool_name": "image_generate"})
+    writer._flush(live)
+    writer._take(ref, {"type": "turn.completed", absorbed_key: "survivor-still-running"})
+    writer._write(ref, live)
+
+    final = calls[-1][-1]
+    assert final["state"] == "removed"
+    assert final["body"] == {"outcome": "completed", "status": None}
+    assert not any(row.get("body", {}).get("text") for batch in calls for row in batch
+                   if row.get("role") == "assistant")
+    assert any(row.get("state") == "removed" and row.get("item_id") == writer._status_item_id(live)
+               for row in calls[-1])
+    assert ref not in writer.live
+
+
 def test_non_sentinel_reply_is_unchanged():
     rows = sync.visible_rows([{"role": "assistant", "content": "The beach is empty."}])
     assert rows[0]["body"]["text"] == "The beach is empty."

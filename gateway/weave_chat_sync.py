@@ -367,6 +367,7 @@ class _Writer:
             live["on_finished"] = event.get("_on_finished")
             live["on_committed"] = event.get("_on_committed")
             live["outcome"] = "stopped" if event.get("stopped") else kind.split(".")[1]
+            live["absorbed_into"] = event.get("merged_into") or event.get("steered_into")
             return True
         return False
 
@@ -491,7 +492,7 @@ class _Writer:
             if live.get("card"):
                 answer["body"]["output"] = live["card"]
             last = answer
-        elif live.get("outcome") == "completed":
+        elif live.get("outcome") == "completed" and not live.get("absorbed_into"):
             from agent.turn_explainers import empty_response_explanation
             text, visible = visible_reply(empty_response_explanation(), live["show_tag"], live["show_over"])
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
