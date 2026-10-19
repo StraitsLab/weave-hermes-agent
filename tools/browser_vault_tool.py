@@ -545,7 +545,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, submit: bool 
             secret = {"password": _password_for_page(backend, handle, page_origin)}
             fills = select_login_fills(classified, secret["password"], meta.identifier or "")
         else:
-            secret = backend.resolve_secret(handle)
+            secret = (backend.resolve_secret(handle, origin=page_origin) if getattr(backend, "requires_origin", False)
+                      else backend.resolve_secret(handle))
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",
