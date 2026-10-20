@@ -158,16 +158,14 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
         supervisor.arm_vault()
     except Exception:  # health: allow BLE001 -- never write a secret into an unguarded document
         return {"success": False, "error_type": "vault_guard_required", "error": "Vault document guard unavailable"}
-    sup = supervisor.evaluate_runtime(expression)
+    try:
+        sup = supervisor.evaluate_runtime(expression)
+    except Exception:  # health: allow BLE001 -- runtime errors can embed the secret expression; return only a content-free failure
+        # Runtime failures may embed the evaluated expression, including the password/code.
+        return {"success": False, "error_type": "eval_failed", "error": "Vault fill failed"}
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
-    return {
-        "success": False,
-        "error_type": "supervisor_required"
-        if "supervisor" in str(sup.get("error") or "").lower()
-        else "eval_failed",
-        "error": str(sup.get("error") or "eval failed"),
-    }
+    return {"success": False, "error_type": "eval_failed", "error": "Vault fill failed"}
 
 
 def _parse_json_result(raw: Any) -> Any:
@@ -300,7 +298,8 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     from agent.vault_store import get_vault_store
 
     from agent.vault_backends import enabled_backends
-    if any(not getattr(b, "can_save", True) for b in enabled_backends()):
+    backends = enabled_backends()
+    if any(not getattr(b, "can_save", True) for b in backends):
         return json.dumps({"success": False, "error_type": "save_in_app",
                            "error": "Save the login in Harso Settings → Vault. Never send a password in chat."})
 
@@ -325,10 +324,16 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     identifier = str(answer["identifier"]).strip()
     id_type = "email" if "@" in identifier else ("phone" if identifier.lstrip("+").isdigit() else "username")
     try:
-        meta = get_vault_store().add_item("login", site, {"identifier_type": id_type, "identifier": identifier,
-                                                        "password": str(answer["password"])}, origin=origin)
-    except Exception as exc:
-        return json.dumps({"success": False, "error_type": "save_failed", "error": str(exc)[:200]})
+        remote = next((b for b in backends if b.name == "weave"), None)
+        if remote is not None:
+            from agent.redact import register_vault_redaction_value
+            register_vault_redaction_value(str(answer["password"]))
+            meta = remote.save_login(origin, site, identifier, str(answer["password"]))
+        else:
+            meta = get_vault_store().add_item("login", site, {"identifier_type": id_type, "identifier": identifier,
+                                                            "password": str(answer["password"])}, origin=origin)
+    except Exception:  # health: allow BLE001 -- storage errors can carry password payloads; suppress details and clear the answer below
+        return json.dumps({"success": False, "error_type": "save_failed", "error": "The login could not be saved."})
     finally:
         answer.clear()
     filled = json.loads(browser_vault_fill(meta.id, task_id=effective_task_id))
@@ -545,7 +550,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, submit: bool 
             secret = {"password": _password_for_page(backend, handle, page_origin)}
             fills = select_login_fills(classified, secret["password"], meta.identifier or "")
         else:
-            secret = backend.resolve_secret(handle)
+            secret = (backend.resolve_secret(handle, origin=page_origin) if getattr(backend, "requires_origin", False)
+                      else backend.resolve_secret(handle))
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",

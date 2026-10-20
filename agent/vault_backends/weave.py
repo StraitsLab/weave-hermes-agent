@@ -1,7 +1,7 @@
-"""Harso password source for native browser_vault; restored from 1030559b44^.
+"""Harso source for native browser_vault.
 
-Only cell login metadata, passwords and server-minted TOTP codes cross this seam.
-No cache, local save, address, payment, API key or retired Work presenter support.
+Only cell login/TOTP/address metadata and approved values cross this seam.
+No cache, local save, payment, API key or retired Work presenter support.
 The server binds native session/turn context and rechecks origin/grants/limits.
 """
 
@@ -11,7 +11,7 @@ import re
 from typing import Any, Optional
 
 from agent.vault_backends.base import LoginBackend, VaultUnavailable, VaultUseRefused
-from agent.vault_store import VaultItemMeta
+from agent.vault_store import ADDRESS_FIELDS, VaultItemMeta
 
 _DEFAULT_TIMEOUT_S = 10.0
 # Cell presenter shape (ledger_mcp.CONNECTOR_BEARER). A bearer that does not
@@ -19,7 +19,7 @@ _DEFAULT_TIMEOUT_S = 10.0
 _BEARER = re.compile(r"^wvc1_[A-Za-z0-9_-]{43}$")
 _REF = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 _HANDLE = re.compile(r"^wv:" + _REF.pattern[1:])
-_FILLABLE = ("login",)
+_FILLABLE = ("login", "totp", "address")
 
 # weave-api error code -> (tool error_type, what the model is told). Anything else is VaultUnavailable.
 _REFUSALS = {
@@ -77,7 +77,10 @@ def _card_gate(approval_ref: Any, tool: str, description: str, denied: str) -> s
 
 
 def _read_gate(approval_ref: Any, handle: str, action: str, origin: str) -> None:
-    _card_gate(approval_ref, "browser_vault", "Use the saved login on this site?", _DENIED)
+    description = {"fill_login": "Use the saved login on this site?",
+                   "enter_otp": "Enter the saved 2FA code on this site?",
+                   "fill_address": "Use the saved address on this site?"}[action]
+    _card_gate(approval_ref, "browser_vault", description, _DENIED)
 
 
 def _meta(raw: Any) -> VaultItemMeta:
@@ -96,7 +99,7 @@ class WeaveLoginBackend(LoginBackend):
     display_name = "Harso vault"
     prefix = "wv:"
     protects_all_values = True
-    can_save = False
+    can_save = True
     requires_origin = True
 
     def __init__(self, base_url: str, timeout_s: float = _DEFAULT_TIMEOUT_S):
@@ -128,6 +131,16 @@ class WeaveLoginBackend(LoginBackend):
         if isinstance(code, str) and code in refusals:
             raise VaultUseRefused(*refusals[code])
         raise VaultUnavailable(f"the Harso vault answered HTTP {response.status_code}")
+
+    def save_login(self, origin: str, label: str, username: str, password: str) -> VaultItemMeta:
+        # The server enforces the same exact-origin grammar and owner limits as Settings.
+        body = {"origin": origin, "label": label, "username": username, "password": password}
+        try:
+            return _meta(self._call("POST", "/v1/vault/runtime/items", body))
+        except Exception:  # health: allow BLE001 -- transport errors may contain the submitted password; never log or expose them
+            raise VaultUnavailable("The login could not be saved to the Harso vault") from None
+        finally:
+            body.clear()
 
     # -- metadata --------------------------------------------------------------------------------------------
 
@@ -169,6 +182,15 @@ class WeaveLoginBackend(LoginBackend):
     def resolve_password(self, handle: str, *, origin: Optional[str] = None) -> str:
         value = self._resolve(handle, "fill_login", origin, "password")
         if not isinstance(value, str):
+            raise VaultUnavailable("the Harso vault returned an invalid answer")
+        return value
+
+    def resolve_secret(self, handle: str, *, origin: Optional[str] = None) -> dict[str, str]:
+        """Resolve one approved address; no login, payment or key payload crosses this path."""
+        value = self._resolve(handle, "fill_address", origin, "address")
+        if not isinstance(value, dict) or any(
+            key not in ADDRESS_FIELDS or not isinstance(field, str) for key, field in value.items()
+        ):
             raise VaultUnavailable("the Harso vault returned an invalid answer")
         return value
 

@@ -24,7 +24,7 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("acknowledged", "cancelled", "data", "event", "reason", "result", "settle")
+    __slots__ = ("acknowledged", "cancelled", "data", "event", "reason", "result", "secret", "settle")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -34,6 +34,7 @@ class _ApprovalEntry:
         # Surface hook run once when the wait ends by ANY path (answer, timeout, interrupt, /approve from
         # another client): the tui_gateway withdraws its open server→client request through it.
         self.settle = None
+        self.secret = None  # masked answer: never part of data, hooks or a projection
         self.result: str | None = None  # "once"|"session"|"always"|"deny"
         # Free-text reason from ``/deny <reason>`` so the agent can adapt, not just hear "denied".
         self.reason: str | None = None
@@ -158,8 +159,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     with _approval._lock:
         leader = next((e for e in _approval._gateway_queues.get(session_key, [])
                        if e.data.get("command") == approval_data.get("command")
+                       and e.data.get("kind") == approval_data.get("kind")
                        and list(e.data.get("pattern_keys") or []) == keys), None)
-    if leader is not None and not preparing_terminal_approval():
+    if leader is not None and not approval_data.get("kind") and not preparing_terminal_approval():
         adopted = _await_coalesced_leader(session_key, leader, payload)
         if adopted is not None:
             return adopted
@@ -228,4 +230,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         resolved = state != "timeout" or choice is not None
         extra = {"cancelled": cancelled} if cancelled else {}
         human.outcome = _hook_choice(resolved, choice, extra)
-        return _finish(payload, resolved, choice, entry.reason, **extra)
+        result = _finish(payload, resolved, choice, entry.reason, **extra)
+        secret, entry.secret = entry.secret, None
+        if choice == "once" and approval_data.get("kind") in {"vault_code", "vault_save_login"}:
+            result["secret"] = secret
+        return result

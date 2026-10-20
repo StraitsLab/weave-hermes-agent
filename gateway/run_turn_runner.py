@@ -1698,6 +1698,20 @@ class TurnRunner:
         session_key = ctx.session_key or ""
         token = set_current_session_key(session_key)
         register_gateway_notify(session_key, self._approval_notify_sync)
+        from agent.vault_backends.unlock import set_code_prompt_callback, set_save_login_prompt_callback
+        from tools.approval import request_vault_secret
+        native_vault = getattr(ctx.source.platform, "value", "") == "api_server"
+        if native_vault:
+            # Only Harso's attended native stream has masked fields. No model text or unlock master password.
+            def code_prompt(site, hint):
+                return (request_vault_secret("vault_code", site) or {}).get("code", "")
+            def login_prompt(origin, site):
+                answer = request_vault_secret("vault_save_login", site)
+                if answer:
+                    answer["identifier"] = answer.pop("username")
+                return answer
+            set_code_prompt_callback(code_prompt)
+            set_save_login_prompt_callback(login_prompt)
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
@@ -1729,6 +1743,9 @@ class TurnRunner:
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                 return agent.run_conversation(api_message, **kwargs)
         finally:
+            if native_vault:
+                set_code_prompt_callback(None)
+                set_save_login_prompt_callback(None)
             unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.

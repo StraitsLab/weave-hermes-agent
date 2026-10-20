@@ -35,7 +35,9 @@ def source(monkeypatch):
         if request.method == "POST":
             return httpx.Response(200, json=answer)
         if request.url.path.endswith("/items"):
-            return httpx.Response(200, json={"items": [dict(META, password=PASSWORD), dict(META, kind="payment")]})
+            return httpx.Response(200, json={"items": [dict(META, password=PASSWORD)] + [
+                dict(META, id=HANDLE[:-1] + suffix, kind=kind)
+                for suffix, kind in zip("bcde", ("totp", "address", "payment", "api_key"))]})
         return httpx.Response(200, json=META)
 
     monkeypatch.setattr(httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(server), **kw))
@@ -47,14 +49,15 @@ def test_config_selects_only_weave_and_never_constructs_local(source):
     with patch("agent.vault_backends.local.LocalLoginBackend", side_effect=AssertionError("local store opened")):
         sources = base.enabled_backends()
     assert [b.name for b in sources] == ["weave"]
-    assert sources[0].can_save is False and sources[0].protects_all_values is True
+    assert sources[0].can_save is True and sources[0].protects_all_values is True
     assert base.backend_for_handle("vault_old") is None
 
 
 def test_list_metadata_and_resolve_exact_origin_over_cell_bearer(source):
     backend, calls, _ = source
     items = backend.list_items()
-    assert len(items) == 1 and PASSWORD not in json.dumps(items[0].to_dict())
+    assert [item.kind for item in items] == ["login", "totp", "address"]
+    assert PASSWORD not in json.dumps([item.to_dict() for item in items])
     assert backend.get_meta(HANDLE).allowed_origins == (ORIGIN,)
     assert backend.resolve_password(HANDLE, origin=ORIGIN) == PASSWORD
     request = calls[-1]
@@ -143,12 +146,13 @@ def test_otp_code_not_seed(source):
 
 
 @contextmanager
-def page(backend):
+def page(backend, controls=None):
     from tools import browser_vault_tool as tool
     supervisor = Mock()
     supervisor.evaluate_runtime.return_value = {"ok": True, "result": json.dumps({"filled": 1})}
-    controls = [{"name": "password", "type": "password", "index": 0, "autocomplete": "current-password"},
-                {"name": "code", "type": "text", "index": 1, "autocomplete": "one-time-code"}]
+    controls = controls if controls is not None else [
+        {"name": "password", "type": "password", "index": 0, "autocomplete": "current-password"},
+        {"name": "code", "type": "text", "index": 1, "autocomplete": "one-time-code"}]
     with patch("agent.vault_backends.backend_for_handle", return_value=backend), \
          patch.object(tool, "_ensure_supervisor", return_value=supervisor), \
          patch.object(tool, "_focus_bound_origin", return_value=None), \
@@ -200,9 +204,127 @@ def test_guard_failure_never_injects(source):
     supervisor.evaluate_runtime.assert_not_called()
 
 
-def test_harso_save_never_opens_prompt_or_local_store(source):
+def test_harso_save_uses_prompt_and_server_never_local_store(source):
     from tools.browser_vault_tool import browser_vault_save_login
-    with patch("agent.vault_backends.unlock.get_save_login_prompt_callback") as bridge:
+    backend, calls, answer = source
+    answer.clear(); answer.update(META)
+    with page(backend), patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+         patch("agent.vault_backends.unlock.get_save_login_prompt_callback", return_value=lambda *_: {"identifier": "user@example.com", "password": PASSWORD}), \
+         patch("agent.vault_store.get_vault_store", side_effect=AssertionError("local store opened")), \
+         patch("tools.browser_vault_tool.browser_vault_fill", return_value='{"success":true}') as fill:
         result = json.loads(browser_vault_save_login())
-    assert result["error_type"] == "save_in_app"
-    bridge.assert_not_called()
+    assert result["success"] and PASSWORD not in json.dumps(result)
+    assert json.loads(calls[-1].content) == {"origin": ORIGIN, "label": "site.example", "username": "user@example.com", "password": PASSWORD}
+    fill.assert_called_once_with(HANDLE, task_id="default")
+
+
+@pytest.mark.parametrize("kind", ["login", "totp", "address", "payment", "api_key"])
+def test_get_meta_exposes_only_native_fillable_kinds(source, monkeypatch, kind):
+    backend, _, _ = source
+    monkeypatch.setitem(META, "kind", kind)
+    meta = backend.get_meta(HANDLE)
+    assert (meta.kind if meta else None) == (kind if kind in ("login", "totp", "address") else None)
+
+
+ADDRESS = {"address_line1": "17 Example Road", "address_line2": "Unit 2", "city": "Example City",
+           "state": "CA", "postal_code": "90210", "country": "United States"}
+
+
+@pytest.mark.parametrize("settled", ["once", "always"])
+def test_address_uses_same_approval_and_exact_origin(source, monkeypatch, settled):
+    backend, calls, answer = source
+    answer.clear(); answer.update(decision="approval_required", approval_ref=CARD)
+    def approve(*args, **kwargs):
+        assert len(calls) == 1 and kwargs == {"rule_key": CARD}
+        assert args[1] == "Use the saved address on this site?"
+        answer.clear(); answer.update(decision=settled, action="fill_address", address=ADDRESS)
+        return {"approved": True}
+    monkeypatch.setattr("tools.approval.request_tool_approval", approve)
+    assert backend.resolve_secret(HANDLE, origin=ORIGIN) == ADDRESS
+    assert len(calls) == 2 and calls[0].content == calls[1].content
+    assert json.loads(calls[0].content) == dict(handle=HANDLE, action="fill_address", page_origin=ORIGIN,
+                                              session_id="session", run_id=RUN)
+
+
+@pytest.mark.parametrize("address", ["not-an-address", {"city": 123}, {"password": PASSWORD},
+                                     {"city": "Example", "otp_secret": "secret"}])
+def test_address_rejects_malformed_or_non_address_payload(source, address):
+    backend, _, answer = source
+    answer.clear(); answer.update(decision="once", action="fill_address", address=address)
+    with pytest.raises(VaultUnavailable):
+        backend.resolve_secret(HANDLE, origin=ORIGIN)
+
+
+def test_address_requires_origin_before_transport(source):
+    backend, calls, _ = source
+    with pytest.raises(VaultUseRefused) as refused:
+        backend.resolve_secret(HANDLE)
+    assert refused.value.error_type == "origin_required" and not calls
+
+
+def test_native_address_fill_passes_page_origin_and_arms_guard(source, monkeypatch):
+    from tools.browser_vault_tool import browser_vault_fill
+    backend, calls, answer = source
+    monkeypatch.setitem(META, "kind", "address")
+    answer.clear(); answer.update(decision="always", action="fill_address", address=ADDRESS)
+    controls = [{"name": "address", "type": "text", "index": 0, "autocomplete": "address-line1"}]
+    with page(backend, controls) as (supervisor, _):
+        raw = browser_vault_fill(HANDLE)
+    assert json.loads(raw)["success"] is True
+    assert ADDRESS["address_line1"] not in raw
+    assert ADDRESS["address_line1"] in supervisor.evaluate_runtime.call_args.args[0]
+    assert json.loads(calls[-1].content)["page_origin"] == ORIGIN
+    supervisor.arm_vault.assert_called_once()
+
+
+def test_standalone_totp_is_listed_and_enters_server_code(source, monkeypatch):
+    from tools.browser_vault_tool import browser_vault_enter_code
+    backend, calls, answer = source
+    monkeypatch.setitem(META, "kind", "totp")
+    assert backend.get_meta(HANDLE).kind == "totp"
+    answer.clear(); answer.update(decision="once", action="enter_otp", otp="123456")
+    with page(backend) as (supervisor, redact):
+        raw = browser_vault_enter_code(HANDLE)
+    assert json.loads(raw)["success"] is True and "123456" not in raw
+    assert json.loads(calls[-1].content)["action"] == "enter_otp"
+    redact.assert_called_once_with("123456")
+    supervisor.arm_vault.assert_called_once()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_prompted_code_failure_never_echoes_supervisor_secret(source, monkeypatch, caplog, raises):
+    from tools.browser_vault_tool import browser_vault_enter_code
+    backend, calls, _ = source
+    with page(backend) as (supervisor, _), \
+         patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+         patch("agent.vault_backends.unlock.get_code_prompt_callback", return_value=lambda *_: PASSWORD):
+        if raises:
+            supervisor.evaluate_runtime.side_effect = RuntimeError(PASSWORD)
+        else:
+            supervisor.evaluate_runtime.return_value = {"ok": False, "error": PASSWORD}
+        raw = browser_vault_enter_code()
+    assert PASSWORD not in raw + caplog.text
+    assert not calls
+    assert not json.loads(raw)["success"]
+
+
+def test_save_failure_never_echoes_or_opens_local_store(source, caplog):
+    from tools.browser_vault_tool import browser_vault_save_login
+    backend, _, _ = source
+    with page(backend), patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+         patch("agent.vault_backends.unlock.get_save_login_prompt_callback", return_value=lambda *_: {"identifier": "user@example.com", "password": PASSWORD}), \
+         patch("agent.vault_store.get_vault_store", side_effect=AssertionError("local store opened")), \
+         patch.object(backend, "save_login", side_effect=RuntimeError(PASSWORD)):
+        raw = browser_vault_save_login()
+    assert PASSWORD not in raw + caplog.text
+    assert json.loads(raw)["error_type"] == "save_failed"
+
+
+def test_harso_missing_code_keeps_prompt_unavailable(source):
+    from tools.browser_vault_tool import browser_vault_enter_code
+    backend, _, _ = source
+    with page(backend) as (supervisor, _), \
+         patch("agent.vault_backends.unlock.get_code_prompt_callback", return_value=None):
+        result = json.loads(browser_vault_enter_code())
+    assert result["error_type"] == "prompt_unavailable"
+    supervisor.evaluate_runtime.assert_not_called()

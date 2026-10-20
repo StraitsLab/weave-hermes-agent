@@ -164,4 +164,4 @@ def can_prompt_here() -> bool:
     from tools.approval_context import _no_user_can_answer
     if _no_user_can_answer():
         return False
-    return get_unlock_prompt_callback() is not None
+    return any((get_unlock_prompt_callback(), get_code_prompt_callback(), get_save_login_prompt_callback()))
