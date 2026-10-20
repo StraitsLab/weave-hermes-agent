@@ -160,7 +160,7 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
         return {"success": False, "error_type": "vault_guard_required", "error": "Vault document guard unavailable"}
     try:
         sup = supervisor.evaluate_runtime(expression)
-    except Exception:
+    except Exception:  # health: allow BLE001 -- runtime errors can embed the secret expression; return only a content-free failure
         # Runtime failures may embed the evaluated expression, including the password/code.
         return {"success": False, "error_type": "eval_failed", "error": "Vault fill failed"}
     if sup.get("ok"):
@@ -332,7 +332,7 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
         else:
             meta = get_vault_store().add_item("login", site, {"identifier_type": id_type, "identifier": identifier,
                                                             "password": str(answer["password"])}, origin=origin)
-    except Exception:
+    except Exception:  # health: allow BLE001 -- storage errors can carry password payloads; suppress details and clear the answer below
         return json.dumps({"success": False, "error_type": "save_failed", "error": "The login could not be saved."})
     finally:
         answer.clear()

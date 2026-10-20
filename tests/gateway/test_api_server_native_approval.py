@@ -181,25 +181,26 @@ async def test_masked_answer_failure_responses_are_not_cacheable(adapter, monkey
     app.on_response_prepare.append(_vault_no_store)
     app.router.add_post(prefix + "/api/sessions/{session_id}/submit/{native_request_ref}/approval/{request_id}",
                         adapter._handle_native_submit_approval_response)
-    headers = HEADERS
-    kwargs = {"json": {"choice": "once", "secret": {"code": "synthetic-code"}}}
-    if failure == "malformed":
-        kwargs = {"data": '{"secret":"synthetic-code'}
-    elif failure == "validation":
-        kwargs = {"json": {"choice": "invalid"}}
-    elif failure == "unauthorized":
-        headers = {}
-    elif failure == "denied":
-        monkeypatch.setattr(adapter, "_check_auth", lambda _: web.json_response({}, status=403))
-    elif failure == "missing":
-        adapter._native_submit_ref_sessions.clear()
-    elif failure == "native":
+    headers = {} if failure == "unauthorized" else HEADERS
+    kwargs = {
+        "malformed": {"data": '{"secret":"synthetic-code'},
+        "validation": {"json": {"choice": "invalid"}},
+    }.get(failure, {"json": {"choice": "once", "secret": {"code": "synthetic-code"}}})
+
+    def reject_native():
         adapter._native_submit_approval_keys[REF] = SESSION_KEY
         monkeypatch.setattr(adapter, "_native_submit_pending_approvals",
                             lambda _: [{"request_id": "request", "kind": "vault_code"}])
         monkeypatch.setattr(ap, "resolve_gateway_approval", lambda *a, **kw: False)
-    elif failure in {"unavailable", "unexpected"}:
-        monkeypatch.setattr(adapter, "_read_json_body", fail_body)
+
+    prepare = {
+        "denied": lambda: monkeypatch.setattr(adapter, "_check_auth", lambda _: web.json_response({}, status=403)),
+        "missing": adapter._native_submit_ref_sessions.clear,
+        "native": reject_native,
+        "unavailable": lambda: monkeypatch.setattr(adapter, "_read_json_body", fail_body),
+        "unexpected": lambda: monkeypatch.setattr(adapter, "_read_json_body", fail_body),
+    }
+    prepare.get(failure, lambda: None)()
     client = TestClient(TestServer(app))
     await client.start_server()
     try:

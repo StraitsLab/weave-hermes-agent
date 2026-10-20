@@ -137,7 +137,7 @@ class WeaveLoginBackend(LoginBackend):
         body = {"origin": origin, "label": label, "username": username, "password": password}
         try:
             return _meta(self._call("POST", "/v1/vault/runtime/items", body))
-        except Exception:
+        except Exception:  # health: allow BLE001 -- transport errors may contain the submitted password; never log or expose them
             raise VaultUnavailable("The login could not be saved to the Harso vault") from None
         finally:
             body.clear()
