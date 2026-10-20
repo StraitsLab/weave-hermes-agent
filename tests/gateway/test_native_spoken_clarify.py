@@ -129,6 +129,39 @@ async def test_with_nothing_pending_a_handoff_still_queues_its_own_turn(native):
     assert (status, body["admission"], queued) == (202, "queued", ["Work result: done"])
 
 
+NOTE = "[Live call] What follows is speech. Answer for the ear."
+
+
+@pytest.mark.asyncio
+async def test_a_new_spoken_request_carries_the_call_note(native, monkeypatch):
+    """DEC-415: the agent was never told a handoff is speech, so it answered with tables and links."""
+    monkeypatch.setenv("WEAVE_LIVE_HANDOFF_NOTE", NOTE)
+    client, queued = native
+    status, body = await _send(client, "n1", "best areas to stay in tokyo")
+    assert (status, body["admission"]) == (202, "queued")
+    assert queued == [NOTE + "\n\nbest areas to stay in tokyo"]
+
+
+@pytest.mark.asyncio
+async def test_a_spoken_answer_still_matches_its_choice_with_the_note_set(native, monkeypatch):
+    """The note goes on after the clarify match, so "the second one" still names a choice."""
+    monkeypatch.setenv("WEAVE_LIVE_HANDOFF_NOTE", NOTE)
+    client, queued = native
+    first = clarify_gateway.register("c1", KEY, "Research first?", CHOICES)
+    status, body = await _send(client, "n2", "the second one")
+    assert (status, body["admission"]) == (202, "answered_clarify")
+    assert first.response == "Business-class flights" and queued == []
+
+
+@pytest.mark.asyncio
+async def test_a_typed_message_never_carries_the_call_note(native, monkeypatch):
+    monkeypatch.setenv("WEAVE_LIVE_HANDOFF_NOTE", NOTE)
+    client, queued = native
+    response = await client.post(f"/api/sessions/{SESSION}/submit", headers=AUTH, json={
+        "kind": "hermes.session.submit", "external_request_id": "t1", "message": "typed words", "busy_mode": "queue"})
+    assert response.status == 202 and queued == ["typed words"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind, said", [("approval", "yes"), ("clarify", "two")])
 async def test_a_failed_answer_record_answers_nothing_so_a_retry_after_restart_is_safe(

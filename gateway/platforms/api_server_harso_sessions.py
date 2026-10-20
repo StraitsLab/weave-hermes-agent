@@ -23,6 +23,14 @@ from gateway.platforms.api_server import (_openai_error, _api_request_profile,
 _NATIVE_SUBMIT_BUSY_MODES = {"queue", "steer", "interrupt"}
 _NATIVE_SUBMIT_ANSWERS = {"answered_approval", "answered_clarify"}
 _NATIVE_SUBMIT_REPLAYABLE = {"streaming", "queued", "steered"} | _NATIVE_SUBMIT_ANSWERS
+
+
+def _live_handoff_message(message: str) -> str:
+    """DEC-415: a call's handoff, prefixed with WEAVE_LIVE_HANDOFF_NOTE so the agent knows its reply is heard,
+    not read. Unset or empty leaves the handoff as it was. Applied only after a pending approval or clarify
+    had its chance to match the caller's raw words."""
+    note = (_scoped_get_secret("WEAVE_LIVE_HANDOFF_NOTE", "") or "").strip()
+    return f"{note}\n\n{message}" if note else message
 logger = logging.getLogger("gateway.platforms.api_server")
 
 class NativeSessionAPI:
@@ -600,6 +608,8 @@ class NativeSessionAPI:
                                     native_request_ref=native_request_ref, admission=admission)
             answer()
             return admission
+        if internal:
+            message = _live_handoff_message(message)
         self._native_submit_ref_sessions[native_request_ref] = (
             _api_request_profile.get() or "default", session_id,
         )
