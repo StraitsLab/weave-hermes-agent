@@ -3,7 +3,9 @@ import pytest
 
 from agent.turn_explainers import empty_response_explanation
 from gateway import weave_chat_sync as sync
-from tests.gateway.test_weave_chat_sync import quiet_writer
+from tests.gateway.test_weave_chat_sync import quiet_writer as _quiet_writer
+
+quiet_writer = _quiet_writer
 
 
 @pytest.mark.parametrize("has_image", [False, True])
