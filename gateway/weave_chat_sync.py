@@ -135,6 +135,10 @@ def visible_rows(messages: list[dict[str, Any]], show_tag: str = "[SHOW]", show_
         uid = (m.get("message_uid") or m.get("_message_uid")) if (m["role"] == "assistant" and not is_card) else None
         body: dict[str, Any] = {"text": content}
         if m["role"] == "assistant":
+            if content.strip() == "(empty)":
+                # Internal replay sentinel, not an answer. Match the gateway's delivery copy.
+                from agent.turn_explainers import empty_response_explanation
+                content = empty_response_explanation()
             body["text"], body["visible"] = visible_reply(content, show_tag, show_over)
         out.append({"cell_key": row_key(m), "role": m["role"], "kind": "text", "state": "final",
                     "body": body,
@@ -363,6 +367,7 @@ class _Writer:
             live["on_finished"] = event.get("_on_finished")
             live["on_committed"] = event.get("_on_committed")
             live["outcome"] = "stopped" if event.get("stopped") else kind.split(".")[1]
+            live["absorbed_into"] = event.get("merged_into") or event.get("steered_into")
             return True
         return False
 
@@ -487,6 +492,12 @@ class _Writer:
             if live.get("card"):
                 answer["body"]["output"] = live["card"]
             last = answer
+        elif live.get("outcome") == "completed" and not live.get("absorbed_into"):
+            from agent.turn_explainers import empty_response_explanation
+            text, visible = visible_reply(empty_response_explanation(), live["show_tag"], live["show_over"])
+            last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
+                    "body": {"text": text, "visible": visible, "status": None,
+                             **({"output": live["card"]} if live.get("card") else {})}}
         elif live.get("outcome") == "stopped" and live["text"].strip():  # Stop keeps what was written (WEV-3464)
             text, visible = visible_reply(live["text"], live["show_tag"], live["show_over"])
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
