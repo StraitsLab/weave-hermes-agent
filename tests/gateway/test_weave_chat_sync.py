@@ -862,6 +862,18 @@ def test_finished_steps_cancelled_payload_live_and_replay(quiet_writer, payload_
     assert sync.visible_rows(messages)[-1]["body"]["steps"] == expected
 
 
+def test_finished_steps_domain_cancelled_status_is_a_completed_call():
+    order = json.dumps({"success": True, "status": "cancelled", "order_id": "order-17"})
+    messages = [
+        {"role": "user", "content": "Cancel my order"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "order", "function": {"name": "cancel_order"}}]},
+        {"role": "tool", "tool_call_id": "order", "content": order},
+        {"role": "assistant", "content": "Cancelled", "message_uid": "done"},
+    ]
+    assert sync.visible_rows(messages)[-1]["body"]["steps"] == [
+        {"id": "order", "name": "cancel_order", "state": "completed"}]
+
+
 def test_finished_steps_scaffolding_keeps_the_same_turn():
     messages = [{"role": "assistant", "content": "", "tool_calls": [{"id": "a", "function": {"name": "read_file"}}]},
                 {"role": "tool", "tool_call_id": "a", "content": "ok"}]

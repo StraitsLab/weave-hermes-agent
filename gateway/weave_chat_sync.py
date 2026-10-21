@@ -158,8 +158,9 @@ def _tool_step_state(name: str, content: Any) -> str:
         payload = json.loads(content) if isinstance(content, str) else content
     except ValueError:
         payload = None
-    if isinstance(payload, dict) and payload.get("status") == "cancelled":
-        return "started"
+    if isinstance(payload, dict) and set(payload) == {"error", "status"} and payload["status"] == "cancelled" \
+            and isinstance(payload["error"], str) and payload["error"].startswith("Tool execution cancelled."):
+        return "started"  # exactly the executor's KeyboardInterrupt envelope, never a tool's own status
     failed, _ = _detect_tool_failure(name, content)
     return "failed" if failed else "completed"
 
