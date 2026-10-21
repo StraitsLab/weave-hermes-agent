@@ -119,9 +119,108 @@ def _is_browser_card(message: dict[str, Any]) -> bool:
     return isinstance(card, dict) and card.get("kind") == "browser"
 
 
+def _record_step(steps: dict[str, dict[str, str]], call_id: Any, name: Any, state: str) -> bool:
+    """Only ID-bearing calls, never tool-generating previews or tool payloads."""
+    if not isinstance(call_id, str) or not call_id or len(call_id) > 256:
+        return False
+    if not isinstance(name, str) or not re.fullmatch(r"[\w.:-]{1,256}", name, flags=re.ASCII):
+        return False
+    if call_id not in steps and len(steps) >= 100:  # wire safety cap, shared with the app readers
+        return True
+    previous = steps.get(call_id)
+    if previous is None or state != "started":
+        steps[call_id] = {"id": call_id, "name": name, "state": state}
+    return False
+
+
+def _attach_steps(body: dict[str, Any], steps: list[dict[str, str]], truncated: bool = False) -> None:
+    if not steps and not truncated:
+        return
+    body["steps"] = steps[:100]
+    # chat_items bounds the entire body at 128 KiB, not just its text.
+    while body["steps"] and len(json.dumps(body).encode()) > 131_040:
+        body["steps"].pop()
+        truncated = True
+    if truncated or len(steps) > 100:
+        body["steps_truncated"] = True
+    if not body["steps"]:
+        body.pop("steps")
+
+
+def _tool_step_state(name: str, content: Any) -> str:
+    from agent.display import _detect_tool_failure
+    from agent.tool_executor import _ToolCancelledResult
+
+    # SQLite preserves the executor's cancellation text, not its str subclass.
+    if isinstance(content, _ToolCancelledResult) or (isinstance(content, str) and content.startswith("[Tool execution cancelled —")):
+        return "started"
+    try:
+        payload = json.loads(content) if isinstance(content, str) else content
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict) and set(payload) == {"error", "status"} and payload["status"] == "cancelled" \
+            and isinstance(payload["error"], str) and payload["error"].startswith("Tool execution cancelled."):
+        return "started"  # exactly the executor's KeyboardInterrupt envelope, never a tool's own status
+    failed, _ = _detect_tool_failure(name, content)
+    return "failed" if failed else "completed"
+
+
+def _finish_steps(body: dict[str, Any], live: dict[str, Any], messages: list[dict[str, Any]]) -> None:
+    # Durable call carriers preserve invocation order even if live completions arrive out of order.
+    steps = {step["id"]: dict(step) for step in body.get("steps", [])}
+    for call_id, step in live.get("steps", {}).items():
+        if call_id not in steps or step["state"] != "started":
+            steps[call_id] = dict(step)
+    results = {m.get("tool_call_id"): m.get("content") for m in messages if m.get("role") == "tool"}
+    for call_id, step in steps.items():
+        if call_id in results:
+            # Native completion events are binary and lose the executor cancellation marker.
+            step["state"] = _tool_step_state(step["name"], results[call_id])
+        elif live.get("outcome") == "stopped" and step["state"] == "completed":
+            step["state"] = "started"  # a stop without a durable result cannot prove completion
+    _attach_steps(body, list(steps.values()), live.get("steps_truncated", False) or body.get("steps_truncated", False))
+
+
+def _steps_turn_boundary(message: dict[str, Any]) -> bool:
+    from agent.prompt_builder import STEER_DISPLAY_KIND
+
+    kind, content = message.get("display_kind"), message.get("content")
+    if message.get("role") != "user" or kind in ("hidden", STEER_DISPLAY_KIND):
+        return False
+    # Internal admissions start real turns even when their text resembles scaffolding.
+    return kind == "internal_notification" or not (isinstance(content, str) and content.lstrip().startswith(SCAFFOLDING))
+
+
+def _saved_steps(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    steps: dict[str, dict[str, str]] = {}
+    answer, truncated = None, False
+    for message in [*messages, {"role": "user", "content": ""}]:
+        role, content = message.get("role"), message.get("content")
+        if _steps_turn_boundary(message):
+            if answer is not None:
+                body: dict[str, Any] = {}
+                _attach_steps(body, list(steps.values()), truncated)
+                out[row_key(answer)] = body
+            steps, answer, truncated = {}, None, False
+        elif role == "assistant":
+            for call in message.get("tool_calls") or ():
+                if isinstance(call, dict) and isinstance(call.get("function"), dict):
+                    truncated |= _record_step(steps, call.get("id"), call["function"].get("name"), "started")
+            if message.get("tool_calls"):
+                answer = None
+            elif isinstance(content, str) and content.strip() and not _is_browser_card(message) and message.get("display_kind") not in ("hidden", "internal_notification"):
+                answer = message
+        elif role == "tool" and message.get("tool_call_id") in steps:
+            step = steps[message["tool_call_id"]]
+            step["state"] = _tool_step_state(step["name"], content)
+    return out
+
+
 def visible_rows(messages: list[dict[str, Any]], show_tag: str = "[SHOW]", show_over: int = 400) -> list[dict[str, Any]]:
     """The rows a person sees: what they said and what the assistant answered (no tool channel)."""
     out = []
+    saved_steps = _saved_steps(messages)
     for m in messages:
         content = m.get("content")
         if m.get("role") not in ("user", "assistant") or m.get("display_kind") in ("hidden", "internal_notification"):
@@ -140,6 +239,8 @@ def visible_rows(messages: list[dict[str, Any]], show_tag: str = "[SHOW]", show_
                 from agent.turn_explainers import empty_response_explanation
                 content = empty_response_explanation()
             body["text"], body["visible"] = visible_reply(content, show_tag, show_over)
+            projection = saved_steps.get(row_key(m), {})
+            _attach_steps(body, projection.get("steps", []), projection.get("steps_truncated", False))
         out.append({"cell_key": row_key(m), "role": m["role"], "kind": "text", "state": "final",
                     "body": body,
                     **({"item_id": _msg_item_id(uid)} if isinstance(uid, str) and uid else {}),
@@ -329,6 +430,10 @@ class _Writer:
             return False
         if live is None or live.get("ended"):
             return False
+        if kind in ("tool.started", "tool.completed", "tool.failed"):
+            truncated = _record_step(live.setdefault("steps", {}), event.get("tool_call_id"),
+                                     event.get("tool_name"), kind.split(".")[1])
+            live["steps_truncated"] = live.get("steps_truncated", False) or truncated
         if kind == "assistant.delta" and isinstance(event.get("delta"), str):
             self._take_delta(live, event)
         elif kind == "assistant.retract":
@@ -506,6 +611,8 @@ class _Writer:
         else:  # no answer: hide any partial reply. Either way the live row tells the apps the turn ended.
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "removed",
                     "body": {"outcome": live.get("outcome") or "failed", "status": None}}
+        if last["state"] == "final" and not live.get("absorbed_into"):
+            _finish_steps(last["body"], live, turn)
         # Without a streamed row these terminal writes can insert, rather than update.
         if live["rev"] is None and "at" not in last:
             last["at"] = _iso(live.get("at") or self._next_at(live))

@@ -730,6 +730,183 @@ def test_failed_first_status_write_is_retired_after_queued_write(quiet_writer, m
     assert ref not in writer.live
 
 
+def test_finished_steps_are_turn_local_and_survive_replay(quiet_writer):
+    writer, live, calls = quiet_writer
+    messages = [
+        {"role": "user", "content": "check", "platform_message_id": live["ref"]},
+        {"role": "assistant", "content": "Checking", "message_uid": "comment", "tool_calls": [
+            {"id": "a", "function": {"name": "web_search", "arguments": "secret arguments"}},
+            {"id": "b", "function": {"name": "web_search", "arguments": "secret arguments"}}]},
+        {"role": "tool", "tool_call_id": "a", "tool_name": "web_search", "content": '{"results": []}'},
+        {"role": "tool", "tool_call_id": "b", "tool_name": "web_search", "content": '{"error": "secret failure"}'},
+        {"role": "assistant", "content": "Done", "message_uid": "answer"},
+    ]
+    expected = [{"id": "a", "name": "web_search", "state": "completed"},
+                {"id": "b", "name": "web_search", "state": "failed"}]
+    for call_id, state in (("a", "completed"), ("b", "failed")):
+        writer._take(live["ref"], {"type": "tool.started", "tool_call_id": call_id, "tool_name": "web_search"})
+        writer._take(live["ref"], {"type": "tool." + state, "tool_call_id": call_id, "tool_name": "web_search"})
+    live["messages"] = messages
+    writer._take(live["ref"], {"type": "assistant.delta", "delta": "Done", "message_uid": "answer"})
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._finish(live)
+    assert calls[-1][-1]["body"].get("steps") == expected
+    assert all("steps" not in row["body"] for row in calls[-1][:-1])
+    assert sync.visible_rows(messages)[-1]["body"]["steps"] == expected
+    assert sync.visible_rows(messages + [{"role": "user", "content": "hello"},
+                                        {"role": "assistant", "content": "Hi", "message_uid": "plain"}])[-1]["body"].get("steps") is None
+    assert "secret" not in json.dumps(calls)
+    writer._finish(live)
+    assert calls[-1][-1]["body"]["steps"] == expected
+
+
+def test_finished_steps_stop_compaction_and_bounds(quiet_writer):
+    writer, live, calls = quiet_writer
+    ref = live["ref"]
+    writer._take(ref, {"type": "tool.generating", "tool_name": "not_a_call"})
+    writer._take(ref, {"type": "tool.started", "tool_call_id": "open", "tool_name": "read_file"})
+    writer._take(ref, {"type": "assistant.delta", "delta": "Partial", "message_uid": "partial"})
+    writer._take(ref, {"type": "turn.failed", "stopped": True})
+    writer._finish(live)
+    assert calls[-1][-1]["body"]["steps"] == [{"id": "open", "name": "read_file", "state": "started"}]
+    call = {"role": "assistant", "content": "", "tool_calls": [{"id": "one", "function": {"name": "read_file"}}]}
+    result = {"role": "tool", "tool_call_id": "one", "content": "ok"}
+    answer = {"role": "assistant", "content": "Done", "message_uid": "done"}
+    hidden = {"role": "user", "content": "", "display_kind": "hidden"}
+    replay = sync.visible_rows([call, result, hidden, call, result, answer])
+    assert replay[-1]["body"]["steps"] == [{"id": "one", "name": "read_file", "state": "completed"}]
+    many = [{"id": str(i), "function": {"name": "read_file"}} for i in range(102)]
+    bounded = sync.visible_rows([{**call, "tool_calls": many}, answer])[-1]["body"]
+    assert len(bounded["steps"]) == 100 and bounded["steps_truncated"] is True
+    assert len(json.dumps(bounded).encode()) < 131_072
+    assert sync.visible_rows([call, {"role": "user", "content": "steer"}, answer])[-1]["body"].get("steps") is None
+
+
+@pytest.mark.parametrize("event_ids", [("before", "after"), ("after",), ("after", "before")])
+@pytest.mark.parametrize("steer_text", ["Use a different approach", "[OUT-OF-BAND user steer"])
+def test_finished_steps_steer_live_matches_replay_in_call_order(quiet_writer, steer_text, event_ids):
+    writer, live, calls = quiet_writer
+    messages = [{"role": "user", "content": "Check", "platform_message_id": live["ref"]}]
+    for call_id in ("before", "after"):
+        if call_id == "after":
+            # The display kind is authoritative even without the model-facing marker.
+            messages.append({"role": "user", "content": steer_text, "display_kind": "steer"})
+        messages.extend([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": call_id, "function": {"name": "read_file"}}]},
+            {"role": "tool", "tool_call_id": call_id, "content": "ok"},
+        ])
+    for call_id in event_ids:
+        writer._take(live["ref"], {"type": "tool.completed", "tool_call_id": call_id, "tool_name": "read_file"})
+    messages.append({"role": "assistant", "content": "Done", "message_uid": "steered"})
+    live["messages"] = messages
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._finish(live)
+    expected = [{"id": call_id, "name": "read_file", "state": "completed"} for call_id in ("before", "after")]
+    assert calls[-1][-1]["body"]["steps"] == expected
+    assert sync.visible_rows(messages)[-1]["body"]["steps"] == expected
+
+
+@pytest.mark.parametrize("plain_followup", [False, True])
+def test_finished_steps_internal_admission_splits_full_history(plain_followup):
+    first = [
+        {"role": "user", "content": "Check"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "a", "function": {"name": "read_file"}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "ok"},
+        {"role": "assistant", "content": "First", "message_uid": "first"},
+    ]
+    internal = [{"role": "user", "content": "[IMPORTANT: Background task finished]",
+                 "display_kind": "internal_notification"}]
+    if not plain_followup:
+        internal.extend([
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "b", "function": {"name": "read_file"}}]},
+            {"role": "tool", "tool_call_id": "b", "content": "ok"},
+        ])
+    internal.append({"role": "assistant", "content": "Second", "message_uid": "second"})
+    assert sync.visible_rows(first + internal) == sync.visible_rows(first) + sync.visible_rows(internal)
+    assert all(row["body"]["text"] != internal[0]["content"] for row in sync.visible_rows(first + internal))
+
+
+@pytest.mark.parametrize("payload_kind", ["marker", "durable", "skipped", "keyboard_interrupt"])
+def test_finished_steps_cancelled_payload_live_and_replay(quiet_writer, payload_kind):
+    from agent.tool_executor import _ToolCancelledResult
+
+    writer, live, calls = quiet_writer
+    cancelled = "[Tool execution cancelled — read_file was abandoned: user stop]"
+    payload = {
+        "marker": _ToolCancelledResult(cancelled),
+        "durable": cancelled,
+        "skipped": "[Tool execution cancelled — read_file was skipped. User sent a new message]",
+        "keyboard_interrupt": json.dumps({"error": "Tool execution cancelled. User stop", "status": "cancelled"}),
+    }[payload_kind]
+    messages = [
+        {"role": "user", "content": "Read", "platform_message_id": live["ref"]},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "done", "function": {"name": "read_file"}},
+            {"id": "cancelled", "function": {"name": "read_file"}}]},
+        {"role": "tool", "tool_call_id": "done", "content": "ok"},
+        {"role": "tool", "tool_call_id": "cancelled", "content": payload},
+        {"role": "assistant", "content": "Partial", "message_uid": "partial"},
+    ]
+    live["messages"] = messages
+    # The native binary classifier currently emits completed for the bracketed cancellation.
+    for call_id in ("done", "cancelled"):
+        writer._take(live["ref"], {"type": "tool.started", "tool_call_id": call_id, "tool_name": "read_file"})
+        writer._take(live["ref"], {"type": "tool.completed", "tool_call_id": call_id, "tool_name": "read_file"})
+    writer._take(live["ref"], {"type": "assistant.delta", "delta": "Partial", "message_uid": "partial"})
+    writer._take(live["ref"], {"type": "turn.failed", "stopped": True})
+    writer._finish(live)
+    expected = [{"id": "done", "name": "read_file", "state": "completed"},
+                {"id": "cancelled", "name": "read_file", "state": "started"}]
+    assert calls[-1][-1]["body"]["steps"] == expected
+    assert sync.visible_rows(messages)[-1]["body"]["steps"] == expected
+
+
+def test_finished_steps_domain_cancelled_status_is_a_completed_call():
+    order = json.dumps({"success": True, "status": "cancelled", "order_id": "order-17"})
+    messages = [
+        {"role": "user", "content": "Cancel my order"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "order", "function": {"name": "cancel_order"}}]},
+        {"role": "tool", "tool_call_id": "order", "content": order},
+        {"role": "assistant", "content": "Cancelled", "message_uid": "done"},
+    ]
+    assert sync.visible_rows(messages)[-1]["body"]["steps"] == [
+        {"id": "order", "name": "cancel_order", "state": "completed"}]
+
+
+def test_finished_steps_scaffolding_keeps_the_same_turn():
+    messages = [{"role": "assistant", "content": "", "tool_calls": [{"id": "a", "function": {"name": "read_file"}}]},
+                {"role": "tool", "tool_call_id": "a", "content": "ok"}]
+    messages.extend({"role": "user", "content": prefix + " context"} for prefix in sync.SCAFFOLDING)
+    messages.extend([{"role": "user", "content": "summary", "display_kind": "hidden"},
+                     {"role": "assistant", "content": "Done", "message_uid": "done"}])
+    assert sync.visible_rows(messages)[-1]["body"]["steps"] == [{"id": "a", "name": "read_file", "state": "completed"}]
+
+
+def test_finished_steps_rebuilt_from_compacted_sqlite_transcript(tmp_path):
+    from hermes_state import SessionDB
+    from gateway.platforms.api_server import _project_client_message
+
+    db = SessionDB(tmp_path / "steps.db")
+    try:
+        sid = db.create_session("steps", "api_server")
+        db.append_message(sid, "user", "Check")
+        db.append_message(sid, "assistant", "Checking", tool_calls=[
+            {"id": "one", "function": {"name": "read_file", "arguments": "private"}}])
+        db.append_message(sid, "tool", "ok", tool_call_id="one", tool_name="read_file")
+        db.append_message(sid, "assistant", "Done")
+        def replay():
+            return sync.visible_rows([_project_client_message(m) for m in db.get_messages(sid, include_compacted=True, include_ancestors=True)])
+        before = replay()
+        db.archive_and_compact(sid, [{"role": "user", "content": "summary", "display_kind": "hidden"}])
+        after = replay()
+        answer = next(row for row in after if row["body"].get("text") == "Done")
+        assert answer == before[-1]
+        assert answer["body"]["steps"] == [{"id": "one", "name": "read_file", "state": "completed"}]
+    finally:
+        db.close()
+
+
 def test_show_tag_marks_a_reply_visible_and_leaves_the_tag_out():
     """DEC-415: the model decides what the screen shows on a call; the tag never reaches the row."""
     assert sync.visible_reply("[SHOW] Here is the table.") == ("Here is the table.", True)
