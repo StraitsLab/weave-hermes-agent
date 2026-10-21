@@ -147,23 +147,56 @@ def _attach_steps(body: dict[str, Any], steps: list[dict[str, str]], truncated: 
         body.pop("steps")
 
 
-def _finish_steps(body: dict[str, Any], live: dict[str, Any]) -> None:
-    steps = {step["id"]: step for step in body.get("steps", [])}
+def _tool_step_state(name: str, content: Any) -> str:
+    from agent.display import _detect_tool_failure
+    from agent.tool_executor import _ToolCancelledResult
+
+    # SQLite preserves the executor's cancellation text, not its str subclass.
+    if isinstance(content, _ToolCancelledResult) or (isinstance(content, str) and content.startswith("[Tool execution cancelled —")):
+        return "started"
+    try:
+        payload = json.loads(content) if isinstance(content, str) else content
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict) and payload.get("status") == "cancelled":
+        return "started"
+    failed, _ = _detect_tool_failure(name, content)
+    return "failed" if failed else "completed"
+
+
+def _finish_steps(body: dict[str, Any], live: dict[str, Any], messages: list[dict[str, Any]]) -> None:
+    # Durable call carriers preserve invocation order even if live completions arrive out of order.
+    steps = {step["id"]: dict(step) for step in body.get("steps", [])}
     for call_id, step in live.get("steps", {}).items():
         if call_id not in steps or step["state"] != "started":
-            steps[call_id] = step
+            steps[call_id] = dict(step)
+    results = {m.get("tool_call_id"): m.get("content") for m in messages if m.get("role") == "tool"}
+    for call_id, step in steps.items():
+        if call_id in results:
+            # Native completion events are binary and lose the executor cancellation marker.
+            step["state"] = _tool_step_state(step["name"], results[call_id])
+        elif live.get("outcome") == "stopped" and step["state"] == "completed":
+            step["state"] = "started"  # a stop without a durable result cannot prove completion
     _attach_steps(body, list(steps.values()), live.get("steps_truncated", False) or body.get("steps_truncated", False))
 
 
-def _saved_steps(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    from agent.display import _detect_tool_failure
+def _steps_turn_boundary(message: dict[str, Any]) -> bool:
+    from agent.prompt_builder import STEER_DISPLAY_KIND
 
+    kind, content = message.get("display_kind"), message.get("content")
+    if message.get("role") != "user" or kind in ("hidden", STEER_DISPLAY_KIND):
+        return False
+    # Internal admissions start real turns even when their text resembles scaffolding.
+    return kind == "internal_notification" or not (isinstance(content, str) and content.lstrip().startswith(SCAFFOLDING))
+
+
+def _saved_steps(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     steps: dict[str, dict[str, str]] = {}
     answer, truncated = None, False
     for message in [*messages, {"role": "user", "content": ""}]:
         role, content = message.get("role"), message.get("content")
-        if role == "user" and message.get("display_kind") not in ("hidden", "internal_notification") and not (isinstance(content, str) and content.lstrip().startswith(SCAFFOLDING)):
+        if _steps_turn_boundary(message):
             if answer is not None:
                 body: dict[str, Any] = {}
                 _attach_steps(body, list(steps.values()), truncated)
@@ -179,8 +212,7 @@ def _saved_steps(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
                 answer = message
         elif role == "tool" and message.get("tool_call_id") in steps:
             step = steps[message["tool_call_id"]]
-            failed, _ = _detect_tool_failure(step["name"], content)
-            step["state"] = "failed" if failed else "completed"
+            step["state"] = _tool_step_state(step["name"], content)
     return out
 
 
@@ -579,7 +611,7 @@ class _Writer:
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "removed",
                     "body": {"outcome": live.get("outcome") or "failed", "status": None}}
         if last["state"] == "final" and not live.get("absorbed_into"):
-            _finish_steps(last["body"], live)
+            _finish_steps(last["body"], live, turn)
         # Without a streamed row these terminal writes can insert, rather than update.
         if live["rev"] is None and "at" not in last:
             last["at"] = _iso(live.get("at") or self._next_at(live))

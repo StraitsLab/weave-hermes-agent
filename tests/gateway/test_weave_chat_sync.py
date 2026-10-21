@@ -782,6 +782,95 @@ def test_finished_steps_stop_compaction_and_bounds(quiet_writer):
     assert sync.visible_rows([call, {"role": "user", "content": "steer"}, answer])[-1]["body"].get("steps") is None
 
 
+@pytest.mark.parametrize("event_ids", [("before", "after"), ("after",), ("after", "before")])
+@pytest.mark.parametrize("steer_text", ["Use a different approach", "[OUT-OF-BAND user steer"])
+def test_finished_steps_steer_live_matches_replay_in_call_order(quiet_writer, steer_text, event_ids):
+    writer, live, calls = quiet_writer
+    messages = [{"role": "user", "content": "Check", "platform_message_id": live["ref"]}]
+    for call_id in ("before", "after"):
+        if call_id == "after":
+            # The display kind is authoritative even without the model-facing marker.
+            messages.append({"role": "user", "content": steer_text, "display_kind": "steer"})
+        messages.extend([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": call_id, "function": {"name": "read_file"}}]},
+            {"role": "tool", "tool_call_id": call_id, "content": "ok"},
+        ])
+    for call_id in event_ids:
+        writer._take(live["ref"], {"type": "tool.completed", "tool_call_id": call_id, "tool_name": "read_file"})
+    messages.append({"role": "assistant", "content": "Done", "message_uid": "steered"})
+    live["messages"] = messages
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._finish(live)
+    expected = [{"id": call_id, "name": "read_file", "state": "completed"} for call_id in ("before", "after")]
+    assert calls[-1][-1]["body"]["steps"] == expected
+    assert sync.visible_rows(messages)[-1]["body"]["steps"] == expected
+
+
+@pytest.mark.parametrize("plain_followup", [False, True])
+def test_finished_steps_internal_admission_splits_full_history(plain_followup):
+    first = [
+        {"role": "user", "content": "Check"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "a", "function": {"name": "read_file"}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "ok"},
+        {"role": "assistant", "content": "First", "message_uid": "first"},
+    ]
+    internal = [{"role": "user", "content": "[IMPORTANT: Background task finished]",
+                 "display_kind": "internal_notification"}]
+    if not plain_followup:
+        internal.extend([
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "b", "function": {"name": "read_file"}}]},
+            {"role": "tool", "tool_call_id": "b", "content": "ok"},
+        ])
+    internal.append({"role": "assistant", "content": "Second", "message_uid": "second"})
+    assert sync.visible_rows(first + internal) == sync.visible_rows(first) + sync.visible_rows(internal)
+    assert all(row["body"]["text"] != internal[0]["content"] for row in sync.visible_rows(first + internal))
+
+
+@pytest.mark.parametrize("payload_kind", ["marker", "durable", "skipped", "keyboard_interrupt"])
+def test_finished_steps_cancelled_payload_live_and_replay(quiet_writer, payload_kind):
+    from agent.tool_executor import _ToolCancelledResult
+
+    writer, live, calls = quiet_writer
+    cancelled = "[Tool execution cancelled — read_file was abandoned: user stop]"
+    payload = {
+        "marker": _ToolCancelledResult(cancelled),
+        "durable": cancelled,
+        "skipped": "[Tool execution cancelled — read_file was skipped. User sent a new message]",
+        "keyboard_interrupt": json.dumps({"error": "Tool execution cancelled. User stop", "status": "cancelled"}),
+    }[payload_kind]
+    messages = [
+        {"role": "user", "content": "Read", "platform_message_id": live["ref"]},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "done", "function": {"name": "read_file"}},
+            {"id": "cancelled", "function": {"name": "read_file"}}]},
+        {"role": "tool", "tool_call_id": "done", "content": "ok"},
+        {"role": "tool", "tool_call_id": "cancelled", "content": payload},
+        {"role": "assistant", "content": "Partial", "message_uid": "partial"},
+    ]
+    live["messages"] = messages
+    # The native binary classifier currently emits completed for the bracketed cancellation.
+    for call_id in ("done", "cancelled"):
+        writer._take(live["ref"], {"type": "tool.started", "tool_call_id": call_id, "tool_name": "read_file"})
+        writer._take(live["ref"], {"type": "tool.completed", "tool_call_id": call_id, "tool_name": "read_file"})
+    writer._take(live["ref"], {"type": "assistant.delta", "delta": "Partial", "message_uid": "partial"})
+    writer._take(live["ref"], {"type": "turn.failed", "stopped": True})
+    writer._finish(live)
+    expected = [{"id": "done", "name": "read_file", "state": "completed"},
+                {"id": "cancelled", "name": "read_file", "state": "started"}]
+    assert calls[-1][-1]["body"]["steps"] == expected
+    assert sync.visible_rows(messages)[-1]["body"]["steps"] == expected
+
+
+def test_finished_steps_scaffolding_keeps_the_same_turn():
+    messages = [{"role": "assistant", "content": "", "tool_calls": [{"id": "a", "function": {"name": "read_file"}}]},
+                {"role": "tool", "tool_call_id": "a", "content": "ok"}]
+    messages.extend({"role": "user", "content": prefix + " context"} for prefix in sync.SCAFFOLDING)
+    messages.extend([{"role": "user", "content": "summary", "display_kind": "hidden"},
+                     {"role": "assistant", "content": "Done", "message_uid": "done"}])
+    assert sync.visible_rows(messages)[-1]["body"]["steps"] == [{"id": "a", "name": "read_file", "state": "completed"}]
+
+
 def test_finished_steps_rebuilt_from_compacted_sqlite_transcript(tmp_path):
     from hermes_state import SessionDB
     from gateway.platforms.api_server import _project_client_message
