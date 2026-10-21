@@ -1745,6 +1745,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/v1/artifacts/upload", self._handle_artifact_upload),
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
             ("GET", "/v1/skills", self._handle_skills),
+            ("POST", "/v1/skills/learned", self._handle_learned_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
@@ -2955,11 +2956,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         category), the same set ``/skills list`` shows."""
         try:
             from tools.skills_tool import _find_all_skills, _sort_skills
-            skills = _sort_skills(_find_all_skills(skip_disabled=False))
+            from gateway.platforms.api_server_learned_skills import learned_metadata
+            skills = learned_metadata(_sort_skills(_find_all_skills(skip_disabled=False)))
         except Exception:
             logger.exception("GET /v1/skills failed")
             return _error_response("Failed to enumerate skills", 500, err_type="server_error")
         return web.json_response({"object": "list", "data": skills})
+
+    @_require_auth
+    async def _handle_learned_skills(self, request: web.Request) -> web.Response:
+        from gateway.platforms.api_server_learned_skills import review
+        return await review(request)
 
     @_require_auth
     async def _handle_toolsets(self, request: web.Request) -> web.Response:
