@@ -44,6 +44,7 @@ async def test_learned_review_pins_and_archives_recoverably(tmp_path, monkeypatc
         listed = await (await client.get("/v1/skills", headers=headers)).json()
         learned = next(row for row in listed["data"] if row["name"] == "learned")
         assert (learned["learned"], learned["kept"]) == (True, False)
+        assert all(not row["learned"] for row in listed["data"] if row["name"] != "learned")
         response = await client.post("/v1/skills/learned", headers=headers, json={"name": "learned", "decision": "keep"})
         assert response.status == 200
         assert (await response.json())["kept"] is True
@@ -66,3 +67,28 @@ async def test_learned_review_pins_and_archives_recoverably(tmp_path, monkeypatc
         assert (root / ".archive" / "learned" / "SKILL.md").read_text().endswith("Body")
         assert skill_usage.restore_skill("learned")[0]
         assert (external / "SKILL.md").read_text().endswith("Body")
+
+
+@pytest.mark.asyncio
+async def test_remove_retry_requires_native_archive_and_keep_stays_not_found(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    folder = tmp_path / "skills" / "learned"
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text("---\nname: learned\ndescription: A skill\n---\nBody")
+    skill_usage.mark_agent_created("learned")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    app = web.Application()
+    app.router.add_post("/v1/skills/learned", adapter._handle_learned_skills)
+    async with TestClient(TestServer(app)) as client:
+        headers = {"Authorization": "Bearer test-key"}
+        for decision, status in (("keep", 200), ("keep", 200), ("remove", 200), ("remove", 200), ("keep", 404)):
+            response = await client.post("/v1/skills/learned", headers=headers, json={"name": "learned", "decision": decision})
+            assert response.status == status
+            if decision == "remove":
+                assert await response.json() == {"name": "learned", "learned": True, "kept": True, "state": "archived"}
+        assert not folder.exists()
+        assert (tmp_path / "skills" / ".archive" / "learned" / "SKILL.md").read_text().endswith("Body")
+        monkeypatch.setattr(skill_usage, "list_archived_skill_names", list)
+        response = await client.post("/v1/skills/learned", headers=headers, json={"name": "learned", "decision": "remove"})
+        assert response.status == 404
+        assert skill_usage.restore_skill("learned")[0]

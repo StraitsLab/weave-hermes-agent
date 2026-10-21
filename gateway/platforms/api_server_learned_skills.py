@@ -3,9 +3,9 @@ from aiohttp import web
 
 
 def learned_metadata(skills):
-    from tools.skill_usage import load_usage
+    from tools.skill_usage import is_bundled, is_curation_eligible, load_usage
     usage = load_usage()
-    return [{**skill, "learned": usage.get(skill["name"], {}).get("created_by") == "agent",
+    return [{**skill, "learned": usage.get(skill["name"], {}).get("created_by") == "agent" and not is_bundled(skill["name"]) and is_curation_eligible(skill["name"]),
              "kept": usage.get(skill["name"], {}).get("pinned") is True} for skill in skills]
 
 
@@ -30,6 +30,10 @@ async def review(request):
                                code="learned_skill_refused")
     from tools.skills_tool import _find_all_skills
     if not any(skill["name"] == name for skill in _find_all_skills(skip_disabled=False)):
+        if (body["decision"] == "remove" and record.get("state") == "archived"
+                and name in skill_usage.list_archived_skill_names()):
+            return web.json_response({"name": name, "learned": True, "kept": record.get("pinned") is True,
+                                      "state": "archived"})
         return _error_response("Learned skill not found", 404, code="learned_skill_not_found")
     success = (skill_usage.set_pinned(name, True) if body["decision"] == "keep"
                else skill_usage.archive_skill(name)[0])
