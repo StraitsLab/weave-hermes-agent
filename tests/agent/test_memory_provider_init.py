@@ -195,3 +195,35 @@ def test_aiagent_reuses_handed_in_memory_manager_without_reinitializing():
     assert second._memory_manager is manager
     assert load_memory_provider.call_count == 1
     assert provider.init_session_id is None
+
+
+def _agent_on(platform, memory_cfg):
+    provider = RecordingMemoryProvider()
+    cfg = {"memory": {"provider": "recording", **memory_cfg}, "agent": {}}
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider) as load,
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1", quiet_mode=True,
+                        skip_context_files=True, skip_memory=False, session_id="s", platform=platform)
+    return agent, load
+
+
+def test_provider_platforms_limits_the_external_provider_to_listed_platforms():
+    """memory.provider_platforms: the external provider loads only for listed platforms; built-in memory stays."""
+    on_slack, load = _agent_on("slack", {"provider_platforms": ["api_server"]})
+    assert on_slack._memory_manager is None and load.call_count == 0
+    assert on_slack._memory_store is not None
+    on_api, _ = _agent_on("api_server", {"provider_platforms": ["api_server"]})
+    assert on_api._memory_manager is not None
+
+
+def test_provider_platforms_unset_keeps_every_platform():
+    agent, _ = _agent_on("slack", {})
+    assert agent._memory_manager is not None
