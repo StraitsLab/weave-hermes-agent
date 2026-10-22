@@ -42,6 +42,65 @@ class NativeSessionAPI:
 
 
 
+    async def _fail_restart_interrupted_submits(self) -> None:
+        """Reattach durable submit owners before publishing a crash failure; never re-answer HTTP turns."""
+        runner = self.gateway_runner
+        if not getattr(runner, "_native_submit_unclean_boot", False):
+            return
+        from hermes_cli.profiles import profiles_to_serve
+        entries = runner.session_store.list_sessions()
+        recovered = self.__dict__.setdefault("_native_submit_restart_recovered_profiles", set())
+        for profile, _home in profiles_to_serve(multiplex=runner.config.multiplex_profiles):
+            if profile in recovered:
+                continue
+            token = _api_request_profile.set(profile)
+            try:
+                with self._profile_scope(profile):
+                    db = await self._ensure_session_db_async()
+                    if db is None:
+                        raise RuntimeError("session database unavailable during native restart recovery")
+                    pending = await asyncio.to_thread(db.pending_native_session_submits)
+                    interrupted = [e for e in entries if e.resume_pending and e.origin
+                                   and e.origin.platform == Platform.API_SERVER and e.origin.chat_id.startswith("weave-")
+                                   and (e.origin.profile or runner.session_store._profile_from_session_key(e.session_key) or profile) == profile]
+                    sessions = {e.origin.chat_id for e in interrupted}
+                    # Legacy admission is not a completion receipt. Only the trailing unanswered
+                    # submits in a marked session are evidence of an interruption on upgrade.
+                    answered_through = {}
+                    for session_id in sessions:
+                        resolved = db.resolve_resume_session_id(session_id) or session_id
+                        messages = db.get_messages(resolved, include_compacted=True, include_ancestors=True)
+                        answered = set()
+                        ref = None
+                        for message in messages:
+                            if message.get("role") == "user":
+                                ref = message.get("platform_message_id")
+                            elif ref and message.get("role") == "assistant" and message.get("content") and not message.get("tool_calls"):
+                                answered.add(ref)
+                        session_rows = [r for r in pending if r["session_id"] == session_id]
+                        # A marked session's latest submit was interrupted even if its final text
+                        # reached SQLite just before death: there is no chat delivery receipt.
+                        latest = max((r["rowid"] for r in session_rows), default=0)
+                        answered_through[session_id] = min(latest - 1, max((r["rowid"] for r in session_rows
+                            if r["native_request_ref"] in answered), default=0))
+                    for row in pending:
+                        ref, session_id = row["native_request_ref"], row["session_id"]
+                        if not session_id.startswith("weave-"):
+                            continue
+                        if row["terminal_event"] == "legacy" and (
+                            session_id not in sessions or row["rowid"] <= answered_through[session_id]
+                        ):
+                            continue
+                        await asyncio.to_thread(db.set_native_session_submit_terminal, ref, "restart_failed_pending")
+                        self._native_submit_ref_sessions[ref] = (profile, session_id)
+                        self._native_submit_close(ref, "turn.failed", error="Gateway restarted before this turn finished. Please resend.",
+                                                  restart_interrupted=True)
+                    for entry in interrupted:
+                        await runner.async_session_store.clear_resume_pending(entry.session_key)
+                    recovered.add(profile)
+            finally:
+                _api_request_profile.reset(token)
+
     @classmethod
     def _parse_event_cursor(cls, raw: Optional[str]):
         """``(epoch, id)``, ``None`` for from-the-start, or ``False`` if malformed."""
@@ -1649,7 +1708,8 @@ class NativeSessionAPI:
                 return ""
 
         if terminal:
-            if not weave_chat_sync.publish(session_id, native_request_ref, event, read_display, secret, on_finished=done):
+            committed = lambda _items: db.set_native_session_submit_terminal(native_request_ref, event["type"])
+            if not weave_chat_sync.publish(session_id, native_request_ref, event, read_display, secret, on_finished=done, on_committed=committed):
                 done()
         else:
             weave_chat_sync.publish(session_id, native_request_ref, event, read_display, secret)
