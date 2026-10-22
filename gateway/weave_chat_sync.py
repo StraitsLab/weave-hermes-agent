@@ -579,7 +579,8 @@ class _Writer:
         rows += [{"item_id": item, "role": "assistant", "kind": "text", "state": "removed", "body": {"status": None}}
                  for item in unmatched_segs]
         status_close = None
-        if live.get("status_open"):
+        # A fresh writer cannot remember the status row the killed process left open.
+        if live.get("status_open") or live.get("restart_interrupted"):
             status_close = {"item_id": self._status_item_id(live), "role": "assistant", "kind": "text",
                             "state": "removed", "body": {"status": None}}
         answer = None

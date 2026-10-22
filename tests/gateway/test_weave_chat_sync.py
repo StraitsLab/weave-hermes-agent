@@ -558,6 +558,52 @@ def test_status_replacement_waits_for_saved_answer_when_no_text_streams(quiet_wr
     assert removed[0][-1]["body"]["text"] == "Done."
 
 
+@pytest.mark.parametrize("before_crash", ["status", "text", "no_rows"])
+@pytest.mark.parametrize("restart_interrupted", [True, False])
+def test_fresh_writer_retires_prior_status_only_for_restart_interruption(quiet_writer, monkeypatch, before_crash, restart_interrupted):
+    writer, live, calls = quiet_writer
+    ref, session = live["ref"], live["session"]
+    status_id = str(sync.uuid.uuid5(sync.uuid.NAMESPACE_URL, f"weave-chat:{ref}:status"))
+    text_id = str(sync.uuid.uuid5(sync.uuid.NAMESPACE_URL, f"weave-chat:{ref}"))
+    rows = {}
+    original_call = sync._call
+
+    def store(conn, items):
+        for item in items:
+            rows[item["item_id"]] = item
+        return original_call(conn, items)
+
+    monkeypatch.setattr(sync, "_call", store)
+    if before_crash == "status":
+        writer._take(ref, {"type": "tool.started", "tool_name": "mcp__weave_connectors__web_search_exa"})
+        writer._flush(live)
+        assert rows[status_id]["state"] == "writing"
+    elif before_crash == "text":
+        writer._take(ref, {"type": "assistant.delta", "delta": "Partial reply"})
+        writer._flush(live)
+        assert rows[text_id]["state"] == "writing"
+    # The database survives SIGKILL; the new process has no memory of open rows.
+    writer.live.clear()
+    calls.clear()
+    assert sync.publish(session, ref, {"type": "turn.failed", "restart_interrupted": restart_interrupted},
+                        list, secrets("https://supabase.example"))
+    new_live = writer.live[ref]
+    assert not new_live["status_open"]
+    queued_ref, event = writer.events.get_nowait()
+    writer._take(queued_ref, event)
+    writer._write(ref, new_live)
+    terminal = calls[-1]
+    removed_status = [row for row in terminal if row.get("item_id") == status_id]
+    if restart_interrupted:
+        assert removed_status == [{"item_id": status_id, "role": "assistant", "kind": "text",
+                                   "state": "removed", "body": {"status": None}}]
+        assert terminal[-1]["item_id"] == text_id and terminal[-1]["state"] == "final"
+        assert terminal[-1]["body"]["outcome"] == "failed"
+        assert not any(row["state"] == "writing" for row in rows.values())
+    else:
+        assert not removed_status  # Ordinary terminal events keep their existing behavior.
+
+
 def test_saved_only_replies_with_equal_source_times_keep_message_order(quiet_writer):
     writer, live, calls = quiet_writer
     now = time.time()
