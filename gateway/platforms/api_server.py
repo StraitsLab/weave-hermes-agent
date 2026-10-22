@@ -4491,6 +4491,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 retryable=False)
             return False
         try:
+            await self._fail_restart_interrupted_submits()
             mws = [mw for mw in (
                 self._make_profile_prefix_middleware(), cors_middleware, body_limit_middleware,
                 security_headers_middleware) if mw is not None]

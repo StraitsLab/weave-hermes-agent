@@ -596,6 +596,10 @@ class GatewayStartupMixin:
             return 0
         scheduled = 0
         for entry in candidates:
+            if (getattr(self, "_native_submit_unclean_boot", False) and entry.origin.platform == Platform.API_SERVER
+                    and entry.origin.chat_id.startswith("weave-")):
+                # The native adapter owns crash failures; HTTP has no synthetic-resume delivery path.
+                continue
             # Epoch math: the marker was stamped naive-local by the previous process, possibly
             # on the other side of a DST change; wall-clock subtraction is off by the shift.
             marker = entry.last_resume_marked_at or entry.updated_at
@@ -727,6 +731,7 @@ class GatewayStartupMixin:
         the old 120 s recency sweep re-answered every recently active chat. Returns (resumed,
         ledgered)."""
         from gateway.run import _float_env
+        self._native_submit_unclean_boot = True
         resumed = ledgered = 0
         max_age = max(60 * 60, int(max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800)) * 2))
         with _log_suppressed(logging.WARNING, "Crash-left reply recovery on startup failed: %s"):
@@ -756,6 +761,8 @@ class GatewayStartupMixin:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
             if started < cutoff:
                 continue
+            if origin.platform == Platform.API_SERVER and origin.chat_id.startswith("weave-"):
+                continue  # Harso's native chat-sync recovery owns the terminal, not adapter.send().
             text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
                                           started, origin)
             if text is None or (text and not ledger_on):

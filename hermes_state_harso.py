@@ -513,6 +513,35 @@ class HarsoSessionMixin:
                 return {"session_id": resolved, "epoch": epoch, "head": max(head, after_id),
                         "reset_required": reset, "rows": rows}
         raise sqlite3.OperationalError("transcript changed during every read attempt")
+    @staticmethod
+    def _migrate_native_submit_terminals(conn) -> bool:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_session_submit_idempotency'").fetchone():
+            return False
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(native_session_submit_idempotency)")}
+        if "terminal_event" not in columns:
+            # Old admission rows were retained even after success. Never treat them all as lost.
+            conn.execute("ALTER TABLE native_session_submit_idempotency ADD COLUMN terminal_event TEXT DEFAULT 'legacy'")
+        return True
+
+    def pending_native_session_submits(self) -> list[dict[str, Any]]:
+        def _do(conn):
+            if not self._migrate_native_submit_terminals(conn):
+                return []
+            return [dict(r) for r in conn.execute(
+                "SELECT rowid, session_id, native_request_ref, admission, terminal_event "
+                "FROM native_session_submit_idempotency WHERE "
+                "(terminal_event IS NULL OR terminal_event IN ('legacy', 'restart_failed_pending')) "
+                "AND (admission IS NULL OR admission IN ('streaming', 'queued', 'steered')) ORDER BY rowid"
+            )]
+        return self._execute_write(_do)
+
+    def set_native_session_submit_terminal(self, native_request_ref: str, terminal_event: str) -> None:
+        def _do(conn):
+            if self._migrate_native_submit_terminals(conn):
+                conn.execute("UPDATE native_session_submit_idempotency SET terminal_event = ? WHERE native_request_ref = ?",
+                             (terminal_event, native_request_ref))
+        self._execute_write(_do)
+
     def register_native_session_submit(
         self,
         session_id: str,
@@ -542,6 +571,7 @@ class HarsoSessionMixin:
             ).fetchall()}
             if "admission" not in columns:
                 conn.execute("ALTER TABLE native_session_submit_idempotency ADD COLUMN admission TEXT")
+            self._migrate_native_submit_terminals(conn)
             existing = conn.execute(
                 "SELECT session_id, message_sha256, native_request_ref, admission "
                 "FROM native_session_submit_idempotency WHERE external_request_id = ?",
@@ -558,8 +588,8 @@ class HarsoSessionMixin:
                 return {"outcome": "session_not_found", "native_request_ref": None, "admission": None}
             conn.execute(
                 "INSERT INTO native_session_submit_idempotency "
-                "(external_request_id, session_id, message_sha256, native_request_ref) "
-                "VALUES (?, ?, ?, ?)",
+                "(external_request_id, session_id, message_sha256, native_request_ref, terminal_event) "
+                "VALUES (?, ?, ?, ?, NULL)",
                 (external_request_id, session_id, message_sha256, native_request_ref),
             )
             return {"outcome": "inserted", "native_request_ref": native_request_ref, "admission": None}

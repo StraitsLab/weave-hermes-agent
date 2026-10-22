@@ -471,6 +471,7 @@ class _Writer:
             live["ended"] = True
             live["on_finished"] = event.get("_on_finished")
             live["on_committed"] = event.get("_on_committed")
+            live["restart_interrupted"] = event.get("restart_interrupted", False)
             live["outcome"] = "stopped" if event.get("stopped") else kind.split(".")[1]
             live["absorbed_into"] = event.get("merged_into") or event.get("steered_into")
             return True
@@ -603,6 +604,10 @@ class _Writer:
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
                     "body": {"text": text, "visible": visible, "status": None,
                              **({"output": live["card"]} if live.get("card") else {})}}
+        elif live.get("restart_interrupted"):
+            last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
+                    "body": {"text": "This turn did not finish because the gateway restarted. Please resend.",
+                             "outcome": "failed", "status": None}}
         elif live.get("outcome") == "stopped" and live["text"].strip():  # Stop keeps what was written (WEV-3464)
             text, visible = visible_reply(live["text"], live["show_tag"], live["show_over"])
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
