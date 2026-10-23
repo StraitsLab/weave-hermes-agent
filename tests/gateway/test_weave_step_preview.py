@@ -58,3 +58,17 @@ def test_step_preview_is_bounded_and_single_line():
     assert preview.startswith('a')
     assert len(preview) <= 120
     assert '\n' not in preview
+
+
+def test_step_preview_redacts_before_capping_with_forced_url_credential_redaction(monkeypatch):
+    from gateway.weave_step_preview import step_preview
+
+    calls = []
+
+    def redact(text, **kwargs):
+        calls.append((text, kwargs))
+        return "r" * 200
+
+    monkeypatch.setattr("agent.redact.redact_sensitive_text", redact)
+    assert step_preview("read_file", {"path": "src/" + "a" * 200}) == "r" * 120
+    assert calls == [("a" * 200, {"force": True, "redact_url_credentials": True})]

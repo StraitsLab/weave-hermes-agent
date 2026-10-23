@@ -520,6 +520,58 @@ def test_status_survives_tool_gaps_until_answer_replaces_it(quiet_writer, with_t
     assert calls[-1][-1]["body"]["status"] is None
 
 
+@pytest.mark.parametrize("with_text", [False, True])
+@pytest.mark.parametrize("terminal", ["tool.completed", "tool.failed"])
+def test_writing_row_status_detail_follows_the_running_tool(quiet_writer, with_text, terminal):
+    writer, live, calls = quiet_writer
+    ref = live["ref"]
+    if with_text:
+        writer._take(ref, {"type": "assistant.delta", "delta": "Checking.", "message_uid": "checking"})
+    for call_id, preview in (("c1", "git"), ("c2", "npm")):
+        count = len(calls)
+        writer._take(ref, {"type": "tool.started", "tool_call_id": call_id,
+                           "tool_name": "terminal", "preview": preview})
+        writer._flush(live)
+        assert len(calls) > count, "same tool with a new preview must write again"
+        row = calls[-1][-1]
+        assert row["state"] == "writing"
+        assert row["body"]["status"] == "terminal"
+        assert row["body"]["status_detail"] == preview
+        count = len(calls)
+        writer._flush(live)
+        assert len(calls) == count, "unchanged status/detail must not write again"
+
+    writer._take(ref, {"type": terminal, "tool_call_id": "c2", "tool_name": "terminal"})
+    writer._flush(live)
+    assert calls[-1][-1]["body"]["status"] == "Thinking"
+    assert calls[-1][-1]["body"]["status_detail"] is None
+    writer._take(ref, {"type": "assistant.delta", "delta": "Done.", "message_uid": "done"})
+    writer._flush(live)
+    live["messages"] = [{"role": "assistant", "content": "Done.", "message_uid": "done", "timestamp": time.time()}]
+    writer._take(ref, {"type": "turn.completed"})
+    writer._finish(live)
+    assert calls[-1][-1]["body"]["status_detail"] is None
+    for batch in calls:
+        for row in batch:
+            if row.get("body", {}).get("status", False) is None:
+                assert row["body"]["status_detail"] is None
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "tool.generating", "tool_name": "terminal", "preview": "not-ready"},
+    {"type": "tool.started", "tool_name": "terminal", "preview": {"command": "raw"}},
+    {"type": "tool.started", "tool_name": "terminal"},
+])
+def test_writing_row_clears_detail_when_no_safe_preview_is_available(quiet_writer, event):
+    writer, live, calls = quiet_writer
+    writer._take(live["ref"], {"type": "tool.started", "tool_name": "terminal", "preview": "git"})
+    writer._flush(live)
+    writer._take(live["ref"], event)
+    writer._flush(live)
+    assert live["status_detail"] is None
+    assert calls[-1][-1]["body"]["status_detail"] is None
+
+
 def test_retracted_text_keeps_a_working_status_in_the_same_batch(quiet_writer):
     writer, live, calls = quiet_writer
     writer._take(live["ref"], {"type": "assistant.delta", "delta": "Partial", "message_uid": "partial"})
@@ -596,7 +648,7 @@ def test_fresh_writer_retires_prior_status_only_for_restart_interruption(quiet_w
     removed_status = [row for row in terminal if row.get("item_id") == status_id]
     if restart_interrupted:
         assert removed_status == [{"item_id": status_id, "role": "assistant", "kind": "text",
-                                   "state": "removed", "body": {"status": None}}]
+                                   "state": "removed", "body": {"status": None, "status_detail": None}}]
         assert terminal[-1]["item_id"] == text_id and terminal[-1]["state"] == "final"
         assert terminal[-1]["body"]["outcome"] == "failed"
         assert not any(row["state"] == "writing" for row in rows.values())
@@ -1099,7 +1151,7 @@ def test_show_settings_come_from_the_profile_secrets(server, monkeypatch):
         sync.publish("weave-show", "ref-show", event, lambda: saved, lambda name: values.get(name, ""))
     wait_for(lambda: any(i.get("state") == "final" for c in calls for i in c["p_items"]) and "ref-show" not in (sync._WRITER.live if sync._WRITER else {}))
     final = next(i for c in calls for i in c["p_items"] if i.get("state") == "final")
-    assert final["body"] == {"text": "read me", "visible": True, "status": None}
+    assert final["body"] == {"text": "read me", "visible": True, "status": None, "status_detail": None}
 
 
 def test_ledger_vault_card_keeps_always_on_server(server, monkeypatch):
