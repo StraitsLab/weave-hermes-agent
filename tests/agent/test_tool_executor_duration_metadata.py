@@ -42,3 +42,32 @@ def test_committed_duration_is_durable_and_display_only(tmp_path, monkeypatch, c
         assert [m.get('display_metadata') for m in messages if m['role'] == 'tool'] == expected
     finally:
         db.close()
+
+
+@pytest.mark.parametrize('existing_metadata', [None, {'kind': 'x'}])
+def test_blocked_commit_has_no_duration_and_preserves_existing_metadata(monkeypatch, existing_metadata):
+    import agent.tool_executor as executor
+
+    agent = _make_agent()
+    agent._current_turn_timestamp = 1.0
+    callback_calls = []
+    agent.tool_result_metadata_callback = lambda *a: callback_calls.append(a)
+    original = executor.make_tool_result_message
+
+    def make_message(*args, **kwargs):
+        message = original(*args, **kwargs)
+        if existing_metadata is not None:
+            message['display_metadata'] = dict(existing_metadata)
+        return message
+
+    monkeypatch.setattr(executor, 'make_tool_result_message', make_message)
+    messages = []
+    result = _commit_tool_result(
+        agent, messages, _ToolCallRef('terminal', {'command': 'git status'}, 'blocked', 'a', []),
+        'blocked', budget=DEFAULT_BUDGET, tool_duration=0.4,
+        is_error=True, blocked=True, effect_disposition=None,
+    )
+    assert result is not None
+    assert messages[-1].get('display_metadata') == existing_metadata
+    assert 'duration_ms' not in (messages[-1].get('display_metadata') or {})
+    assert callback_calls == []  # blocked calls do not emit completion metadata callbacks

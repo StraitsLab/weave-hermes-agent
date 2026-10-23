@@ -43,6 +43,8 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
+import hermes_constants
+
 logger = logging.getLogger(__name__)
 
 FLUSH_S = 0.2  # live text cadence: Supabase bills each Broadcast, 5/s per reply
@@ -310,6 +312,14 @@ class _Writer:
                 self._write(ref, live)
 
     def _write(self, ref: str, live: dict[str, Any]) -> None:
+        # Vault redaction is profile-local; the writer thread is shared across turns.
+        token = hermes_constants.set_hermes_home_override(live.get("home"))
+        try:
+            self._write_scoped(ref, live)
+        finally:
+            hermes_constants.reset_hermes_home_override(token)
+
+    def _write_scoped(self, ref: str, live: dict[str, Any]) -> None:
         ended = live.get("ended", False)
         now = time.monotonic()
         if ended and now >= live.get("retry_until", float("inf")):
@@ -320,7 +330,7 @@ class _Writer:
                     row.get("item_id") == status_id for row in live.get("closing", ()))):
                 # Shed transcript data while giving status retirement one bounded retry window.
                 cleanup = {key: live[key] for key in ("url", "key", "bearer", "session", "ref")}
-                cleanup.update(ended=True, status_cleanup=True, retry_until=now + FINAL_RETRY_S,
+                cleanup.update(home=live.get("home"), ended=True, status_cleanup=True, retry_until=now + FINAL_RETRY_S,
                                retry_at=live.get("retry_at", 0),
                                retry_delay=live.get("retry_delay", FINAL_BACKOFF_S),
                                closing=[{"item_id": status_id, "role": "assistant", "kind": "text",
@@ -709,6 +719,7 @@ def publish(session_id: str, ref: str, event: dict[str, Any], read_display: Call
             with _LOCK:
                 _WRITER = _WRITER or _Writer()
             _WRITER.live[ref] = {"session": session_id, "ref": ref, "url": url, "key": key, "bearer": bearer, "started": time.time() - 1,
+                                 "home": str(hermes_constants.get_hermes_home()),
                                  "read": read_display, "item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}")),
                                  "status_item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}:status")),
                                  "status_open": False, "uid": None, "at": None,
@@ -739,6 +750,7 @@ def publish_rows(session_id: str, messages: list[dict[str, Any]], secret: Callab
         key, bearer = secret("WEAVE_CHAT_SUPABASE_KEY") or "", secret("WEAVE_API_MCP_BEARER") or ""
         if not (url.startswith("https://") and key and bearer and session_id.startswith("weave-")):
             return False
+        # Previews are projected here, on the profile-scoped caller, before any queue handoff.
         rows = list(raw_rows) if raw_rows is not None else visible_rows(messages, (secret("WEAVE_CHAT_SHOW_TAG") or "[SHOW]").strip())
         if not rows:
             return True

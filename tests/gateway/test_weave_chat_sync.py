@@ -842,8 +842,8 @@ def test_finished_steps_carry_preview_and_duration_live_and_replay(quiet_writer,
         {"role": "assistant", "content": "Done", "message_uid": "answer"},
     ]
     expected = [
-        {"id": "a", "name": "terminal", "state": "completed", "preview": "git status", "duration_ms": 1250},
-        {"id": "b", "name": "read_file", "state": "completed", "preview": "src/app.ts",
+        {"id": "a", "name": "terminal", "state": "completed", "preview": "git", "duration_ms": 1250},
+        {"id": "b", "name": "read_file", "state": "completed", "preview": "app.ts",
          **({"duration_ms": 500} if duration_metadata is not None else {})},
     ]
     for call_id, name in (("a", "terminal"), ("b", "read_file")):
@@ -855,6 +855,73 @@ def test_finished_steps_carry_preview_and_duration_live_and_replay(quiet_writer,
     writer._finish(live)
     assert calls[-1][-1]["body"]["steps"] == expected
     assert sync.visible_rows(messages)[-1]["body"]["steps"] == expected
+
+
+@pytest.mark.parametrize("metadata", [
+    {"duration_ms": -1}, {"duration_ms": True}, {"duration_ms": "12"},
+    {"duration_ms": 1.5}, "not JSON",
+])
+def test_finished_steps_reject_invalid_duration_live_and_replay(quiet_writer, metadata):
+    writer, live, calls = quiet_writer
+    messages = [
+        {"role": "user", "content": "check", "platform_message_id": live["ref"]},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "function": {"name": "terminal", "arguments": '{"command":"git"}'}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "ok", "display_metadata": metadata},
+        {"role": "assistant", "content": "Done", "message_uid": "answer"},
+    ]
+    live["messages"] = messages
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._write(live["ref"], live)
+    expected = [{"id": "a", "name": "terminal", "state": "completed", "preview": "git"}]
+    assert calls[-1][-1]["body"]["steps"] == expected
+    assert sync.visible_rows(messages)[-1]["body"]["steps"] == expected
+
+
+def test_writer_redacts_previews_in_publishing_profile(quiet_writer, tmp_path, monkeypatch):
+    import hermes_constants
+    from agent.redact import clear_vault_redaction_values, register_vault_redaction_value
+    from gateway.weave_step_preview import step_preview
+
+    writer, _live, calls = quiet_writer
+    home_a, home_b = tmp_path / "A", tmp_path / "B"
+    secret = "Zq9secretVault77"
+    messages = [
+        {"role": "user", "content": "check", "platform_message_id": "profile-B"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "function": {"name": "terminal", "arguments": json.dumps({"command": secret})}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "ok"},
+        {"role": "assistant", "content": "Done", "message_uid": "profile-answer"},
+    ]
+    token_b = hermes_constants.set_hermes_home_override(home_b)
+    try:
+        register_vault_redaction_value(secret)
+        expected = step_preview("terminal", {"command": secret})
+        assert expected and secret not in expected
+        assert sync.publish("weave-profile", "profile-B", {"type": "turn.completed"},
+                            lambda: messages, secrets("https://supabase.example"))
+        live = writer.live["profile-B"]
+        writer._take(*writer.events.get_nowait())
+        seen_homes = []
+        real_finish = writer._finish
+
+        def finish(entry):
+            seen_homes.append(hermes_constants.get_hermes_home())
+            return real_finish(entry)
+
+        monkeypatch.setattr(writer, "_finish", finish)
+        token_a = hermes_constants.set_hermes_home_override(home_a)
+        try:
+            assert step_preview("terminal", {"command": secret}) == secret
+            writer._write("profile-B", live)  # real dispatch, not a direct _finish call
+            assert hermes_constants.get_hermes_home() == home_a
+        finally:
+            hermes_constants.reset_hermes_home_override(token_a)
+        assert calls[-1][-1]["body"]["steps"][0]["preview"] == expected
+        assert seen_homes == [home_b]
+    finally:
+        clear_vault_redaction_values()
+        hermes_constants.reset_hermes_home_override(token_b)
 
 
 def test_finished_steps_stop_compaction_and_bounds(quiet_writer):
