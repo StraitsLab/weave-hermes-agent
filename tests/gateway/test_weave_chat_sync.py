@@ -806,6 +806,35 @@ def test_finished_steps_are_turn_local_and_survive_replay(quiet_writer):
     assert calls[-1][-1]["body"]["steps"] == expected
 
 
+@pytest.mark.parametrize("duration_metadata", [{"duration_ms": 500}, '{"duration_ms": 500}', None])
+def test_finished_steps_carry_preview_and_duration_live_and_replay(quiet_writer, duration_metadata):
+    writer, live, calls = quiet_writer
+    messages = [
+        {"role": "user", "content": "check", "platform_message_id": live["ref"]},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "function": {"name": "terminal", "arguments": json.dumps({"command": "git status"})}},
+            {"id": "b", "function": {"name": "read_file", "arguments": json.dumps({"path": "src/app.ts"})}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "ok", "display_metadata": {"duration_ms": 1250}},
+        {"role": "tool", "tool_call_id": "b", "content": "ok",
+         **({"display_metadata": duration_metadata} if duration_metadata is not None else {})},
+        {"role": "assistant", "content": "Done", "message_uid": "answer"},
+    ]
+    expected = [
+        {"id": "a", "name": "terminal", "state": "completed", "preview": "git status", "duration_ms": 1250},
+        {"id": "b", "name": "read_file", "state": "completed", "preview": "src/app.ts",
+         **({"duration_ms": 500} if duration_metadata is not None else {})},
+    ]
+    for call_id, name in (("a", "terminal"), ("b", "read_file")):
+        writer._take(live["ref"], {"type": "tool.started", "tool_call_id": call_id, "tool_name": name})
+        writer._take(live["ref"], {"type": "tool.completed", "tool_call_id": call_id, "tool_name": name})
+    live["messages"] = messages
+    writer._take(live["ref"], {"type": "assistant.delta", "delta": "Done", "message_uid": "answer"})
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._finish(live)
+    assert calls[-1][-1]["body"]["steps"] == expected
+    assert sync.visible_rows(messages)[-1]["body"]["steps"] == expected
+
+
 def test_finished_steps_stop_compaction_and_bounds(quiet_writer):
     writer, live, calls = quiet_writer
     ref = live["ref"]

@@ -133,7 +133,7 @@ def _record_step(steps: dict[str, dict[str, str]], call_id: Any, name: Any, stat
     return False
 
 
-def _attach_steps(body: dict[str, Any], steps: list[dict[str, str]], truncated: bool = False) -> None:
+def _attach_steps(body: dict[str, Any], steps: list[dict[str, Any]], truncated: bool = False) -> None:
     if not steps and not truncated:
         return
     body["steps"] = steps[:100]
@@ -165,6 +165,38 @@ def _tool_step_state(name: str, content: Any) -> str:
     return "failed" if failed else "completed"
 
 
+def _step_details(messages: list[dict[str, Any]]) -> dict[str, dict]:
+    from gateway.weave_step_preview import step_preview
+
+    details: dict[str, dict] = {}
+    for message in messages:
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or ():
+                if not isinstance(call, dict) or not isinstance(call.get("id"), str):
+                    continue
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                try:
+                    args = json.loads(function.get("arguments"))
+                except (ValueError, TypeError):
+                    continue
+                preview = step_preview(function.get("name"), args)
+                if preview:
+                    details.setdefault(call["id"], {})["preview"] = preview
+        elif message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str):
+            metadata = message.get("display_metadata")
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except ValueError:
+                    continue
+            duration = metadata.get("duration_ms") if isinstance(metadata, dict) else None
+            if type(duration) is int and duration >= 0:
+                details.setdefault(message["tool_call_id"], {})["duration_ms"] = duration
+    return details
+
+
 def _finish_steps(body: dict[str, Any], live: dict[str, Any], messages: list[dict[str, Any]]) -> None:
     # Durable call carriers preserve invocation order even if live completions arrive out of order.
     steps = {step["id"]: dict(step) for step in body.get("steps", [])}
@@ -172,7 +204,9 @@ def _finish_steps(body: dict[str, Any], live: dict[str, Any], messages: list[dic
         if call_id not in steps or step["state"] != "started":
             steps[call_id] = dict(step)
     results = {m.get("tool_call_id"): m.get("content") for m in messages if m.get("role") == "tool"}
+    details = _step_details(messages)
     for call_id, step in steps.items():
+        step.update(details.get(call_id, {}))
         if call_id in results:
             # Native completion events are binary and lose the executor cancellation marker.
             step["state"] = _tool_step_state(step["name"], results[call_id])
@@ -193,13 +227,16 @@ def _steps_turn_boundary(message: dict[str, Any]) -> bool:
 
 def _saved_steps(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
-    steps: dict[str, dict[str, str]] = {}
+    steps: dict[str, dict[str, Any]] = {}
+    details = _step_details(messages)
     answer, truncated = None, False
     for message in [*messages, {"role": "user", "content": ""}]:
         role, content = message.get("role"), message.get("content")
         if _steps_turn_boundary(message):
             if answer is not None:
                 body: dict[str, Any] = {}
+                for call_id, step in steps.items():
+                    step.update(details.get(call_id, {}))
                 _attach_steps(body, list(steps.values()), truncated)
                 out[row_key(answer)] = body
             steps, answer, truncated = {}, None, False
