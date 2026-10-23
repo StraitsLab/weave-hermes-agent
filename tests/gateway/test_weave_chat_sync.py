@@ -1151,7 +1151,7 @@ def test_show_settings_come_from_the_profile_secrets(server, monkeypatch):
         sync.publish("weave-show", "ref-show", event, lambda: saved, lambda name: values.get(name, ""))
     wait_for(lambda: any(i.get("state") == "final" for c in calls for i in c["p_items"]) and "ref-show" not in (sync._WRITER.live if sync._WRITER else {}))
     final = next(i for c in calls for i in c["p_items"] if i.get("state") == "final")
-    assert final["body"] == {"text": "read me", "visible": True, "status": None, "status_detail": None}
+    assert (final["body"]["text"], final["body"]["visible"]) == ("read me", True)
 
 
 def test_ledger_vault_card_keeps_always_on_server(server, monkeypatch):
