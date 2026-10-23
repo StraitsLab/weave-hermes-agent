@@ -228,18 +228,19 @@ def _steps_turn_boundary(message: dict[str, Any]) -> bool:
 def _saved_steps(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     steps: dict[str, dict[str, Any]] = {}
-    details = _step_details(messages)
+    turn_messages: list[dict[str, Any]] = []
     answer, truncated = None, False
     for message in [*messages, {"role": "user", "content": ""}]:
         role, content = message.get("role"), message.get("content")
         if _steps_turn_boundary(message):
             if answer is not None:
                 body: dict[str, Any] = {}
+                details = _step_details(turn_messages)
                 for call_id, step in steps.items():
                     step.update(details.get(call_id, {}))
                 _attach_steps(body, list(steps.values()), truncated)
                 out[row_key(answer)] = body
-            steps, answer, truncated = {}, None, False
+            steps, turn_messages, answer, truncated = {}, [], None, False
         elif role == "assistant":
             for call in message.get("tool_calls") or ():
                 if isinstance(call, dict) and isinstance(call.get("function"), dict):
@@ -251,6 +252,7 @@ def _saved_steps(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         elif role == "tool" and message.get("tool_call_id") in steps:
             step = steps[message["tool_call_id"]]
             step["state"] = _tool_step_state(step["name"], content)
+        turn_messages.append(message)
     return out
 
 

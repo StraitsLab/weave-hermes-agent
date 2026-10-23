@@ -806,6 +806,28 @@ def test_finished_steps_are_turn_local_and_survive_replay(quiet_writer):
     assert calls[-1][-1]["body"]["steps"] == expected
 
 
+def test_finished_step_details_are_turn_local_with_reused_call_ids():
+    messages = [
+        {"role": "user", "content": "read first"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "reused", "function": {"name": "read_file", "arguments": json.dumps({"path": "first.txt"})}}]},
+        {"role": "tool", "tool_call_id": "reused", "content": "ok", "display_metadata": {"duration_ms": 10}},
+        {"role": "assistant", "content": "First answer", "message_uid": "first-answer"},
+        {"role": "user", "content": "read second"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "reused", "function": {"name": "read_file", "arguments": json.dumps({"path": "second.txt"})}}]},
+        {"role": "tool", "tool_call_id": "reused", "content": "ok", "display_metadata": {"duration_ms": 20}},
+        {"role": "assistant", "content": "Second answer", "message_uid": "second-answer"},
+    ]
+
+    answers = [row for row in sync.visible_rows(messages) if row["role"] == "assistant"]
+    assert [row["body"]["text"] for row in answers] == ["First answer", "Second answer"]
+    assert [row["body"]["steps"] for row in answers] == [
+        [{"id": "reused", "name": "read_file", "state": "completed", "preview": "first.txt", "duration_ms": 10}],
+        [{"id": "reused", "name": "read_file", "state": "completed", "preview": "second.txt", "duration_ms": 20}],
+    ]
+
+
 @pytest.mark.parametrize("duration_metadata", [{"duration_ms": 500}, '{"duration_ms": 500}', None])
 def test_finished_steps_carry_preview_and_duration_live_and_replay(quiet_writer, duration_metadata):
     writer, live, calls = quiet_writer

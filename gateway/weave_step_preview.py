@@ -31,7 +31,7 @@ def step_preview(name: str, args: dict | None) -> str | None:
             parsed = urlsplit(url)
             if not parsed.hostname:
                 return None
-            text = parsed.netloc.rsplit("@", 1)[-1] + ("" if parsed.path == "/" else parsed.path)
+            text = parsed.netloc.rsplit("@", 1)[-1] + parsed.path
         except ValueError:
             return None
     elif name in {"read_file", "write_file", "patch", "search_files"}:

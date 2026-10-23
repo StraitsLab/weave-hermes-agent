@@ -10,6 +10,7 @@ CASES = [
     ('terminal', {'command': 'export GITHUB_TOKEN=ghp_' + 'a' * 36 + ' && gh pr list'}, 'export'),
     ('terminal', {'command': 'psql postgresql://app:S3cret@db.x.co/db'}, 'psql'),
     ('web_extract', {'urls': ['https://user:pw@api.example.com/v1/x?token=abc#f']}, 'api.example.com/v1/x'),
+    ('browser_navigate', {'url': 'https://example.com/'}, 'example.com/'),
     ('read_file', {'path': 'src/app.ts'}, 'src/app.ts'),
     ('web_search', {'query': 'swiftui disclosure animation'}, 'swiftui disclosure animation'),
     ('todo', {'items': []}, None),
