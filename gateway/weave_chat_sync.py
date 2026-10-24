@@ -263,10 +263,12 @@ def _step_details(messages: list[dict[str, Any]]) -> dict[str, dict]:
                     details.setdefault(call["id"], {})["preview"] = preview
         elif message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str):
             call_id = message["tool_call_id"]
-            try:
-                payload = json.loads(message.get("content"))
-            except (ValueError, TypeError):
-                payload = None
+            payload = None
+            if call_id in terminals or call_id in delegates:  # parse only the results we read
+                try:
+                    payload = json.loads(message.get("content"))
+                except (ValueError, TypeError):
+                    pass
             at = message.get("timestamp")
             if call_id in terminals and isinstance(payload, dict) and type(at) in (int, float):
                 process_id = payload.get("session_id")
@@ -737,7 +739,8 @@ class _Writer:
         turn = messages[start:] if start is not None else [m for m in messages if (m.get("timestamp") or 0) >= live["started"]]
         rows = visible_rows(turn, live["show_tag"], live["show_over"])
         # Completion turns also update the original answer via the same saved projection.
-        full_rows = visible_rows(messages, live["show_tag"], live["show_over"])
+        full_rows = visible_rows(messages, live["show_tag"], live["show_over"]) \
+            if any(_background_outcome(m) for m in turn) else []
         full_by_key = {row["cell_key"]: row for row in full_rows}
         source_keys = set()
         for row in rows:
