@@ -49,6 +49,17 @@ def is_core_memory_provider(name: Optional[str]) -> bool:
     return str(name or "").strip().lower() in CORE_MEMORY_PROVIDER_SENTINELS
 
 
+def configured_memory_provider(mem_config: Optional[dict[str, Any]], platform: Optional[str]) -> str:
+    """``memory.provider`` for this platform. Harso: an optional ``memory.provider_platforms`` allowlist
+    keeps the external provider to the listed platforms; others fall back to the built-in store."""
+    if not mem_config:
+        return ""
+    only = mem_config.get("provider_platforms")
+    if isinstance(only, list) and (platform or "cli") not in only:
+        return ""
+    return mem_config.get("provider", "")
+
+
 @dataclass(frozen=True)
 class RecallStatus:
     """What the last prefetch injected, for the deterministic recall indicator

@@ -249,6 +249,7 @@ def _make_agent(tool_progress_mode: str):
         )
     agent.client = MagicMock()
     agent.tool_delay = 0
+    agent._current_turn_timestamp = 1_700_000_000.0
     agent._flush_messages_to_session_db = MagicMock()
     return agent
 
@@ -277,6 +278,7 @@ def _run_fake_turn(tool_progress_mode: str, dispatch_mode: str = "sequential"):
     messages: list = [
         {"role": "system", "content": "you are hermes"},
         {"role": "user", "content": "find three things"},
+        agent._build_assistant_message(assistant_message, "tool_calls"),
     ]
 
     def fake_dispatch(name, args, task_id, *positional, **kwargs):
@@ -289,14 +291,24 @@ def _run_fake_turn(tool_progress_mode: str, dispatch_mode: str = "sequential"):
             "agent.tool_executor.maybe_persist_tool_result",
             side_effect=lambda **kwargs: kwargs["content"],
         ),
-        # Swallow display writes so the test doesn't spam stdout; the point is
-        # what lands in `messages`, not what prints.
+        # Swallow display writes so the test doesn't spam stdout; compare the
+        # actual provider projection below, not persistence-only metadata.
         patch("builtins.print"),
     ):
         execute = getattr(agent, f"_execute_tool_calls_{dispatch_mode}")
         execute(assistant_message, messages, "task-focus")
 
-    return messages
+    from agent.turn_context import build_api_messages
+
+    api_messages, _ = build_api_messages(
+        agent, messages, current_turn_user_idx=1, ext_prefetch_cache="",
+        plugin_user_context="", moa_config=None, active_system_prompt="you are hermes",
+    )
+    assert all("display_metadata" not in message for message in api_messages)
+    declared_ids = [call["id"] for message in api_messages for call in message.get("tool_calls", [])]
+    result_ids = [message["tool_call_id"] for message in api_messages if message["role"] == "tool"]
+    assert declared_ids == result_ids == ["call-1", "call-2", "call-3"]
+    return api_messages
 
 
 class TestModelFacingMessagesUnchanged:
