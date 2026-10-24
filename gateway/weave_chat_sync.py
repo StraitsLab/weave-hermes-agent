@@ -167,10 +167,63 @@ def _tool_step_state(name: str, content: Any) -> str:
     return "failed" if failed else "completed"
 
 
+def _finished_helpers(payload: Any, args: dict) -> list[dict[str, Any]]:
+    from agent.redact import redact_sensitive_text
+    from gateway.weave_step_preview import _plain_words, step_preview
+    import math
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        return []
+    helpers = []
+    tasks = args.get("tasks")
+    for i, entry in enumerate(payload["results"][:10]):
+        if not isinstance(entry, dict):
+            continue
+        index = entry.get("task_index", i)
+        task = tasks[index] if isinstance(tasks, list) and type(index) is int and 0 <= index < len(tasks) else args
+        goal = _plain_words(task.get("goal")) if isinstance(task, dict) else None
+        failed = entry.get("status") in ("failed", "error", "timeout", "interrupted")
+        helper: dict[str, Any] = {"state": "failed" if failed else "completed"}
+        if goal:
+            helper["goal"] = redact_sensitive_text(goal, force=True, redact_url_credentials=True)
+        seconds = entry.get("duration_seconds")
+        if type(seconds) in (int, float) and math.isfinite(seconds) and seconds >= 0:
+            helper["duration_ms"] = round(seconds * 1000)
+        summary = entry.get("summary")
+        if not failed and isinstance(summary, str):
+            text = " ".join(redact_sensitive_text(summary, force=True, redact_url_credentials=True).split())
+            if len(text) > 600:
+                text = text[:601].rsplit(" ", 1)[0][:600] + "…"
+            if text:
+                helper["result"] = text
+        trace = entry.get("tool_trace")
+        trace = trace if isinstance(trace, list) else []
+        steps = []
+        for child in trace[:30]:
+            if not isinstance(child, dict):
+                continue
+            name = child.get("tool")
+            if not isinstance(name, str) or not re.fullmatch(r"[\w.:-]{1,256}", name, flags=re.ASCII):
+                continue
+            step = {"name": name, "state": "failed" if child.get("status") == "error" else "completed"}
+            inputs = child.get("input_summary")
+            preview = step_preview(name, inputs.get("targets") if isinstance(inputs, dict) else None)
+            if preview:
+                step["preview"] = preview
+            duration = child.get("duration_ms")
+            if type(duration) is int and duration >= 0:
+                step["duration_ms"] = duration
+            steps.append(step)
+        helper.update(steps=steps, steps_truncated=len(trace) > 30)
+        helpers.append(helper)
+    return helpers
+
+
 def _step_details(messages: list[dict[str, Any]]) -> dict[str, dict]:
     from gateway.weave_step_preview import step_preview
 
     details: dict[str, dict] = {}
+    delegates: dict[str, dict] = {}
     for message in messages:
         if message.get("role") == "assistant":
             for call in message.get("tool_calls") or ():
@@ -183,10 +236,21 @@ def _step_details(messages: list[dict[str, Any]]) -> dict[str, dict]:
                     args = json.loads(function.get("arguments"))
                 except (ValueError, TypeError):
                     continue
+                if function.get("name") == "delegate_task" and isinstance(args, dict):
+                    delegates[call["id"]] = args
                 preview = step_preview(function.get("name"), args)
                 if preview:
                     details.setdefault(call["id"], {})["preview"] = preview
         elif message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str):
+            call_id = message["tool_call_id"]
+            if call_id in delegates:
+                try:
+                    payload = json.loads(message.get("content"))
+                except (ValueError, TypeError):
+                    payload = None
+                helpers = _finished_helpers(payload, delegates[call_id])
+                if helpers:
+                    details.setdefault(call_id, {})["helpers"] = helpers
             metadata = message.get("display_metadata")
             if isinstance(metadata, str):
                 try:

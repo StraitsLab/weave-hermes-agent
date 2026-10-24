@@ -79,6 +79,59 @@ def run_turn(url, session, ref, events, saved, monkeypatch, started=True):
         sync.publish(session, ref, event, lambda: saved, secrets(url))
 
 
+def helper_messages(ref, results, args=None):
+    return [
+        {"role": "user", "content": "Check", "platform_message_id": ref},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "delegate", "function": {
+            "name": "delegate_task", "arguments": json.dumps(args or {})}}]},
+        {"role": "tool", "tool_call_id": "delegate", "content": results},
+        {"role": "assistant", "content": "Done", "message_uid": "helpers-answer"},
+    ]
+
+
+def test_finished_helpers_are_safe_bounded_and_match_replay(quiet_writer):
+    writer, live, calls = quiet_writer
+    token, key = "ghp_" + "a" * 36, "sk-" + "b" * 48
+    trace = [{"tool": "web_extract", "status": "ok", "duration_ms": 900,
+              "input_summary": {"targets": {"urls": ["https://user:pass@hyatt.com/private?token=secret"]}},
+              "output_tail": "private output"}] * 40
+    results = [
+        {"task_index": 0, "status": "completed", "duration_seconds": 185.001,
+         "summary": f"Found {token} {key} https://user:pass@host " + "word " * 200, "tool_trace": trace},
+        {"task_index": 1, "status": "interrupted", "summary": "private failure", "duration_seconds": 2},
+        {"task_index": 2, "status": "completed", "summary": "  One\n result  "},
+    ]
+    args = {"tasks": [{"goal": "Check Park Hyatt Tokyo rates for tomorrow", "context": "private context"},
+                      {"goal": "Check Aman"}, {"goal": "Check rooms"}]}
+    messages = helper_messages(live["ref"], json.dumps({"results": results}), args)
+    live["messages"] = messages
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._finish(live)
+    body = calls[-1][-1]["body"]
+    helpers = body["steps"][0]["helpers"]
+    assert helpers == sync.visible_rows(messages)[-1]["body"]["steps"][0]["helpers"]
+    assert len(helpers) == 3
+    assert helpers[0]["goal"] == "Check Park Hyatt Tokyo rates for…"
+    assert helpers[0]["duration_ms"] == 185001
+    assert len(helpers[0]["result"]) <= 601 and helpers[0]["result"].endswith("…")
+    assert len(helpers[0]["steps"]) == 30 and helpers[0]["steps_truncated"] is True
+    assert helpers[0]["steps"][0] == {"name": "web_extract", "state": "completed",
+                                      "preview": "hyatt.com", "duration_ms": 900}
+    assert helpers[1] == {"goal": "Check Aman", "state": "failed", "duration_ms": 2000,
+                          "steps": [], "steps_truncated": False}
+    assert helpers[2]["result"] == "One result"
+    wire = json.dumps(body)
+    for secret in (token, key, "user:pass@", "private context", "private output", "private failure"):
+        assert secret not in wire
+
+
+@pytest.mark.parametrize("payload", ["not JSON", "[]", '{"results":null}',
+                                    '{"status":"dispatched","mode":"background"}'])
+def test_finished_helpers_ignore_missing_results(payload):
+    body = sync.visible_rows(helper_messages("ref", payload))[-1]["body"]
+    assert "helpers" not in body["steps"][0]
+
+
 def test_reply_streams_into_one_row_and_is_saved_as_that_row(server, monkeypatch):
     url, calls, rows = server
     now = time.time()
