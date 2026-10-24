@@ -520,6 +520,58 @@ def test_status_survives_tool_gaps_until_answer_replaces_it(quiet_writer, with_t
     assert calls[-1][-1]["body"]["status"] is None
 
 
+@pytest.mark.parametrize("with_text", [False, True])
+@pytest.mark.parametrize("terminal", ["tool.completed", "tool.failed"])
+def test_writing_row_status_detail_follows_the_running_tool(quiet_writer, with_text, terminal):
+    writer, live, calls = quiet_writer
+    ref = live["ref"]
+    if with_text:
+        writer._take(ref, {"type": "assistant.delta", "delta": "Checking.", "message_uid": "checking"})
+    for call_id, preview in (("c1", "git"), ("c2", "npm")):
+        count = len(calls)
+        writer._take(ref, {"type": "tool.started", "tool_call_id": call_id,
+                           "tool_name": "terminal", "preview": preview})
+        writer._flush(live)
+        assert len(calls) > count, "same tool with a new preview must write again"
+        row = calls[-1][-1]
+        assert row["state"] == "writing"
+        assert row["body"]["status"] == "terminal"
+        assert row["body"]["status_detail"] == preview
+        count = len(calls)
+        writer._flush(live)
+        assert len(calls) == count, "unchanged status/detail must not write again"
+
+    writer._take(ref, {"type": terminal, "tool_call_id": "c2", "tool_name": "terminal"})
+    writer._flush(live)
+    assert calls[-1][-1]["body"]["status"] == "Thinking"
+    assert calls[-1][-1]["body"]["status_detail"] is None
+    writer._take(ref, {"type": "assistant.delta", "delta": "Done.", "message_uid": "done"})
+    writer._flush(live)
+    live["messages"] = [{"role": "assistant", "content": "Done.", "message_uid": "done", "timestamp": time.time()}]
+    writer._take(ref, {"type": "turn.completed"})
+    writer._finish(live)
+    assert calls[-1][-1]["body"]["status_detail"] is None
+    for batch in calls:
+        for row in batch:
+            if row.get("body", {}).get("status", False) is None:
+                assert row["body"]["status_detail"] is None
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "tool.generating", "tool_name": "terminal", "preview": "not-ready"},
+    {"type": "tool.started", "tool_name": "terminal", "preview": {"command": "raw"}},
+    {"type": "tool.started", "tool_name": "terminal"},
+])
+def test_writing_row_clears_detail_when_no_safe_preview_is_available(quiet_writer, event):
+    writer, live, calls = quiet_writer
+    writer._take(live["ref"], {"type": "tool.started", "tool_name": "terminal", "preview": "git"})
+    writer._flush(live)
+    writer._take(live["ref"], event)
+    writer._flush(live)
+    assert live["status_detail"] is None
+    assert calls[-1][-1]["body"]["status_detail"] is None
+
+
 def test_retracted_text_keeps_a_working_status_in_the_same_batch(quiet_writer):
     writer, live, calls = quiet_writer
     writer._take(live["ref"], {"type": "assistant.delta", "delta": "Partial", "message_uid": "partial"})
@@ -596,7 +648,7 @@ def test_fresh_writer_retires_prior_status_only_for_restart_interruption(quiet_w
     removed_status = [row for row in terminal if row.get("item_id") == status_id]
     if restart_interrupted:
         assert removed_status == [{"item_id": status_id, "role": "assistant", "kind": "text",
-                                   "state": "removed", "body": {"status": None}}]
+                                   "state": "removed", "body": {"status": None, "status_detail": None}}]
         assert terminal[-1]["item_id"] == text_id and terminal[-1]["state"] == "final"
         assert terminal[-1]["body"]["outcome"] == "failed"
         assert not any(row["state"] == "writing" for row in rows.values())
@@ -806,6 +858,124 @@ def test_finished_steps_are_turn_local_and_survive_replay(quiet_writer):
     assert calls[-1][-1]["body"]["steps"] == expected
 
 
+def test_finished_step_details_are_turn_local_with_reused_call_ids():
+    messages = [
+        {"role": "user", "content": "read first"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "reused", "function": {"name": "read_file", "arguments": json.dumps({"path": "first.txt"})}}]},
+        {"role": "tool", "tool_call_id": "reused", "content": "ok", "display_metadata": {"duration_ms": 10}},
+        {"role": "assistant", "content": "First answer", "message_uid": "first-answer"},
+        {"role": "user", "content": "read second"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "reused", "function": {"name": "read_file", "arguments": json.dumps({"path": "second.txt"})}}]},
+        {"role": "tool", "tool_call_id": "reused", "content": "ok", "display_metadata": {"duration_ms": 20}},
+        {"role": "assistant", "content": "Second answer", "message_uid": "second-answer"},
+    ]
+
+    answers = [row for row in sync.visible_rows(messages) if row["role"] == "assistant"]
+    assert [row["body"]["text"] for row in answers] == ["First answer", "Second answer"]
+    assert [row["body"]["steps"] for row in answers] == [
+        [{"id": "reused", "name": "read_file", "state": "completed", "preview": "first.txt", "duration_ms": 10}],
+        [{"id": "reused", "name": "read_file", "state": "completed", "preview": "second.txt", "duration_ms": 20}],
+    ]
+
+
+@pytest.mark.parametrize("duration_metadata", [{"duration_ms": 500}, '{"duration_ms": 500}', None])
+def test_finished_steps_carry_preview_and_duration_live_and_replay(quiet_writer, duration_metadata):
+    writer, live, calls = quiet_writer
+    messages = [
+        {"role": "user", "content": "check", "platform_message_id": live["ref"]},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "function": {"name": "terminal", "arguments": json.dumps({"command": "git status"})}},
+            {"id": "b", "function": {"name": "read_file", "arguments": json.dumps({"path": "src/app.ts"})}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "ok", "display_metadata": {"duration_ms": 1250}},
+        {"role": "tool", "tool_call_id": "b", "content": "ok",
+         **({"display_metadata": duration_metadata} if duration_metadata is not None else {})},
+        {"role": "assistant", "content": "Done", "message_uid": "answer"},
+    ]
+    expected = [
+        {"id": "a", "name": "terminal", "state": "completed", "preview": "git", "duration_ms": 1250},
+        {"id": "b", "name": "read_file", "state": "completed", "preview": "app.ts",
+         **({"duration_ms": 500} if duration_metadata is not None else {})},
+    ]
+    for call_id, name in (("a", "terminal"), ("b", "read_file")):
+        writer._take(live["ref"], {"type": "tool.started", "tool_call_id": call_id, "tool_name": name})
+        writer._take(live["ref"], {"type": "tool.completed", "tool_call_id": call_id, "tool_name": name})
+    live["messages"] = messages
+    writer._take(live["ref"], {"type": "assistant.delta", "delta": "Done", "message_uid": "answer"})
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._finish(live)
+    assert calls[-1][-1]["body"]["steps"] == expected
+    assert sync.visible_rows(messages)[-1]["body"]["steps"] == expected
+
+
+@pytest.mark.parametrize("metadata", [
+    {"duration_ms": -1}, {"duration_ms": True}, {"duration_ms": "12"},
+    {"duration_ms": 1.5}, "not JSON",
+])
+def test_finished_steps_reject_invalid_duration_live_and_replay(quiet_writer, metadata):
+    writer, live, calls = quiet_writer
+    messages = [
+        {"role": "user", "content": "check", "platform_message_id": live["ref"]},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "function": {"name": "terminal", "arguments": '{"command":"git"}'}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "ok", "display_metadata": metadata},
+        {"role": "assistant", "content": "Done", "message_uid": "answer"},
+    ]
+    live["messages"] = messages
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._write(live["ref"], live)
+    expected = [{"id": "a", "name": "terminal", "state": "completed", "preview": "git"}]
+    assert calls[-1][-1]["body"]["steps"] == expected
+    assert sync.visible_rows(messages)[-1]["body"]["steps"] == expected
+
+
+def test_writer_redacts_previews_in_publishing_profile(quiet_writer, tmp_path, monkeypatch):
+    import hermes_constants
+    from agent.redact import clear_vault_redaction_values, register_vault_redaction_value
+    from gateway.weave_step_preview import step_preview
+
+    writer, _live, calls = quiet_writer
+    home_a, home_b = tmp_path / "A", tmp_path / "B"
+    secret = "Zq9secretVault77"
+    messages = [
+        {"role": "user", "content": "check", "platform_message_id": "profile-B"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "function": {"name": "terminal", "arguments": json.dumps({"command": secret})}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "ok"},
+        {"role": "assistant", "content": "Done", "message_uid": "profile-answer"},
+    ]
+    token_b = hermes_constants.set_hermes_home_override(home_b)
+    try:
+        register_vault_redaction_value(secret)
+        expected = step_preview("terminal", {"command": secret})
+        assert expected and secret not in expected
+        assert sync.publish("weave-profile", "profile-B", {"type": "turn.completed"},
+                            lambda: messages, secrets("https://supabase.example"))
+        live = writer.live["profile-B"]
+        writer._take(*writer.events.get_nowait())
+        seen_homes = []
+        real_finish = writer._finish
+
+        def finish(entry):
+            seen_homes.append(hermes_constants.get_hermes_home())
+            return real_finish(entry)
+
+        monkeypatch.setattr(writer, "_finish", finish)
+        token_a = hermes_constants.set_hermes_home_override(home_a)
+        try:
+            assert step_preview("terminal", {"command": secret}) == secret
+            writer._write("profile-B", live)  # real dispatch, not a direct _finish call
+            assert hermes_constants.get_hermes_home() == home_a
+        finally:
+            hermes_constants.reset_hermes_home_override(token_a)
+        assert calls[-1][-1]["body"]["steps"][0]["preview"] == expected
+        assert seen_homes == [home_b]
+    finally:
+        clear_vault_redaction_values()
+        hermes_constants.reset_hermes_home_override(token_b)
+
+
 def test_finished_steps_stop_compaction_and_bounds(quiet_writer):
     writer, live, calls = quiet_writer
     ref = live["ref"]
@@ -981,7 +1151,7 @@ def test_show_settings_come_from_the_profile_secrets(server, monkeypatch):
         sync.publish("weave-show", "ref-show", event, lambda: saved, lambda name: values.get(name, ""))
     wait_for(lambda: any(i.get("state") == "final" for c in calls for i in c["p_items"]) and "ref-show" not in (sync._WRITER.live if sync._WRITER else {}))
     final = next(i for c in calls for i in c["p_items"] if i.get("state") == "final")
-    assert final["body"] == {"text": "read me", "visible": True, "status": None}
+    assert (final["body"]["text"], final["body"]["visible"]) == ("read me", True)
 
 
 def test_ledger_vault_card_keeps_always_on_server(server, monkeypatch):

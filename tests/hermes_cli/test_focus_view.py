@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.message_metadata import without_persistence_fields
 from hermes_cli.focus_view import (
     FOCUS_CONFIG_KEY,
     FOCUS_STATUSBAR_LABEL,
@@ -296,7 +297,9 @@ def _run_fake_turn(tool_progress_mode: str, dispatch_mode: str = "sequential"):
         execute = getattr(agent, f"_execute_tool_calls_{dispatch_mode}")
         execute(assistant_message, messages, "task-focus")
 
-    return messages
+    # What the provider receives: turn_context strips persistence-only fields (tool timings
+    # included) from every outgoing copy.
+    return [dict(without_persistence_fields(m)) for m in messages]
 
 
 class TestModelFacingMessagesUnchanged:

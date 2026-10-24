@@ -1168,6 +1168,11 @@ def _commit_tool_result(
                 tool_message["display_metadata"] = metadata
         except Exception as callback_error:
             logging.debug("Tool result metadata callback error: %s", callback_error)
+    if not blocked:
+        tool_message["display_metadata"] = {
+            **(tool_message.get("display_metadata") or {}),
+            "duration_ms": max(0, round(tool_duration * 1000)),
+        }
     messages.append(tool_message)
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
         return None
