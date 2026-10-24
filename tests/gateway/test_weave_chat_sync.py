@@ -79,6 +79,54 @@ def run_turn(url, session, ref, events, saved, monkeypatch, started=True):
         sync.publish(session, ref, event, lambda: saved, secrets(url))
 
 
+def background_messages(ref="completion", status="completed normally", exit_code=0, complete=True):
+    messages = [
+        {"role": "user", "content": "Run", "timestamp": 100},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "bg", "function": {
+            "name": "terminal", "arguments": '{"command":"npm test","background":true}'}}]},
+        {"role": "tool", "tool_call_id": "bg", "timestamp": 101, "content": json.dumps({
+            "session_id": "proc_123", "output": "Background process started", "notify_on_complete": True}),
+         "display_metadata": {"duration_ms": 300}},
+        {"role": "assistant", "content": "Running", "message_uid": "background-source", "timestamp": 102},
+    ]
+    if complete:
+        messages.extend([
+            {"role": "user", "content": f"[IMPORTANT: Background process proc_123 {status} (exit code {exit_code}).\\nOutput: secret]",
+             "display_kind": "internal_notification", "platform_message_id": ref, "timestamp": 372},
+            {"role": "assistant", "content": "Reported", "message_uid": "background-reply", "timestamp": 373},
+        ])
+    return messages
+
+
+@pytest.mark.parametrize("status,code,state", [("completed normally", 0, "completed"),
+                                              ("exited", 1, "failed"), ("terminated by Hermes", 0, "failed")])
+def test_background_completion_reprojects_source_and_links_reply(quiet_writer, status, code, state):
+    writer, live, calls = quiet_writer
+    messages = background_messages(live["ref"], status, code)
+    replay = sync.visible_rows(messages)
+    source, reply = replay[1:]
+    step = source["body"]["steps"][0]
+    assert step["background"] == {"id": "proc_123", "started_ms": 101000, "ended_ms": 372000, "exit_code": code}
+    assert step["duration_ms"] == 271000 and step["state"] == state
+    assert reply["body"]["reply_to"] == {"cell_key": "msg:background-source", "name": "terminal",
+                                         "preview": "npm", "state": state, "duration_ms": 271000}
+    assert "secret" not in json.dumps(replay)
+    live["messages"] = messages
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._finish(live)
+    sent = {row.get("cell_key"): row for batch in calls for row in batch}
+    assert sent[source["cell_key"]]["body"] == source["body"]
+    assert sent[reply["cell_key"]]["body"]["reply_to"] == reply["body"]["reply_to"]
+
+
+def test_background_without_completion_keeps_launch_duration_and_running_metadata():
+    body = sync.visible_rows(background_messages(complete=False))[-1]["body"]
+    step = body["steps"][0]
+    assert step["background"] == {"id": "proc_123", "started_ms": 101000}
+    assert step["duration_ms"] == 300
+    assert "reply_to" not in body
+
+
 def helper_messages(ref, results, args=None):
     return [
         {"role": "user", "content": "Check", "platform_message_id": ref},

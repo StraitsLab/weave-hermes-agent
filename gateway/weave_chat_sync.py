@@ -56,6 +56,23 @@ SCAFFOLDING = ("[System:", "[IMPORTANT: Background", "[Your active task list", "
                "[CONTEXT COMPACTION", "[ASYNC DELEGATION", "[Planning state preserved")
 
 
+_BACKGROUND_DONE = re.compile(
+    r"^\[IMPORTANT: Background process (proc_[\w-]+) "
+    r"(completed normally|exited|killed|terminated by [^\n(]{1,120}) \(exit code (-?\d+)(?:[,).])",
+    flags=re.ASCII,
+)
+
+
+def _background_outcome(message: dict[str, Any]):
+    content, at = message.get("content"), message.get("timestamp")
+    match = _BACKGROUND_DONE.match(content) if message.get("role") == "user" and isinstance(content, str) else None
+    if not match or type(at) not in (int, float):
+        return None
+    process_id, status, code = match.groups()
+    return {"id": process_id, "ended_ms": round(at * 1000), "exit_code": int(code),
+            "state": "failed" if int(code) != 0 or status.startswith(("killed", "terminated")) else "completed"}
+
+
 HUB = "mcp__weave_connectors__"  # the cell's name prefix for Harso hub tools
 CODE_CARDS = {HUB + "weather_now", HUB + "page_read"}  # hub tools whose own code builds a card
 
@@ -224,6 +241,7 @@ def _step_details(messages: list[dict[str, Any]]) -> dict[str, dict]:
 
     details: dict[str, dict] = {}
     delegates: dict[str, dict] = {}
+    terminals: dict[str, dict] = {}
     for message in messages:
         if message.get("role") == "assistant":
             for call in message.get("tool_calls") or ():
@@ -238,16 +256,24 @@ def _step_details(messages: list[dict[str, Any]]) -> dict[str, dict]:
                     continue
                 if function.get("name") == "delegate_task" and isinstance(args, dict):
                     delegates[call["id"]] = args
+                if function.get("name") == "terminal" and isinstance(args, dict):
+                    terminals[call["id"]] = args
                 preview = step_preview(function.get("name"), args)
                 if preview:
                     details.setdefault(call["id"], {})["preview"] = preview
         elif message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str):
             call_id = message["tool_call_id"]
+            try:
+                payload = json.loads(message.get("content"))
+            except (ValueError, TypeError):
+                payload = None
+            at = message.get("timestamp")
+            if call_id in terminals and isinstance(payload, dict) and type(at) in (int, float):
+                process_id = payload.get("session_id")
+                if isinstance(process_id, str) and re.fullmatch(r"proc_[\w-]{1,128}", process_id, flags=re.ASCII) \
+                        and (payload.get("notify_on_complete") or payload.get("background") or terminals[call_id].get("background")):
+                    details.setdefault(call_id, {})["background"] = {"id": process_id, "started_ms": round(at * 1000)}
             if call_id in delegates:
-                try:
-                    payload = json.loads(message.get("content"))
-                except (ValueError, TypeError):
-                    payload = None
                 helpers = _finished_helpers(payload, delegates[call_id])
                 if helpers:
                     details.setdefault(call_id, {})["helpers"] = helpers
@@ -288,7 +314,7 @@ def _steps_turn_boundary(message: dict[str, Any]) -> bool:
     if message.get("role") != "user" or kind in ("hidden", STEER_DISPLAY_KIND):
         return False
     # Internal admissions start real turns even when their text resembles scaffolding.
-    return kind == "internal_notification" or not (isinstance(content, str) and content.lstrip().startswith(SCAFFOLDING))
+    return kind == "internal_notification" or _background_outcome(message) is not None or not (isinstance(content, str) and content.lstrip().startswith(SCAFFOLDING))
 
 
 def _saved_steps(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -319,6 +345,27 @@ def _saved_steps(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             step = steps[message["tool_call_id"]]
             step["state"] = _tool_step_state(step["name"], content)
         turn_messages.append(message)
+    sources = {}
+    for key, body in out.items():
+        for step in body.get("steps", []):
+            if background := step.get("background"):
+                sources[background["id"]] = (key, step)
+    pending = None
+    for message in messages:
+        outcome = _background_outcome(message)
+        if outcome and outcome["id"] in sources:
+            key, step = sources[outcome["id"]]
+            background = step["background"]
+            if outcome["ended_ms"] >= background["started_ms"]:
+                background.update({field: outcome[field] for field in ("ended_ms", "exit_code")})
+                step.update(state=outcome["state"], duration_ms=outcome["ended_ms"] - background["started_ms"])
+                pending = {"cell_key": key, **{field: step[field] for field in ("name", "state", "duration_ms", "preview") if field in step}}
+        elif _steps_turn_boundary(message):
+            pending = None
+        key = row_key(message)
+        if pending and key in out:
+            out[key]["reply_to"] = pending
+            pending = None
     return out
 
 
@@ -345,6 +392,8 @@ def visible_rows(messages: list[dict[str, Any]], show_tag: str = "[SHOW]", show_
                 content = empty_response_explanation()
             body["text"], body["visible"] = visible_reply(content, show_tag, show_over)
             projection = saved_steps.get(row_key(m), {})
+            if "reply_to" in projection:
+                body["reply_to"] = projection["reply_to"]
             _attach_steps(body, projection.get("steps", []), projection.get("steps_truncated", False))
         out.append({"cell_key": row_key(m), "role": m["role"], "kind": "text", "state": "final",
                     "body": body,
@@ -658,6 +707,17 @@ class _Writer:
         start = next((i for i, m in enumerate(messages) if m.get("platform_message_id") == live["ref"]), None)
         turn = messages[start:] if start is not None else [m for m in messages if (m.get("timestamp") or 0) >= live["started"]]
         rows = visible_rows(turn, live["show_tag"], live["show_over"])
+        # Completion turns also update the original answer via the same saved projection.
+        full_rows = visible_rows(messages, live["show_tag"], live["show_over"])
+        full_by_key = {row["cell_key"]: row for row in full_rows}
+        source_keys = set()
+        for row in rows:
+            projection = full_by_key.get(row["cell_key"])
+            if projection and "reply_to" in projection["body"]:
+                row["body"]["reply_to"] = projection["body"]["reply_to"]
+                source_keys.add(row["body"]["reply_to"]["cell_key"])
+        present = {row["cell_key"] for row in rows}
+        rows = [row for row in full_rows if row["cell_key"] in source_keys - present] + rows
         # This turn's visible assistant messages (excluding browser cards, which are pushed as passive appends).
         mine = [m for m in (messages[start + 1:] if start is not None else [m for m in messages if (m.get("timestamp") or 0) >= live["started"]])
                 if m.get("role") == "assistant" and isinstance(m.get("content"), str)
