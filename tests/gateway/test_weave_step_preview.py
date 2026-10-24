@@ -31,6 +31,13 @@ CASES = [
     ('web_search', {'query': 'login hunter2 fails'}, None),
     ('session_search', {'query': 'login hunter2 fails'}, None),
     ('todo', {'items': []}, None),
+    ('delegate_task', {'goal': 'Audit the iOS chat steps view for layout jumps and report'}, 'Audit the iOS chat steps view…'),
+    ('delegate_task', {'goal': '  Fix\nthe build  '}, 'Fix the build'),
+    ('delegate_task', {'tasks': [{'goal': 'a'}, {'goal': 'b'}, {'goal': 'c'}]}, '3 tasks'),
+    ('delegate_task', {'tasks': [{'goal': 'Check the login page loads'}]}, 'Check the login page loads'),
+    ('delegate_task', {'goal': 'Use key ghp_' + 'a' * 36 + ' to list'}, None),
+    ('delegate_task', {'goal': 'x' * 300}, None),
+    ('delegate_task', {}, None),
     ('terminal', 'not a dict', None),
 ]
 
