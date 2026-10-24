@@ -36,9 +36,29 @@ def step_preview(name: str, args: dict | None) -> str | None:
         path = args.get("path")
         if isinstance(path, str):
             text = posixpath.basename(path.rstrip("/"))
+    elif name == "delegate_task":
+        tasks = args.get("tasks")
+        if isinstance(tasks, list) and len(tasks) > 1:
+            return f"{len(tasks)} tasks"
+        goal = tasks[0].get("goal") if isinstance(tasks, list) and tasks and isinstance(tasks[0], dict) else args.get("goal")
+        text = _plain_words(goal)
     if not isinstance(text, str):
         return None
     from agent.redact import redact_sensitive_text
 
     text = redact_sensitive_text(" ".join(text.split()), force=True, redact_url_credentials=True)
     return text[:120] or None
+
+
+_PLAIN_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9.,:'()/-]{0,23}")
+
+
+def _plain_words(goal, limit: int = 6) -> str | None:
+    """A free-text goal's first words, only when every one is short plain prose (no keys, ids, paths)."""
+    if not isinstance(goal, str):
+        return None
+    words = goal.split()
+    head = words[:limit]
+    if not head or not all(_PLAIN_WORD.fullmatch(word) for word in head):
+        return None
+    return " ".join(head) + ("…" if len(words) > limit else "")
