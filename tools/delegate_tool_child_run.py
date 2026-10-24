@@ -541,6 +541,10 @@ def _build_tool_trace(messages: Any) -> list[dict[str, Any]]:
         elif msg.get("role") == "tool":
             content = _stringify_tool_content(msg.get("content", ""))
             result_meta = {"result_bytes": len(content), "status": "error" if _looks_like_error_output(content) else "ok"}
+            metadata = msg.get("display_metadata")
+            duration = metadata.get("duration_ms") if isinstance(metadata, dict) else None
+            if type(duration) is int and duration >= 0:
+                result_meta["duration_ms"] = duration
             tc_id = msg.get("tool_call_id")
             target = trace_by_id.get(tc_id) if tc_id else None
             if target is not None:

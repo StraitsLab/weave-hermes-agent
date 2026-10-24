@@ -38,6 +38,35 @@ def adapter(tmp_path):
         db.close()
 
 
+@pytest.mark.parametrize("status,state", [("completed", "completed"), ("interrupted", "failed")])
+def test_native_subagent_callback_preserves_previous_and_only_emits_safe_fields(adapter, status, state):
+    from gateway.native_session_lifecycle import wire_tools
+
+    adapter._native_submit_active_refs["native-session-key"] = REQUEST_REF
+    events, previous = [], []
+    adapter._native_submit_event = lambda ref, kind, **fields: events.append({"type": kind, **fields})
+    agent = SimpleNamespace(tool_start_callback=None, tool_complete_callback=None, tool_gen_callback=None,
+                            tool_progress_callback=lambda *a, **kw: previous.append((a, kw, len(events))))
+    wire_tools(agent, adapter, "native-session-key")
+    identity = {"subagent_id": "sa-0-123", "goal": "Check Park Hyatt Tokyo rates for tomorrow",
+                "summary": "private summary", "context": "private context"}
+    agent.tool_progress_callback("subagent.start", None, "raw preview", None, **identity)
+    agent.tool_progress_callback("subagent.tool", "web_extract", "raw preview",
+                                 {"urls": ["https://user:pass@hyatt.com/private?token=secret"]}, **identity)
+    agent.tool_progress_callback("subagent.complete", None, "output tail", None,
+                                 status=status, duration_seconds=2.5, **identity)
+    agent.tool_progress_callback("subagent.text", None, "private output", None, **identity)
+    assert len(previous) == 4 and [entry[2] for entry in previous] == [0, 1, 2, 3]
+    assert len(events) == 3
+    assert events[0]["state"] == "running" and type(events[0]["started_ms"]) is int
+    assert events[1] == {"type": "subagent.update", "id": "sa-0-123", "state": "running",
+                         "goal": "Check Park Hyatt Tokyo rates for…", "tool": "web_extract", "preview": "hyatt.com"}
+    assert events[2] == {"type": "subagent.update", "id": "sa-0-123", "state": state,
+                         "goal": "Check Park Hyatt Tokyo rates for…", "duration_ms": 2500}
+    for secret in ("private", "raw preview", "output tail", "user:pass@", "token=secret"):
+        assert secret not in json.dumps(events)
+
+
 async def _client(adapter):
     app = web.Application()
     for method, path, handler in adapter._http_route_table():

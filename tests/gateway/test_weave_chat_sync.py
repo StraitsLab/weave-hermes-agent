@@ -79,6 +79,164 @@ def run_turn(url, session, ref, events, saved, monkeypatch, started=True):
         sync.publish(session, ref, event, lambda: saved, secrets(url))
 
 
+@pytest.mark.parametrize("with_text", [False, True])
+def test_live_helpers_coalesce_persist_across_tools_and_retire(quiet_writer, with_text):
+    writer, live, calls = quiet_writer
+    ref = live["ref"]
+    writer._take(ref, {"type": "tool.started", "tool_name": "delegate_task"})
+    if with_text:
+        writer._take(ref, {"type": "assistant.delta", "delta": "Checking"})
+    writer._take(ref, {"type": "subagent.update", "id": "sa-1", "goal": "Check rooms",
+                       "state": "running", "started_ms": 1000})
+    writer._take(ref, {"type": "subagent.update", "id": "sa-1", "state": "running",
+                       "tool": "web_extract", "preview": "hyatt.com", "args": {"secret": "private args"}})
+    assert calls == []
+    writer._flush(live)
+    assert calls[-1][-1]["body"]["helpers"] == [{"id": "sa-1", "goal": "Check rooms", "state": "running",
+                                                 "started_ms": 1000, "tool": "web_extract", "preview": "hyatt.com"}]
+    count = len(calls)
+    writer._flush(live)
+    assert len(calls) == count
+    writer._take(ref, {"type": "tool.started", "tool_name": "read_file"})
+    writer._flush(live)
+    assert calls[-1][-1]["body"]["helpers"][0]["id"] == "sa-1"
+    writer._take(ref, {"type": "subagent.update", "id": "sa-1", "state": "completed", "duration_ms": 2500})
+    writer._flush(live)
+    assert calls[-1][-1]["body"]["helpers"] == [{"id": "sa-1", "goal": "Check rooms", "state": "completed",
+                                                 "started_ms": 1000, "duration_ms": 2500}]
+    live["messages"] = [{"role": "assistant", "content": "Done", "message_uid": "helpers-done"}]
+    writer._take(ref, {"type": "turn.completed"})
+    writer._finish(live)
+    for batch in calls:
+        for row in batch:
+            if row.get("body", {}).get("status", False) is None:
+                assert row["body"]["helpers"] is None
+    assert "private args" not in json.dumps(calls)
+
+
+def background_messages(ref="completion", status="completed normally", exit_code=0, complete=True):
+    messages = [
+        {"role": "user", "content": "Run", "timestamp": 100},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "bg", "function": {
+            "name": "terminal", "arguments": '{"command":"npm test","background":true}'}}]},
+        {"role": "tool", "tool_call_id": "bg", "timestamp": 101, "content": json.dumps({
+            "session_id": "proc_123", "output": "Background process started", "notify_on_complete": True}),
+         "display_metadata": {"duration_ms": 300}},
+        {"role": "assistant", "content": "Running", "message_uid": "background-source", "timestamp": 102},
+    ]
+    if complete:
+        messages.extend([
+            {"role": "user", "content": f"[IMPORTANT: Background process proc_123 {status} (exit code {exit_code}).\\nOutput: secret]",
+             "display_kind": "internal_notification", "platform_message_id": ref, "timestamp": 372},
+            {"role": "assistant", "content": "Reported", "message_uid": "background-reply", "timestamp": 373},
+        ])
+    return messages
+
+
+@pytest.mark.parametrize("status,code,state", [("completed normally", 0, "completed"),
+                                              ("exited", 1, "failed"), ("terminated by Hermes", 0, "failed")])
+def test_background_completion_reprojects_source_and_links_reply(quiet_writer, status, code, state):
+    writer, live, calls = quiet_writer
+    messages = background_messages(live["ref"], status, code)
+    replay = sync.visible_rows(messages)
+    source, reply = replay[1:]
+    step = source["body"]["steps"][0]
+    assert step["background"] == {"id": "proc_123", "started_ms": 101000, "ended_ms": 372000, "exit_code": code}
+    assert step["duration_ms"] == 271000 and step["state"] == state
+    assert reply["body"]["reply_to"] == {"cell_key": "msg:background-source", "name": "terminal",
+                                         "preview": "npm", "state": state, "duration_ms": 271000}
+    assert "secret" not in json.dumps(replay)
+    live["messages"] = messages
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._finish(live)
+    sent = {row.get("cell_key"): row for batch in calls for row in batch}
+    assert sent[source["cell_key"]]["body"] == source["body"]
+    assert sent[reply["cell_key"]]["body"]["reply_to"] == reply["body"]["reply_to"]
+
+
+def test_background_without_completion_keeps_launch_duration_and_running_metadata():
+    body = sync.visible_rows(background_messages(complete=False))[-1]["body"]
+    step = body["steps"][0]
+    assert step["background"] == {"id": "proc_123", "started_ms": 101000}
+    assert step["duration_ms"] == 300
+    assert "reply_to" not in body
+
+
+def helper_messages(ref, results, args=None):
+    return [
+        {"role": "user", "content": "Check", "platform_message_id": ref},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "delegate", "function": {
+            "name": "delegate_task", "arguments": json.dumps(args or {})}}]},
+        {"role": "tool", "tool_call_id": "delegate", "content": results},
+        {"role": "assistant", "content": "Done", "message_uid": "helpers-answer"},
+    ]
+
+
+def test_finished_helpers_are_safe_bounded_and_match_replay(quiet_writer):
+    writer, live, calls = quiet_writer
+    token, key = "ghp_" + "a" * 36, "sk-" + "b" * 48
+    trace = [{"tool": "web_extract", "status": "ok", "duration_ms": 900,
+              "input_summary": {"targets": {"urls": ["https://user:pass@hyatt.com/private?token=secret"]}},
+              "output_tail": "private output"}] * 40
+    results = [
+        {"task_index": 0, "status": "completed", "duration_seconds": 185.001,
+         "summary": f"Found {token} {key} https://user:pass@host " + "word " * 200, "tool_trace": trace},
+        {"task_index": 1, "status": "interrupted", "summary": "private failure", "duration_seconds": 2},
+        {"task_index": 2, "status": "completed", "summary": "  One\n result  "},
+    ]
+    args = {"tasks": [{"goal": "Check Park Hyatt Tokyo rates for tomorrow", "context": "private context"},
+                      {"goal": "Check Aman"}, {"goal": "Check rooms"}]}
+    messages = helper_messages(live["ref"], json.dumps({"results": results}), args)
+    live["messages"] = messages
+    writer._take(live["ref"], {"type": "turn.completed"})
+    writer._finish(live)
+    body = calls[-1][-1]["body"]
+    helpers = body["steps"][0]["helpers"]
+    assert helpers == sync.visible_rows(messages)[-1]["body"]["steps"][0]["helpers"]
+    assert len(helpers) == 3
+    assert helpers[0]["goal"] == "Check Park Hyatt Tokyo rates for…"
+    assert helpers[0]["duration_ms"] == 185001
+    assert len(helpers[0]["result"]) <= 601 and helpers[0]["result"].endswith("…")
+    assert len(helpers[0]["steps"]) == 30 and helpers[0]["steps_truncated"] is True
+    assert helpers[0]["steps"][0] == {"name": "web_extract", "state": "completed",
+                                      "preview": "hyatt.com", "duration_ms": 900}
+    assert helpers[1] == {"goal": "Check Aman", "state": "failed", "duration_ms": 2000,
+                          "steps": [], "steps_truncated": False}
+    assert helpers[2]["result"] == "One result"
+    wire = json.dumps(body)
+    for secret in (token, key, "user:pass@", "private context", "private output", "private failure"):
+        assert secret not in wire
+
+
+def test_finished_helpers_caps_and_body_bound():
+    args = {"goal": "Check rooms"}
+    results = [{"status": "completed", "duration_seconds": 0, "summary": "ok"}] * 12
+    body = sync.visible_rows(helper_messages("ref", json.dumps({"results": results}), args))[-1]["body"]
+    assert len(body["steps"][0]["helpers"]) == 10
+    assert body["steps"][0]["helpers"][0]["goal"] == "Check rooms"
+    assert body["steps"][0]["helpers"][0]["duration_ms"] == 0
+    # The existing byte ceiling still drops whole steps, including helper detail.
+    large = {"text": "x" * 130000}
+    sync._attach_steps(large, body["steps"] * 10)
+    assert len(json.dumps(large, ensure_ascii=False).encode()) <= 131040
+    assert large["steps_truncated"] is True
+
+
+def test_background_unknown_process_does_not_link_an_answer():
+    messages = background_messages()
+    messages[-2]["content"] = messages[-2]["content"].replace("proc_123", "proc_other")
+    rows = sync.visible_rows(messages)
+    assert "ended_ms" not in rows[1]["body"]["steps"][0]["background"]
+    assert "reply_to" not in rows[-1]["body"]
+
+
+@pytest.mark.parametrize("payload", ["not JSON", "[]", '{"results":null}',
+                                    '{"status":"dispatched","mode":"background"}'])
+def test_finished_helpers_ignore_missing_results(payload):
+    body = sync.visible_rows(helper_messages("ref", payload))[-1]["body"]
+    assert "helpers" not in body["steps"][0]
+
+
 def test_reply_streams_into_one_row_and_is_saved_as_that_row(server, monkeypatch):
     url, calls, rows = server
     now = time.time()
@@ -648,7 +806,7 @@ def test_fresh_writer_retires_prior_status_only_for_restart_interruption(quiet_w
     removed_status = [row for row in terminal if row.get("item_id") == status_id]
     if restart_interrupted:
         assert removed_status == [{"item_id": status_id, "role": "assistant", "kind": "text",
-                                   "state": "removed", "body": {"status": None, "status_detail": None}}]
+                                   "state": "removed", "body": {"status": None, "status_detail": None, "helpers": None}}]
         assert terminal[-1]["item_id"] == text_id and terminal[-1]["state"] == "final"
         assert terminal[-1]["body"]["outcome"] == "failed"
         assert not any(row["state"] == "writing" for row in rows.values())
