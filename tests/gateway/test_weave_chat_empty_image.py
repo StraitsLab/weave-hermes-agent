@@ -74,7 +74,7 @@ def test_absorbed_turn_without_saved_answer_retires_silently(quiet_writer, absor
 
     final = calls[-1][-1]
     assert final["state"] == "removed"
-    assert final["body"] == {"outcome": "completed", "status": None}
+    assert final["body"] == {"outcome": "completed", "status": None, "status_detail": None}
     assert not any(row.get("body", {}).get("text") for batch in calls for row in batch
                    if row.get("role") == "assistant")
     assert any(row.get("state") == "removed" and row.get("item_id") == writer._status_item_id(live)
