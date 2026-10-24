@@ -1085,15 +1085,19 @@ class NativeSessionAPI:
             )
 
     def _native_submit_tool_started(
-        self, session_key: str, tool_call_id: Any, tool_name: Any,
+        self, session_key: str, tool_call_id: Any, tool_name: Any, args=None,
     ) -> None:
+        from gateway.weave_step_preview import step_preview
+
         native_request_ref = self._native_submit_active_ref(session_key)
         if native_request_ref:
+            preview = step_preview(str(tool_name), args)
             self._native_submit_event(
                 native_request_ref,
                 "tool.started",
                 tool_call_id=str(tool_call_id)[:256],
                 tool_name=str(tool_name)[:256],
+                **({"preview": preview} if preview else {}),
             )
 
     async def _handle_session_stop(self, request: "web.Request") -> "web.Response":

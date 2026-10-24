@@ -52,7 +52,7 @@ def wire_tools(agent, adapter, session_key):
         def start(call_id, name, args):
             if previous_start:
                 previous_start(call_id, name, args)
-            native_start(session_key, call_id, name)
+            native_start(session_key, call_id, name, args)
         agent.tool_start_callback = start
     if callable(native_complete):
         def complete(call_id, name, args, result):

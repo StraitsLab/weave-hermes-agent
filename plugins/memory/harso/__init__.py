@@ -40,17 +40,17 @@ _PREFETCH_TIMEOUT_SECONDS = 0.8
 #               45 ("evidence:" + UUIDv7); occurred_at exactly 27
 #               ("YYYY-MM-DDTHH:MM:SS.ffffffZ"); session_id exactly 42
 #               ("weave-" + UUID); kind "projection"/"evidence".
-#   envelope: <= 5 allowlisted gap reasons; routing hint <= 200 chars.
+#   envelope: <= 5 allowlisted gap reasons; routing + card hints <= 200 chars each.
 # Transport (JSON bytes; json.dumps default ", "/": " separators, above
 # Starlette's compact ones): content worst escape is 6 bytes per content byte
 # (a control char -> \u00XX) = 786432; per item, all fields but "text" =
-# 3425, plus 255 ", " item separators; envelope with 5 gaps and a 200-char
-# hint of worst-escaped chars = 1458.
-# 786432 + 256 * 3425 + 255 * 2 + 1458 = 1665200, so 2 MiB.
+# 3425, plus 255 ", " item separators; envelope with 5 gaps and two 200-char
+# hints of worst-escaped chars = 2675.
+# 786432 + 256 * 3425 + 255 * 2 + 2675 = 1666417, so 2 MiB.
 _PREFETCH_MAX_BYTES = 2 * 1024 * 1024
 # Rendered chars, whole output: per item the date prefix "[YYYY-MM-DD HH:MM] "
 # 19 + 64 refs * 45 + 63 separators + 1 space before text + 1 newline = 2964;
-# 131072 + 256 * 2964 + gaps line 77 + 1 + hint 200 = 890134, so 1 MiB.
+# 131072 + 256 * 2964 + gaps line 77 + 2 + hints 400 = 890335, so 1 MiB.
 _CONTEXT_MAX_CHARS = 1024 * 1024
 _GAP_REASONS = ("missing", "stale", "contradictory", "privacy-excluded", "budget-excluded")
 _P = r"(?:0\.[0-9]{2}|1\.00)"
@@ -59,6 +59,12 @@ _ACTION = rf"external action: (?:likely|unlikely|unsure) \({_P}\)"
 # free text can match, so nothing instruction-shaped reaches the chat model.
 _ROUTING_HINT = re.compile(
     rf"Routing hint: (?:(?:inline|work) \({_P}\)(?:; {_ACTION})?|none; {_ACTION})")
+# Template names may grow without an agent release; include words stay fixed,
+# in canonical order with no duplicates or free-text suffixes.
+_CARD_HINT = re.compile(
+    rf"Card hint: [a-z][a-z0-9-]{{1,39}} \({_P}\)"
+    r"(?:; include: (?:(?:map(?:, photos)?|photos)(?:, chart)?(?:, table)?|chart(?:, table)?|table))?"
+    r"(?:; clarify first)?")
 # Always-on profile + memory tools (config.yaml ``plugins.harso``).
 _PROFILE_WAIT_SECONDS = 1.0
 _PROFILE_TIMEOUT_SECONDS = 3
@@ -192,11 +198,15 @@ def _render_recall(response: Any, max_chars: int, profile: str = "") -> str:
     skipped; with no profile this is exactly the base prefetch rendering."""
     if not response:
         return ""
-    # Jev's advisory hint is independent of recall: it renders with or
-    # without admitted memory, after items and gaps. Anything else drops.
+    # Jev's advisory hints are independent of recall and each other: they
+    # render with or without admitted memory, after items and gaps.
     hint = response.get("routing_hint")
     hint = hint.strip() if isinstance(hint, str) and len(hint.strip()) <= 200 else ""
     hint = hint if _ROUTING_HINT.fullmatch(hint) else ""
+    card_hint = response.get("card_hint")
+    card_hint = card_hint.strip() if isinstance(card_hint, str) and len(card_hint.strip()) <= 200 else ""
+    card_hint = card_hint if _CARD_HINT.fullmatch(card_hint) else ""
+    hint = "\n".join(filter(None, (hint, card_hint)))
     # Explicit recall status supersedes the legacy degraded boolean.
     if "recall_status" in response:
         if response["recall_status"] not in ("ok", "degraded"):
@@ -240,10 +250,10 @@ def _render_recall(response: Any, max_chars: int, profile: str = "") -> str:
             parts.append(hint)
         return "\n".join(parts)
 
-    # context_max_chars bounds the COMPLETE output, gaps line and hint
+    # context_max_chars bounds the COMPLETE output, gaps line and hints
     # included. Over it, keep a whole-item prefix in server order under the
     # room left by the final suffix; never cut an item. The suffix is at
-    # most 278 chars, under the 1024 minimum, so an admitted item excluded
+    # most 479 chars, under the 1024 minimum, so an admitted item excluded
     # by the bound is always reported as budget-excluded, even if none fit.
     output = render(lines, False)
     if len(output) <= max_chars:
