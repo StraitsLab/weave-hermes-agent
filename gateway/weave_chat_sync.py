@@ -408,6 +408,22 @@ def visible_rows(messages: list[dict[str, Any]], show_tag: str = "[SHOW]", show_
     return out
 
 
+def _with_background_sources(messages, turn, rows, show_tag, show_over):
+    """A completion turn also re-saves the answer whose step started the command (same saved projection)."""
+    if not any(_background_outcome(m) for m in turn):
+        return rows
+    full_rows = visible_rows(messages, show_tag, show_over)
+    full_by_key = {row["cell_key"]: row for row in full_rows}
+    source_keys = set()
+    for row in rows:
+        projection = full_by_key.get(row["cell_key"])
+        if projection and "reply_to" in projection["body"]:
+            row["body"]["reply_to"] = projection["body"]["reply_to"]
+            source_keys.add(row["body"]["reply_to"]["cell_key"])
+    present = {row["cell_key"] for row in rows}
+    return [row for row in full_rows if row["cell_key"] in source_keys - present] + rows
+
+
 class _Writer:
     def __init__(self) -> None:
         self.events: queue.Queue[tuple] = queue.Queue(maxsize=10_000)
@@ -601,23 +617,7 @@ class _Writer:
                                      event.get("tool_name"), kind.split(".")[1])
             live["steps_truncated"] = live.get("steps_truncated", False) or truncated
         if kind == "subagent.update":
-            helper_id = event.get("id")
-            if isinstance(helper_id, str) and re.fullmatch(r"[\w.:-]{1,256}", helper_id, flags=re.ASCII):
-                helpers = live.get("helpers") or {}
-                live["helpers"] = helpers
-                if helper_id in helpers or len(helpers) < 10:
-                    helper = helpers.setdefault(helper_id, {"id": helper_id})
-                    # The adapter constructs safe fields; never copy the event payload wholesale.
-                    helper.update({key: event[key] for key in
-                                   ("goal", "state", "started_ms", "duration_ms", "tool") if key in event})
-                    if "tool" in event:
-                        helper.pop("preview", None)
-                    if isinstance(event.get("preview"), str):
-                        helper["preview"] = event["preview"]
-                    if helper.get("state") != "running":
-                        helper.pop("tool", None)
-                        helper.pop("preview", None)
-                    live["status"] = live.get("status") or "delegate_task"
+            self._take_helper(live, event)
         if kind == "assistant.delta" and isinstance(event.get("delta"), str):
             self._take_delta(live, event)
         elif kind == "assistant.retract":
@@ -663,6 +663,26 @@ class _Writer:
             live["absorbed_into"] = event.get("merged_into") or event.get("steered_into")
             return True
         return False
+
+    @staticmethod
+    def _take_helper(live: dict[str, Any], event: dict[str, Any]) -> None:
+        helper_id = event.get("id")
+        if not (isinstance(helper_id, str) and re.fullmatch(r"[\w.:-]{1,256}", helper_id, flags=re.ASCII)):
+            return
+        helpers = live["helpers"] = live.get("helpers") or {}
+        if helper_id not in helpers and len(helpers) >= 10:
+            return
+        helper = helpers.setdefault(helper_id, {"id": helper_id})
+        # The adapter constructs safe fields; never copy the event payload wholesale.
+        helper.update({key: event[key] for key in ("goal", "state", "started_ms", "duration_ms", "tool") if key in event})
+        if "tool" in event:
+            helper.pop("preview", None)
+        if isinstance(event.get("preview"), str):
+            helper["preview"] = event["preview"]
+        if helper.get("state") != "running":
+            helper.pop("tool", None)
+            helper.pop("preview", None)
+        live["status"] = live.get("status") or "delegate_task"
 
     @staticmethod
     def _writing_body(live: dict[str, Any]) -> dict[str, Any]:
@@ -738,18 +758,7 @@ class _Writer:
         start = next((i for i, m in enumerate(messages) if m.get("platform_message_id") == live["ref"]), None)
         turn = messages[start:] if start is not None else [m for m in messages if (m.get("timestamp") or 0) >= live["started"]]
         rows = visible_rows(turn, live["show_tag"], live["show_over"])
-        # Completion turns also update the original answer via the same saved projection.
-        full_rows = visible_rows(messages, live["show_tag"], live["show_over"]) \
-            if any(_background_outcome(m) for m in turn) else []
-        full_by_key = {row["cell_key"]: row for row in full_rows}
-        source_keys = set()
-        for row in rows:
-            projection = full_by_key.get(row["cell_key"])
-            if projection and "reply_to" in projection["body"]:
-                row["body"]["reply_to"] = projection["body"]["reply_to"]
-                source_keys.add(row["body"]["reply_to"]["cell_key"])
-        present = {row["cell_key"] for row in rows}
-        rows = [row for row in full_rows if row["cell_key"] in source_keys - present] + rows
+        rows = _with_background_sources(messages, turn, rows, live["show_tag"], live["show_over"])
         # This turn's visible assistant messages (excluding browser cards, which are pushed as passive appends).
         mine = [m for m in (messages[start + 1:] if start is not None else [m for m in messages if (m.get("timestamp") or 0) >= live["started"]])
                 if m.get("role") == "assistant" and isinstance(m.get("content"), str)
