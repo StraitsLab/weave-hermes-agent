@@ -271,7 +271,7 @@ def _step_details(messages: list[dict[str, Any]]) -> dict[str, dict]:
             if call_id in terminals and isinstance(payload, dict) and type(at) in (int, float):
                 process_id = payload.get("session_id")
                 if isinstance(process_id, str) and re.fullmatch(r"proc_[\w-]{1,128}", process_id, flags=re.ASCII) \
-                        and (payload.get("notify_on_complete") or payload.get("background") or terminals[call_id].get("background")):
+                        and (payload.get("notify_on_complete") or payload.get("background")):
                     details.setdefault(call_id, {})["background"] = {"id": process_id, "started_ms": round(at * 1000)}
             if call_id in delegates:
                 helpers = _finished_helpers(payload, delegates[call_id])
@@ -314,7 +314,8 @@ def _steps_turn_boundary(message: dict[str, Any]) -> bool:
     if message.get("role") != "user" or kind in ("hidden", STEER_DISPLAY_KIND):
         return False
     # Internal admissions start real turns even when their text resembles scaffolding.
-    return kind == "internal_notification" or _background_outcome(message) is not None or not (isinstance(content, str) and content.lstrip().startswith(SCAFFOLDING))
+    return (kind == "internal_notification" or _background_outcome(message) is not None
+            or not (isinstance(content, str) and content.lstrip().startswith(SCAFFOLDING)))
 
 
 def _saved_steps(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -359,7 +360,8 @@ def _saved_steps(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             if outcome["ended_ms"] >= background["started_ms"]:
                 background.update({field: outcome[field] for field in ("ended_ms", "exit_code")})
                 step.update(state=outcome["state"], duration_ms=outcome["ended_ms"] - background["started_ms"])
-                pending = {"cell_key": key, **{field: step[field] for field in ("name", "state", "duration_ms", "preview") if field in step}}
+                pending = {"cell_key": key, **{field: step[field] for field in
+                           ("name", "state", "duration_ms", "preview") if field in step}}
         elif _steps_turn_boundary(message):
             pending = None
         key = row_key(message)
@@ -447,7 +449,7 @@ class _Writer:
                                retry_at=live.get("retry_at", 0),
                                retry_delay=live.get("retry_delay", FINAL_BACKOFF_S),
                                closing=[{"item_id": status_id, "role": "assistant", "kind": "text",
-                                         "state": "removed", "body": {"status": None, "status_detail": None},
+                                         "state": "removed", "body": {"status": None, "status_detail": None, "helpers": None},
                                          "at": _iso(self._next_at(live))}])
                 live.clear()
                 live.update(cleanup)
@@ -517,7 +519,7 @@ class _Writer:
         live["segs"].append((live["item"], live.get("uid"), text))
         row: dict[str, Any] = {
             "item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
-            "body": {"text": text, "visible": visible, "status": None, "status_detail": None, "output": None},
+            "body": {"text": text, "visible": visible, "status": None, "status_detail": None, "helpers": None, "output": None},
             **({"cell_key": f"msg:{live['uid']}"} if live.get("uid") else {}),
             **({"at": _iso(live["at"])} if live.get("at") else {}),
         }
@@ -535,7 +537,7 @@ class _Writer:
         if live["rev"] is not None:
             live["closing"].append({
                 "item_id": live["item"], "role": "assistant", "kind": "text", "state": "removed",
-                "body": {"status": None, "status_detail": None},
+                "body": {"status": None, "status_detail": None, "helpers": None},
                 **({"cell_key": f"msg:{live['uid']}"} if live.get("uid") else {}),
             })
         live["item"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{live['ref']}:{len(live['segs']) + len(live['closing'])}"))
@@ -596,6 +598,24 @@ class _Writer:
             truncated = _record_step(live.setdefault("steps", {}), event.get("tool_call_id"),
                                      event.get("tool_name"), kind.split(".")[1])
             live["steps_truncated"] = live.get("steps_truncated", False) or truncated
+        if kind == "subagent.update":
+            helper_id = event.get("id")
+            if isinstance(helper_id, str) and re.fullmatch(r"[\w.:-]{1,256}", helper_id, flags=re.ASCII):
+                helpers = live.get("helpers") or {}
+                live["helpers"] = helpers
+                if helper_id in helpers or len(helpers) < 10:
+                    helper = helpers.setdefault(helper_id, {"id": helper_id})
+                    # The adapter constructs safe fields; never copy the event payload wholesale.
+                    helper.update({key: event[key] for key in
+                                   ("goal", "state", "started_ms", "duration_ms", "tool") if key in event})
+                    if "tool" in event:
+                        helper.pop("preview", None)
+                    if isinstance(event.get("preview"), str):
+                        helper["preview"] = event["preview"]
+                    if helper.get("state") != "running":
+                        helper.pop("tool", None)
+                        helper.pop("preview", None)
+                    live["status"] = live.get("status") or "delegate_task"
         if kind == "assistant.delta" and isinstance(event.get("delta"), str):
             self._take_delta(live, event)
         elif kind == "assistant.retract":
@@ -642,14 +662,23 @@ class _Writer:
             return True
         return False
 
+    @staticmethod
+    def _writing_body(live: dict[str, Any]) -> dict[str, Any]:
+        return {"status": live["status"], "status_detail": live.get("status_detail"),
+                "helpers": list((live.get("helpers") or {}).values()) or None}
+
+    @staticmethod
+    def _shown(live: dict[str, Any]) -> tuple:
+        return live["status"], live.get("status_detail"), json.dumps(live.get("helpers"), sort_keys=True)
+
     def _flush_idle_status(self, live: dict[str, Any]) -> None:
         status_id = self._status_item_id(live)
-        if (live["status"], live.get("status_detail")) != live["shown"] and live["status"]:
+        if self._shown(live) != live["shown"] and live["status"]:
             live["closing"].append({"item_id": status_id, "role": "assistant", "kind": "text",
-                                    "state": "writing", "body": {"status": live["status"], "status_detail": live.get("status_detail")},
+                                    "state": "writing", "body": self._writing_body(live),
                                     **({"at": _iso(self._next_at(live))} if not live.get("status_open") else {})})
             live["status_open"] = True
-            live["shown"] = (live["status"], live.get("status_detail"))
+            live["shown"] = self._shown(live)
         if live["closing"]:
             _call(live, live["closing"])
             live["closing"] = []
@@ -665,13 +694,13 @@ class _Writer:
             return
         if live.pop("status_open", False):
             live["closing"].append({"item_id": self._status_item_id(live), "role": "assistant", "kind": "text",
-                                       "state": "removed", "body": {"status": None, "status_detail": None}})
+                                       "state": "removed", "body": {"status": None, "status_detail": None, "helpers": None}})
         if live["rev"] is not None and live.get("card_sent") is False:
             # A body-only write: the push trigger sends the whole body (card included) only when nothing is appended.
             out = _call(live, [{"item_id": live["item"], "role": "assistant", "kind": "text", "state": "writing",
-                                "body": {"output": live["card"], "status": live["status"], "status_detail": live.get("status_detail")}}])[0]
-            live["rev"], live["shown"], live["card_sent"] = out["rev"], (live["status"], live.get("status_detail")), True
-        if live["rev"] is not None and not piece and (live["status"], live.get("status_detail")) == live["shown"]:
+                                "body": {"output": live["card"], **self._writing_body(live)}}])[0]
+            live["rev"], live["shown"], live["card_sent"] = out["rev"], self._shown(live), True
+        if live["rev"] is not None and not piece and self._shown(live) == live["shown"]:
             if live["closing"]:
                 _call(live, live["closing"])
                 live["closing"] = []
@@ -681,7 +710,7 @@ class _Writer:
         if live["rev"] is None and not live.get("at"):
             live["at"] = self._next_at(live)
         item: dict[str, Any] = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "writing",
-                                "append": piece, "body": {"status": live["status"], "status_detail": live.get("status_detail")}}
+                                "append": piece, "body": self._writing_body(live)}
         if live.get("uid"):
             item["cell_key"] = f"msg:{live['uid']}"
         if live["rev"] is not None:
@@ -692,8 +721,8 @@ class _Writer:
         live["closing"] = []
         if out.get("conflict"):  # the row moved under us: send the whole text once
             out = _call(live, [{"item_id": live["item"], "role": "assistant", "kind": "text", "state": "writing",
-                                "body": {"text": live["text"], "status": live["status"], "status_detail": live.get("status_detail")}}])[0]
-        live["sent"], live["rev"], live["shown"] = len(live["text"]), out["rev"], (live["status"], live.get("status_detail"))
+                                "body": {"text": live["text"], **self._writing_body(live)}}])[0]
+        live["sent"], live["rev"], live["shown"] = len(live["text"]), out["rev"], self._shown(live)
 
     def _finish(self, live: dict[str, Any]) -> None:
         if live.pop("split", False) and live["text"].strip():
@@ -749,16 +778,16 @@ class _Writer:
                 unmatched_segs.append(seg_item)
         for seg_item, saved in matched_segs:
             rows.remove(saved)
-            rows.append({**saved, "item_id": seg_item, "body": {**saved["body"], "status": None, "status_detail": None, "output": None}})
+            rows.append({**saved, "item_id": seg_item, "body": {**saved["body"], "status": None, "status_detail": None, "helpers": None, "output": None}})
             mine = [m for m in mine if row_key(m) != saved["cell_key"]]
         # A closed row with no saved message of its own would show twice: hide it.
-        rows += [{"item_id": item, "role": "assistant", "kind": "text", "state": "removed", "body": {"status": None, "status_detail": None}}
+        rows += [{"item_id": item, "role": "assistant", "kind": "text", "state": "removed", "body": {"status": None, "status_detail": None, "helpers": None}}
                  for item in unmatched_segs]
         status_close = None
         # A fresh writer cannot remember the status row the killed process left open.
         if live.get("status_open") or live.get("restart_interrupted"):
             status_close = {"item_id": self._status_item_id(live), "role": "assistant", "kind": "text",
-                            "state": "removed", "body": {"status": None, "status_detail": None}}
+                            "state": "removed", "body": {"status": None, "status_detail": None, "helpers": None}}
         answer = None
         if live.get("uid"):
             answer = next((r for r in rows if r.get("cell_key") == f"msg:{live['uid']}"), None)
@@ -773,6 +802,7 @@ class _Writer:
             answer["item_id"] = live["item"]  # the streamed row becomes the saved answer
             answer["body"]["status"] = None
             answer["body"]["status_detail"] = None
+            answer["body"]["helpers"] = None
             if live.get("card"):
                 answer["body"]["output"] = live["card"]
             last = answer
@@ -780,20 +810,20 @@ class _Writer:
             from agent.turn_explainers import empty_response_explanation
             text, visible = visible_reply(empty_response_explanation(), live["show_tag"], live["show_over"])
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
-                    "body": {"text": text, "visible": visible, "status": None, "status_detail": None,
+                    "body": {"text": text, "visible": visible, "status": None, "status_detail": None, "helpers": None,
                              **({"output": live["card"]} if live.get("card") else {})}}
         elif live.get("restart_interrupted"):
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
                     "body": {"text": "This turn did not finish because the gateway restarted. Please resend.",
-                             "outcome": "failed", "status": None, "status_detail": None}}
+                             "outcome": "failed", "status": None, "status_detail": None, "helpers": None}}
         elif live.get("outcome") == "stopped" and live["text"].strip():  # Stop keeps what was written (WEV-3464)
             text, visible = visible_reply(live["text"], live["show_tag"], live["show_over"])
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "final",
-                    "body": {"text": text, "visible": visible, "outcome": "stopped", "status": None, "status_detail": None,
+                    "body": {"text": text, "visible": visible, "outcome": "stopped", "status": None, "status_detail": None, "helpers": None,
                              **({"output": live["card"]} if live.get("card") else {})}}
         else:  # no answer: hide any partial reply. Either way the live row tells the apps the turn ended.
             last = {"item_id": live["item"], "role": "assistant", "kind": "text", "state": "removed",
-                    "body": {"outcome": live.get("outcome") or "failed", "status": None, "status_detail": None}}
+                    "body": {"outcome": live.get("outcome") or "failed", "status": None, "status_detail": None, "helpers": None}}
         if last["state"] == "final" and not live.get("absorbed_into"):
             _finish_steps(last["body"], live, turn)
         # Without a streamed row these terminal writes can insert, rather than update.
@@ -851,7 +881,7 @@ def publish(session_id: str, ref: str, event: dict[str, Any], read_display: Call
                                  "read": read_display, "item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}")),
                                  "status_item": str(uuid.uuid5(uuid.NAMESPACE_URL, f"weave-chat:{ref}:status")),
                                  "status_open": False, "uid": None, "at": None,
-                                 "text": "", "sent": 0, "rev": None, "status": None, "status_detail": None, "shown": None,
+                                 "text": "", "sent": 0, "rev": None, "status": None, "status_detail": None, "helpers": None, "shown": None,
                                  "cards": [], "card_keys": [], "show_tag": show_tag, "show_over": show_over,
                                  "segs": [], "closing": [], "pushed_keys": set()}
             if event.get("type") == "turn.started":

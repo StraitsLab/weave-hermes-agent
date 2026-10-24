@@ -79,6 +79,41 @@ def run_turn(url, session, ref, events, saved, monkeypatch, started=True):
         sync.publish(session, ref, event, lambda: saved, secrets(url))
 
 
+@pytest.mark.parametrize("with_text", [False, True])
+def test_live_helpers_coalesce_persist_across_tools_and_retire(quiet_writer, with_text):
+    writer, live, calls = quiet_writer
+    ref = live["ref"]
+    writer._take(ref, {"type": "tool.started", "tool_name": "delegate_task"})
+    if with_text:
+        writer._take(ref, {"type": "assistant.delta", "delta": "Checking"})
+    writer._take(ref, {"type": "subagent.update", "id": "sa-1", "goal": "Check rooms",
+                       "state": "running", "started_ms": 1000})
+    writer._take(ref, {"type": "subagent.update", "id": "sa-1", "state": "running",
+                       "tool": "web_extract", "preview": "hyatt.com", "args": {"secret": "private args"}})
+    assert calls == []
+    writer._flush(live)
+    assert calls[-1][-1]["body"]["helpers"] == [{"id": "sa-1", "goal": "Check rooms", "state": "running",
+                                                 "started_ms": 1000, "tool": "web_extract", "preview": "hyatt.com"}]
+    count = len(calls)
+    writer._flush(live)
+    assert len(calls) == count
+    writer._take(ref, {"type": "tool.started", "tool_name": "read_file"})
+    writer._flush(live)
+    assert calls[-1][-1]["body"]["helpers"][0]["id"] == "sa-1"
+    writer._take(ref, {"type": "subagent.update", "id": "sa-1", "state": "completed", "duration_ms": 2500})
+    writer._flush(live)
+    assert calls[-1][-1]["body"]["helpers"] == [{"id": "sa-1", "goal": "Check rooms", "state": "completed",
+                                                 "started_ms": 1000, "duration_ms": 2500}]
+    live["messages"] = [{"role": "assistant", "content": "Done", "message_uid": "helpers-done"}]
+    writer._take(ref, {"type": "turn.completed"})
+    writer._finish(live)
+    for batch in calls:
+        for row in batch:
+            if row.get("body", {}).get("status", False) is None:
+                assert row["body"]["helpers"] is None
+    assert "private args" not in json.dumps(calls)
+
+
 def background_messages(ref="completion", status="completed normally", exit_code=0, complete=True):
     messages = [
         {"role": "user", "content": "Run", "timestamp": 100},
@@ -171,6 +206,28 @@ def test_finished_helpers_are_safe_bounded_and_match_replay(quiet_writer):
     wire = json.dumps(body)
     for secret in (token, key, "user:pass@", "private context", "private output", "private failure"):
         assert secret not in wire
+
+
+def test_finished_helpers_caps_and_body_bound():
+    args = {"goal": "Check rooms"}
+    results = [{"status": "completed", "duration_seconds": 0, "summary": "ok"}] * 12
+    body = sync.visible_rows(helper_messages("ref", json.dumps({"results": results}), args))[-1]["body"]
+    assert len(body["steps"][0]["helpers"]) == 10
+    assert body["steps"][0]["helpers"][0]["goal"] == "Check rooms"
+    assert body["steps"][0]["helpers"][0]["duration_ms"] == 0
+    # The existing byte ceiling still drops whole steps, including helper detail.
+    large = {"text": "x" * 130000}
+    sync._attach_steps(large, body["steps"] * 10)
+    assert len(json.dumps(large, ensure_ascii=False).encode()) <= 131040
+    assert large["steps_truncated"] is True
+
+
+def test_background_unknown_process_does_not_link_an_answer():
+    messages = background_messages()
+    messages[-2]["content"] = messages[-2]["content"].replace("proc_123", "proc_other")
+    rows = sync.visible_rows(messages)
+    assert "ended_ms" not in rows[1]["body"]["steps"][0]["background"]
+    assert "reply_to" not in rows[-1]["body"]
 
 
 @pytest.mark.parametrize("payload", ["not JSON", "[]", '{"results":null}',
@@ -749,7 +806,7 @@ def test_fresh_writer_retires_prior_status_only_for_restart_interruption(quiet_w
     removed_status = [row for row in terminal if row.get("item_id") == status_id]
     if restart_interrupted:
         assert removed_status == [{"item_id": status_id, "role": "assistant", "kind": "text",
-                                   "state": "removed", "body": {"status": None, "status_detail": None}}]
+                                   "state": "removed", "body": {"status": None, "status_detail": None, "helpers": None}}]
         assert terminal[-1]["item_id"] == text_id and terminal[-1]["state"] == "final"
         assert terminal[-1]["body"]["outcome"] == "failed"
         assert not any(row["state"] == "writing" for row in rows.values())

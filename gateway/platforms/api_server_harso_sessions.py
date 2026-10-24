@@ -1100,6 +1100,38 @@ class NativeSessionAPI:
                 **({"preview": preview} if preview else {}),
             )
 
+    def _native_submit_subagent(self, session_key, event_type, tool_name, args, kwargs) -> None:
+        import math
+        import re
+        import time
+        from agent.redact import redact_sensitive_text
+        from gateway.weave_step_preview import _plain_words, step_preview
+
+        ref = self._native_submit_active_ref(session_key)
+        helper_id = kwargs.get("subagent_id")
+        if not ref or not isinstance(helper_id, str) or not re.fullmatch(r"[\w.:-]{1,256}", helper_id, flags=re.ASCII):
+            return
+        fields = {"id": helper_id, "state": "running"}
+        goal = _plain_words(kwargs.get("goal"))
+        if goal:
+            fields["goal"] = redact_sensitive_text(goal, force=True, redact_url_credentials=True)
+        if event_type == "subagent.start":
+            fields["started_ms"] = round(time.time() * 1000)
+        elif event_type == "subagent.tool":
+            if isinstance(tool_name, str) and re.fullmatch(r"[\w.:-]{1,256}", tool_name, flags=re.ASCII):
+                fields["tool"] = tool_name
+                preview = step_preview(tool_name, args)
+                if preview:
+                    fields["preview"] = preview
+        elif event_type == "subagent.complete":
+            fields["state"] = "failed" if kwargs.get("status") in ("failed", "error", "timeout", "interrupted") else "completed"
+            seconds = kwargs.get("duration_seconds")
+            if type(seconds) in (int, float) and math.isfinite(seconds) and seconds >= 0:
+                fields["duration_ms"] = round(seconds * 1000)
+        else:
+            return
+        self._native_submit_event(ref, "subagent.update", **fields)
+
     async def _handle_session_stop(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{id}/stop: end the running answer (WEV-3464). Queues nothing; idle is a no-op."""
         auth_err = self._check_auth(request)
