@@ -298,3 +298,61 @@ def test_native_model_lock_rejects_and_reverts_provider_reroute(native, stock_sw
     stock_switch.persist.assert_not_called()
     assert not any(m == "prompt.submit" for m, _ in native.calls)
     assert native.adapter._native_submit_active_refs == {}
+
+
+@pytest.mark.parametrize("failure", ["error", "noop", "confirm", "wrong-model", "wrong-route"])
+def test_failed_rollback_quarantines_session_before_retry(native, stock_switch, monkeypatch, failure):
+    """Real catalog reroute, failed restore, then retry (even without a lock)."""
+    stock_switch.config["providers"] = {"competitor": {
+        "base_url": "https://competitor.example/v1", "api_key": "fixture", "models": ["picked-model"]}}
+    real_rpc = native.transport.rpc
+    attempts = 0
+
+    def rpc(method, params):
+        nonlocal attempts
+        if method == "config.set" and params["key"] == "model":
+            attempts += 1
+            if attempts == 2:
+                assert "--session" in params["value"]
+                if failure == "error":
+                    raise RuntimeError("rollback failed")
+                if failure == "confirm":
+                    return {"confirm_required": True}
+                if failure == "wrong-model":
+                    native.agent.provider = "custom"
+                    native.agent.base_url = "https://cell.example/v1"
+                elif failure == "wrong-route":
+                    native.agent.model = "default-model"
+                return {}
+        return real_rpc(method, params)
+
+    monkeypatch.setattr(native.transport, "rpc", rpc)
+    lock(native, effort=None, fast=False)
+    with pytest.raises(RuntimeError):
+        submit(native)
+    assert not any(m == "prompt.submit" for m, _ in native.calls)
+    with pytest.raises(RuntimeError, match="model lock"):
+        submit(native, "retry")
+    # Removing the persisted pick must not revive a quarantined runtime.
+    native.db.patch_session_model_config("chat", {"browser_model_lock": None})
+    with pytest.raises(RuntimeError, match="model lock"):
+        submit(native, "retry-without-lock")
+    stock_switch.persist.assert_not_called()
+    assert not any(m == "prompt.submit" for m, _ in native.calls)
+    assert native.adapter._native_submit_active_refs == {}
+
+
+@pytest.mark.parametrize("field,value", [
+    ("provider", "competitor"), ("base_url", "https://competitor.example/v1")])
+@pytest.mark.parametrize("initial_lock", [False, True])
+def test_matching_model_still_checks_original_session_route(native, stock_switch, field, value, initial_lock):
+    if initial_lock:
+        lock(native, effort=None, fast=False)
+    assert submit(native) == "streaming"
+    native.calls.clear()
+    # A matching ID on the wrong provider/endpoint is not the same runtime.
+    lock(native, model=native.agent.model, effort=None, fast=False)
+    setattr(native.agent, field, value)
+    with pytest.raises(RuntimeError, match="model lock"):
+        submit(native, "retry")
+    assert not any(m == "prompt.submit" for m, _ in native.calls)

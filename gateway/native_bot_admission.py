@@ -229,7 +229,14 @@ async def _apply_session_model_lock(adapter, transport, session_id, sid, session
     reasoning = options.get("reasoning") or {}
     agent = session["agent"]
     previous_model = agent.model
-    previous_route = (getattr(agent, "provider", None), getattr(agent, "base_url", None))
+    expected_route = session["_native_model_lock_route"]
+
+    def route():
+        return (getattr(agent, "provider", None), getattr(agent, "base_url", None))
+
+    if route() != expected_route:
+        session["_native_model_lock_unusable"] = True
+        raise RuntimeError("native session model lock changed model route")
     # Compare after each RPC: switching model may also change its presets.
     for key, value, current in (
         ("model", model, lambda: agent.model),
@@ -247,23 +254,29 @@ async def _apply_session_model_lock(adapter, transport, session_id, sid, session
             "value": f"{value} --session" if key == "model" else value,
             "confirm_expensive_model": True,
         })
-        if key == "model" and (
-            agent.model != model
-            or (getattr(agent, "provider", None), getattr(agent, "base_url", None)) != previous_route
-        ):
-            # Stock aliases/catalogs may reroute even an exact model ID. Never
-            # dispatch through a different endpoint; restore session scope too.
+        if key == "model" and (agent.model != model or route() != expected_route):
+            # Stock aliases/catalogs may reroute even an exact model ID. A
+            # failed (or cancelled) restore permanently quarantines this live
+            # session; neither a retry nor removing its lock may dispatch it.
+            session["_native_model_lock_unusable"] = True
             await _before_dispatch(transport.rpc, "config.set", {
                 "session_id": sid, "key": "model",
                 "value": (f"{previous_model} --session"
-                          + (f" --provider {previous_route[0]}"
-                             if previous_route[0] and getattr(agent, "provider", None) != previous_route[0]
+                          + (f" --provider {expected_route[0]}"
+                             if expected_route[0] and route()[0] != expected_route[0]
                              else "")),
                 "confirm_expensive_model": True,
             })
+            if agent.model == previous_model and route() == expected_route:
+                session["_native_model_lock_unusable"] = False
             raise RuntimeError("native session model lock changed model route")
         if result.get("confirm_required") or result.get("deferred") or value != current():
             raise RuntimeError(f"native session model lock was not applied: {key}")
+    # Matching IDs skip config.set, not route validation. Also check after the
+    # options RPCs, before prompt ownership can be recorded.
+    if agent.model != model or route() != expected_route:
+        session["_native_model_lock_unusable"] = True
+        raise RuntimeError("native session model lock changed model route")
 
 
 async def admit(
@@ -295,6 +308,13 @@ async def admit(
     session, error = await _before_dispatch(server._sess, {"session_id": sid}, "admit")
     if error or session is None or session.get("agent") is None:
         raise RuntimeError("native session is not ready")
+    # Capture the profile's original runtime once, including admissions without
+    # a lock. Never trust a potentially rerouted agent as the next baseline.
+    agent = session["agent"]
+    session.setdefault("_native_model_lock_route", (
+        getattr(agent, "provider", None), getattr(agent, "base_url", None)))
+    if session.get("_native_model_lock_unusable"):
+        raise RuntimeError("native session model lock runtime is unusable; reopen session")
     # The HTTP request ending does not end the bot: this transport is the cell's
     # own controller, and native completion notifications resume the same agent.
     if internal:
