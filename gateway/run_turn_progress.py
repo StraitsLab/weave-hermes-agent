@@ -295,7 +295,7 @@ class GatewayTurnProgressMixin:
         emoji = get_tool_emoji(tool_name, default="⚙️")
         try:
             adapter = self._runner._delivery_adapter_for(ctx.source)
-        except Exception:
+        except Exception:  # health: allow BLE001 -- upstream v0.22.5 code carried through the mixin split; debt predates the fork base
             adapter = None
         code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
         verbose = ctx.progress_mode == "verbose"
@@ -807,7 +807,7 @@ class GatewayTurnProgressMixin:
             self._schedule(
                 adapter.play_ack_in_voice(ctx._voice_ack_guild[0]), "voice ack scheduling error", loop=ctx._voice_ack_loop,
             )
-        except Exception as err:
+        except Exception as err:  # health: allow BLE001 -- upstream v0.22.5 code carried through the mixin split; debt predates the fork base
             logger.debug("voice ack schedule failed: %s", err)
 
     # Slack-native task cards ride agent.tool_start_callback / tool_complete_callback so start and

@@ -166,7 +166,7 @@ class GatewayTurnPersistenceMixin:
                 default=bool(getattr(self, "_show_reasoning", False)), platform=source.platform,
                 require_platform_override_for={Platform.MATTERMOST},
             )
-        except Exception:
+        except Exception:  # health: allow BLE001 -- upstream v0.22.5 code carried through the mixin split; debt predates the fork base
             _show_reasoning_effective = (
                 False if source.platform == Platform.MATTERMOST else getattr(self, "_show_reasoning", False)
             )
@@ -186,7 +186,7 @@ class GatewayTurnPersistenceMixin:
             _reasoning_style = resolve_display_setting(
                 _load_gateway_config(), _platform_config_key(source.platform), "reasoning_style", "code",
             )
-        except Exception:
+        except Exception:  # health: allow BLE001 -- upstream v0.22.5 code carried through the mixin split; debt predates the fork base
             _reasoning_style = "code"
         _quote = self._REASONING_QUOTE_STYLES.get(_reasoning_style)
         if _quote:
@@ -216,7 +216,7 @@ class GatewayTurnPersistenceMixin:
                 requested_model=agent_result.get("requested_model"),
                 served_model=agent_result.get("served_model"),
             )
-        except Exception as _footer_err:
+        except Exception as _footer_err:  # health: allow BLE001 -- upstream v0.22.5 code carried through the mixin split; debt predates the fork base
             logger.debug("runtime_footer build failed: %s", _footer_err)
             return ""
 

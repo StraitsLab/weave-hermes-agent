@@ -28,7 +28,7 @@ class GatewayInboundTranscriptionMixin:
         if not getattr(self.config, "stt_enabled", True):
             notes = []
             for path in audio_paths:
-                abs_path = os.path.abspath(path)
+                abs_path = os.path.abspath(path)  # health: allow ASYNC240 -- os.path.abspath is pure string work; upstream v0.22.5 code carried through the mixin split; debt predates the fork base
                 duration_str = await _probe_audio_duration(abs_path)
                 suffix = f" (duration: {duration_str})" if duration_str else ""
                 notes.append(f"[The user sent a voice message: {abs_path}{suffix}]")
@@ -58,7 +58,7 @@ class GatewayInboundTranscriptionMixin:
                 if transcript is not None:
                     successful_transcripts.append(transcript)
                 enriched_parts.append(note)
-            except Exception as e:
+            except Exception as e:  # health: allow BLE001 -- upstream v0.22.5 code carried through the mixin split; debt predates the fork base
                 logger.error("Transcription error: %s", e)
                 enriched_parts.append(self._untranscribed_audio_note(path))
 
@@ -139,7 +139,7 @@ class GatewayInboundTranscriptionMixin:
                 event, adapter, source, transcripts, metadata=metadata, log_context=log_context
             )
             return enriched_text or text, transcripts
-        except Exception as trans_exc:
+        except Exception as trans_exc:  # health: allow BLE001 -- upstream v0.22.5 code carried through the mixin split; debt predates the fork base
             logger.warning("%s transcription failed: %s", log_context, trans_exc)
             return text, []
 
