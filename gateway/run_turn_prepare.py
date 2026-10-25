@@ -618,7 +618,7 @@ class GatewayTurnPrepareMixin:
                     message_text = _clean_message_text
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
-        if event.media_urls and (event.metadata or {}).get("native_submit_authenticated"):
+        if getattr(event, "media_urls", None) and (getattr(event, "metadata", None) or {}).get("native_submit_authenticated"):
             # Supabase adopts the app bubble by exact text. A list override also replaces native image blocks.
             persist_user_message = [{"type": "text", "text": event.text}]
         return message_text, persist_user_message, persist_user_timestamp
