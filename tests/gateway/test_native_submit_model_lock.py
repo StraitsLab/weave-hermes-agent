@@ -11,6 +11,11 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_state import SessionDB
 from tui_gateway import server
+from hermes_cli.config import get_compatible_custom_providers as REAL_CUSTOM_PROVIDERS
+from hermes_cli.runtime_provider import resolve_runtime_provider as REAL_RESOLVE_RUNTIME
+
+
+REAL_PERSIST_RUNTIME = server._persist_live_session_runtime
 
 
 @pytest.fixture
@@ -19,8 +24,14 @@ def native(tmp_path, monkeypatch):
     db.create_session("chat", "api_server", model="default-model")
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "fixture"}))
     monkeypatch.setattr(adapter, "_ensure_session_db_async", AsyncMock(return_value=db))
-    agent = SimpleNamespace(model="default-model", reasoning_config={"enabled": True, "effort": "low"},
-                            service_tier=None)
+    cfg = {"model": {"default": "default-model", "provider": "custom",
+                     "base_url": "https://cell.example/v1"}}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **kw: cfg)
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw: {
+        "provider": kw.get("requested") or "custom", "base_url": cfg["model"]["base_url"],
+        "api_key": "fixture", "api_mode": "chat_completions"})
+    agent = SimpleNamespace(model="default-model", provider="custom", base_url="https://cell.example/v1",
+                            reasoning_config={"enabled": True, "effort": "low"}, service_tier=None)
     session = {"agent": agent, "session_key": "chat", "running": False}
     monkeypatch.setattr(server, "_sess", lambda *_: (session, None))
     monkeypatch.setattr(admission, "_answer_blocking_approval", lambda *_: False)
@@ -226,9 +237,11 @@ def stock_switch(native, monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.models.detect_provider_for_model", lambda *_: None)
     monkeypatch.setattr("hermes_cli.models.validate_requested_model", lambda *a, **kw:
                         {"accepted": True, "persist": True, "recognized": True, "message": ""})
-    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw:
-                        {"provider": kw.get("requested"), "base_url": cfg["model"]["base_url"],
-                         "api_key": "fixture", "api_mode": "chat_completions"})
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw: {
+        "provider": kw.get("requested") or "custom",
+        "base_url": (cfg.get("providers", {}).get(kw.get("requested"), {}).get("base_url")
+                     or cfg["model"]["base_url"]),
+        "api_key": "fixture", "api_mode": "chat_completions"})
     native.agent.provider = "custom"
     native.agent.base_url = cfg["model"]["base_url"]
     native.agent.api_key = "fixture"
@@ -292,16 +305,21 @@ def test_native_model_lock_rejects_and_reverts_provider_reroute(native, stock_sw
     with pytest.raises(RuntimeError, match="model lock"):
         submit(native)
     assert len(stock_switch.swaps) == 2
-    assert native.agent.model == "default-model"
+    assert native.agent.model == "picked-model"
     assert native.agent.provider == "custom"
-    assert native.agent.base_url == "https://cell.example/v1"
+    assert native.agent.base_url == (
+        "https://cell.example/v1" if route == "configured-provider" else "https://alias.example/v1")
+    assert native.session.get("_native_model_lock_unusable") is (route == "direct-alias")
+    persisted = native.db.get_session_model_config("chat")["model_config"]
+    import json
+    assert json.loads(persisted)["base_url"] == "https://cell.example/v1"
     stock_switch.persist.assert_not_called()
     assert not any(m == "prompt.submit" for m, _ in native.calls)
     assert native.adapter._native_submit_active_refs == {}
 
 
 @pytest.mark.parametrize("failure", ["error", "noop", "confirm", "wrong-model", "wrong-route"])
-def test_failed_rollback_quarantines_session_before_retry(native, stock_switch, monkeypatch, failure):
+def test_failed_rollback_self_heals_before_retry(native, stock_switch, monkeypatch, failure):
     """Real catalog reroute, failed restore, then retry (even without a lock)."""
     stock_switch.config["providers"] = {"competitor": {
         "base_url": "https://competitor.example/v1", "api_key": "fixture", "models": ["picked-model"]}}
@@ -321,8 +339,9 @@ def test_failed_rollback_quarantines_session_before_retry(native, stock_switch, 
                 if failure == "wrong-model":
                     native.agent.provider = "custom"
                     native.agent.base_url = "https://cell.example/v1"
-                elif failure == "wrong-route":
                     native.agent.model = "default-model"
+                elif failure == "wrong-route":
+                    native.agent.model = "picked-model"
                 return {}
         return real_rpc(method, params)
 
@@ -331,15 +350,17 @@ def test_failed_rollback_quarantines_session_before_retry(native, stock_switch, 
     with pytest.raises(RuntimeError):
         submit(native)
     assert not any(m == "prompt.submit" for m, _ in native.calls)
-    with pytest.raises(RuntimeError, match="model lock"):
-        submit(native, "retry")
-    # Removing the persisted pick must not revive a quarantined runtime.
+    assert submit(native, "retry") == "streaming"
+    assert (native.agent.model, native.agent.provider, native.agent.base_url) == (
+        "picked-model", "custom", "https://cell.example/v1")
+    # Removing the lock still heals back to the profile default, not the poison.
     native.db.patch_session_model_config("chat", {"browser_model_lock": None})
-    with pytest.raises(RuntimeError, match="model lock"):
-        submit(native, "retry-without-lock")
+    native.agent.base_url = "https://competitor.example/v1"
+    native.calls.clear()
+    assert submit(native, "retry-without-lock") == "streaming"
+    assert (native.agent.model, native.agent.provider, native.agent.base_url) == (
+        "default-model", "custom", "https://cell.example/v1")
     stock_switch.persist.assert_not_called()
-    assert not any(m == "prompt.submit" for m, _ in native.calls)
-    assert native.adapter._native_submit_active_refs == {}
 
 
 @pytest.mark.parametrize("field,value", [
@@ -353,6 +374,108 @@ def test_matching_model_still_checks_original_session_route(native, stock_switch
     # A matching ID on the wrong provider/endpoint is not the same runtime.
     lock(native, model=native.agent.model, effort=None, fast=False)
     setattr(native.agent, field, value)
-    with pytest.raises(RuntimeError, match="model lock"):
-        submit(native, "retry")
+    assert submit(native, "retry") == "streaming"
+    assert (native.agent.provider, native.agent.base_url) == ("custom", "https://cell.example/v1")
+    assert settings(native) == [("model", native.agent.model)]
+
+
+@pytest.mark.parametrize("has_lock", [False, True])
+def test_first_admission_does_not_trust_already_switched_agent(native, stock_switch, has_lock):
+    """Reviewer first-admission probe, with the safety assertion reversed."""
+    native.agent.model = "picked-model"
+    native.agent.provider = "competitor"
+    native.agent.base_url = "https://competitor.example/v1"
+    if has_lock:
+        lock(native, effort=None, fast=False)
+    assert submit(native) == "streaming"
+    assert (native.agent.model, native.agent.provider, native.agent.base_url) == (
+        "picked-model" if has_lock else "default-model", "custom", "https://cell.example/v1")
+
+
+@pytest.mark.parametrize("has_lock", [False, True])
+@pytest.mark.parametrize("failure", ["error", "noop"])
+def test_rejected_route_is_not_accepted_after_cold_resume(native, stock_switch, monkeypatch, has_lock, failure):
+    """Reviewer restart probe: enable real persistence and rebuild a fresh dict."""
+    import json
+
+    stock_switch.config["providers"] = {"competitor": {
+        "base_url": "https://competitor.example/v1", "api_key": "fixture", "models": ["picked-model"]}}
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw: {
+        "provider": kw.get("requested") or "custom",
+        "base_url": ("https://competitor.example/v1" if kw.get("requested") == "competitor"
+                     else "https://cell.example/v1"),
+        "api_key": "fixture", "api_mode": "chat_completions"})
+    native.agent._session_db = native.db
+    monkeypatch.setattr(server, "_persist_live_session_runtime", REAL_PERSIST_RUNTIME)
+    real_rpc = native.transport.rpc
+    attempts = 0
+
+    def rpc(method, params):
+        nonlocal attempts
+        if method == "config.set" and params["key"] == "model":
+            attempts += 1
+            if attempts == 2:
+                if failure == "error":
+                    raise RuntimeError("rollback failed")
+                return {}
+        return real_rpc(method, params)
+
+    monkeypatch.setattr(native.transport, "rpc", rpc)
+    lock(native, effort=None, fast=False)
+    with pytest.raises(RuntimeError):
+        submit(native)
     assert not any(m == "prompt.submit" for m, _ in native.calls)
+    persisted = json.loads(native.db.get_session("chat")["model_config"])
+    assert persisted["base_url"] == "https://cell.example/v1"
+    assert persisted["provider"] == "custom"
+    # Also defend against an older process's already-poisoned durable row.
+    native.db.patch_session_model_config("chat", {
+        "provider": "competitor", "base_url": "https://competitor.example/v1"})
+    if not has_lock:
+        native.db.patch_session_model_config("chat", {"browser_model_lock": None})
+    restored = server._stored_session_runtime_overrides(native.db.get_session("chat"))
+    mo = restored["model_override"]
+    cold_agent = SimpleNamespace(**vars(native.agent))
+    cold_agent.model, cold_agent.provider, cold_agent.base_url = mo["model"], mo["provider"], mo["base_url"]
+    cold = {"agent": cold_agent, "session_key": "chat", "running": False}
+    monkeypatch.setattr(server, "_sess", lambda *_: (cold, None))
+    monkeypatch.setitem(server._sessions, "live-chat", cold)
+    native.agent = cold_agent
+    # The real fixture switch must mutate the newly resumed agent too.
+    cold_agent.switch_model = lambda **kw: vars(cold_agent).update(
+        model=kw["new_model"], provider=kw["new_provider"], base_url=kw["base_url"])
+    native.calls.clear()
+    assert submit(native, "after-restart") == "streaming"
+    assert (cold_agent.model, cold_agent.provider, cold_agent.base_url) == (
+        "picked-model" if has_lock else "default-model", "custom", "https://cell.example/v1")
+    persisted = json.loads(native.db.get_session("chat")["model_config"])
+    assert persisted["base_url"] == "https://cell.example/v1"
+    assert persisted["provider"] == "custom"
+
+
+@pytest.mark.parametrize("provider", ["custom", "custom:weave-gate-b"])
+def test_custom_config_route_matches_startup_and_stock_switch(native, stock_switch, monkeypatch, provider):
+    import hermes_cli.runtime_provider as rp
+
+    cfg = stock_switch.config
+    cfg["model"].update(provider=provider, base_url="https://models-dev.harso.dev/v1")
+    cfg["providers"] = {"weave-gate-b": {
+        "base_url": "https://models-dev.harso.dev/v1", "api_key": "fixture"}} if provider != "custom" else {}
+    monkeypatch.setattr(rp, "resolve_runtime_provider", REAL_RESOLVE_RUNTIME)
+    monkeypatch.setattr("hermes_cli.config.get_compatible_custom_providers", REAL_CUSTOM_PROVIDERS)
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **kw: None)
+    startup = REAL_RESOLVE_RUNTIME()
+    assert (startup["provider"], startup["base_url"]) == ("custom", "https://models-dev.harso.dev/v1")
+    native.agent.provider, native.agent.base_url = startup["provider"], startup["base_url"]
+    lock(native, model="default-model", effort=None, fast=False)
+    assert submit(native) == "streaming"
+    expected = admission._model_lock_route(startup["provider"], startup["base_url"])
+    assert admission._model_lock_route(native.agent.provider, native.agent.base_url) == expected
+    assert submit(native, "second") == "streaming"
+    lock(native, effort=None, fast=False)
+    # A poisoned endpoint (even under a named-custom label) must be repaired.
+    native.agent.base_url = "https://competitor.example/v1"
+    assert submit(native, "healed") == "streaming"
+    assert admission._model_lock_route(native.agent.provider, native.agent.base_url) == expected
+    assert f"--provider {provider}" in [
+        p["value"] for m, p in native.calls if m == "config.set"][-1]

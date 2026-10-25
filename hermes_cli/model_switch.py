@@ -2043,6 +2043,19 @@ def switch_model(
         elif target_provider == "custom" and current_base_url:
             api_key = current_api_key
             base_url = current_base_url
+            if explicit_provider == "custom":
+                # An explicit return to the configured bare-custom route must
+                # not inherit a different session endpoint or its credentials.
+                from hermes_cli.config import load_config
+
+                configured = load_config().get("model") or {}
+                if (isinstance(configured, dict) and configured.get("provider") == "custom"
+                        and configured.get("base_url")
+                        and configured["base_url"].rstrip("/") != current_base_url.rstrip("/")):
+                    runtime = resolve_runtime_provider(
+                        requested="custom", explicit_base_url=configured["base_url"], target_model=new_model)
+                    base_url = runtime["base_url"]
+                    api_key = runtime.get("api_key", "")
             api_mode = determine_api_mode(target_provider, base_url)
         else:
             try:
