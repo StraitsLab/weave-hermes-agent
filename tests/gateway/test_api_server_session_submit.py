@@ -442,6 +442,35 @@ class _Agent:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("media,name,expected", [("application/pdf", "report.pdf", "document"),
+    ("image/png", "photo.png", "photo"), ("audio/mpeg", "sound.mp3", "document"),
+    ("video/mp4", "clip.mp4", "document")])
+async def test_attachment_submit_queues_cached_media_not_text_steer(adapter, monkeypatch, tmp_path, media, name, expected):
+    from gateway.platforms import base
+    from gateway.platforms.base import MessageType
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-test")
+    download = AsyncMock(return_value=str(document))
+    monkeypatch.setattr(base, "_cache_media_from_url", download)
+    agent = _Agent()
+    _busy_adapter(adapter, agent)
+    events = []
+    adapter.gateway_runner._enqueue_fifo = lambda key, event, adapter: events.append(event)
+    attachments = [{"url": "https://files.example/report.pdf?token=one",
+                    "media_type": media, "name": name}]
+    status, receipt = await _post_submit(adapter, "file-turn", "steer", attachments=attachments)
+    assert status == 202 and receipt["admission"] == "queued", receipt
+    assert events[0].media_urls == [str(document)]
+    assert events[0].media_types == [media]
+    assert events[0].message_type == (MessageType.PHOTO if expected == "photo" else MessageType.DOCUMENT)
+    assert events[0].text == "hello" and agent.steered == []
+    attachments[0]["url"] = "https://files.example/report.pdf?token=two"
+    status, retry = await _post_submit(adapter, "file-turn", "steer", attachments=attachments)
+    assert status == 202 and retry == receipt and len(events) == 1
+    download.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_steer_joins_the_running_turn_and_settles_when_that_turn_ends(adapter):
     """WEV-2108: steer reaches the running agent, not the FIFO, and the steered ref stays open
     (observable through its events) until the turn it joined finishes, then ends with it."""
@@ -900,6 +929,112 @@ async def _wait_native_terminal(gateway, ref):
     rows = [row for row in gateway.db.get_messages(SESSION_ID) if row["role"] in {"user", "assistant"}]
     assert any(row["role"] == "assistant" for row in rows), rows
     return rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy", [False, True])
+async def test_attachment_document_reaches_model_without_duplicate_user_content(internal_gateway, monkeypatch, busy):
+    import httpx
+    from pathlib import Path
+    from tools import url_safety
+    gateway = internal_gateway
+    await _bind_internal_gateway(gateway)
+    body = b"%PDF-1.4\nattachment cache fixture"
+    monkeypatch.setattr(url_safety, "create_ssrf_safe_async_client", lambda **kwargs:
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=body))))
+    if busy:
+        gateway.release.clear()
+        status, _first = await _submit_internal_gateway(gateway, "before-document", "first task")
+        assert status == 202
+        await asyncio.wait_for(gateway.started.wait(), 10)
+    text = "Read my report"
+    status, receipt = await _submit_internal_gateway(gateway, "document", text, attachments=[{
+        "url": "https://93.184.216.34/report.pdf", "media_type": "application/pdf", "name": "report.pdf"}])
+    assert status == 202, receipt
+    if busy:
+        assert receipt["admission"] == "queued"
+        gateway.release.set()
+    rows = await _wait_native_terminal(gateway, receipt["native_request_ref"])
+    user_rows = [row for row in rows if row["role"] == "user"]
+    assert [row["content"] for row in user_rows] == (["first task", text] if busy else [text])
+    payload = gateway.requests[-1]
+    user_content = payload["messages"][-1]["content"]
+    assert text in user_content and "report.pdf" in user_content
+    documents = list(Path(gateway_run._hermes_home).rglob("doc_*report.pdf"))
+    assert len(documents) == 1 and documents[0].read_bytes() == body
+
+
+@pytest.mark.asyncio
+async def test_attachment_image_is_native_pixels_on_provider_wire(internal_gateway, monkeypatch):
+    import httpx
+    import io
+    from PIL import Image
+    from tools import url_safety
+    gateway = internal_gateway
+    await _bind_internal_gateway(gateway)
+    monkeypatch.setattr(gateway.runner, "_decide_image_input_mode", lambda **kwargs: "native")
+    image = io.BytesIO()
+    Image.new("RGB", (4, 4), "red").save(image, format="PNG")
+    monkeypatch.setattr(url_safety, "create_ssrf_safe_async_client", lambda **kwargs:
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=image.getvalue()))))
+    status, receipt = await _submit_internal_gateway(gateway, "image", "Look at this", attachments=[{
+        "url": "https://93.184.216.34/photo.png", "media_type": "image/png", "name": "photo.png"}])
+    assert status == 202, receipt
+    rows = await _wait_native_terminal(gateway, receipt["native_request_ref"])
+    content = gateway.requests[0]["messages"][-1]["content"]
+    assert any(part.get("type") == "image_url" and part["image_url"]["url"].startswith("data:image/") for part in content)
+    assert rows[0]["content"] == "Look at this"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attachments", [None, {}, "file", [{}], [{"url": "https://example.com/file"}],
+    [{"url": "http://example.com/file", "media_type": "application/pdf", "name": "report.pdf"}],
+    [{"url": "https://example.com/file", "media_type": "application/pdf", "name": "../report.pdf"}],
+    [{"url": "https://example.com/file", "media_type": "not-a-mime", "name": "report.pdf"}],
+    [{"url": "https://example.com/file", "media_type": "application/pdf", "name": "report.pdf", "extra": True}],
+    [{"url": "https://example.com/file", "media_type": "application/pdf", "name": "report.pdf"}] * 11])
+async def test_attachment_schema_refuses_bad_shapes(adapter, attachments):
+    status, body = await _post_submit(adapter, "invalid-attachment", "queue", attachments=attachments)
+    assert status == 400 and body["error"]["code"] == "invalid_native_submit_schema"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media,name,directory", [("image/png", "photo.png", "images"),
+    ("application/pdf", "report.pdf", "documents"), ("audio/mpeg", "sound.mp3", "audio"),
+    ("video/mp4", "clip.mp4", "videos")])
+async def test_attachment_bytes_use_hermes_media_cache(tmp_path, monkeypatch, media, name, directory):
+    import httpx
+    from pathlib import Path
+    from tools import url_safety
+    from gateway.platforms import base
+    from gateway.platforms.api_server_harso_attachments import cache_attachments
+    # The image cache refuses bytes that are not an image, so the image case needs a real PNG header.
+    payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16 if directory == "images" else b"cached bytes"
+    monkeypatch.setattr(base, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(url_safety, "create_ssrf_safe_async_client", lambda **kwargs:
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=payload))))
+    paths, types = await cache_attachments([{"url": "https://93.184.216.34/file", "media_type": media, "name": name}])
+    assert types == [media] and Path(paths[0]).read_bytes() == payload
+    assert directory in Path(paths[0]).parts
+    if directory == "documents":
+        assert Path(paths[0]).name.endswith("_report.pdf")
+
+
+@pytest.mark.asyncio
+async def test_attachment_download_failure_refuses_then_retries(adapter, monkeypatch):
+    from gateway.platforms import base
+    agent = _Agent()
+    queued = _busy_adapter(adapter, agent)
+    download = AsyncMock(side_effect=ValueError("download refused"))
+    monkeypatch.setattr(base, "_cache_media_from_url", download)
+    attachments = [{"url": "https://example.com/file", "media_type": "application/pdf", "name": "report.pdf"}]
+    status, body = await _post_submit(adapter, "download-failure", "queue", attachments=attachments)
+    assert status == 503 and body["error"]["code"] == "native_admission_unavailable"
+    assert queued == []
+    download.side_effect = None
+    download.return_value = "/cache/report.pdf"
+    status, body = await _post_submit(adapter, "download-failure", "queue", attachments=attachments)
+    assert status == 202 and queued == ["hello"]
 
 
 @pytest.mark.asyncio

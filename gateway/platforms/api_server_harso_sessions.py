@@ -557,13 +557,16 @@ class NativeSessionAPI:
     @staticmethod
     def _native_submit_request(body: dict[str, Any]) -> tuple[Optional[tuple[str, str, str, Optional[str], bool]], Optional["web.Response"]]:
         """Validate the deliberately narrow native-admission request shape."""
-        if set(body) - {"expected_active_ref", "internal", "hub_tools"} != {"kind", "external_request_id", "message", "busy_mode"}:
+        if set(body) - {"expected_active_ref", "internal", "hub_tools", "attachments"} != {"kind", "external_request_id", "message", "busy_mode"}:
             return None, web.json_response(
                 _openai_error("Invalid native submit schema", code="invalid_native_submit_schema"), status=400
             )
         from gateway.hub_revision import validate
         if "hub_tools" in body and not validate(body["hub_tools"]):
             return None, web.json_response(_openai_error("Invalid hub revision", code="invalid_native_submit_schema"), status=400)
+        from gateway.platforms.api_server_harso_attachments import valid_attachments
+        if "attachments" in body and not valid_attachments(body["attachments"]):
+            return None, web.json_response(_openai_error("Invalid attachments", code="invalid_native_submit_schema"), status=400)
         request_id = body.get("external_request_id")
         message = body.get("message")
         if (
@@ -614,7 +617,7 @@ class NativeSessionAPI:
     async def _admit_native_session_submit(
         self, session_id: str, message: str, native_request_ref: str,
         external_request_id: str = "", busy_mode: str = "queue", expected_active_ref: Optional[str] = None,
-        internal: bool = False,
+        internal: bool = False, attachments: Optional[list[dict[str, str]]] = None,
     ) -> str:
         """Submit one user or internal turn through the running gateway's writer lease."""
         runner = self.gateway_runner
@@ -627,8 +630,9 @@ class NativeSessionAPI:
             raise RuntimeError("native gateway runner is unavailable")
 
         # D-119: an internal notification is always its own turn, never a steer
-        # or interrupt of a user turn. Queue mode also ignores the active-ref fence.
-        if internal:
+        # or interrupt of a user turn. Attachments also need a full event, not text-only steer.
+        # Queue mode ignores the active-ref fence.
+        if internal or attachments:
             busy_mode = "queue"
 
         existing_start = self._native_submit_started.get(native_request_ref)
@@ -653,9 +657,9 @@ class NativeSessionAPI:
         # (run_busy._plaintext_approval_words). A pending clarify is answered the same way: the running
         # turn is blocked in the tool, so a steer would wait behind it and a queued turn would run after
         # the call. Only weave-api submits here; its other internal sends are never caller replies.
-        answer = self._native_submit_answers_approval(runner, entry.session_key, message)
+        answer = None if attachments else self._native_submit_answers_approval(runner, entry.session_key, message)
         admission = "answered_approval"
-        if answer is None and internal:
+        if answer is None and internal and not attachments:
             from gateway.platforms.api_server_harso_clarify import pending_clarify_answer
             answer, admission = pending_clarify_answer(self, entry.session_key, message), "answered_clarify"
         if answer is not None:
@@ -672,9 +676,15 @@ class NativeSessionAPI:
         self._native_submit_ref_sessions[native_request_ref] = (
             _api_request_profile.get() or "default", session_id,
         )
+        media_urls, media_types = [], []
+        if attachments:
+            from gateway.platforms.api_server_harso_attachments import cache_attachments
+            media_urls, media_types = await cache_attachments(attachments)
         event = MessageEvent(
             text=message,
-            message_type=MessageType.TEXT,
+            media_urls=media_urls, media_types=media_types,
+            message_type=(MessageType.PHOTO if all(t.startswith("image/") for t in media_types)
+                          else MessageType.DOCUMENT) if media_types else MessageType.TEXT,
             user_id=source.user_id,
             user_name=source.user_name,
             source=source,
@@ -775,7 +785,8 @@ class NativeSessionAPI:
     def _native_submit_fingerprint(message: str, busy_mode: str, internal: bool = False) -> str:
         """Weave (WEV-2108): the idempotency identity of one submit. A retry that changes busy_mode is
         changed input (409), not a replay. queue keeps the message-only hash that records written
-        before busy modes existed carry, so their identical retries still replay across a deploy."""
+        before busy modes existed carry, so their identical retries still replay across a deploy.
+        Attachments deliberately do not join this identity: freshly signed URLs must replay too."""
         digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
         fingerprint = digest if busy_mode == "queue" else f"{busy_mode}:{digest}"
         # Preserve legacy user identities, but do not replay a user request as
@@ -869,6 +880,8 @@ class NativeSessionAPI:
                     owns_hold = native_request_ref not in self.__dict__.setdefault("_native_awake_refs", set())
                     await self._native_acquire_hold(native_request_ref)
                     admission_options = self._native_admission_options(busy_mode, expected_active_ref, internal)
+                    if body.get("attachments"):
+                        admission_options["attachments"] = body["attachments"]
                     if native_request_ref in self._native_submit_handoffs:
                         handed_off = self._native_submit_handoffs[native_request_ref]
                         if handed_off == "dispatch_pending":

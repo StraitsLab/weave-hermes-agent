@@ -1928,6 +1928,8 @@ class GatewayTurnMixin(NativeFollowupMixin, GatewayTurnPrepareMixin, GatewayTurn
                 return result
             from gateway.run_inbound import strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
+            if getattr(pending_event, "media_urls", None) and (getattr(pending_event, "metadata", None) or {}).get("native_submit_authenticated"):
+                next_persist_message = [{"type": "text", "text": pending_event.text}]
             next_message_id = self._reply_anchor_for_event(pending_event)
             next_inbound_id = str(pending_event.message_id) if getattr(pending_event, "message_id", None) else None
             next_channel_prompt, next_source = self._pinned_channel_inputs(
