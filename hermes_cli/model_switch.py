@@ -2052,8 +2052,9 @@ def switch_model(
                 if (isinstance(configured, dict) and configured.get("provider") == "custom"
                         and configured.get("base_url")
                         and configured["base_url"].rstrip("/") != current_base_url.rstrip("/")):
-                    runtime = resolve_runtime_provider(
-                        requested="custom", explicit_base_url=configured["base_url"], target_model=new_model)
+                    # No explicit_base_url: the configured-provider resolver keeps
+                    # model.api_key; the direct-alias path would drop it.
+                    runtime = resolve_runtime_provider(requested="custom", target_model=new_model)
                     base_url = runtime["base_url"]
                     api_key = runtime.get("api_key", "")
             api_mode = determine_api_mode(target_provider, base_url)
