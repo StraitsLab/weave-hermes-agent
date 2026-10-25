@@ -215,6 +215,39 @@ def _answer_blocking_approval(session_key, message):
     return False
 
 
+async def _apply_session_model_lock(adapter, transport, session_id, sid, session):
+    """Reconcile the persisted chat pick before giving the native prompt custody."""
+    db = await adapter._ensure_session_db_async()
+    if db is None:
+        raise RuntimeError("native session model lock database is unavailable")
+    row = await asyncio.to_thread(db.get_session, session_id)
+    runtime = adapter._runtime_request_from_persisted_session_lock(row, {})
+    if runtime is None:
+        return
+    model = (runtime.get("route") or {}).get("model") or runtime["requested"]["model"]
+    options = runtime["model_options"]
+    reasoning = options.get("reasoning") or {}
+    agent = session["agent"]
+    # Compare after each RPC: switching model may also change its presets.
+    for key, value, current in (
+        ("model", model, lambda: agent.model),
+        ("reasoning", reasoning.get("effort"),
+         lambda: ((getattr(agent, "reasoning_config", None) or {}).get("effort")
+                  if (getattr(agent, "reasoning_config", None) or {}).get("enabled") is not False
+                  else None)),
+        ("fast", "on" if options.get("fast") else "off",
+         lambda: "on" if getattr(agent, "service_tier", None) == "priority" else "off"),
+    ):
+        if value is None or value == current():
+            continue
+        result = await _before_dispatch(transport.rpc, "config.set", {
+            "session_id": sid, "key": key, "value": value,
+            "confirm_expensive_model": True,
+        })
+        if result.get("confirm_required") or result.get("deferred") or value != current():
+            raise RuntimeError(f"native session model lock was not applied: {key}")
+
+
 async def admit(
     adapter,
     profile,
@@ -281,6 +314,7 @@ async def admit(
         # Retry durable admission after native cancellation settles. Never
         # replace the native single queued slot or acknowledge unowned input.
         raise RuntimeError("native bot is busy")
+    await _apply_session_model_lock(adapter, transport, session_id, sid, session)
     transport.ref = request_ref
     session["agent"]._relay_pending_turn_id = external_id
     key = session["session_key"]

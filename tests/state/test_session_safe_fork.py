@@ -39,6 +39,22 @@ def test_safe_fork_is_atomic_lineage_record_and_identical_replay(db):
     assert [m["content"] for m in db.get_messages("weave-successor")] == ["hello", "hi"]
 
 
+def test_safe_fork_preserves_chat_model_lock(db):
+    db.update_session_runtime_lock(
+        "predecessor", model="picked-model", confirmed=True,
+        model_options={"reasoning": {"effort": "high"}, "fast": False},
+    )
+    original = json.loads(db.get_session("predecessor")["model_config"])["browser_model_lock"]
+
+    assert db.safe_fork_session("predecessor", "weave-successor") == "forked"
+    child = db.get_session("weave-successor")
+    config = json.loads(child["model_config"])
+    assert config["browser_model_lock"] == original
+    assert config["keep"] is True
+    assert config["_branched_from"] == "predecessor"
+    assert child["model"] == original["model"]
+
+
 @pytest.mark.parametrize("lock_kind", ["compression", "turn"])
 def test_safe_fork_refuses_native_durable_locks_without_revoking(db, lock_kind):
     if lock_kind == "compression":
