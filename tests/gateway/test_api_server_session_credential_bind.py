@@ -14,6 +14,23 @@ import hermes_state
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource
 from gateway.platforms.api_server import APIServerAdapter
+from gateway.session_authority import initialize_session_authority
+
+
+def _bind_session_authority(runner, instance_id):
+    """Upstream (v0.22.5) binds API storage to the runner's registered session authority; a sync
+    fixture cannot await inside pytest-asyncio's loop, so the one-off init runs on its own loop."""
+    import threading
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+    try:
+        asyncio.run_coroutine_threadsafe(
+            initialize_session_authority(runner, profile_id="default", instance_id=instance_id), loop).result(30)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join()
+        loop.close()
 from gateway.run import GatewayRunner, _resolve_runtime_agent_kwargs
 from hermes_state import SessionDB
 
@@ -54,6 +71,9 @@ def _runtime_holder(runner, session_id):
 @pytest.fixture
 def adapter_and_runner(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # The hermetic conftest pins hermes_state.DEFAULT_DB_PATH under tmp_path/hermes_test; upstream's
+    # per-home authority lookup (v0.22.5) needs the store at the home this test serves.
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
     monkeypatch.setattr(
         gateway_run, "_resolve_runtime_agent_kwargs",
         lambda: {"api_key": "ambient-key", "provider": "stock"},
@@ -66,6 +86,9 @@ def adapter_and_runner(tmp_path, monkeypatch):
     )
     adapter._session_db = runner._session_db._db
     adapter.gateway_runner = runner
+    runner.adapters = {Platform.API_SERVER: adapter}
+    # Upstream binds API storage to the runner's registered session authority (v0.22.5).
+    _bind_session_authority(runner, "bind-test")
     try:
         yield adapter, runner
     finally:
@@ -99,10 +122,19 @@ def gate_b_agent(adapter_and_runner, tmp_path, monkeypatch):
     monkeypatch.setattr(GatewayRunner, "_load_fallback_model", staticmethod(
         lambda: [{"provider": "openrouter", "model": "fallback-model"}],
     ))
-    constructor = MagicMock()
-    agent = constructor.return_value
-    agent.run_conversation.return_value = {"final_response": "done"}
-    agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+    def _fake_agent(**kwargs):
+        """Upstream's canonical turn runner (v0.22.5) serialises the agent's session_id / model /
+        provider / compressor stats into durable rows: pin those to real values on the Mock."""
+        agent = MagicMock()
+        agent.run_conversation = constructor.return_value.run_conversation
+        agent.session_id = SESSION_ID
+        agent.model, agent.provider = kwargs.get("model"), kwargs.get("provider")
+        agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        agent.context_compressor.last_prompt_tokens = agent.context_compressor.context_length = 0
+        return agent
+
+    constructor = MagicMock(side_effect=_fake_agent)
+    constructor.return_value.run_conversation.return_value = {"final_response": "done"}
     monkeypatch.setattr(run_agent, "AIAgent", constructor)
     return adapter, runner, constructor
 
@@ -186,7 +218,7 @@ async def test_gate_b_run_holder_refresh_and_revoke_are_live(gate_b_agent, updat
     entered, proceed = threading.Event(), threading.Event()
     observed = []
 
-    def conversation(**_kwargs):
+    def conversation(*_args, **_kwargs):
         holder = constructor.call_args.kwargs["api_key"]
         observed.append(holder())
         entered.set()

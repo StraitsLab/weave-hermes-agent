@@ -598,9 +598,18 @@ def prepare_api_runtime(model, runtime_kwargs):
     configured = current['adapter']._model_routes.get(options.get('requested_model'))
     if configured and {k: v for k, v in configured.items() if k != 'api_key'} == route:
         route = configured
+    # A Gate-B session credential (callable holder) is the session's only credential: request
+    # selection may pick the model, never swap the holder for an ambient key (same rule as
+    # ``_create_agent``'s ``native`` re-application).
+    native = dict(runtime_kwargs) if callable(runtime_kwargs.get('api_key')) else None
     model, _, _, _ = current['adapter']._select_agent_runtime(runtime_kwargs, model,
         requested_model=options.get('requested_model'), requested_provider=options.get('requested_provider'),
         route=route, session_model=options.get('session_model'),
         confirmed_runtime_lock=bool(options.get('confirmed_runtime_lock')),
         gateway_session_key=None, session_id=None)
+    if native:
+        runtime_kwargs.update(native)
+        # The holder is the session's confirmed runtime: no ambient fallback chain, and the settled
+        # turn must report the runtime it named (mirrors ``_create_agent``: ``confirmed_runtime_lock = True``).
+        options['confirmed_runtime_lock'] = True
     return model, runtime_kwargs
