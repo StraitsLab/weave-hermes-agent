@@ -67,6 +67,8 @@ async def test_unclean_boot_fails_native_submits_once_in_their_own_profile(tmp_p
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
     adapter.gateway_runner = runner
     adapter._session_db = db
+    # Upstream now lends only runtime-owned stores; this test uses its explicit profile fixture.
+    monkeypatch.setattr("gateway.platforms.api_server_store.selected_session_db", lambda adapter, selected: db)
     monkeypatch.setattr(adapter, "_api_key_passes_startup_guard", lambda: True)
     monkeypatch.setattr(adapter, "_wire_plugin_handlers", lambda app: None)
     monkeypatch.setattr(adapter, "_publish_runtime_status", lambda: None)

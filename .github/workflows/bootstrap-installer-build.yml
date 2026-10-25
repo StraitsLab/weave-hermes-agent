@@ -106,7 +106,7 @@ jobs:
         run: |
           file="$RUNNER_TEMP/azure-federated-token"
           mint() {
-            curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            curl -sSf -H "Authorization: bearer $ACTIO...OKEN" \
               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" \
               | jq -r .value > "$file.tmp" && mv -f "$file.tmp" "$file"
           }

@@ -31,6 +31,17 @@ def _request(request_id="request-1", message="hello"):
     }
 
 
+@pytest.fixture(autouse=True)
+def isolated_runner_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(GatewayRunner, "_VOICE_MODE_PATH", tmp_path / "gateway_voice_mode.json")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # This suite exercises native receipts/lifecycle with explicitly injected stores.
+    # Runtime-owned profile selection is covered by test_harso_native_authority.
+    monkeypatch.setattr("gateway.platforms.api_server_store.selected_session_db",
+                        lambda adapter, home: adapter._session_db)
+
+
 @pytest.fixture
 def adapter(tmp_path):
     adapter = APIServerAdapter(

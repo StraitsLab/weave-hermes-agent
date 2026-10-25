@@ -43,6 +43,8 @@ def platform_root(tmp_path, monkeypatch):
     root = tmp_path / "platform-scripts"
     root.mkdir(mode=0o755)
     os.chmod(root, 0o755)
+    from tests.platform_script_helpers import trust_host_ancestors
+    trust_host_ancestors(monkeypatch, tmp_path)
     monkeypatch.setattr(scheduler, "_PLATFORM_SCRIPT_OWNER_UID", os.getuid())  # windows-footgun: ok
     return root
 
@@ -287,7 +289,7 @@ def test_tenant_script_refused_on_no_agent_path(home, tmp_path):
     assert not marker.exists()
 
 
-def test_tenant_script_refused_on_prerun_path(home, tmp_path):
+def test_tenant_script_refused_on_prerun_path(home, tmp_path, cron_owner):
     from unittest.mock import MagicMock, patch
 
     import cron.harso_scripts as scheduler
@@ -920,7 +922,7 @@ def test_unreadable_pinned_script_blocked_at_fire(unreadable_pinned):
     assert out.startswith("Blocked: platform script cannot be read")
 
 
-def test_unreadable_pinned_script_blocked_on_prerun(unreadable_pinned):
+def test_unreadable_pinned_script_blocked_on_prerun(unreadable_pinned, cron_owner):
     from unittest.mock import MagicMock, patch
 
     import cron.harso_scripts as scheduler
