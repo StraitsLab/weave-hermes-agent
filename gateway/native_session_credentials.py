@@ -87,7 +87,7 @@ def install(runner):
 def runtime(runner, source, session_key, user_config):
     """Return the Gate-B route with a live holder; never fall back to ambient credentials."""
     from gateway.config import Platform
-    if source is None or source.platform != Platform.API_SERVER:
+    if source is None or getattr(source, "platform", None) != Platform.API_SERVER:
         return None
     config = user_config or {}
     model = config.get("model") or {}

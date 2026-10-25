@@ -1293,7 +1293,9 @@ class NativeSessionAPI:
         """Expose the existing clarify waiter without inventing a prompt system."""
         native_request_ref = self._native_submit_active_ref(session_key)
         if not native_request_ref:
-            return SendResult(success=False, error="native clarification surface unavailable")
+            # Not a native submit: upstream's /v1/runs clarify ACK (shared prompt registry).
+            return await self._upstream_send_clarify(
+                chat_id, question, choices, clarify_id, session_key, metadata=metadata)
         from tools.clarify_gateway import get_clarify_metadata
 
         clarify = get_clarify_metadata(clarify_id) or {}
@@ -1767,6 +1769,7 @@ def initialize(adapter):
     adapter._harso_native_initialized = True
     if not hasattr(type(adapter), '_upstream_fork_session'):
         type(adapter)._upstream_fork_session = type(adapter)._handle_fork_session
+        type(adapter)._upstream_send_clarify = type(adapter).send_clarify
     for name, value in NativeSessionAPI.__dict__.items():
         if not name.startswith("__"):
             setattr(type(adapter), name, value)

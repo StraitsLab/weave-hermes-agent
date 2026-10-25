@@ -120,10 +120,14 @@ async def test_native_codec_closed_metadata_contract_and_reply_expected(tmp_path
         authority.db.close()
     # Closed producer matrix: no other adapter stamps MessageEvent.metadata on ordinary inbound,
     # so the WhatsApp keys above are the whole contract. A new producer must extend it here.
+    # Fork: the Harso native submit route stamps gateway_session_* / native_* keys on its own
+    # authenticated admission path (tests/gateway/test_native_awake_admission.py), never on the
+    # replay envelope above, which keeps refusing those keys.
     producers = set()
     for path in [*REPO.glob('gateway/platforms/**/*.py'), *REPO.glob('plugins/platforms/**/*.py')]:
         for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
             if (isinstance(node, ast.Call) and getattr(node.func, 'id', getattr(node.func, 'attr', '')) == 'MessageEvent'
                     and any(k.arg == 'metadata' for k in node.keywords)):
                 producers.add(path.relative_to(REPO).as_posix())
-    assert producers == {'plugins/platforms/whatsapp/adapter.py'}, producers
+    assert producers == {'plugins/platforms/whatsapp/adapter.py',
+                         'gateway/platforms/api_server_harso_sessions.py'}, producers

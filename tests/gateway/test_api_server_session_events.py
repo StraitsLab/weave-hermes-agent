@@ -496,7 +496,7 @@ def test_provider_resolution_failure_returns_failed_result():
     )
     source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID, user_id="api")
     ctx = SimpleNamespace(
-        source=source, session_key="native-key", user_config={},
+        source=source, session_key="native-key", session_id=SESSION_ID, user_config={},
         message="hello", context_prompt="", channel_prompt="",
     )
     result = TurnRunner(runner, ctx).run_sync()
