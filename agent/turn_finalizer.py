@@ -743,9 +743,9 @@ def finalize_turn(
     if _cleanup_errors:
         result["cleanup_errors"] = _cleanup_errors
     # A /steer landing after the final assistant turn has no tool batch to drain into;
-    # hand it back so it becomes the next user turn instead of being lost.
+    # Close native admission before draining; ticketed transfers stay buffered for settlement.
     _close = getattr(agent, "_close_steer_window", None)
-    _leftover_steer = _close() if callable(_close) else agent._drain_pending_steer()
+    _leftover_steer = (_close or getattr(agent, "_drain_leftover_steer", None) or agent._drain_pending_steer)()
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False

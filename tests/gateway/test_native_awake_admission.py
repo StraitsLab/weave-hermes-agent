@@ -3,6 +3,9 @@ import pytest
 from unittest.mock import AsyncMock
 from tests.gateway import test_api_server_session_submit as submit_tests
 adapter = submit_tests.adapter
+# The injected store stands in for runtime-owned profile selection here too (v0.22.5 routes
+# API storage through the session authority registry).
+isolated_runner_paths = submit_tests.isolated_runner_paths
 _client, _request, SESSION_ID = submit_tests._client, submit_tests._request, submit_tests.SESSION_ID
 from gateway import native_awake
 

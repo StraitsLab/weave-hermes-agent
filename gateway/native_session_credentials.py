@@ -87,7 +87,7 @@ def install(runner):
 def runtime(runner, source, session_key, user_config):
     """Return the Gate-B route with a live holder; never fall back to ambient credentials."""
     from gateway.config import Platform
-    if source is None or source.platform != Platform.API_SERVER:
+    if source is None or getattr(source, "platform", None) != Platform.API_SERVER:
         return None
     config = user_config or {}
     model = config.get("model") or {}
@@ -131,7 +131,7 @@ def for_api(adapter, session_id, requested_provider=None, route=None):
     if provider not in ('custom:weave-gate-b', 'weave-gate-b'):
         return None
     source = SessionSource(platform=Platform.API_SERVER, chat_id=session_id or '', chat_type='dm',
-                           user_id='api_server', user_name='API server', profile=_api_request_profile.get() or None)
+                           user_id='api', user_name='API server', profile=_api_request_profile.get() or None)
     try:
         selected = runtime(adapter.gateway_runner, source, None, config)
         if adapter.gateway_runner.session_credential_for(source, session_id) is None:
@@ -158,7 +158,7 @@ def revoke(adapter, session_id):
         return
     install(runner)
     source = SessionSource(platform=Platform.API_SERVER, chat_id=session_id, chat_type='dm',
-                           user_id='api_server', user_name='API server', profile=_api_request_profile.get() or None)
+                           user_id='api', user_name='API server', profile=_api_request_profile.get() or None)
     if callable(getattr(runner, 'revoke_session_credential', None)):
         runner.revoke_session_credential(source, session_id)
 

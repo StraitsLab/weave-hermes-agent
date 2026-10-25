@@ -52,7 +52,13 @@ async def probe(peer):
     from gateway.config import Platform, PlatformConfig
     from gateway.platforms.api_server import APIServerAdapter
     from gateway.run import GatewayRunner
+    from gateway.runtime_ownership import process_ownership
+    from gateway.run_runtime import initialize_gateway_runtime
+    from hermes_constants import get_hermes_home
+    home = get_hermes_home()
+    process_ownership.reserve([home])
     runner = GatewayRunner()
+    await initialize_gateway_runtime(runner)
     runner._running = True
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={'key': 'loopback-only-api', 'port': 0}))
     adapter.gateway_runner = runner

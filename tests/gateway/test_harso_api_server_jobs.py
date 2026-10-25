@@ -831,6 +831,8 @@ class TestPlatformScriptJobs:
             "allow_scripts": False, "platform_script_root": str(root),
         }}))
         monkeypatch.setenv("HERMES_HOME", str(home))
+        from tests.platform_script_helpers import trust_host_ancestors
+        trust_host_ancestors(monkeypatch, tmp_path)
         monkeypatch.setattr(scheduler, "_PLATFORM_SCRIPT_OWNER_UID", os.getuid())  # windows-footgun: ok
         return home
 

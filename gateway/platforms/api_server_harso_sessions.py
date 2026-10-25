@@ -527,7 +527,7 @@ class NativeSessionAPI:
             return web.json_response({"status": "ready", "credential_slot": "GATE_B_API_KEY"})
         source = SessionSource(
             platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
-            user_id="api_server", user_name="API server",
+            user_id="api", user_name="API server",
             profile=_api_request_profile.get() or None,
         )
         async with self._native_lifecycle_lock(session_id):
@@ -639,7 +639,7 @@ class NativeSessionAPI:
             platform=Platform.API_SERVER,
             chat_id=session_id,
             chat_type="dm",
-            user_id="api_server",
+            user_id="api",
             user_name="API server",
             profile=_api_request_profile.get() or None,
         )
@@ -818,7 +818,7 @@ class NativeSessionAPI:
             )
         source = SessionSource(
             platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
-            user_id="api_server", user_name="API server",
+            user_id="api", user_name="API server",
             profile=_api_request_profile.get() or None,
         )
         return await self._native_submit_registered(session_id, body, parsed, db, profile, runner, source)
@@ -1139,7 +1139,7 @@ class NativeSessionAPI:
             return auth_err
         runner = self.gateway_runner
         source = SessionSource(platform=Platform.API_SERVER, chat_id=request.match_info["session_id"], chat_type="dm",
-                               user_id="api_server", user_name="API server", profile=_api_request_profile.get() or None)
+                               user_id="api", user_name="API server", profile=_api_request_profile.get() or None)
         session_key = runner.session_store._generate_session_key(source) if runner else None
         agent = self._native_submit_running_agent(runner, session_key) if runner else None
         stopped = False
@@ -1293,7 +1293,9 @@ class NativeSessionAPI:
         """Expose the existing clarify waiter without inventing a prompt system."""
         native_request_ref = self._native_submit_active_ref(session_key)
         if not native_request_ref:
-            return SendResult(success=False, error="native clarification surface unavailable")
+            # Not a native submit: upstream's /v1/runs clarify ACK (shared prompt registry).
+            return await self._upstream_send_clarify(
+                chat_id, question, choices, clarify_id, session_key, metadata=metadata)
         from tools.clarify_gateway import get_clarify_metadata
 
         clarify = get_clarify_metadata(clarify_id) or {}
@@ -1585,7 +1587,7 @@ class NativeSessionAPI:
             return web.json_response(
                 _openai_error("Session fork conflicts with native lineage", code="session_fork_conflict"), status=409,
             )
-        source_kwargs = dict(platform=Platform.API_SERVER, chat_type="dm", user_id="api_server",
+        source_kwargs = dict(platform=Platform.API_SERVER, chat_type="dm", user_id="api",
                              user_name="API server", profile=_api_request_profile.get() or None)
         source = SessionSource(chat_id=source_id, **source_kwargs)
         successor = SessionSource(chat_id=successor_id, **source_kwargs)
@@ -1684,6 +1686,11 @@ class NativeSessionAPI:
         db = await self._ensure_session_db_async()
         row = await asyncio.to_thread(db.get_session, request.match_info['session_id']) if db is not None else None
         if row and row.get('ended_at') is not None:
+            # Upstream's deferred overflow reset stamps a LOCAL Bot Chat ``session_reset`` and keeps
+            # serving its titled creation id from the lineage tip (``admit_peer_turn``): a ``hermes peer
+            # dm`` follow-up on that id is live, not ended.
+            if row.get('end_reason') == 'session_reset' and row.get('source') == 'local':
+                return None
             return web.json_response(_openai_error('Session is ended', code='session_ended'), status=409)
         return None
 
@@ -1767,6 +1774,7 @@ def initialize(adapter):
     adapter._harso_native_initialized = True
     if not hasattr(type(adapter), '_upstream_fork_session'):
         type(adapter)._upstream_fork_session = type(adapter)._handle_fork_session
+        type(adapter)._upstream_send_clarify = type(adapter).send_clarify
     for name, value in NativeSessionAPI.__dict__.items():
         if not name.startswith("__"):
             setattr(type(adapter), name, value)

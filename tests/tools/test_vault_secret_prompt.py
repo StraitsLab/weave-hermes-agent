@@ -62,7 +62,8 @@ def test_native_runner_binds_masked_callbacks_and_clears_on_exit(monkeypatch, fa
     ctx = TurnContext()
     ctx.source = SimpleNamespace(platform=Platform.API_SERVER, user_id="user", user_name="User")
     ctx.session_key = "masked-runner"; ctx.session_id = "session"
-    worker = SimpleNamespace(_ctx=ctx, _approval_notify_sync=lambda _: None, _native_image_run_message=lambda: "Sign in")
+    worker = SimpleNamespace(_ctx=ctx, _approval_notify_sync=lambda _: None, _native_image_run_message=lambda: "Sign in",
+                             _approval_owner=None)  # upstream (v0.22.5) arms the onboarding prelude from the owner
     monkeypatch.setattr(notifications, "notification_turn", lambda *a, **kw: nullcontext())
     monkeypatch.setattr(ap, "request_vault_secret", lambda kind, site: {"code": "code-canary"} if kind == "vault_code" else {"username": "user", "password": "password-canary"})
     def run(message, **kwargs):

@@ -110,4 +110,10 @@ def test_layout_inference_survives_every_derived_id_shape(store, tmp_path) -> No
     report = _map_as_salvage(tmp_path, columns, rows)
     assert report["mapped"]["sessions"] == len(rows)
     assert report["unrecognized_layout_rows"] == 0
-    assert report["inferred_layouts"]["sessions"][str(len(columns))] == columns
+    inferred = report["inferred_layouts"]["sessions"][str(len(columns))]
+    assert all(name in (None, expected) for name, expected in zip(inferred, columns))
+    # ``transcript_revision`` (upstream) and ``transcript_epoch`` (fork) are both INTEGER DEFAULT 0
+    # appended after ``tool_names``; a fork-upgraded DB and a fresh one hold them in opposite physical
+    # order and zero cells cannot tell them apart, so the mapper leaves those positions unnamed.
+    unresolved = {columns[i] for i, name in enumerate(inferred) if name is None}
+    assert unresolved <= {"transcript_revision", "transcript_epoch"}, unresolved

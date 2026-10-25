@@ -35,7 +35,7 @@ ADVISORY_FAILURE_JOBS = frozenset(("tests-os",))
 NEEDS_JSON_OUTPUT = "needs-json"
 
 # Reusable-workflow parents of the update/E2E consumers, and of the real
-# remote-backend lane. The actual detect outputs already arrive in
+# remote-backend and catalog lanes. The actual detect outputs already arrive in
 # toJSON(needs); a selected consumer cannot skip merely because this is a PR
 # rather than a release.
 _UPDATE_CONSUMER_LANES = {
@@ -43,6 +43,7 @@ _UPDATE_CONSUMER_LANES = {
     "tests-os": ("python", "desktop_updater", "e2e", "e2e_upgrade"),
     "e2e-desktop-update": ("e2e_desktop_update",),
     "remote-backends": ("remote_backends",),
+    "catalog-tests": ("catalog",),
 }
 
 

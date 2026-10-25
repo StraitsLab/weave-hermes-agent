@@ -23,6 +23,14 @@ from tools.approval_gateway_wait import _ApprovalEntry
 from tools.clarify_gateway import SKIPPED
 
 SESSION, KEY, AUTH = "spoken-session", "spoken-key", {"Authorization": "Bearer spoken-test"}
+
+
+@pytest.fixture(autouse=True)
+def explicit_fixture_store(monkeypatch):
+    # The runtime lends its owned store in production; these handler tests pin their own fixture.
+    monkeypatch.setattr("gateway.platforms.api_server_store.selected_session_db",
+                        lambda adapter, home: adapter._session_db)
+
 CHOICES = ["Best route and destinations (Recommended)", "Business-class flights", "Luxury hotels and ryokans"]
 
 
