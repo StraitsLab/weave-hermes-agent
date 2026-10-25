@@ -944,7 +944,7 @@ async def test_attachment_document_reaches_model_without_duplicate_user_content(
         httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=body))))
     if busy:
         gateway.release.clear()
-        status, first = await _submit_internal_gateway(gateway, "before-document", "first task")
+        status, _first = await _submit_internal_gateway(gateway, "before-document", "first task")
         assert status == 202
         await asyncio.wait_for(gateway.started.wait(), 10)
     text = "Read my report"

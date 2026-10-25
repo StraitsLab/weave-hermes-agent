@@ -43,7 +43,7 @@ async def cache_attachments(attachments):
             path = await base._cache_media_from_url(
                 attachment["url"], suffix, 0, media_type=kind, accept=media,
                 cache_fn=cache_functions[kind], log_label="Native attachment")
-        except Exception:
+        except Exception:  # health: allow BLE001 -- re-raised as a typed refusal; the cause is dropped because a signed URL is a credential
             # Signed URLs are credentials; the submit error logger must not print transport exceptions.
             raise RuntimeError("Native attachment download failed") from None
         paths.append(path)
