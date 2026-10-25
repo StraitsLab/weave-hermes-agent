@@ -17,7 +17,8 @@ class ModelPeer(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(json.dumps({"data": [{"id": "local-wire-stub", "object": "model"}]}).encode())
+        self.wfile.write(json.dumps({"data": [{"id": model, "object": "model"}
+                                                     for model in ("local-wire-stub", "chat-wire-stub", "next-wire-stub")]}).encode())
 
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -72,6 +73,9 @@ async def probe(peer):
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as client:
             base = f'http://127.0.0.1:{port}/api/sessions/harso-native'
+            lock_response = await client.post(base + '/model', headers=headers, json={
+                'model': 'chat-wire-stub', 'model_options': {'reasoning': {'effort': 'high'}, 'fast': True}})
+            assert lock_response.status == 200, await lock_response.text()
             body = {'kind': 'hermes.session.submit', 'external_request_id': 'first',
                     'message': 'HARSO_NATIVE', 'busy_mode': 'queue'}
             async with client.post(base + '/submit', json=body, headers=headers) as response:
@@ -88,7 +92,11 @@ async def probe(peer):
             rows = [m for m in db.get_messages('harso-native') if m['role'] == 'user']
             assert len(rows) == 1, rows
             assert len(peer.requests) == 1, peer.requests
+            assert peer.requests[0]['model'] == 'chat-wire-stub', peer.requests
             assert db.get_messages('harso-native')[0].get('display_kind') is None
+            lock_response = await client.post(base + '/model', headers=headers, json={
+                'model': 'next-wire-stub', 'model_options': {'reasoning': {'effort': 'low'}, 'fast': False}})
+            assert lock_response.status == 200, await lock_response.text()
             body = {**body, 'external_request_id': 'internal', 'message': 'HARSO_NOTICE', 'internal': True}
             async with client.post(base + '/submit', json=body, headers=headers) as response:
                 notice = await response.json()
@@ -98,6 +106,7 @@ async def probe(peer):
             users = [m for m in db.get_messages('harso-native') if m['role'] == 'user']
             assert [m.get('display_kind') for m in users] == [None, 'internal_notification'], users
             assert len(peer.requests) == 2
+            assert peer.requests[1]['model'] == 'next-wire-stub', peer.requests
             persisted = db.get_messages_as_conversation('harso-native', include_row_ids=True)
             assert all(isinstance(m.get('_row_id'), int) for m in persisted if m['role'] in {'user', 'assistant'}), persisted
 

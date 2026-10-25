@@ -2987,6 +2987,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             )
         except (TypeError, json.JSONDecodeError):
             model_config = None
+        payload["model_lock"] = None
+        lock = model_config.get("browser_model_lock") if isinstance(model_config, dict) else None
+        if isinstance(lock, dict) and _coerce_request_bool(lock.get("confirmed"), default=False):
+            options = lock.get("model_options")
+            options = options if isinstance(options, dict) else {}
+            reasoning = options.get("reasoning")
+            reasoning = reasoning if isinstance(reasoning, dict) else {}
+            payload["model_lock"] = {
+                "model": lock.get("model"),
+                "effort": reasoning.get("effort") or None,
+                "fast": bool(options.get("fast")),
+            }
         # Exact-id consumers may inspect/resume delegate children even though
         # list endpoints intentionally omit them. Project only the provenance
         # bit the client needs so it cannot accidentally promote such a row

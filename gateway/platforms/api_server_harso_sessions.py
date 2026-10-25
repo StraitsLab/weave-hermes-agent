@@ -669,6 +669,8 @@ class NativeSessionAPI:
             return admission
         if internal:
             message = _live_handoff_message(message)
+        from gateway.platforms.api_server_native_model_lock import apply_native_model_lock
+        await apply_native_model_lock(self, session_id, source, entry.session_key)
         self._native_submit_ref_sessions[native_request_ref] = (
             _api_request_profile.get() or "default", session_id,
         )
