@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone, UTC
 import threading
 
 import pytest
+import hermes_state
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -12,6 +13,23 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from gateway.session_authority import initialize_session_authority
+
+
+def _bind_session_authority(runner, instance_id):
+    """Upstream (v0.22.5) binds API storage to the runner's registered session authority; a sync
+    fixture cannot await inside pytest-asyncio's loop, so the one-off init runs on its own loop."""
+    import threading
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+    try:
+        asyncio.run_coroutine_threadsafe(
+            initialize_session_authority(runner, profile_id="default", instance_id=instance_id), loop).result(30)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join()
+        loop.close()
 
 
 PREDECESSOR = "fork-predecessor"
@@ -30,13 +48,16 @@ def _request(**changes):
 def _source(session_id=PREDECESSOR):
     return SessionSource(
         platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
-        user_id="api_server", user_name="API server",
+        user_id="api", user_name="API server",
     )
 
 
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # The hermetic conftest pins hermes_state.DEFAULT_DB_PATH under tmp_path/hermes_test; upstream's
+    # per-home authority lookup (v0.22.5) needs the store at the home this test serves.
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
     runner = GatewayRunner(GatewayConfig())
     runner._running = True
     db = runner._session_db._db
@@ -47,6 +68,8 @@ def setup(tmp_path, monkeypatch):
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-safe-fork-test"}))
     adapter._session_db = db
     adapter.gateway_runner = runner
+    # Upstream binds API storage to the runner's registered session authority (v0.22.5).
+    _bind_session_authority(runner, "fork-test")
     try:
         yield adapter, runner, db
     finally:

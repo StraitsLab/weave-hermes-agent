@@ -382,7 +382,7 @@ async def test_raised_native_execution_marks_terminal_failure(
     adapter, monkeypatch, tmp_path,
 ):
     source = SessionSource(
-        platform=Platform.API_SERVER, chat_id=SESSION_ID, user_id="api_server",
+        platform=Platform.API_SERVER, chat_id=SESSION_ID, user_id="api",
     )
     event = MessageEvent(
         text="raise", source=source, message_id=REQUEST_REF,
@@ -435,7 +435,7 @@ async def test_raised_native_execution_marks_terminal_failure(
 @pytest.mark.parametrize("provider_failed", [True, False], ids=["provider-failure", "success"])
 async def test_returned_native_result_terminal(adapter, monkeypatch, tmp_path, provider_failed):
     source = SessionSource(
-        platform=Platform.API_SERVER, chat_id=SESSION_ID, user_id="api_server",
+        platform=Platform.API_SERVER, chat_id=SESSION_ID, user_id="api",
     )
     event = MessageEvent(
         text="hello", source=source, message_id=REQUEST_REF,
@@ -494,9 +494,9 @@ def test_provider_resolution_failure_returns_failed_result():
             side_effect=RuntimeError("no provider configured for session"),
         ),
     )
-    source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID, user_id="api_server")
+    source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID, user_id="api")
     ctx = SimpleNamespace(
-        source=source, session_key="native-key", user_config={},
+        source=source, session_key="native-key", session_id=SESSION_ID, user_config={},
         message="hello", context_prompt="", channel_prompt="",
     )
     result = TurnRunner(runner, ctx).run_sync()

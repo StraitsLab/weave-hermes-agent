@@ -1379,6 +1379,17 @@ def _stalled_server(monkeypatch):
         server.server_close()
 
 
+def _prefetch_threads(manager):
+    """Live external prefetch threads by provider name, read from upstream's process-wide gate
+    (v0.22.5 replaced the per-manager ``_external_prefetch_threads`` dict with ``_PREFETCH_GATE``)."""
+    gate = type(manager)._PREFETCH_GATE
+    threads: dict[str, list[threading.Thread]] = {}
+    with gate.lock:
+        for key, calls in gate.calls.items():
+            threads.setdefault(key[1], []).extend(t for t in calls if isinstance(t, threading.Thread))
+    return threads
+
+
 def test_stalled_server_costs_the_turn_only_the_manager_deadline(_stalled_server):
     """The caller returns at the manager deadline while the socket is still
     open; ordering is proven by events, not by a narrow timing window."""
@@ -1393,13 +1404,16 @@ def test_stalled_server_costs_the_turn_only_the_manager_deadline(_stalled_server
     # deadline, with >=2s of scheduler slack either side.
     assert time.monotonic() - started < 2.5
     assert entered.wait(5)  # the request reached the server, which holds it
-    thread = manager._external_prefetch_threads["harso"]
+    (thread,) = _prefetch_threads(manager)["harso"]
     assert thread.is_alive()  # held until release: server never answered
-    assert manager.prefetch_all("again") == ""  # no second thread piles up
-    assert manager._external_prefetch_threads["harso"] is thread
+    # Upstream's process-wide gate admits healthy concurrent callers, so a second turn starts its own
+    # call; the first stuck thread stays registered (bounded by the gate) and is never duplicated.
+    assert manager.prefetch_all("again") == ""
+    assert thread in _prefetch_threads(manager)["harso"]
     release.set()
-    thread.join(timeout=10)
-    assert not thread.is_alive()
+    for stuck in list(_prefetch_threads(manager).get("harso", [])):
+        stuck.join(timeout=10)
+        assert not stuck.is_alive()
 
 
 def test_stalled_server_is_freed_by_the_prefetch_socket_timeout(_stalled_server):
@@ -1410,8 +1424,7 @@ def test_stalled_server_is_freed_by_the_prefetch_socket_timeout(_stalled_server)
     _write_config("plugins:\n  harso:\n    prefetch_timeout: 0.6\n")
     assert manager.prefetch_all("What did we decide?") == ""
     # Absent only if a descheduled caller saw it finish inside the join.
-    thread = manager._external_prefetch_threads.get("harso")
-    if thread is not None:
+    for thread in _prefetch_threads(manager).get("harso", []):
         thread.join(timeout=4.0)  # 0.6s socket + 3.4s slack; 5s would miss it
         assert not thread.is_alive()
     assert entered.wait(5) and not release.is_set()  # server never answered

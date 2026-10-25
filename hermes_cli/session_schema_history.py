@@ -207,7 +207,14 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
         ('28 2026-09-25T23:25Z 2941aadffa', (('+', 'compression_overload_streak', 'compression_recovery_deadline'),)),
         ('29 2026-09-27T00:29Z d75f29934b', (('+', 'created_source', 'source'),)),
         ('30 2026-09-28T00:00Z #117713', (('+', 'auto_archived', 'archived'),)),
+        # Fork epoch shipped as schema 31 before the upstream runtime columns reached Harso.
+        # Event sequence is physical-layout history, not the schema_version migration counter.
         ('31 2026-10-15T00:00Z harso-native-session', (('+', 'transcript_epoch', 'tool_names'),)),
+        ('32 2026-09-08T18:45Z 0695b12b4c', (
+            ('+', 'runtime_revision', 'id'),
+            ('+', 'runtime_generation', 'runtime_revision'),
+        )),
+        ('33 2026-10-18T10:11Z 1fc1999769', (('+', 'transcript_revision', 'tool_names'),)),
         ),
     ),
     "messages": _TableHistory(

@@ -194,6 +194,26 @@ jobs:
         run: |
           "$HERMES_PYTHON" -c "import sqlite3, hermes_state_wal as w; print('sqlite', sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"
 
+      - name: Install and verify tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          tmux -V
+
+      - name: Run messaging-gated gateway tests
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/messaging-gateway.log"
+          scripts/run_tests.sh -rs \
+            tests/gateway/test_native_pause_notice.py \
+            tests/gateway/test_native_reply_crash_recovery.py \
+            tests/gateway/test_native_role_reauthorization.py \
+            tests/gateway/test_native_telegram_startup_recovery.py | tee "$log"
+          summary=$(grep '^=== Summary:' "$log")
+          case "$summary" in
+            *skipped*) echo "::error::messaging-gated gateway cases skipped: $summary"; exit 1 ;;
+          esac
+
       - name: Run e2e tests
         # One subprocess per file, in parallel: the core suites spawn real
         # processes (serve, gateway, tui_gateway, MCP servers, SQLite writers)

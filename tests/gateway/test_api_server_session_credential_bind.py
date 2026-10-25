@@ -14,6 +14,23 @@ import hermes_state
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource
 from gateway.platforms.api_server import APIServerAdapter
+from gateway.session_authority import initialize_session_authority
+
+
+def _bind_session_authority(runner, instance_id):
+    """Upstream (v0.22.5) binds API storage to the runner's registered session authority; a sync
+    fixture cannot await inside pytest-asyncio's loop, so the one-off init runs on its own loop."""
+    import threading
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+    try:
+        asyncio.run_coroutine_threadsafe(
+            initialize_session_authority(runner, profile_id="default", instance_id=instance_id), loop).result(30)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join()
+        loop.close()
 from gateway.run import GatewayRunner, _resolve_runtime_agent_kwargs
 from hermes_state import SessionDB
 
@@ -42,7 +59,7 @@ def _bind_body(**overrides):
 def _runtime_holder(runner, session_id):
     source = SessionSource(
         platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
-        user_id="api_server", user_name="API server",
+        user_id="api", user_name="API server",
     )
     session_key = runner.session_store._generate_session_key(source)
     _, runtime = runner._resolve_session_agent_runtime(
@@ -54,6 +71,9 @@ def _runtime_holder(runner, session_id):
 @pytest.fixture
 def adapter_and_runner(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # The hermetic conftest pins hermes_state.DEFAULT_DB_PATH under tmp_path/hermes_test; upstream's
+    # per-home authority lookup (v0.22.5) needs the store at the home this test serves.
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
     monkeypatch.setattr(
         gateway_run, "_resolve_runtime_agent_kwargs",
         lambda: {"api_key": "ambient-key", "provider": "stock"},
@@ -66,6 +86,9 @@ def adapter_and_runner(tmp_path, monkeypatch):
     )
     adapter._session_db = runner._session_db._db
     adapter.gateway_runner = runner
+    runner.adapters = {Platform.API_SERVER: adapter}
+    # Upstream binds API storage to the runner's registered session authority (v0.22.5).
+    _bind_session_authority(runner, "bind-test")
     try:
         yield adapter, runner
     finally:
@@ -99,10 +122,19 @@ def gate_b_agent(adapter_and_runner, tmp_path, monkeypatch):
     monkeypatch.setattr(GatewayRunner, "_load_fallback_model", staticmethod(
         lambda: [{"provider": "openrouter", "model": "fallback-model"}],
     ))
-    constructor = MagicMock()
-    agent = constructor.return_value
-    agent.run_conversation.return_value = {"final_response": "done"}
-    agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+    def _fake_agent(**kwargs):
+        """Upstream's canonical turn runner (v0.22.5) serialises the agent's session_id / model /
+        provider / compressor stats into durable rows: pin those to real values on the Mock."""
+        agent = MagicMock()
+        agent.run_conversation = constructor.return_value.run_conversation
+        agent.session_id = SESSION_ID
+        agent.model, agent.provider = kwargs.get("model"), kwargs.get("provider")
+        agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        agent.context_compressor.last_prompt_tokens = agent.context_compressor.context_length = 0
+        return agent
+
+    constructor = MagicMock(side_effect=_fake_agent)
+    constructor.return_value.run_conversation.return_value = {"final_response": "done"}
     monkeypatch.setattr(run_agent, "AIAgent", constructor)
     return adapter, runner, constructor
 
@@ -152,7 +184,7 @@ async def test_gate_b_run_refuses_unusable_binding(gate_b_agent, state):
     adapter, runner, constructor = gate_b_agent
     source = SessionSource(
         platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm",
-        user_id="api_server", user_name="API server",
+        user_id="api", user_name="API server",
     )
     if state != "missing":
         expires = datetime.now(UTC) + timedelta(minutes=5)
@@ -166,15 +198,26 @@ async def test_gate_b_run_refuses_unusable_binding(gate_b_agent, state):
     if state == "no-runner":
         adapter.gateway_runner = None
     client = await _client(adapter)
+    headers = {"Authorization": f"Bearer {adapter.config.extra['key']}"}
     try:
-        result = await _finished_run(
-            client, adapter,
-            session_id="unbound-session" if state == "wrong-session" else SESSION_ID,
-        )
+        if state == "displaced":
+            # Upstream (v0.22.5) admits API runs through the session authority: a route whose live
+            # session was reset no longer admits the old id at all (409), so no agent is ever built.
+            response = await client.post(
+                "/v1/runs", headers=headers, json={"session_id": SESSION_ID, "input": "test only"},
+            )
+            result = await response.json()
+            assert response.status == 409, result
+            assert result["error"]["code"] == "admission_conflict"
+        else:
+            result = await _finished_run(
+                client, adapter,
+                session_id="unbound-session" if state == "wrong-session" else SESSION_ID,
+            )
+            assert result["status"] == "failed", result
+            assert "credential unavailable" in result["error"]
     finally:
         await client.close()
-    assert result["status"] == "failed", result
-    assert "credential unavailable" in result["error"]
     assert BEARER not in repr(result)
     constructor.assert_not_called()
 
@@ -186,7 +229,7 @@ async def test_gate_b_run_holder_refresh_and_revoke_are_live(gate_b_agent, updat
     entered, proceed = threading.Event(), threading.Event()
     observed = []
 
-    def conversation(**_kwargs):
+    def conversation(*_args, **_kwargs):
         holder = constructor.call_args.kwargs["api_key"]
         observed.append(holder())
         entered.set()
@@ -276,6 +319,7 @@ async def test_gate_b_runs_use_exact_profile_holder(gate_b_agent, tmp_path, monk
         db = SessionDB(home / "state.db")
         db.create_session(SESSION_ID, "api_server")
         db.close()
+    await _serve_profiles(runner, tmp_path, ("alpha", "beta"))
     client = await _profile_client(adapter)
     headers = {"Authorization": f"Bearer {adapter.config.extra['key']}"}
     try:
@@ -382,6 +426,18 @@ async def _client(adapter):
     return client
 
 
+
+async def _serve_profiles(runner, root, names):
+    """Upstream (v0.22.5) routes a /p/<name>/ request to that profile's registered session
+    authority: reserve the homes and build one authority per profile, as the gateway boot does."""
+    from gateway.run_runtime import initialize_gateway_runtime
+    from gateway.runtime_ownership import process_ownership
+    homes = [("default", root.resolve())] + [(name, (root / "profiles" / name).resolve()) for name in names]
+    runner.config.multiplex_profiles = True
+    runner.config._runtime_profile_homes = tuple(homes)
+    process_ownership.reserve([home for _, home in homes])
+    await initialize_gateway_runtime(runner)
+
 async def _profile_client(adapter):
     app = web.Application(middlewares=[adapter._make_profile_prefix_middleware()])
     for method, path, handler in adapter._http_route_table():
@@ -463,7 +519,7 @@ async def test_persisted_reset_route_requires_reset_without_binding_a_credential
     store = runner.session_store
     source = SessionSource(
         platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm",
-        user_id="api_server", user_name="API server",
+        user_id="api", user_name="API server",
     )
     entry = store.bind_existing_session(source, SESSION_ID, reopen=False)
     runner._session_db._db.append_message(SESSION_ID, "user", "keep this history")
@@ -695,6 +751,7 @@ async def test_named_profile_routes_isolate_same_session_id_and_credentials(tmp_
     alpha_db, beta_db = SessionDB(alpha / "state.db"), SessionDB(beta / "state.db")
     alpha_db.create_session("shared-session", "api_server")
     beta_db.create_session("shared-session", "api_server")
+    await _serve_profiles(runner, root, ("alpha", "beta"))
     client = await _profile_client(adapter)
     try:
         alpha_bind = await client.post("/p/alpha/api/sessions/shared-session/credential/bind", headers={"Authorization": "Bearer sk-alpha-profile-test"}, json=_bind_body(bearer="alpha-bearer"))
@@ -714,8 +771,8 @@ async def test_named_profile_routes_isolate_same_session_id_and_credentials(tmp_
     assert cross.status == 409
     assert beta_refresh.status == 200
     assert alpha_body == beta_body == {"status": "ready", "credential_slot": "GATE_B_API_KEY"}
-    alpha_source = SessionSource(platform=Platform.API_SERVER, chat_id="shared-session", chat_type="dm", user_id="api_server", profile="alpha")
-    beta_source = SessionSource(platform=Platform.API_SERVER, chat_id="shared-session", chat_type="dm", user_id="api_server", profile="beta")
+    alpha_source = SessionSource(platform=Platform.API_SERVER, chat_id="shared-session", chat_type="dm", user_id="api", profile="alpha")
+    beta_source = SessionSource(platform=Platform.API_SERVER, chat_id="shared-session", chat_type="dm", user_id="api", profile="beta")
     assert runner.session_credential_available(alpha_source, "shared-session")
     assert runner.session_credential_available(beta_source, "shared-session")
     assert runner._peek_session_state(runner.session_store._generate_session_key(alpha_source)).conversation.credential_holder() == "alpha-bearer"
