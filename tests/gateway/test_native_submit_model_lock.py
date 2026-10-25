@@ -2,7 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -45,7 +45,8 @@ def native(tmp_path, monkeypatch):
                     return {}
                 key, value = params["key"], params["value"]
                 if key == "model":
-                    agent.model = value
+                    from hermes_cli.model_switch import parse_model_switch_args
+                    agent.model = parse_model_switch_args(value).model_input
                 elif key == "reasoning":
                     agent.reasoning_config = {"enabled": True, "effort": value}
                 elif key == "fast":
@@ -71,7 +72,10 @@ def lock(native, model="picked-model", effort="high", fast=True):
 
 
 def settings(native):
-    return [(p["key"], p["value"]) for m, p in native.calls if m == "config.set"]
+    from hermes_cli.model_switch import parse_model_switch_args
+    return [(p["key"], parse_model_switch_args(p["value"]).model_input
+             if p["key"] == "model" else p["value"])
+            for m, p in native.calls if m == "config.set"]
 
 
 def test_lock_applied_before_prompt_on_every_turn(native):
@@ -155,8 +159,9 @@ def test_native_lock_drives_real_tui_config_set(native, monkeypatch):
 
     def switch(sid, session, value, **kwargs):
         assert sid == "live-chat" and session is native.session
-        session["agent"].model = value
-        return {"value": value, "warning": ""}
+        from hermes_cli.model_switch import parse_model_switch_args
+        session["agent"].model = parse_model_switch_args(value).model_input
+        return {"value": session["agent"].model, "warning": ""}
 
     monkeypatch.setattr(server, "_apply_model_switch", switch)
     fake_rpc = native.transport.rpc
@@ -178,3 +183,118 @@ def test_native_lock_drives_real_tui_config_set(native, monkeypatch):
     assert submit(native) == "streaming"
     assert native.session["create_service_tier_override"] == "priority"
     assert native.db.get_session("chat")["model"] == "gpt-6"
+
+
+def test_lock_read_does_not_load_session_or_flush_usage(native, monkeypatch):
+    lock(native)
+    monkeypatch.setattr(native.db, "get_session", Mock(side_effect=AssertionError("full row read")))
+    flush = Mock(side_effect=AssertionError("usage flush"))
+    monkeypatch.setattr(native.db, "flush_token_counts", flush)
+    assert submit(native) == "streaming"
+    flush.assert_not_called()
+
+
+def test_model_config_reader_is_narrow_and_does_not_flush(native, monkeypatch):
+    import json
+
+    lock(native)
+    monkeypatch.setattr(native.db, "flush_token_counts", Mock(side_effect=AssertionError("usage flush")))
+    row = native.db.get_session_model_config("chat")
+    assert set(row) == {"model_config"}
+    assert json.loads(row["model_config"])["browser_model_lock"]["model"] == "picked-model"
+    assert native.db.get_session_model_config("missing") is None
+
+
+@pytest.fixture
+def stock_switch(native, monkeypatch, tmp_path):
+    """Use real config.set/parser/switch_model; stub only I/O and agent execution."""
+    import hermes_cli.model_switch as ms
+    import yaml
+
+    cfg = {"model": {"default": "default-model", "provider": "custom",
+                     "base_url": "https://cell.example/v1", "persist_switch_by_default": True}}
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(cfg))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **kw: cfg)
+    # Single catalog view: v12 providers otherwise appear twice under legacy slugs.
+    monkeypatch.setattr("hermes_cli.config.get_compatible_custom_providers", lambda *_: [])
+    monkeypatch.setattr(ms, "DIRECT_ALIASES", {})
+    monkeypatch.setattr(ms, "list_provider_models", lambda *_: [])
+    monkeypatch.setattr(ms, "get_model_info", lambda *a, **kw: None)
+    monkeypatch.setattr(ms, "get_model_capabilities", lambda *a, **kw: None)
+    monkeypatch.setattr("hermes_cli.models.detect_provider_for_model", lambda *_: None)
+    monkeypatch.setattr("hermes_cli.models.validate_requested_model", lambda *a, **kw:
+                        {"accepted": True, "persist": True, "recognized": True, "message": ""})
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw:
+                        {"provider": kw.get("requested"), "base_url": cfg["model"]["base_url"],
+                         "api_key": "fixture", "api_mode": "chat_completions"})
+    native.agent.provider = "custom"
+    native.agent.base_url = cfg["model"]["base_url"]
+    native.agent.api_key = "fixture"
+    native.agent.request_overrides = {}
+    swaps = []
+
+    def switch_model(**kw):
+        swaps.append(kw)
+        native.agent.model = kw["new_model"]
+        native.agent.provider = kw["new_provider"]
+        native.agent.base_url = kw["base_url"]
+
+    native.agent.switch_model = switch_model
+    monkeypatch.setitem(server._sessions, "live-chat", native.session)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_: None)
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *_: None)
+    monkeypatch.setattr(server, "_persist_live_session_system_prompt", lambda *_: None)
+    monkeypatch.setattr(server, "_append_model_switch_marker", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_: {})
+    monkeypatch.setattr(server, "_emit", lambda *_: None)
+    persist = Mock()
+    monkeypatch.setattr(server, "_persist_model_switch", persist)
+    fake_rpc = native.transport.rpc
+
+    def rpc(method, params):
+        if method == "config.set":
+            native.calls.append((method, params))
+            response = server._methods[method]("fixture", params)
+            assert "error" not in response, response
+            return response["result"]
+        return fake_rpc(method, params)
+
+    monkeypatch.setattr(native.transport, "rpc", rpc)
+    return SimpleNamespace(config=cfg, path=config_path, persist=persist, swaps=swaps)
+
+
+def test_native_model_lock_is_session_only_even_with_persist_default(native, stock_switch, monkeypatch):
+    other_agent = SimpleNamespace(model="default-model", provider="custom", base_url="https://cell.example/v1")
+    other = {"agent": other_agent, "session_key": "other"}
+    monkeypatch.setitem(server._sessions, "other", other)
+    before = stock_switch.path.read_bytes()
+    lock(native, effort=None, fast=False)
+    assert submit(native) == "streaming"
+    stock_switch.persist.assert_not_called()
+    assert stock_switch.path.read_bytes() == before
+    assert vars(other_agent) == {"model": "default-model", "provider": "custom", "base_url": "https://cell.example/v1"}
+    assert "model_override" not in other
+
+
+@pytest.mark.parametrize("route", ["configured-provider", "direct-alias"])
+def test_native_model_lock_rejects_and_reverts_provider_reroute(native, stock_switch, route):
+    if route == "configured-provider":
+        stock_switch.config["providers"] = {"competitor": {
+            "base_url": "https://competitor.example/v1", "api_key": "fixture", "models": ["picked-model"]}}
+    else:
+        # Same provider label, different URL: checking provider alone is insufficient.
+        stock_switch.config["model_aliases"] = {"pick": {
+            "model": "picked-model", "provider": "custom",
+            "base_url": "https://alias.example/v1", "api_key": "fixture"}}
+    lock(native, effort=None, fast=False)
+    with pytest.raises(RuntimeError, match="model lock"):
+        submit(native)
+    assert len(stock_switch.swaps) == 2
+    assert native.agent.model == "default-model"
+    assert native.agent.provider == "custom"
+    assert native.agent.base_url == "https://cell.example/v1"
+    stock_switch.persist.assert_not_called()
+    assert not any(m == "prompt.submit" for m, _ in native.calls)
+    assert native.adapter._native_submit_active_refs == {}

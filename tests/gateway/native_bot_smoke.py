@@ -30,7 +30,10 @@ class Model(BaseHTTPRequestHandler):
         self.wfile.write(
             json.dumps({
                 "object": "list",
-                "data": [{"id": "native-fixture", "object": "model"}],
+                "data": [{"id": name, "object": "model"} for name in (
+                    ["native-fixture", "native-picked-a", "native-picked-b"]
+                    if a.model_lock_only else ["native-fixture"]
+                )],
             }).encode()
         )
 
@@ -163,12 +166,12 @@ config = {
 }
 if a.model_lock_only:
     # A declared catalog keeps fixture picks on the local endpoint during /model.
-    config["custom_providers"] = [{
-        "name": "fixture", "base_url": f"http://127.0.0.1:{model.server_port}/v1",
-        "api_key": "fixture-not-a-secret",
-        "models": ["native-fixture", "native-picked-a", "native-picked-b"],
-    }]
-    del config["providers"]
+    config["providers"]["custom"] = dict(config["providers"]["fixture"], models=[
+        "native-fixture", "native-picked-a", "native-picked-b",
+    ])
+    config["providers"]["fixture"]["models"] = [
+        "native-fixture", "native-picked-a", "native-picked-b",
+    ]
 import yaml
 
 for profile in ("general", "work"):

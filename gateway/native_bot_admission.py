@@ -220,7 +220,7 @@ async def _apply_session_model_lock(adapter, transport, session_id, sid, session
     db = await adapter._ensure_session_db_async()
     if db is None:
         raise RuntimeError("native session model lock database is unavailable")
-    row = await asyncio.to_thread(db.get_session, session_id)
+    row = await asyncio.to_thread(db.get_session_model_config, session_id)
     runtime = adapter._runtime_request_from_persisted_session_lock(row, {})
     if runtime is None:
         return
@@ -228,6 +228,8 @@ async def _apply_session_model_lock(adapter, transport, session_id, sid, session
     options = runtime["model_options"]
     reasoning = options.get("reasoning") or {}
     agent = session["agent"]
+    previous_model = agent.model
+    previous_route = (getattr(agent, "provider", None), getattr(agent, "base_url", None))
     # Compare after each RPC: switching model may also change its presets.
     for key, value, current in (
         ("model", model, lambda: agent.model),
@@ -241,9 +243,25 @@ async def _apply_session_model_lock(adapter, transport, session_id, sid, session
         if value is None or value == current():
             continue
         result = await _before_dispatch(transport.rpc, "config.set", {
-            "session_id": sid, "key": key, "value": value,
+            "session_id": sid, "key": key,
+            "value": f"{value} --session" if key == "model" else value,
             "confirm_expensive_model": True,
         })
+        if key == "model" and (
+            agent.model != model
+            or (getattr(agent, "provider", None), getattr(agent, "base_url", None)) != previous_route
+        ):
+            # Stock aliases/catalogs may reroute even an exact model ID. Never
+            # dispatch through a different endpoint; restore session scope too.
+            await _before_dispatch(transport.rpc, "config.set", {
+                "session_id": sid, "key": "model",
+                "value": (f"{previous_model} --session"
+                          + (f" --provider {previous_route[0]}"
+                             if previous_route[0] and getattr(agent, "provider", None) != previous_route[0]
+                             else "")),
+                "confirm_expensive_model": True,
+            })
+            raise RuntimeError("native session model lock changed model route")
         if result.get("confirm_required") or result.get("deferred") or value != current():
             raise RuntimeError(f"native session model lock was not applied: {key}")
 

@@ -10126,6 +10126,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 })
         return out
 
+    def get_session_model_config(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Read only model_config, without draining unrelated usage writes."""
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
         # Cost/usage readers (/status, /usage, gateway endpoints) reach the

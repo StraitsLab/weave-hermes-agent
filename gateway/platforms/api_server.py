@@ -4435,6 +4435,19 @@ class APIServerAdapter(BasePlatformAdapter):
         # callers only need to know whether those snapshots exist.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
         payload["has_model_config"] = bool(session.get("model_config"))
+        config = APIServerAdapter._parse_session_model_config(session.get("model_config"))
+        lock = config.get("browser_model_lock")
+        payload["model_lock"] = None
+        if isinstance(lock, dict) and _coerce_request_bool(lock.get("confirmed"), default=False):
+            options = lock.get("model_options")
+            options = options if isinstance(options, dict) else {}
+            reasoning = options.get("reasoning")
+            reasoning = reasoning if isinstance(reasoning, dict) else {}
+            payload["model_lock"] = {
+                "model": lock.get("model"),
+                "effort": reasoning.get("effort") or None,
+                "fast": bool(options.get("fast")),
+            }
         return payload
 
     @staticmethod
