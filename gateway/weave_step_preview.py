@@ -5,6 +5,7 @@ import re
 from urllib.parse import urlsplit
 
 _COMMAND_HEAD = re.compile(r"[A-Za-z0-9._/][A-Za-z0-9._/-]{0,63}")
+_HUB = "mcp__weave_connectors__"
 _PLAIN_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9.,:'()/-]{0,23}")
 
 
@@ -12,6 +13,8 @@ def _command(field: str):
     def preview(args: dict) -> str | None:
         command = args.get(field)
         tokens = command.split() if isinstance(command, str) else []
+        if field == "command" and isinstance(args.get("argv"), list):  # the Harso hub terminal takes argv
+            tokens = [str(token) for token in args["argv"][:1]]
         if not tokens or not _COMMAND_HEAD.fullmatch(tokens[0]):
             return None
         return tokens[0].rsplit("/", 1)[-1]
@@ -69,6 +72,8 @@ _PREVIEWS = {
 
 
 def step_preview(name: str, args: dict | None) -> str | None:
+    if isinstance(name, str) and name.startswith(_HUB):  # user cells reach tools through the Harso hub
+        name = name[len(_HUB):]
     preview = _PREVIEWS.get(name) if isinstance(name, str) else None
     text = preview(args) if preview and isinstance(args, dict) else None
     if not isinstance(text, str):
