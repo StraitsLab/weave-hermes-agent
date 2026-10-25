@@ -39,6 +39,14 @@ CASES = [
     ('delegate_task', {'goal': 'x' * 300}, None),
     ('delegate_task', {}, None),
     ('terminal', 'not a dict', None),
+    # User cells reach tools through the Harso hub: same rules, prefixed name, argv instead of a command string.
+    ('mcp__weave_connectors__terminal', {'argv': ['/usr/bin/npm', 'test', '--token=abc']}, 'npm'),
+    ('mcp__weave_connectors__terminal', {'argv': ['TOKEN=abc', 'run']}, None),
+    ('mcp__weave_connectors__terminal', {'argv': []}, None),
+    ('mcp__weave_connectors__terminal', {'argv': 'npm test'}, None),
+    ('mcp__weave_connectors__browser_navigate', {'url': 'https://user:pw@hyatt.com/x'}, 'hyatt.com'),
+    ('mcp__weave_connectors__web_search', {'query': 'tokyo'}, None),
+    ('mcp__other__terminal', {'argv': ['npm']}, None),
 ]
 
 
