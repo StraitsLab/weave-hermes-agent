@@ -21,6 +21,11 @@ async def apply_native_model_lock(adapter, session_id, source, session_key):
         ctx = _ModelSwitchContext(session_key=session_key, source=source,
                                   config_path=get_hermes_home() / "config.yaml", persist_global=False)
         await asyncio.to_thread(ctx.read_config)
+        # read_config leaves current_api_key empty; a bare-custom switch keeps that empty key and
+        # bricks authenticated chats. Seed it from the profile's own startup resolution.
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        configured_runtime = await asyncio.to_thread(resolve_runtime_provider)
+        ctx.current_api_key = configured_runtime.get("api_key") or ""
         provider, base_url = ctx.route_provider, ctx.current_base_url
         # Named custom providers may keep the endpoint only in their provider entry.
         if provider and provider.startswith("custom:"):

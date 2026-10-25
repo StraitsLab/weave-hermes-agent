@@ -157,3 +157,25 @@ def test_safe_fork_keeps_the_confirmed_model_lock(native):
     child = json.loads(native.db.get_session("child")["model_config"])
     assert child["browser_model_lock"] == parent["browser_model_lock"]
     assert child["_branched_from"] == "chat"
+
+
+@pytest.mark.asyncio
+async def test_inline_bare_custom_key_reaches_real_turn_resolution(native):
+    n = native
+    n.config['model'].update(provider='custom', api_key='review-inline-config-key')
+    n.config['custom_providers'] = []
+    import hermes_yaml as yaml
+    (n.home / 'config.yaml').write_text(yaml.safe_dump(n.config))
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    baseline = resolve_runtime_provider()
+    assert baseline['api_key'] == 'review-inline-config-key'
+    assert baseline['base_url'] == n.config['model']['base_url']
+    seen = []
+    async def dispatch(event):
+        model, runtime = n.runner._resolve_session_agent_runtime(source=event.source,
+            session_key=event.metadata['gateway_session_key'], user_config=n.config)
+        seen.append((model, runtime['api_key'], runtime['base_url']))
+    n.adapter.handle_message.side_effect = dispatch
+    n.db.update_session_runtime_lock('chat', model='chat-model', provider='custom', confirmed=True)
+    await submit(n)
+    assert seen == [('chat-model', 'review-inline-config-key', n.config['model']['base_url'])]
