@@ -1686,6 +1686,11 @@ class NativeSessionAPI:
         db = await self._ensure_session_db_async()
         row = await asyncio.to_thread(db.get_session, request.match_info['session_id']) if db is not None else None
         if row and row.get('ended_at') is not None:
+            # Upstream's deferred overflow reset stamps a LOCAL Bot Chat ``session_reset`` and keeps
+            # serving its titled creation id from the lineage tip (``admit_peer_turn``): a ``hermes peer
+            # dm`` follow-up on that id is live, not ended.
+            if row.get('end_reason') == 'session_reset' and row.get('source') == 'local':
+                return None
             return web.json_response(_openai_error('Session is ended', code='session_ended'), status=409)
         return None
 
