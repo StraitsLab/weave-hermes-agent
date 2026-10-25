@@ -1336,6 +1336,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             with sudo_prompt_scope(self, agent), secret_prompt_scope(self, agent):
                 result = run_classic_cli_turn(self, lambda: self._run_conversation_with_approval(
                     agent, agent_history, observed_group_context, persist_msg, persist_ts))
+        except BaseException:
+            # A turn that raised produces no result: finish the stream consumer now, else the outer
+            # cleanup waits out its full 5s flush before the error reply can be delivered.
+            if stream_consumer is not None:
+                stream_consumer.finish()
+            raise
         finally:
             if local_sinks is not None:
                 from gateway import local_viewer_events

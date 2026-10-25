@@ -660,6 +660,10 @@ class GatewayTurnPersistenceMixin:
         elif getattr(e, "reason", None) == "launch_credentials_unavailable" and getattr(e, "field", None):
             # The session's own frozen route credential is gone or changed: name it, not the model.
             status_hint = f" {e.reason} ({e.field}: {e.detail or 'unavailable'})."
+        elif isinstance(e, RuntimeError) and str(e) == "credential unavailable":
+            # A Gate-B session holder was revoked/expired mid-turn (agent.session_credential): the API
+            # run receipt names that cause, as the pre-canonical run path did, so a client re-binds.
+            status_hint = " credential unavailable."
         from gateway.session_results import record_unexecuted_failure
         return record_unexecuted_failure(self._hmwa_add_failed_turn_notice(
             t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,

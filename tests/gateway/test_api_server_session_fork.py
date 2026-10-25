@@ -48,7 +48,7 @@ def _request(**changes):
 def _source(session_id=PREDECESSOR):
     return SessionSource(
         platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
-        user_id="api_server", user_name="API server",
+        user_id="api", user_name="API server",
     )
 
 

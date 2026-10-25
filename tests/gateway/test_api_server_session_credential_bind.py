@@ -59,7 +59,7 @@ def _bind_body(**overrides):
 def _runtime_holder(runner, session_id):
     source = SessionSource(
         platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
-        user_id="api_server", user_name="API server",
+        user_id="api", user_name="API server",
     )
     session_key = runner.session_store._generate_session_key(source)
     _, runtime = runner._resolve_session_agent_runtime(
@@ -184,7 +184,7 @@ async def test_gate_b_run_refuses_unusable_binding(gate_b_agent, state):
     adapter, runner, constructor = gate_b_agent
     source = SessionSource(
         platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm",
-        user_id="api_server", user_name="API server",
+        user_id="api", user_name="API server",
     )
     if state != "missing":
         expires = datetime.now(UTC) + timedelta(minutes=5)
@@ -198,15 +198,26 @@ async def test_gate_b_run_refuses_unusable_binding(gate_b_agent, state):
     if state == "no-runner":
         adapter.gateway_runner = None
     client = await _client(adapter)
+    headers = {"Authorization": f"Bearer {adapter.config.extra['key']}"}
     try:
-        result = await _finished_run(
-            client, adapter,
-            session_id="unbound-session" if state == "wrong-session" else SESSION_ID,
-        )
+        if state == "displaced":
+            # Upstream (v0.22.5) admits API runs through the session authority: a route whose live
+            # session was reset no longer admits the old id at all (409), so no agent is ever built.
+            response = await client.post(
+                "/v1/runs", headers=headers, json={"session_id": SESSION_ID, "input": "test only"},
+            )
+            result = await response.json()
+            assert response.status == 409, result
+            assert result["error"]["code"] == "admission_conflict"
+        else:
+            result = await _finished_run(
+                client, adapter,
+                session_id="unbound-session" if state == "wrong-session" else SESSION_ID,
+            )
+            assert result["status"] == "failed", result
+            assert "credential unavailable" in result["error"]
     finally:
         await client.close()
-    assert result["status"] == "failed", result
-    assert "credential unavailable" in result["error"]
     assert BEARER not in repr(result)
     constructor.assert_not_called()
 
@@ -308,6 +319,7 @@ async def test_gate_b_runs_use_exact_profile_holder(gate_b_agent, tmp_path, monk
         db = SessionDB(home / "state.db")
         db.create_session(SESSION_ID, "api_server")
         db.close()
+    await _serve_profiles(runner, tmp_path, ("alpha", "beta"))
     client = await _profile_client(adapter)
     headers = {"Authorization": f"Bearer {adapter.config.extra['key']}"}
     try:
@@ -414,6 +426,18 @@ async def _client(adapter):
     return client
 
 
+
+async def _serve_profiles(runner, root, names):
+    """Upstream (v0.22.5) routes a /p/<name>/ request to that profile's registered session
+    authority: reserve the homes and build one authority per profile, as the gateway boot does."""
+    from gateway.run_runtime import initialize_gateway_runtime
+    from gateway.runtime_ownership import process_ownership
+    homes = [("default", root.resolve())] + [(name, (root / "profiles" / name).resolve()) for name in names]
+    runner.config.multiplex_profiles = True
+    runner.config._runtime_profile_homes = tuple(homes)
+    process_ownership.reserve([home for _, home in homes])
+    await initialize_gateway_runtime(runner)
+
 async def _profile_client(adapter):
     app = web.Application(middlewares=[adapter._make_profile_prefix_middleware()])
     for method, path, handler in adapter._http_route_table():
@@ -495,7 +519,7 @@ async def test_persisted_reset_route_requires_reset_without_binding_a_credential
     store = runner.session_store
     source = SessionSource(
         platform=Platform.API_SERVER, chat_id=SESSION_ID, chat_type="dm",
-        user_id="api_server", user_name="API server",
+        user_id="api", user_name="API server",
     )
     entry = store.bind_existing_session(source, SESSION_ID, reopen=False)
     runner._session_db._db.append_message(SESSION_ID, "user", "keep this history")
@@ -727,6 +751,7 @@ async def test_named_profile_routes_isolate_same_session_id_and_credentials(tmp_
     alpha_db, beta_db = SessionDB(alpha / "state.db"), SessionDB(beta / "state.db")
     alpha_db.create_session("shared-session", "api_server")
     beta_db.create_session("shared-session", "api_server")
+    await _serve_profiles(runner, root, ("alpha", "beta"))
     client = await _profile_client(adapter)
     try:
         alpha_bind = await client.post("/p/alpha/api/sessions/shared-session/credential/bind", headers={"Authorization": "Bearer sk-alpha-profile-test"}, json=_bind_body(bearer="alpha-bearer"))
@@ -746,8 +771,8 @@ async def test_named_profile_routes_isolate_same_session_id_and_credentials(tmp_
     assert cross.status == 409
     assert beta_refresh.status == 200
     assert alpha_body == beta_body == {"status": "ready", "credential_slot": "GATE_B_API_KEY"}
-    alpha_source = SessionSource(platform=Platform.API_SERVER, chat_id="shared-session", chat_type="dm", user_id="api_server", profile="alpha")
-    beta_source = SessionSource(platform=Platform.API_SERVER, chat_id="shared-session", chat_type="dm", user_id="api_server", profile="beta")
+    alpha_source = SessionSource(platform=Platform.API_SERVER, chat_id="shared-session", chat_type="dm", user_id="api", profile="alpha")
+    beta_source = SessionSource(platform=Platform.API_SERVER, chat_id="shared-session", chat_type="dm", user_id="api", profile="beta")
     assert runner.session_credential_available(alpha_source, "shared-session")
     assert runner.session_credential_available(beta_source, "shared-session")
     assert runner._peek_session_state(runner.session_store._generate_session_key(alpha_source)).conversation.credential_holder() == "alpha-bearer"

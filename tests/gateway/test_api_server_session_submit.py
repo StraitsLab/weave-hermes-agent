@@ -880,7 +880,7 @@ async def _bind_internal_gateway(gateway):
     from gateway.session import SessionSource
 
     source = SessionSource(platform=Platform.API_SERVER, chat_id=SESSION_ID,
-                           chat_type="dm", user_id="api_server", user_name="API server")
+                           chat_type="dm", user_id="api", user_name="API server")
     assert gateway.runner.bind_session_credential(
         source, SESSION_ID, "local-provider-key",
         datetime.now(UTC) + timedelta(minutes=5), "local-route")

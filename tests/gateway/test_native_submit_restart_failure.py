@@ -31,7 +31,7 @@ async def test_unclean_boot_fails_native_submits_once_in_their_own_profile(tmp_p
     runner.config = config
     runner.session_store = store
     runner._ledger_crash_left_replies = AsyncMock(return_value=0)
-    source = SessionSource(platform=Platform.API_SERVER, chat_id="weave-crashed", user_id="api_server", profile="general")
+    source = SessionSource(platform=Platform.API_SERVER, chat_id="weave-crashed", user_id="api", profile="general")
     entry = store.get_or_create_session(source)
     store.mark_turn_active(entry.session_key)
     other = store.get_or_create_session(SessionSource(platform=Platform.TELEGRAM, chat_id="tg", user_id="u"))

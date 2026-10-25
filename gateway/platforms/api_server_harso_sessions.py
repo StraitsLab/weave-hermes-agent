@@ -527,7 +527,7 @@ class NativeSessionAPI:
             return web.json_response({"status": "ready", "credential_slot": "GATE_B_API_KEY"})
         source = SessionSource(
             platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
-            user_id="api_server", user_name="API server",
+            user_id="api", user_name="API server",
             profile=_api_request_profile.get() or None,
         )
         async with self._native_lifecycle_lock(session_id):
@@ -639,7 +639,7 @@ class NativeSessionAPI:
             platform=Platform.API_SERVER,
             chat_id=session_id,
             chat_type="dm",
-            user_id="api_server",
+            user_id="api",
             user_name="API server",
             profile=_api_request_profile.get() or None,
         )
@@ -818,7 +818,7 @@ class NativeSessionAPI:
             )
         source = SessionSource(
             platform=Platform.API_SERVER, chat_id=session_id, chat_type="dm",
-            user_id="api_server", user_name="API server",
+            user_id="api", user_name="API server",
             profile=_api_request_profile.get() or None,
         )
         return await self._native_submit_registered(session_id, body, parsed, db, profile, runner, source)
@@ -1139,7 +1139,7 @@ class NativeSessionAPI:
             return auth_err
         runner = self.gateway_runner
         source = SessionSource(platform=Platform.API_SERVER, chat_id=request.match_info["session_id"], chat_type="dm",
-                               user_id="api_server", user_name="API server", profile=_api_request_profile.get() or None)
+                               user_id="api", user_name="API server", profile=_api_request_profile.get() or None)
         session_key = runner.session_store._generate_session_key(source) if runner else None
         agent = self._native_submit_running_agent(runner, session_key) if runner else None
         stopped = False
@@ -1585,7 +1585,7 @@ class NativeSessionAPI:
             return web.json_response(
                 _openai_error("Session fork conflicts with native lineage", code="session_fork_conflict"), status=409,
             )
-        source_kwargs = dict(platform=Platform.API_SERVER, chat_type="dm", user_id="api_server",
+        source_kwargs = dict(platform=Platform.API_SERVER, chat_type="dm", user_id="api",
                              user_name="API server", profile=_api_request_profile.get() or None)
         source = SessionSource(chat_id=source_id, **source_kwargs)
         successor = SessionSource(chat_id=successor_id, **source_kwargs)
