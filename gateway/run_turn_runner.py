@@ -958,7 +958,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         register_gateway_notify(session_key, self._approval_notify_sync)
         from agent.vault_backends.unlock import set_code_prompt_callback, set_save_login_prompt_callback
         from tools.approval import request_vault_secret
-        native_vault = getattr(ctx.source.platform, "value", "") == "api_server"
+        native_vault = getattr(getattr(ctx.source, "platform", None), "value", "") == "api_server"
         if native_vault:
             # Only Harso's attended native stream has masked fields. No model text or unlock master password.
             def code_prompt(site, hint):

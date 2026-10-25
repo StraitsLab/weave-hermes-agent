@@ -28,8 +28,8 @@ async def review(request):
             or not skill_usage.is_curation_eligible(name)):
         return _error_response("Only learned, locally managed skills can be reviewed", 403,
                                code="learned_skill_refused")
-    from tools.skills_tool import _find_all_skills
-    if not any(skill["name"] == name for skill in _find_all_skills(skip_disabled=False)):
+    from tools.skills_tool import find_all_skills
+    if not any(skill["name"] == name for skill in find_all_skills(skip_disabled=False)):
         if (body["decision"] == "remove" and record.get("state") == "archived"
                 and name in skill_usage.list_archived_skill_names()):
             return web.json_response({"name": name, "learned": True, "kept": record.get("pinned") is True,
