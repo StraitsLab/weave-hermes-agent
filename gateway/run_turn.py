@@ -1493,6 +1493,9 @@ class GatewayTurnMixin(NativeFollowupMixin):
                     message_text = _clean_message_text
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
+        if event.media_urls and (event.metadata or {}).get("native_submit_authenticated"):
+            # Supabase adopts the app bubble by exact text. A list override also replaces native image blocks.
+            persist_user_message = [{"type": "text", "text": event.text}]
         return message_text, persist_user_message, persist_user_timestamp
 
     async def _hmwa_stop_typing_for_turn(self, event, source):
@@ -3898,6 +3901,8 @@ class GatewayTurnMixin(NativeFollowupMixin):
                 return result
             from gateway.run_inbound import strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
+            if pending_event.media_urls and (pending_event.metadata or {}).get("native_submit_authenticated"):
+                next_persist_message = [{"type": "text", "text": pending_event.text}]
             next_message_id = self._reply_anchor_for_event(pending_event)
             next_inbound_id = str(pending_event.message_id) if getattr(pending_event, "message_id", None) else None
             next_channel_prompt, next_source = self._pinned_channel_inputs(
