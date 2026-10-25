@@ -3452,7 +3452,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         record = await asyncio.to_thread(_admit)
         return None if record is None else (home, record)
 
-    async def _answer_through_live_bot_chat(self, ctx: dict[str, Any]) -> Optional[web.Response]:
+    async def _answer_through_live_bot_chat(self, ctx: dict[str, Any], admitted) -> web.Response:
         """Hand a turn aimed at a canonical Bot Chat that a Desktop holds live to that owner.
 
         This is the ``hermes peer dm`` transport. Running the turn here would make this process a
@@ -3461,10 +3461,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         Local and relayed DMs already hand such a message to the owner's mailbox
         (``tools/bot_mode_dm.py``, ``tui_gateway/methods_bot_relay.py``). This waits for the owner's
         receipt on the same budget as the local path, so the peer still gets the reply on this call.
+        *admitted* is ``_admit_to_live_bot_chat``'s record, taken by the caller under its fence.
         """
-        admitted = await self._admit_to_live_bot_chat(ctx["session_id"], ctx["user_message"], ctx["run_kwargs"].get("turn_author"))
-        if admitted is None:
-            return None
         session_id = admitted[1].get("session_id") or ctx["session_id"]  # a moved-aside API row: the local chat (MSG-21)
         record = await self._await_live_bot_chat_receipt(*admitted)
         delivery_id = record["delivery_id"]
@@ -3499,13 +3497,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 await keepalive()
         return record
 
-    async def _stream_through_live_bot_chat(self, request: web.Request, ctx: dict[str, Any]) -> Optional[web.StreamResponse]:
+    async def _stream_through_live_bot_chat(self, request: web.Request, ctx: dict[str, Any], admitted) -> web.StreamResponse:
         """``_answer_through_live_bot_chat`` for the SSE sibling route: the owner's settled receipt is
         the run's single ``assistant.completed`` event; a receipt still open at the budget is a
         ``run.queued`` event (the 202 shape), a failed one an ``error`` event carrying the reason."""
-        admitted = await self._admit_to_live_bot_chat(ctx["session_id"], ctx["user_message"], ctx["run_kwargs"].get("turn_author"))
-        if admitted is None:
-            return None
         session_id = admitted[1].get("session_id") or ctx["session_id"]  # a moved-aside API row: the local chat (MSG-21)
         events = _SessionEventQueue(session_id, f"run_{uuid.uuid4().hex}")
         response = await self._prepare_sse_response(request, session_id, ctx["gateway_session_key"])
@@ -3541,25 +3536,27 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_session_chat(self, request: web.Request) -> web.Response:
         async with self._native_lifecycle_lock(request.match_info["session_id"]):
             err = await self._native_chat_lifecycle_error(request)
-            return err if err is not None else await self._handle_session_chat_unlocked(request)
+            if err is not None:
+                return err
+            limited = self._concurrency_limited_response()
+            if limited is not None:
+                return limited
+            ctx, err = await self._prepare_session_chat(request)
+            if err is not None:
+                return err
+            admitted = await self._admit_to_live_bot_chat(
+                ctx["session_id"], ctx["user_message"], ctx["run_kwargs"].get("turn_author"))
+            if admitted is None:
+                return await self._run_session_chat(ctx)
+        # A Bot Chat turn is admitted to its FIFO under the fence and waited on OUTSIDE it: upstream
+        # queues a second peer DM behind the running one (LC-23); the fence held it at the door.
+        return await self._answer_through_live_bot_chat(ctx, admitted)
 
-    async def _handle_session_chat_unlocked(self, request: web.Request) -> web.Response:
+    async def _run_session_chat(self, ctx: dict[str, Any]) -> web.Response:
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn (plus the delivery lanes'
         one bounded re-run of a transient failure; ``hermes peer dm`` is the client)."""
         from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
-        # This turn runs through _run_agent, so it already COUNTS toward the cap (#7483).
-        # Spending the budget without checking it refused every other caller while never
-        # refusing this route — and a fleet's cross-machine DMs all arrive here.
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-        ctx, err = await self._prepare_session_chat(request)
-        if err is not None:
-            return err
         from gateway.platforms.api_server_openai_routes import _response_status
-        handed_off = await self._answer_through_live_bot_chat(ctx)
-        if handed_off is not None:
-            return handed_off
         gateway_session_key = ctx["gateway_session_key"]
         session_id = ctx["session_id"]
         history = await self._conversation_history_for_session(session_id)
@@ -3592,19 +3589,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_session_chat_stream(self, request: web.Request) -> web.StreamResponse:
         async with self._native_lifecycle_lock(request.match_info["session_id"]):
             err = await self._native_chat_lifecycle_error(request)
-            return err if err is not None else await self._handle_session_chat_stream_unlocked(request)
+            if err is not None:
+                return err
+            limited = self._concurrency_limited_response()
+            if limited is not None:
+                return limited
+            ctx, err = await self._prepare_session_chat(request)
+            if err is not None:
+                return err
+            admitted = await self._admit_to_live_bot_chat(
+                ctx["session_id"], ctx["user_message"], ctx["run_kwargs"].get("turn_author"))
+            if admitted is None:
+                return await self._stream_session_chat(request, ctx)
+        return await self._stream_through_live_bot_chat(request, ctx, admitted)  # waited on outside the fence
 
-    async def _handle_session_chat_stream_unlocked(self, request: web.Request) -> web.StreamResponse:
+    async def _stream_session_chat(self, request: web.Request, ctx: dict[str, Any]) -> web.StreamResponse:
         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-        ctx, err = await self._prepare_session_chat(request)
-        if err is not None:
-            return err
-        handed_off = await self._stream_through_live_bot_chat(request, ctx)
-        if handed_off is not None:
-            return handed_off
         gateway_session_key, session_id = ctx["gateway_session_key"], ctx["session_id"]
         user_message, runtime_request = ctx["user_message"], ctx["runtime_request"]
         runtime_meta = self._sanitize_runtime_metadata(
