@@ -81,6 +81,12 @@ def _commit_hub_for(db_path) -> _CommitWakeHub:
         return hub
 
 class HarsoSessionMixin:
+    def get_session_model_config(self, session_id: str) -> dict:
+        """Read the runtime snapshot without draining token deltas or loading prompts."""
+        from hermes_state_sessions import _parse_model_config
+        row = self._read_one("SELECT model_config FROM sessions WHERE id = ?", (session_id,))
+        return _parse_model_config(row[0]) if row else {}
+
     _TRANSCRIPT_READ_ATTEMPTS = 8
 
     def _bump_transcript_epoch(self, conn, session_id):
