@@ -147,7 +147,7 @@ def bind_api_session(authority, session_id, *, hosted_dispatch=None, declared_ke
 
 
 def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=None, caller_key=None,
-                   walked_from=None):
+                   walked_from=None, native_history_delivery=False):
     """``bind_api_session`` as write steps (``run_steps``): the binding transaction is yielded.
 
     ``caller_key`` is this request's validated ``X-Hermes-Session-Key`` even when an explicit
@@ -189,6 +189,8 @@ def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=
                          transport_profile=transport_profile)
     receipt = {'profile_id': authority.profile_id, 'session_id': session_id,
                'route': route, 'entry': entry.to_dict()}
+    if native_history_delivery:
+        receipt['native_history_delivery'] = True
     if declared_key:
         receipt['declared_key'] = declared_key
     if room_identity is not None:
@@ -214,6 +216,10 @@ def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=
                 raise RuntimeStoreError('permission_denied')
             if declared_key and binding.get('declared_key') != declared_key:
                 raise RuntimeStoreError('admission_conflict')
+            if native_history_delivery:
+                binding['native_history_delivery'] = True
+                conn.execute('UPDATE state_meta SET value=? WHERE key=?',
+                             (_json(binding), _BINDING_PREFIX + session_id))
             return
         if declared_key:
             existing_declared = conn.execute('SELECT value FROM state_meta WHERE key=?',

@@ -332,6 +332,8 @@ def recover_authority_api_turns(adapter, authority):
     collect_unheld_api_images(authority.db)
     from gateway.session_api_media import compact_settled_api_payloads
     compact_settled_api_payloads(authority.db)
+    from gateway.session_api_automation import recover
+    recover(adapter, authority)
     with authority.db._read_ctx() as conn:
         targets = [row[0] for row in conn.execute(
             "SELECT DISTINCT target_session_id FROM session_admissions WHERE principal_id='api' AND status='queued'")]

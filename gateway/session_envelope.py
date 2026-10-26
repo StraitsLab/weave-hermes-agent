@@ -297,11 +297,26 @@ def restore_native(payload, runner=None):
         from gateway.session_automation import automation_display_metadata, automation_notification_metadata
         event.metadata.update(automation_notification_metadata(envelope['automation']))
         event.metadata.update(automation_display_metadata(envelope['automation']))
+    if 'harso_submit' in envelope:
+        submit = envelope['harso_submit']
+        event.internal = submit['internal']
+        event.metadata = {'gateway_session_key': envelope['route'],
+                          'gateway_session_id': source.chat_id,
+                          'native_request_ref': submit['native_request_ref'],
+                          'external_request_id': submit['external_request_id'],
+                          'native_submit_authenticated': True}
     return event
 
 
 async def check_native_route(runner, payload, session_id, available_source, adapter):
     """Read-only preflight: route/auth rejection must never consume a queued row."""
+    if 'harso_submit' in payload['native_text_v1']:
+        from gateway.session_authorities import active_authority
+        from gateway.session_contract import SessionRef
+        from gateway.session_api_automation import check_native_payload
+        authority = active_authority(runner)
+        check_native_payload(authority, SessionRef(authority.profile_id, authority.logical_owner(session_id)), payload)
+        return available_source, payload['native_text_v1']['route']
     if 'automation' in payload['native_text_v1']:
         from gateway.session_automation import check_automation_route
         return check_automation_route(runner, payload, session_id, available_source, adapter)

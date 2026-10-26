@@ -789,6 +789,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         self-post them as a new role=user prompt. Other watch events wake the session via self-post.
         """
         from gateway.wake import deliver_wake, persist_delegation_delivery
+        from gateway.session_api_automation import deliver as deliver_native
+        try:
+            if await deliver_native(self, adapter, synth_text, raw_sid, evt):
+                return True
+        except Exception:
+            logger.warning("Native API automation admission failed for %s", raw_sid, exc_info=True)
+            return False
         scope = contextlib.nullcontext()
         if evt.get("type") == "async_delegation":
             info = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"

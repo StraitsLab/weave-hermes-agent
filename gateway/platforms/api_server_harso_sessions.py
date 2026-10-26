@@ -85,6 +85,9 @@ class NativeSessionAPI:
                             if r["native_request_ref"] in answered), default=0))
                     for row in pending:
                         ref, session_id = row["native_request_ref"], row["session_id"]
+                        from gateway.session_api_automation import queued_submit
+                        if queued_submit(db, ref):
+                            continue
                         if not session_id.startswith("weave-"):
                             continue
                         if row["terminal_event"] == "legacy" and (
@@ -652,6 +655,10 @@ class NativeSessionAPI:
         )
         if entry is None or entry.session_id != session_id:
             raise RuntimeError("native session binding was rejected")
+        # Like /api/sessions/{id}/chat (#98619), this authenticated consumer addresses
+        # the saved history. Pin its native wake capability on the private API binding.
+        from gateway.session_api_automation import bind_native
+        authority = await bind_native(runner, session_id)
         # DEC-415: a spoken "yes"/"no" on a call reaches the cell as the call's handoff (an internal submit).
         # While the agent waits on an approval it answers it, with the gateway's own approval words
         # (run_busy._plaintext_approval_words). A pending clarify is answered the same way: the running
@@ -718,6 +725,12 @@ class NativeSessionAPI:
             busy = bool(is_session_running(entry.session_key))
         if expected_active_ref is not None and busy_mode != "queue" and self._native_submit_active_ref(entry.session_key) != expected_active_ref:
             return "target_changed"
+        if authority is not None and busy_mode == "queue":
+            from gateway.session_api_automation import admit_submit
+            from gateway.session_contract import SessionRef
+            await admit_submit(authority, SessionRef(authority.profile_id, authority.logical_owner(session_id)), event)
+            self._record_native_submit_handoff(native_request_ref, "queued")
+            return "queued"
         if busy:
             # Weave (WEV-2108): the caller's busy_mode, never the ambient policy. steer folds the
             # text into the running turn; interrupt stops it and runs this submit next. Either
@@ -1062,6 +1075,7 @@ class NativeSessionAPI:
     def _native_submit_close(self, native_request_ref: str, event_type: str, **fields: Any) -> None:
         terminal = self._native_submit_event(native_request_ref, event_type, **fields)
         self._native_submit_terminals[native_request_ref] = terminal
+        self._native_submit_idle_helpers(native_request_ref)
         if len(self._native_submit_terminals) > 1_024:
             evicted = next(iter(self._native_submit_terminals))
             self._native_submit_terminals.pop(evicted, None)
@@ -1115,14 +1129,14 @@ class NativeSessionAPI:
                 **({"preview": preview} if preview else {}),
             )
 
-    def _native_submit_subagent(self, session_key, event_type, tool_name, args, kwargs) -> None:
+    def _native_submit_subagent(self, session_key, event_type, tool_name, args, kwargs, *, native_request_ref=None) -> None:
         import math
         import re
         import time
         from agent.redact import redact_sensitive_text
         from gateway.weave_step_preview import _plain_words, step_preview
 
-        ref = self._native_submit_active_ref(session_key)
+        ref = native_request_ref or self._native_submit_active_ref(session_key)
         helper_id = kwargs.get("subagent_id")
         if not ref or not isinstance(helper_id, str) or not re.fullmatch(r"[\w.:-]{1,256}", helper_id, flags=re.ASCII):
             return
@@ -1145,7 +1159,31 @@ class NativeSessionAPI:
                 fields["duration_ms"] = round(seconds * 1000)
         else:
             return
-        self._native_submit_event(ref, "subagent.update", **fields)
+        helpers = self.__dict__.setdefault('_native_background_helpers', {}).setdefault(ref, {})
+        helpers.setdefault(helper_id, {}).update(fields)
+        if ref in self._native_submit_terminals:
+            self._native_submit_idle_helpers(ref)
+        else:
+            self._native_submit_event(ref, "subagent.update", **fields)
+
+    def _native_submit_idle_helpers(self, ref):
+        helpers = self.__dict__.get('_native_background_helpers', {}).get(ref)
+        owner = self._native_submit_ref_sessions.get(ref)
+        if helpers is None or owner is None:
+            return
+        running = [helper for helper in helpers.values() if helper.get('state') == 'running']
+        # A final text row is already understood by the phone and does not hold Stop mode.
+        count = len(running)
+        text = f"Will continue when {count} helper{'s' if count != 1 else ''} finish."
+        for helper in running:
+            detail = ' — '.join(str(helper[k]) for k in ('goal', 'tool', 'preview') if helper.get(k))
+            if detail:
+                text += '\n' + detail
+        weave_chat_sync.publish_rows(owner[1], [], lambda name: _scoped_get_secret(name, "") or "", raw_rows=[{
+            'cell_key': f'helpers:{ref}', 'role': 'assistant', 'kind': 'text',
+            'state': 'final' if count else 'removed', 'body': {'text': text if count else '', 'visible': True}}])
+        if not count:
+            self._native_background_helpers.pop(ref, None)
 
     async def _handle_session_stop(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{id}/stop: end the running answer (WEV-3464). Queues nothing; idle is a no-op."""
@@ -1472,6 +1510,10 @@ class NativeSessionAPI:
                     native_request_ref,
                     (getattr(source, "profile", None) or "default", chat_id),
                 )
+            if event.metadata.get('native_automation'):
+                await self._native_acquire_hold(native_request_ref)
+                self._native_submit_event(native_request_ref, 'turn.started')
+                return
             started = self._native_submit_started.get(native_request_ref)
             try:
                 db = await self._ensure_session_db_async()

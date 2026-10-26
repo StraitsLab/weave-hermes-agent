@@ -3988,6 +3988,13 @@ class GatewayRunner(
         from gateway.session_api_turn import api_session_vars
         _api_vars = api_session_vars()
         _history_delivery = _api_vars.pop("session_history_delivery", None)
+        from gateway.native_bot_admission import native_turn_context
+        if context.source.platform == Platform.API_SERVER and native_turn_context.get() is not None:
+            from gateway.session_authorities import active_authority
+            from gateway.session_api_automation import native_binding
+            authority = active_authority(self)
+            if authority is not None and native_binding(authority, context.session_id).get('native_history_delivery'):
+                _history_delivery, _async_delivery = "1", True
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,

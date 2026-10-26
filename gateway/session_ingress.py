@@ -283,14 +283,18 @@ async def execute_admission(authority, ref, row):
         with await _execution_scope(authority, home):
             if is_api:
                 # Committed media resolves under the owning profile's home, like admission did.
-                prepared = prepare_api_execution(authority, ref, row['payload'])
-                api_execution.set(prepared)
+                if 'native_text_v1' in row['payload']:
+                    from gateway.session_api_automation import prepare_event
+                    await prepare_event(authority, ref, row, event)
+                else:
+                    prepared = prepare_api_execution(authority, ref, row['payload'])
+                    api_execution.set(prepared)
+                    event.internal = True  # API JSON is trusted only after private binding/preclaim
                 if isinstance(event.text, list):
                     # The durable transcript keeps the committed media references (the same
                     # ``[Image attached ...]`` hints native transports persist), not only the caption.
                     event.text = '\n'.join(part['text'] for part in prepared['content'] if part.get('type') == 'text')
                 event.allow_gateway_control = False
-                event.internal = True  # trust comes from the private binding and preclaim, never client JSON
             response = await authority.runner._handle_message(event)
             result = captured.get('terminal_result', captured.get('result'))
             if result is None:
