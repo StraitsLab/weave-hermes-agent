@@ -11,7 +11,7 @@ from gateway.config import GatewayConfig, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.run import GatewayRunner
 from gateway.session import SessionStore
-from hermes_state import SessionDB
+from hermes_state import AsyncSessionDB, SessionDB
 
 
 @pytest.fixture
@@ -39,7 +39,7 @@ def native(tmp_path, monkeypatch):
     runner.config = GatewayConfig()
     runner.session_store = store
     runner._running = True
-    runner._session_db = None
+    runner._session_db = AsyncSessionDB(db)
     runner._evict_cached_agent = lambda key: None
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     adapter.gateway_runner = runner
@@ -76,9 +76,19 @@ async def test_native_submit_uses_lock_and_reads_again_between_turns(native):
     original = (n.home / "config.yaml").read_bytes()
     pick(n)
     assert await submit(n) == "streaming"
+    assert n.adapter._session_response(n.db.get_session("chat"))["model_lock"] == {
+        "model": "chat-model", "effort": "high", "fast": True}
+    # Even if in-memory overrides are cleared (gateway restart), the next submit re-reads the intact lock.
+    n.runner._session_model_overrides.clear()
+    n.runner._session_reasoning_overrides.clear()
+    n.runner._session_service_tier_overrides.clear()
+    assert await submit(n, "after-restart") == "streaming"
     pick(n, "next-model", "low", False)
     assert await submit(n, "second") == "streaming"
+    assert n.adapter._session_response(n.db.get_session("chat"))["model_lock"] == {
+        "model": "next-model", "effort": "low", "fast": False}
     assert n.seen == [
+        ("chat-model", "https://models-dev.harso.dev/v1", {"enabled": True, "effort": "high"}, "priority"),
         ("chat-model", "https://models-dev.harso.dev/v1", {"enabled": True, "effort": "high"}, "priority"),
         ("next-model", "https://models-dev.harso.dev/v1", {"enabled": True, "effort": "low"}, None)]
     assert (n.home / "config.yaml").read_bytes() == original

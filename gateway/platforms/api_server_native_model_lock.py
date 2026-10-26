@@ -46,7 +46,8 @@ async def apply_native_model_lock(adapter, session_id, source, session_key):
                     or (base_url and result.base_url != base_url)):
                 raise RuntimeError("native model lock differs from the configured provider route")
             # Do not switch a running cached agent: /submit may be enqueuing its next turn.
-            await runner._record_model_switch(result, ctx, source=source, one_turn=False, picker=False)
+            await runner._record_model_switch(result, ctx, source=source, one_turn=False, picker=False,
+                                              clear_runtime_lock=False)
         options = request["runtime_options"]
         runner._set_session_reasoning_override(session_key, options.get("reasoning_config"))
         runner._set_session_service_tier_override(session_key, options.get("service_tier"))

@@ -210,7 +210,7 @@ class GatewayModelCommandsMixin:
         return None
 
     async def _record_model_switch(
-        self, result, ctx: _ModelSwitchContext, *, source, one_turn: bool, picker: bool
+        self, result, ctx: _ModelSwitchContext, *, source, one_turn: bool, picker: bool, clear_runtime_lock: bool = True
     ) -> Optional[str]:
         """Persist a committed switch: session DB, next-turn note, config write-through, override map.
 
@@ -231,7 +231,7 @@ class GatewayModelCommandsMixin:
                     _sess_entry.was_auto_reset = False
                 await _sess_db.update_session_model(
                     _sess_entry.session_id, result.new_model, provider=result.target_provider,
-                    base_url=result.base_url, api_mode=result.api_mode,
+                    base_url=result.base_url, api_mode=result.api_mode, clear_runtime_lock=clear_runtime_lock,
                 )
             except Exception as exc:
                 logger.debug("Failed to persist model switch to DB: %s", exc)
