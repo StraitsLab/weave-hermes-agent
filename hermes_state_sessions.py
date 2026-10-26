@@ -714,7 +714,7 @@ class SessionSessionsMixin:
 
     def update_session_model(
         self, session_id: str, model: str, provider: Optional[str] = None, *,
-        base_url: Optional[str] = None, api_mode: Optional[str] = None,
+        base_url: Optional[str] = None, api_mode: Optional[str] = None, clear_runtime_lock: bool = True,
     ) -> None:
         """Set the model after a mid-session /model switch (unconditionally) and drop any Browser
         runtime lock (lineage markers survive).
@@ -731,7 +731,7 @@ class SessionSessionsMixin:
         # Flush first: a still-queued pre-switch delta applied after this UPDATE would trip the
         # first_accounted_route overwrite and resurrect the old route.
         self.flush_token_counts()
-        patch: dict[str, Any] = {"browser_model_lock": None}
+        patch: dict[str, Any] = {"browser_model_lock": None} if clear_runtime_lock else {}
         if model:
             patch["model"] = model
         if provider:
