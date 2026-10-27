@@ -418,6 +418,9 @@ DEFAULT_CONFIG = {
     },
 
     "browser": {
+        "execution_backend": "local",  # ssh moves full browser Python onto the isolated computer
+        "ssh_python": "/opt/browser/bin/python",
+        "ssh_workspace": "/workspace/browser",
         # "" = Browser Use mode when the browser-use CLI (or uvx) is available, else built-in tools
         # (Camofox setups always keep built-in tools: no CDP surface); "browser-use" = force one
         # browser_exec tool driving the Browser Use CLI over any CDP backend (local Chrome, cloud);

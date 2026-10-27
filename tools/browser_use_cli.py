@@ -784,6 +784,12 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     verdict = _code_url_verdict(code)
     if verdict.blocked:
         return tool_error(verdict.blocked)
+    execution = _read_browser_cfg()
+    if execution.get("execution_backend", "local") == "ssh":
+        from tools.browser_ssh import browser_exec_ssh
+        return browser_exec_ssh(code, session, _clamp_timeout(timeout_s), task_id, local, execution)
+    if execution.get("execution_backend", "local") != "local":
+        return tool_error("Unknown browser execution backend; refusing local fallback.")
     # One endpoint per call: any private URL sends the whole call to the local sidecar. A call with no URL
     # literal stays on the route the previous call took (browser_navigate's _last_session_key twin).
     route_key = _backend_cache_key(task_id, session)
