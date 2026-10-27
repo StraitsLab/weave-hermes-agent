@@ -298,7 +298,7 @@ def _finish_steps(body: dict[str, Any], live: dict[str, Any], messages: list[dic
         if body.get("steps_before_text") and call_id not in steps:
             continue
         if call_id not in steps or step["state"] != "started":
-            steps[call_id] = dict(step)
+            steps[call_id] = {**steps.get(call_id, {}), **step}
     results = {m.get("tool_call_id"): m.get("content") for m in messages if m.get("role") == "tool"}
     details = _step_details(messages)
     for call_id, step in steps.items():

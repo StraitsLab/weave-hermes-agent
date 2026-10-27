@@ -22,3 +22,15 @@ def test_steps_attach_to_next_spoken_segment_in_native_order():
     assert by_text['Next']['steps_before_text'] is True
     assert by_text['Done']['steps_before_text'] is True
     assert 'secret' not in str(rows)
+
+
+def test_thinking_is_a_reference_not_text_in_supabase():
+    rows = visible_rows([
+        {'role': 'user', 'content': 'check', 'timestamp': 1},
+        {'role': 'assistant', 'content': '', 'timestamp': 2, 'reasoning': 'private thinking',
+         'tool_calls': [{'id': 'read', 'function': {'name': 'read_file', 'arguments': '{}'}}]},
+        {'role': 'tool', 'tool_call_id': 'read', 'content': 'done', 'timestamp': 3},
+        {'role': 'assistant', 'content': 'Done', 'timestamp': 4},
+    ])
+    assert rows[-1]['body']['steps'][0]['thinking_key'] == 'assistant:2'
+    assert 'private thinking' not in str(rows)
