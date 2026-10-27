@@ -85,9 +85,6 @@ class NativeSessionAPI:
                             if r["native_request_ref"] in answered), default=0))
                     for row in pending:
                         ref, session_id = row["native_request_ref"], row["session_id"]
-                        from gateway.session_api_automation import queued_submit
-                        if queued_submit(db, ref):
-                            continue
                         if not session_id.startswith("weave-"):
                             continue
                         if row["terminal_event"] == "legacy" and (
@@ -658,7 +655,7 @@ class NativeSessionAPI:
         # Like /api/sessions/{id}/chat (#98619), this authenticated consumer addresses
         # the saved history. Pin its native wake capability on the private API binding.
         from gateway.session_api_automation import bind_native
-        authority = await bind_native(runner, session_id)
+        await bind_native(runner, session_id)
         # DEC-415: a spoken "yes"/"no" on a call reaches the cell as the call's handoff (an internal submit).
         # While the agent waits on an approval it answers it, with the gateway's own approval words
         # (run_busy._plaintext_approval_words). A pending clarify is answered the same way: the running
@@ -725,12 +722,6 @@ class NativeSessionAPI:
             busy = bool(is_session_running(entry.session_key))
         if expected_active_ref is not None and busy_mode != "queue" and self._native_submit_active_ref(entry.session_key) != expected_active_ref:
             return "target_changed"
-        if authority is not None and busy_mode == "queue":
-            from gateway.session_api_automation import admit_submit
-            from gateway.session_contract import SessionRef
-            await admit_submit(authority, SessionRef(authority.profile_id, authority.logical_owner(session_id)), event)
-            self._record_native_submit_handoff(native_request_ref, "queued")
-            return "queued"
         if busy:
             # Weave (WEV-2108): the caller's busy_mode, never the ambient policy. steer folds the
             # text into the running turn; interrupt stops it and runs this submit next. Either
@@ -1075,7 +1066,6 @@ class NativeSessionAPI:
     def _native_submit_close(self, native_request_ref: str, event_type: str, **fields: Any) -> None:
         terminal = self._native_submit_event(native_request_ref, event_type, **fields)
         self._native_submit_terminals[native_request_ref] = terminal
-        self._native_submit_idle_helpers(native_request_ref)
         if len(self._native_submit_terminals) > 1_024:
             evicted = next(iter(self._native_submit_terminals))
             self._native_submit_terminals.pop(evicted, None)
@@ -1153,37 +1143,14 @@ class NativeSessionAPI:
                 if preview:
                     fields["preview"] = preview
         elif event_type == "subagent.complete":
+            fields.update(weave_chat_sync._finished_helpers({'results': [kwargs]}, {'goal': kwargs.get('goal')})[0])
             fields["state"] = "failed" if kwargs.get("status") in ("failed", "error", "timeout", "interrupted") else "completed"
             seconds = kwargs.get("duration_seconds")
             if type(seconds) in (int, float) and math.isfinite(seconds) and seconds >= 0:
                 fields["duration_ms"] = round(seconds * 1000)
         else:
             return
-        helpers = self.__dict__.setdefault('_native_background_helpers', {}).setdefault(ref, {})
-        helpers.setdefault(helper_id, {}).update(fields)
-        if ref in self._native_submit_terminals:
-            self._native_submit_idle_helpers(ref)
-        else:
-            self._native_submit_event(ref, "subagent.update", **fields)
-
-    def _native_submit_idle_helpers(self, ref):
-        helpers = self.__dict__.get('_native_background_helpers', {}).get(ref)
-        owner = self._native_submit_ref_sessions.get(ref)
-        if helpers is None or owner is None:
-            return
-        running = [helper for helper in helpers.values() if helper.get('state') == 'running']
-        # A final text row is already understood by the phone and does not hold Stop mode.
-        count = len(running)
-        text = f"Will continue when {count} helper{'s' if count != 1 else ''} finish."
-        for helper in running:
-            detail = ' — '.join(str(helper[k]) for k in ('goal', 'tool', 'preview') if helper.get(k))
-            if detail:
-                text += '\n' + detail
-        weave_chat_sync.publish_rows(owner[1], [], lambda name: _scoped_get_secret(name, "") or "", raw_rows=[{
-            'cell_key': f'helpers:{ref}', 'role': 'assistant', 'kind': 'text',
-            'state': 'final' if count else 'removed', 'body': {'text': text if count else '', 'visible': True}}])
-        if not count:
-            self._native_background_helpers.pop(ref, None)
+        self._native_submit_event(ref, "subagent.update", **fields)
 
     async def _handle_session_stop(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{id}/stop: end the running answer (WEV-3464). Queues nothing; idle is a no-op."""

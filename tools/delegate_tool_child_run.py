@@ -1085,6 +1085,7 @@ class _ChildRun:
             "status": entry["status"],
             "duration_seconds": duration,
             "summary": summary[:500] if summary else entry.get("error", ""),
+            "tool_trace": entry.get("tool_trace", []),
             "input_tokens": _num(getattr(child, "session_prompt_tokens", 0)),
             "output_tokens": _num(getattr(child, "session_completion_tokens", 0)),
             "reasoning_tokens": _num(getattr(child, "session_reasoning_tokens", 0)),

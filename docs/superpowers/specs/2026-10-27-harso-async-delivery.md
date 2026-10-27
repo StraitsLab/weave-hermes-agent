@@ -21,9 +21,9 @@ notification in the same session and the agent's follow-up uses the same native 
   Admit first, acknowledge producer second. Stable identities deduplicate retries.
 - The authority waits behind the classic native writer lease before claiming
   (`gateway/session_authority.py:1066-1070`). A completion never steers or interrupts.
-- Queue-mode native human inputs now commit to that same authority FIFO before returning
-  their queued receipt; steer/interrupt remain explicit native controls. This prevents a later
-  human input overtaking a completion and removes the classic-slot preparation race.
+- Human submits retain their existing native queue/steer/interrupt path unchanged.
+  A later human submit may precede a queued completion. Both wait behind the active turn;
+  completion delivery never steers or interrupts it.
 - Execute API automation through the native request lifecycle/writer using its admission ID
   as the stable native request ref. Preserve the internal display marker and session proof.
   Reuse the native submit terminal index for crash cleanup, and carry the persisted runtime
@@ -39,9 +39,9 @@ While a human gate holds the active turn, the completion remains queued behind t
 
 ## Phone and background commands
 The existing native terminal event clears the writing row and ends Stop mode. Keep helper
-progress on a separate stable, non-writing chat status row after the parent finishes; update
-and remove it as helpers finish, without reopening the parent turn. Progress must remain
-attributed to its original turn even if another human turn starts. Reuse the existing helper
+progress on the existing final answer's delegate_task step after the parent finishes.
+Update that same row through the existing writer cadence, without adding a text row or
+reopening the parent turn. Keep progress attributed to its original turn. Reuse the existing helper
 sanitization and Supabase row publisher. Native capabilities enable terminal notification
 stamping too; no changes to hub MCP terminal semantics (user cells disable local terminal).
 

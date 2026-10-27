@@ -63,6 +63,7 @@ def test_child_result_events_memory_hooks_and_spill_use_redacted_output(
         payload for name, payload in events if name == "subagent.complete"
     )
     assert completion["preview"] == redact_for_egress(summary)[:160]
+    assert completion["tool_trace"] == entry["tool_trace"]
     assert text not in parent._memory_manager.on_delegation.call_args.kwargs["result"]
     stop = next(
         call.kwargs for call in hooks.call_args_list if call.args[0] == "subagent_stop"

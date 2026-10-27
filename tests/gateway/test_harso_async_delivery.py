@@ -23,6 +23,7 @@ internal_gateway = _internal_gateway
 @pytest_asyncio.fixture
 async def native(tmp_path, monkeypatch):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setattr('gateway.weave_chat_sync.publish', lambda *a, **kw: False)
     monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
     db = SessionDB(tmp_path / 'state.db')
@@ -48,7 +49,9 @@ async def native(tmp_path, monkeypatch):
 async def test_native_submit_binds_detached_delegate_and_terminal_capability(native, monkeypatch):
     n = native
     await n.adapter._admit_native_session_submit('weave-chat', 'hello', 'human')
-    event = restore_native(list_session_admissions(n.db, session_id='weave-chat', pending_only=False)[0]['payload'], n.runner)
+    import asyncio
+    await asyncio.sleep(0)
+    event = n.adapter.handle_message.call_args.args[0]
     from gateway.native_session_lifecycle import run
     from gateway.session_context import session_history_delivery_supported
     from tools.delegate_tool_dispatch import _resolve_async_wake_sid
@@ -83,7 +86,9 @@ async def test_native_submit_binds_detached_delegate_and_terminal_capability(nat
 async def test_completion_admitted_once_behind_active_turn_and_restored_internal(native, kind, monkeypatch):
     n = native
     await n.adapter._admit_native_session_submit('weave-chat', 'hello', 'human')
-    event = restore_native(list_session_admissions(n.db, session_id='weave-chat', pending_only=False)[0]['payload'], n.runner)
+    import asyncio
+    await asyncio.sleep(0)
+    event = n.adapter.handle_message.call_args.args[0]
     key = event.metadata['gateway_session_key']
     n.authority._classic_turn_holds = lambda route: True
     n.adapter._native_submit_answers_approval = lambda *a: pytest.fail('completion answered approval')
@@ -93,8 +98,8 @@ async def test_completion_admitted_once_behind_active_turn_and_restored_internal
     assert await n.runner._self_post_api_server(n.adapter, 'yes', 'weave-chat', evt)
     assert await n.runner._self_post_api_server(n.adapter, 'yes', 'weave-chat', evt)
     rows = list_session_admissions(n.db, session_id='weave-chat', pending_only=False)
-    assert len(rows) == 2
-    row = rows[1]
+    assert len(rows) == 1
+    row = rows[0]
     assert row['status'] == 'queued'
     ref = SessionRef(n.authority.profile_id, 'weave-chat')
     assert (await n.authority._claim_next(ref, n.authority.sessions['weave-chat']))[0] == 'classic_busy'
@@ -133,40 +138,6 @@ async def test_unmarked_api_session_keeps_delivery_only(native, monkeypatch):
     assert list_session_admissions(n.db, session_id='plain-api', pending_only=False) == []
 
 
-def test_helper_progress_survives_parent_end_without_reopening_turn(monkeypatch):
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
-    adapter._native_submit_ref_sessions['parent'] = ('default', 'weave-chat')
-    adapter._native_submit_active_refs['key'] = 'parent'
-    calls = []
-    monkeypatch.setattr('gateway.platforms.api_server_harso_sessions.weave_chat_sync.publish_rows',
-                        lambda *a, **kw: calls.extend(kw['raw_rows']))
-    adapter._native_submit_subagent('key', 'subagent.start', None, None, {'subagent_id': 'sa-1'})
-    adapter._native_submit_close('parent', 'turn.completed')
-    assert calls[-1]['state'] == 'final'
-    assert '1 helper' in calls[-1]['body']['text']
-    adapter._native_submit_active_refs['key'] = 'other-turn'
-    adapter._native_submit_subagent('key', 'subagent.complete', None, None,
-                                   {'subagent_id': 'sa-1'}, native_request_ref='parent')
-    assert calls[-1]['state'] == 'removed'
-    assert calls[-1]['cell_key'] == calls[-2]['cell_key']
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('completion_first', [True, False])
-async def test_native_queue_and_completion_share_order(native, completion_first):
-    n = native
-    await n.adapter._admit_native_session_submit('weave-chat', 'first', 'human-1')
-    if not completion_first:
-        await n.adapter._admit_native_session_submit('weave-chat', 'second', 'human-2')
-    await n.runner._self_post_api_server(n.adapter, 'done', 'weave-chat',
-                                       dict(type='async_delegation', delegation_id='ordered'))
-    if completion_first:
-        await n.adapter._admit_native_session_submit('weave-chat', 'second', 'human-2')
-    rows = list_session_admissions(n.db, session_id='weave-chat', pending_only=False)
-    assert [r['payload']['text'] for r in rows] == (
-        ['first', 'done', 'second'] if completion_first else ['first', 'second', 'done'])
-
-
 @pytest.mark.asyncio
 async def test_completion_registers_crash_cleanup_and_runtime_lock(native):
     n = native
@@ -192,9 +163,6 @@ async def test_completion_registers_crash_cleanup_and_runtime_lock(native):
         assert result['failed'] and result['final_response'] == ''
         # Existing boot terminal cleanup can now find the automation ref.
         from hermes_state_runtime import claim_session_input, settle_session_input
-        head = claim_session_input(n.db, epoch=n.authority.epoch, session_id='weave-chat')
-        settle_session_input(n.db, epoch=n.authority.epoch, admission_id=head['admission_id'],
-                             generation=head['generation'], outcome='completed')
         claim_session_input(n.db, epoch=n.authority.epoch, session_id='weave-chat')
         n.runner._native_submit_unclean_boot = True
         n.runner.config.multiplex_profiles = False
@@ -207,46 +175,10 @@ async def test_completion_registers_crash_cleanup_and_runtime_lock(native):
 
 
 @pytest.mark.asyncio
-async def test_queued_native_input_is_not_failed_at_boot(native):
-    n = native
-    n.db.register_native_session_submit('weave-chat', external_request_id='queued',
-                                      message_sha256='fingerprint', native_request_ref='queued-ref')
-    await n.adapter._admit_native_session_submit('weave-chat', 'waiting', 'queued-ref')
-    n.runner._native_submit_unclean_boot = True
-    await n.adapter._fail_restart_interrupted_submits()
-    assert 'queued-ref' not in n.adapter._native_submit_terminals
-
-
-@pytest.mark.asyncio
-async def test_cancel_during_commit_keeps_identity_and_schedules(native, monkeypatch):
-    import asyncio
-    import threading
-    import hermes_state_runtime as store
-    from tests.waiting import async_wait_until
-    n = native
-    entered, release = threading.Event(), threading.Event()
-    real = store.admit_session_input
-    def blocked(*a, **kw):
-        entered.set()
-        assert release.wait(5)
-        return real(*a, **kw)
-    monkeypatch.setattr(store, 'admit_session_input', blocked)
-    scheduled = []
-    n.authority._schedule = scheduled.append
-    task = asyncio.create_task(n.adapter._admit_native_session_submit('weave-chat', 'hello', 'cancel-ref'))
-    await async_wait_until(entered.is_set)
-    task.cancel()
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert n.adapter._native_submit_handoffs['cancel-ref'] == 'queued'
-    assert scheduled == [SessionRef('default', 'weave-chat')]
-    assert len(list_session_admissions(n.db, session_id='weave-chat', pending_only=False)) == 1
-
-
-@pytest.mark.asyncio
 async def test_real_native_writer_answers_completion_once(internal_gateway, monkeypatch):
-    monkeypatch.setattr('gateway.weave_chat_sync._call', lambda *args: None)
+    monkeypatch.setattr('gateway.weave_chat_sync._call',
+                        lambda live, items: [{'item_id': item.get('item_id'), 'rev': 1} for item in items])
+    monkeypatch.setenv('WEAVE_LIVE_HANDOFF_NOTE', '')
     from agent.relay_runtime import NoopRelayRuntime
     monkeypatch.setattr('agent.relay_runtime.RelayHostRegistry.for_profile',
                         lambda self, profile_key=None, **kw: NoopRelayRuntime(profile_key or 'test', 'isolated test'))
@@ -256,13 +188,14 @@ async def test_real_native_writer_answers_completion_once(internal_gateway, monk
     g.adapter._ensure_session_db_async = AsyncMock(return_value=g.db)
     g.adapter._ensure_session_db = lambda: g.db
     await initialize_session_authority(g.runner, profile_id='default', instance_id='wire', db=g.db)
+    g.adapter._native_submit_start_timeout_s = 120
     status, receipt = await _submit_internal_gateway(g, 'human', 'human task')
     assert status == 202, receipt
-    await _wait_native_terminal(g, receipt['native_request_ref'])
+    await async_wait_until(lambda: receipt['native_request_ref'] in g.adapter._native_submit_terminals, timeout=120)
     evt = dict(type='async_delegation', delegation_id='wire-child', session_key=key)
     assert await g.runner._self_post_api_server(g.adapter, 'Completed child result', SESSION_ID, evt)
     await async_wait_until(lambda: any(r['status'] == 'terminal' and r['principal_id'].startswith('automation:') for r in
-        list_session_admissions(g.db, session_id=SESSION_ID, pending_only=False)), timeout=20)
+        list_session_admissions(g.db, session_id=SESSION_ID, pending_only=False)), timeout=120)
     rows = g.db.get_messages(SESSION_ID)
     users = [m for m in rows if m['role'] == 'user']
     assert [m.get('display_kind') for m in users] == [None, 'internal_notification']

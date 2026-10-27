@@ -306,6 +306,11 @@ def _finish_steps(body: dict[str, Any], live: dict[str, Any], messages: list[dic
             step["state"] = _tool_step_state(step["name"], results[call_id])
         elif live.get("outcome") == "stopped" and step["state"] == "completed":
             step["state"] = "started"  # a stop without a durable result cannot prove completion
+    for call_id, step in steps.items():
+        helpers = [helper for helper_id, helper in (live.get("helpers") or {}).items()
+                   if live.get("helper_steps", {}).get(helper_id) == call_id]
+        if helpers:
+            step["helpers"] = helpers
     _attach_steps(body, list(steps.values()), live.get("steps_truncated", False) or body.get("steps_truncated", False))
 
 
@@ -483,13 +488,32 @@ class _Writer:
                 self.live.pop(ref, None)
                 _ENDED.append(ref)
                 return
+            if "final_shown" in live:
+                row = live["final_row"]
+                for step in row["body"].get("steps", []):
+                    helpers = [helper for helper_id, helper in (live.get("helpers") or {}).items()
+                               if live.get("helper_steps", {}).get(helper_id) == step["id"]]
+                    if helpers:
+                        step["helpers"] = helpers
+                shown = json.dumps(row["body"], sort_keys=True)
+                if shown != live["final_shown"]:
+                    _call(live, [row])
+                    live["final_shown"] = shown
+                if not self._has_running_helpers(live):
+                    self.live.pop(ref, None)
+                return
             if ended and "messages" not in live:
                 # Completion can admit another turn while we retry. Never adopt that turn's answer.
                 live["messages"] = live["read"]()
             self._flush(live)
             if ended:
                 committed = self._finish(live)
-                self.live.pop(ref, None)
+                if self._has_running_helpers(live) and live.get("final_row", {}).get("state") == "final":
+                    live["final_shown"] = json.dumps(live["final_row"]["body"], sort_keys=True)
+                else:
+                    self.live.pop(ref, None)
+                live.pop("retry_until", None)
+                live.pop("retry_at", None)
                 _ENDED.append(ref)
                 on_committed = live.pop("on_committed", None)
                 if on_committed:
@@ -526,6 +550,10 @@ class _Writer:
             at_us = max(raw_us, cutoff_us, self.last_at_us.get(live["session"], 0) + 1)
             self.last_at_us[live["session"]] = at_us
         return at_us / 1_000_000
+
+    @staticmethod
+    def _has_running_helpers(live):
+        return any(h.get("state") == "running" for h in (live.get("helpers") or {}).values())
 
     @staticmethod
     def _status_item_id(live: dict[str, Any]) -> str:
@@ -610,6 +638,9 @@ class _Writer:
             elif event.get("_conn"):
                 _call(event["_conn"], self._stamp_rows(event["_conn"], event.get("rows")))
             return False
+        if live is not None and live.get("ended") and kind == "subagent.update":
+            self._take_helper(live, event)
+            return False
         if live is None or live.get("ended"):
             return False
         if kind in ("tool.started", "tool.completed", "tool.failed"):
@@ -673,8 +704,13 @@ class _Writer:
         if helper_id not in helpers and len(helpers) >= 10:
             return
         helper = helpers.setdefault(helper_id, {"id": helper_id})
+        if helper_id not in live.get("helper_steps", {}):
+            call_id = next((key for key, step in reversed(list(live.get("steps", {}).items()))
+                            if step["name"] == "delegate_task"), None)
+            if call_id:
+                live.setdefault("helper_steps", {})[helper_id] = call_id
         # The adapter constructs safe fields; never copy the event payload wholesale.
-        helper.update({key: event[key] for key in ("goal", "state", "started_ms", "duration_ms", "tool") if key in event})
+        helper.update({key: event[key] for key in ("goal", "state", "started_ms", "duration_ms", "tool", "result", "steps", "steps_truncated") if key in event})
         if "tool" in event:
             helper.pop("preview", None)
         if isinstance(event.get("preview"), str):
@@ -851,6 +887,7 @@ class _Writer:
                 batch.insert(-1, status_close)  # retire status only in the batch that replaces it
             committed.extend(_call(live, batch))
         live["status_open"] = False
+        live["final_row"] = last
         return committed
 
 
