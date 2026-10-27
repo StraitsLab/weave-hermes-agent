@@ -20,15 +20,15 @@ def test_browser_python_and_page_run_on_computer(tmp_path, monkeypatch):
         'TERMINAL_SSH_KNOWN_HOSTS': str(known),
         'TERMINAL_SSH_SYNC_FILES': 'false', 'TERMINAL_SSH_FORWARD_ENV': 'false'})
     monkeypatch.setattr(browser, '_read_browser_cfg', lambda: {
-        'execution_backend': 'ssh', 'ssh_python': '/opt/browser-proof/bin/python',
-        'ssh_workspace': '/home/workspace/paired-browser-proof'})
+        'execution_backend': 'ssh', 'ssh_python': os.environ.get('PAIRED_BROWSER_PYTHON', '/opt/browser-proof/bin/python'),
+        'ssh_workspace': os.environ.get('PAIRED_BROWSER_WORKSPACE', '/home/workspace/paired-browser-proof')})
     monkeypatch.setenv('AGENT_ONLY_PROOF_SECRET', 'not-for-computer')
     sentinel = tmp_path / 'agent-only-file'
     sentinel.write_text('agent-only')
     code = f'''import os, pathlib, socket, json
 assert os.environ.get("AGENT_ONLY_PROOF_SECRET") is None
 assert not pathlib.Path({str(sentinel)!r}).exists()
-assert socket.gethostname() == "comp-test-01"
+assert socket.gethostname() == {os.environ.get('PAIRED_BROWSER_HOSTNAME', 'comp-test-01')!r}
 new_tab("about:blank")
 js("document.title = 'Paired browser proof'; document.body.innerHTML = '<button id=proof>Check</button>'")
 js("document.querySelector('#proof').textContent = 'Passed'")
