@@ -551,6 +551,33 @@ def _is_compressed_summary_message(message: Any) -> bool:
     return is_compaction_summary_message(message)
 
 
+def _expand_slash_skills(message: str) -> str:
+    """Weave (WEV-3580): `/skill [/skill ...] instruction` becomes the skill turn the CLI builds.
+
+    Only installed skills expand (up to 5 stacked). Built-in commands stay plain text: a Harso
+    chat never runs /yolo, /model, /new and the like. Skills disabled for api_server never
+    resolve, because the scan honours skills.platform_disabled.
+    """
+    head, _, rest = message.strip().partition(" ")
+    if not head.startswith("/"):
+        return message
+    from agent.skill_commands import (
+        build_skill_invocation_message,
+        build_stacked_skill_invocation_message,
+        resolve_skill_command_key,
+        split_stacked_skill_commands,
+    )
+
+    key = resolve_skill_command_key(head[1:])
+    if key is None:
+        return message
+    extra, instruction = split_stacked_skill_commands(rest)
+    if extra:
+        stacked = build_stacked_skill_invocation_message([key, *extra], instruction)
+        return stacked[0] if stacked else message
+    return build_skill_invocation_message(key, instruction.strip()) or message
+
+
 def _project_client_message(message: Dict[str, Any]) -> Dict[str, Any]:
     """Remove model-only compaction scaffolding from a client message.
 
@@ -566,6 +593,13 @@ def _project_client_message(message: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     projected = project_compaction_message_for_display(message)
+    if projected is not None and projected.get("role") == "user":
+        from agent.skill_commands import describe_skill_invocation
+
+        # A skill turn shows as the invocation the user typed, never the skill body.
+        typed = describe_skill_invocation(projected.get("content"), separator=" ")
+        if typed:
+            projected = {**projected, "content": typed}
     if projected is None:
         projected = message.copy()
         for internal_key in _COMPACTION_INTERNAL_FIELDS:
@@ -5287,7 +5321,7 @@ class APIServerAdapter(BasePlatformAdapter):
     @staticmethod
     def _native_submit_request(body: Dict[str, Any]) -> tuple[Optional[tuple[str, str, str, Optional[str], bool]], Optional["web.Response"]]:
         """Validate the deliberately narrow native-admission request shape."""
-        if set(body) - {"expected_active_ref", "internal", "hub_tools"} != {"kind", "external_request_id", "message", "busy_mode"}:
+        if set(body) - {"expected_active_ref", "internal", "hub_tools", "slash_commands"} != {"kind", "external_request_id", "message", "busy_mode"}:
             return None, web.json_response(
                 _openai_error("Invalid native submit schema", code="invalid_native_submit_schema"), status=400
             )
@@ -5299,6 +5333,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if (
             body.get("kind") != "hermes.session.submit"
             or not isinstance(body.get("internal", False), bool)
+            or not isinstance(body.get("slash_commands", False), bool)
             or not isinstance(body.get("busy_mode"), str)
             or body["busy_mode"] not in _NATIVE_SUBMIT_BUSY_MODES
             or ("expected_active_ref" in body and (not isinstance(body["expected_active_ref"], str) or not body["expected_active_ref"]))
@@ -5317,6 +5352,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return None, web.json_response(
                 _openai_error("Invalid native submit schema", code="invalid_native_submit_schema"), status=400
             )
+        if body.get("slash_commands") and not body.get("internal"):
+            message = _expand_slash_skills(message)
         return (request_id, message, body["busy_mode"], body.get("expected_active_ref"), body.get("internal", False)), None
 
     def _record_native_submit_handoff(self, native_request_ref: str, admission: Any) -> None:
@@ -5533,7 +5570,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 db.register_native_session_submit,
                 session_id,
                 external_request_id=external_request_id,
-                message_sha256=self._native_submit_fingerprint(message, busy_mode, internal),
+                # WEV-3580: hash what was typed, so a skill edit cannot turn a retry into a conflict.
+                message_sha256=self._native_submit_fingerprint(
+                    f"slash:{body['message']}" if body.get("slash_commands") else message, busy_mode, internal),
                 native_request_ref=native_request_ref,
             ))
             try:
