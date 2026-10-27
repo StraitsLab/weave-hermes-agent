@@ -18,6 +18,7 @@ LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choi
 
 
 from hermes_cli.config_defaults_aux import auxiliary_defaults as _aux
+from hermes_cli.config_defaults_aux import camofox_defaults
 
 
 DEFAULT_CONFIG = {
@@ -473,19 +474,7 @@ DEFAULT_CONFIG = {
         "dialog_policy": "must_respond",  # must_respond | auto_dismiss | auto_accept
         "web_bot_auth": False,  # Opt-in request signing via the browser signer hook.
         "dialog_timeout_s": 300,  # safety auto-dismiss after N seconds under must_respond
-        "camofox": {
-            # true = send a stable profile-scoped userId so Camofox maps it to a persistent Firefox
-            # profile; false = random ephemeral userId per session.
-            "managed_persistence": False,
-            # Externally managed Camofox identity, for when another app owns the visible browser.
-            "user_id": "",
-            "session_key": "",
-            "adopt_existing_tab": False,  # rehydrate tab_id from Camofox before creating a tab
-            # Docker Camofox opens page URLs from inside the container: rewrite loopback page URLs
-            # (localhost/127.0.0.1/::1) to the host alias; CAMOFOX_URL itself is unchanged.
-            "rewrite_loopback_urls": False,
-            "loopback_host_alias": "host.docker.internal",
-        },
+        "camofox": camofox_defaults(),
         # Authenticated browser-extension controller lane: a registered extension can become the
         # exact controller for a session's browser_* tools (fail-closed once bound). Local API
         # registration also requires the API server bearer key. developer_mode gates the privileged

@@ -2,6 +2,14 @@
 import hashlib
 import posixpath
 import shlex
+import subprocess
+
+
+def browser_exec_remote(code, session, timeout, task_id, local, config):
+    from tools.registry import tool_error
+    if config.get('execution_backend') != 'ssh':
+        return tool_error('Unknown browser execution backend; refusing local fallback.')
+    return browser_exec_ssh(code, session, timeout, task_id, local, config)
 
 
 def browser_exec_ssh(code, session, timeout, task_id, local, config):
@@ -43,7 +51,7 @@ def browser_exec_ssh(code, session, timeout, task_id, local, config):
         return tool_result({'success': result['returncode'] == 0, 'exit_code': result['returncode'],
             'output': redact_sensitive_text(result.get('output', ''), force=True),
             'execution_backend': 'ssh', 'workspace': workspace, 'session': session})
-    except Exception as exc:
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         return tool_error('Remote browser failed: ' + redact_sensitive_text(str(exc), force=True))
     finally:
         if env is not None:

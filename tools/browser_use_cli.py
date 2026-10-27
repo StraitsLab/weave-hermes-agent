@@ -771,25 +771,27 @@ def _take_real_profile_note(route_key: str) -> dict:
     return {"real_profile_unavailable": _real_profile_fallback[route_key]}
 
 
+def _exec_code_verdict(code):
+    if not code or not code.strip():
+        return _CodeUrlVerdict(blocked="No code provided. Pass Python that uses the pre-imported helpers.")
+    return _code_url_verdict(code)
+
+
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  task_id: Optional[str] = None, local: bool = False):
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
-    if not code or not code.strip():
-        return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
 
     # The verdict is carried into the route, never re-derived: the predicate resolves DNS, so a second
     # evaluation could relax the floor and still pick the cloud for a rebinding host.
-    verdict = _code_url_verdict(code)
+    verdict = _exec_code_verdict(code)
     if verdict.blocked:
         return tool_error(verdict.blocked)
     execution = _read_browser_cfg()
-    if execution.get("execution_backend", "local") == "ssh":
-        from tools.browser_ssh import browser_exec_ssh
-        return browser_exec_ssh(code, session, _clamp_timeout(timeout_s), task_id, local, execution)
     if execution.get("execution_backend", "local") != "local":
-        return tool_error("Unknown browser execution backend; refusing local fallback.")
+        from tools.browser_ssh import browser_exec_remote
+        return browser_exec_remote(code, session, _clamp_timeout(timeout_s), task_id, local, execution)
     # One endpoint per call: any private URL sends the whole call to the local sidecar. A call with no URL
     # literal stays on the route the previous call took (browser_navigate's _last_session_key twin).
     route_key = _backend_cache_key(task_id, session)
