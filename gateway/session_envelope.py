@@ -266,6 +266,17 @@ def restore_native_source(payload, runner=None):
     envelope = payload['native_text_v1']
     source = SessionSource.from_dict(envelope['source'])
     source.is_bot = envelope['source']['is_bot']
+    if runner is not None and 'automation' in envelope and source.platform.value == 'api_server':
+        from gateway.session_authorities import active_authority
+        from gateway.session_api import _pin_api_identity
+        from gateway.session_api_automation import native_binding
+        authority = active_authority(runner)
+        if authority is None:
+            raise RuntimeStoreError('not_found')
+        binding = native_binding(authority, envelope['automation']['owner'])
+        if binding.get('native_history_delivery') is not True:
+            raise RuntimeStoreError('permission_denied')
+        _pin_api_identity(runner, source, transport_profile=binding['entry'].get('transport_profile'))
     # Private descriptor requests a fresh check, never supplies the verdict.
     source.role_authorized = envelope.get('reauthorize') == 'roles'
     if 'provenance' in envelope:
