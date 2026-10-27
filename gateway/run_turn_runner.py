@@ -1148,7 +1148,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         ctx = self._ctx
         from gateway.session_api_turn import api_execution
         api = api_execution.get()
-        if api is not None:
+        if api is not None and not api.get('native_history_delivery'):
             return api['settings'].get('ephemeral_system_prompt') or ''
         combined = ctx.context_prompt or ""
         for extra in (

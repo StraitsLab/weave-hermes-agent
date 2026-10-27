@@ -63,12 +63,14 @@ def wire_tools(agent, adapter, session_key):
     native_subagent = getattr(adapter, '_native_submit_subagent', None)
     if callable(native_subagent):
         previous_progress = getattr(agent, 'tool_progress_callback', None)
+        # Detached children retain this callback after the parent's active ref is gone.
+        native_ref = adapter._native_submit_active_ref(session_key)
 
         def progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
             if previous_progress:
                 previous_progress(event_type, tool_name, preview, args, **kwargs)
             if event_type in ('subagent.start', 'subagent.tool', 'subagent.complete'):
-                native_subagent(session_key, event_type, tool_name, args, kwargs)
+                native_subagent(session_key, event_type, tool_name, args, kwargs, native_request_ref=native_ref)
         agent.tool_progress_callback = progress
     native_gen = getattr(adapter, '_native_submit_tool_generating', None)
     if callable(native_gen):  # WEV-3464: a card tool being written shows its placeholder at once

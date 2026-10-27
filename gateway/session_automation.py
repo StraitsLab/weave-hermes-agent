@@ -346,12 +346,15 @@ def snapshot_automation(authority, adapter, event, identity):
     runner = authority.runner
     if (not event.internal or event.message_type != MessageType.TEXT or event.is_command()
             or not isinstance(event.text, str) or not identity
-            or event.media_urls or event.prompt_response or event.source.platform == Platform.API_SERVER
+            or event.media_urls or event.prompt_response
             or set(event.metadata) - _AUTOMATION_METADATA):
         raise RuntimeStoreError('invalid_params')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
                     | _tick_metadata(event.metadata))
     entry = _owner(runner, event, authority)
+    if event.source.platform == Platform.API_SERVER:
+        from gateway.session_api_automation import snapshot
+        return snapshot(authority, adapter, event, identity, entry, notification)
     if event.source.platform == Platform.LOCAL:
         return snapshot_local_automation(authority, adapter, event, identity, entry)
     from gateway.session_envelope import restore_native
@@ -397,6 +400,9 @@ def check_automation_route(runner, payload, session_id, available_source, adapte
     if authority is None:  # a late preflight for a profile this runtime no longer serves
         raise RuntimeStoreError('not_found')
     entry = _owner(runner, event, authority)
+    if event.source.platform == Platform.API_SERVER:
+        from gateway.session_api_automation import check_native_consumer
+        check_native_consumer(authority, session_id)
     if (entry.session_id != session_id
             or envelope['automation']['owner'] != authority.logical_owner(session_id)
             or runner.session_store._generate_session_key(available_source) != entry.session_key

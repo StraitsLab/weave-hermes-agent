@@ -593,6 +593,46 @@ def quiet_writer(monkeypatch):
     return writer, writer.live["writer-regression"], calls
 
 
+def test_detached_helpers_update_original_final_answer_step(quiet_writer):
+    writer, live, calls = quiet_writer
+    ref = live['ref']
+    writer._take(ref, {'type': 'tool.started', 'tool_name': 'delegate_task', 'tool_call_id': 'delegate'})
+    writer._take(ref, {'type': 'subagent.update', 'id': 'sa-1', 'goal': 'Check rooms',
+                       'state': 'running', 'started_ms': 1000})
+    live['messages'] = [{'role': 'assistant', 'content': 'I will check.', 'message_uid': 'parent-answer', 'timestamp': time.time()}]
+    writer._take(ref, {'type': 'turn.completed'})
+    writer._write(ref, live)
+    answer = calls[-1][-1]
+    assert answer['state'] == 'final'
+    assert answer['body']['steps'][0]['helpers'] == [
+        {'id': 'sa-1', 'goal': 'Check rooms', 'state': 'running', 'started_ms': 1000}]
+    item_id, cell_key = answer['item_id'], answer['cell_key']
+    # A later turn must not receive the detached callback, nor be adopted by a re-read.
+    live['read'] = lambda: pytest.fail('read a newer turn')
+    count = len(calls)
+    writer._take(ref, {'type': 'subagent.update', 'id': 'sa-1', 'state': 'running',
+                       'tool': 'web_extract', 'preview': 'hotel.example'})
+    assert len(calls) == count  # only the existing writer cadence publishes
+    writer._write(ref, live)
+    progress = calls[-1][-1]
+    assert progress['item_id'] == item_id and progress['cell_key'] == cell_key
+    assert progress['state'] == 'final'
+    assert progress['body']['steps'][0]['helpers'][0]['preview'] == 'hotel.example'
+    writer._write(ref, live)
+    assert len(calls) == count + 1  # unchanged state is not re-published
+    finished = sync._finished_helpers({'results': [{'summary': 'Room available', 'tool_trace': [
+        {'tool': 'web_search', 'status': 'success'}]}]}, {'goal': 'Check rooms'})[0]
+    writer._take(ref, {'type': 'subagent.update', 'id': 'sa-1', **finished})
+    writer._write(ref, live)
+    final = calls[-1][-1]
+    assert final['state'] == 'final' and final['item_id'] == item_id
+    assert final['body']['steps'][0]['helpers'] == [
+        {'id': 'sa-1', 'started_ms': 1000, **finished}]
+    assert ref not in writer.live
+    assert all(not row.get('cell_key', '').startswith('helpers:') for batch in calls for row in batch)
+    assert 'Will continue when' not in json.dumps(calls)
+
+
 def test_same_clock_burst_has_strictly_increasing_formatted_timestamps(quiet_writer, monkeypatch):
     writer, live, calls = quiet_writer
     clock = 1760875200.123456

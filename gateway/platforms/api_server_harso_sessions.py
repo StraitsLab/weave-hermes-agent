@@ -682,6 +682,10 @@ class NativeSessionAPI:
         )
         if entry is None or entry.session_id != session_id:
             raise RuntimeError("native session binding was rejected")
+        # Like /api/sessions/{id}/chat (#98619), this authenticated consumer addresses
+        # the saved history. Pin its native wake capability on the private API binding.
+        from gateway.session_api_automation import bind_native
+        await bind_native(runner, session_id)
         # DEC-415: a spoken "yes"/"no" on a call reaches the cell as the call's handoff (an internal submit).
         # While the agent waits on an approval it answers it, with the gateway's own approval words
         # (run_busy._plaintext_approval_words). A pending clarify is answered the same way: the running
@@ -1147,14 +1151,14 @@ class NativeSessionAPI:
                 **({"preview": preview} if preview else {}),
             )
 
-    def _native_submit_subagent(self, session_key, event_type, tool_name, args, kwargs) -> None:
+    def _native_submit_subagent(self, session_key, event_type, tool_name, args, kwargs, *, native_request_ref=None) -> None:
         import math
         import re
         import time
         from agent.redact import redact_sensitive_text
         from gateway.weave_step_preview import _plain_words, step_preview
 
-        ref = self._native_submit_active_ref(session_key)
+        ref = native_request_ref or self._native_submit_active_ref(session_key)
         helper_id = kwargs.get("subagent_id")
         if not ref or not isinstance(helper_id, str) or not re.fullmatch(r"[\w.:-]{1,256}", helper_id, flags=re.ASCII):
             return
@@ -1171,6 +1175,11 @@ class NativeSessionAPI:
                 if preview:
                     fields["preview"] = preview
         elif event_type == "subagent.complete":
+            finished = weave_chat_sync._finished_helpers({'results': [kwargs]}, {'goal': kwargs.get('goal')})[0]
+            if finished.get('steps'):
+                fields['steps'] = finished['steps']
+            if finished.get('steps_truncated'):
+                fields['steps_truncated'] = True
             fields["state"] = "failed" if kwargs.get("status") in ("failed", "error", "timeout", "interrupted") else "completed"
             seconds = kwargs.get("duration_seconds")
             if type(seconds) in (int, float) and math.isfinite(seconds) and seconds >= 0:
@@ -1504,6 +1513,10 @@ class NativeSessionAPI:
                     native_request_ref,
                     (getattr(source, "profile", None) or "default", chat_id),
                 )
+            if event.metadata.get('native_automation'):
+                await self._native_acquire_hold(native_request_ref)
+                self._native_submit_event(native_request_ref, 'turn.started')
+                return
             started = self._native_submit_started.get(native_request_ref)
             try:
                 db = await self._ensure_session_db_async()
