@@ -106,6 +106,14 @@ async def test_completion_admitted_once_behind_active_turn_and_restored_internal
     restored = restore_native(row['payload'], n.runner)
     assert restored.internal and restored.text == 'yes'
     assert restored.metadata['gateway_session_id'] == 'weave-chat'
+    # A restored API source must retain its shared-listener transport, including
+    # when the profile itself has no API adapter.
+    from gateway.session_api import _pin_api_identity
+    from unittest.mock import Mock
+    pin = Mock(wraps=_pin_api_identity)
+    monkeypatch.setattr('gateway.session_api._pin_api_identity', pin)
+    restored = restore_native(row['payload'], n.runner)
+    assert pin.called
     # The native lifecycle projects the follow-up through the SAME chat writer.
     seen = []
     async def handle(e):
