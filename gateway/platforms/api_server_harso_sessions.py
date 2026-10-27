@@ -1175,7 +1175,11 @@ class NativeSessionAPI:
                 if preview:
                     fields["preview"] = preview
         elif event_type == "subagent.complete":
-            fields.update(weave_chat_sync._finished_helpers({'results': [kwargs]}, {'goal': kwargs.get('goal')})[0])
+            finished = weave_chat_sync._finished_helpers({'results': [kwargs]}, {'goal': kwargs.get('goal')})[0]
+            if finished.get('steps'):
+                fields['steps'] = finished['steps']
+            if finished.get('steps_truncated'):
+                fields['steps_truncated'] = True
             fields["state"] = "failed" if kwargs.get("status") in ("failed", "error", "timeout", "interrupted") else "completed"
             seconds = kwargs.get("duration_seconds")
             if type(seconds) in (int, float) and math.isfinite(seconds) and seconds >= 0:
