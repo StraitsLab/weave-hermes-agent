@@ -380,6 +380,10 @@ DEFAULT_CONFIG = {
         # SSH: carry exported env vars between commands (cwd always carries). false = every command
         # starts from the login env, profile functions included. Local: TERMINAL_LOCAL_PERSISTENT.
         "persistent_shell": True,
+        # Remote computers can run untrusted user code. Disable both transfers for isolation.
+        "ssh_sync_files": True,
+        "ssh_forward_env": True,
+        "ssh_known_hosts": "",  # nonempty = strict checking against this provisioned file only
     },
 
     "web": {
