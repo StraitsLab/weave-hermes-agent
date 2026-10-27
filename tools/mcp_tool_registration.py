@@ -454,10 +454,23 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
         if manifest != frozen:
             raise RuntimeStoreError('acp_mcp_schema_changed')
         server._editor_frozen_manifest = frozen
-    registered = _register_candidates(
-        name, _resolve_name_collisions(name, candidates),
-        check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(key), lazy=False, key=key,
-        execution_timeout=config.get("timeout"))
+    # Shared connections publish into every adopted overlay, not only their owner.
+    # Adoption requires the same connection identity (including the tool filter).
+    from tools.registry import registry
+    owner_scope = _core._server_registry_scope(key)
+    with _core._lock:
+        scopes = set(_core._server_tool_scopes.get(key, ())) | {owner_scope}
+    candidates = _resolve_name_collisions(name, candidates)
+    registered = []
+    for scope in scopes:
+        # Utility opt-ins can differ even on an identical route; retain each
+        # adopter's existing utility surface rather than copying the owner's.
+        scoped_candidates = [c for c in candidates if scope == owner_scope or not c.is_utility
+                             or registry.snapshot_registration(c.registry_name, scope=scope) is not None]
+        names = _register_candidates(
+            name, scoped_candidates, check_fn=_make_check_fn(name), scope=lambda scope=scope: scope, lazy=False, key=key,
+            execution_timeout=config.get("timeout"))
+        registered.extend(n for n in names if n not in registered)
     if registered and not (_core._server_registry_scope(key) or '').startswith('editor-session:'):
         _write_schema_cache(name, server, config, should_register)
     return registered
