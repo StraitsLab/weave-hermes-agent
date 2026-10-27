@@ -389,6 +389,13 @@ def _project_client_message(message: dict[str, Any]) -> dict[str, Any]:
             "id", "session_id", "role", "timestamp", "display_kind", "platform_message_id",
         }} | {"content": ""}
     projected = project_compaction_message_for_display(message)
+    if projected is not None and projected.get("role") == "user":
+        from agent.skill_commands import describe_skill_invocation
+
+        # WEV-3580: a skill turn shows as the invocation the user typed, never the skill body.
+        typed = describe_skill_invocation(projected.get("content"), separator=" ")
+        if typed:
+            projected = {**projected, "content": typed}
     if projected is None:
         projected = {k: v for k, v in message.items() if k not in _COMPACTION_INTERNAL_FIELDS}
         projected["content"] = ""
