@@ -1368,3 +1368,89 @@ async def test_internal_flag_change_conflicts_instead_of_replaying(internal_gate
     status, body = await _submit_internal_gateway(gateway, "changed-internal", internal=second)
     assert status == 409 and body["error"]["code"] == "native_submit_idempotency_conflict"
     assert len(gateway.requests) == 1
+
+
+# ── WEV-3580: developer slash skills on native submit ──────────────────────
+
+
+@pytest.fixture
+def demo_skill(tmp_path, monkeypatch):
+    from unittest.mock import patch
+    from agent.skill_commands import scan_skill_commands
+
+    root = tmp_path / "skills"
+    for name in ("demo", "other"):
+        (root / name).mkdir(parents=True)
+        (root / name / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {name} skill.\n---\n\n# {name}\n\nBody of {name}.\n"
+        )
+    with patch("tools.skills_tool.SKILLS_DIR", root):
+        scan_skill_commands()
+        yield
+    scan_skill_commands()
+
+
+async def _submit_capture(adapter, monkeypatch, body):
+    admitted = []
+
+    async def admit(session_id, message, native_request_ref, external_request_id=""):
+        admitted.append(message)
+        return "streaming"
+
+    monkeypatch.setattr(adapter, "_admit_native_session_submit", admit)
+    client = await _client(adapter)
+    try:
+        response = await client.post(f"/api/sessions/{SESSION_ID}/submit", json=body,
+                                     headers={"Authorization": "Bearer sk-native-submit-test"})
+        status = response.status
+    finally:
+        await client.close()
+    return status, admitted
+
+
+@pytest.mark.asyncio
+async def test_slash_skill_loads_only_when_the_caller_allows_it(adapter, monkeypatch, demo_skill):
+    """The API's Developer switch rides the submit; without it a / message stays plain text."""
+    status, admitted = await _submit_capture(adapter, monkeypatch, {**_request(message="/demo fix it"), "slash_commands": True})
+    assert status == 202
+    assert admitted[0].startswith('[IMPORTANT: The user has invoked the "demo" skill')
+    assert "Body of demo." in admitted[0] and "fix it" in admitted[0]
+
+    status, admitted = await _submit_capture(adapter, monkeypatch, _request("request-2", "/demo fix it"))
+    assert status == 202 and admitted == ["/demo fix it"]
+
+
+@pytest.mark.asyncio
+async def test_slash_skills_stack_and_other_commands_stay_text(adapter, monkeypatch, demo_skill):
+    status, admitted = await _submit_capture(adapter, monkeypatch, {**_request(message="/demo /other go"), "slash_commands": True})
+    assert status == 202 and "Body of demo." in admitted[0] and "Body of other." in admitted[0]
+    # Built-in commands (/yolo, /model, /new …) are never run from a Harso chat.
+    status, admitted = await _submit_capture(adapter, monkeypatch, {**_request("request-3", "/yolo"), "slash_commands": True})
+    assert status == 202 and admitted == ["/yolo"]
+
+
+@pytest.mark.asyncio
+async def test_slash_flag_must_be_a_boolean(adapter, monkeypatch):
+    status, admitted = await _submit_capture(adapter, monkeypatch, {**_request(), "slash_commands": "yes"})
+    assert status == 400 and admitted == []
+
+
+def test_skill_turn_shows_as_what_the_user_typed(demo_skill):
+    """Clients and the chat copy see `/demo fix it`, never the skill body."""
+    from agent.skill_commands import build_skill_invocation_message
+    from gateway.platforms.api_server import _project_client_message
+
+    body = build_skill_invocation_message("/demo", "fix it")
+    projected = _project_client_message({"role": "user", "content": body})
+    assert projected["content"] == "/demo fix it"
+    assert _project_client_message({"role": "assistant", "content": body})["content"] == body
+
+
+@pytest.mark.asyncio
+async def test_slash_retry_replays_even_after_the_skill_changes(adapter, monkeypatch, demo_skill, tmp_path):
+    body = {**_request("request-9", "/demo fix it"), "slash_commands": True}
+    status, _ = await _submit_capture(adapter, monkeypatch, body)
+    assert status == 202
+    (tmp_path / "skills" / "demo" / "SKILL.md").write_text("---\nname: demo\ndescription: d.\n---\n\nNew body.\n")
+    status, _ = await _submit_capture(adapter, monkeypatch, body)
+    assert status == 202
