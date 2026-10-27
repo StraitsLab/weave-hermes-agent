@@ -28,7 +28,11 @@ def chronological_steps(messages, projections):
             if body['steps']:
                 body['steps_before_text'] = True
             pending = []
+        reasoning = None if content else message.get('reasoning') or message.get('reasoning_content')
         for call in message.get('tool_calls') or ():
             if isinstance(call, dict) and call.get('id') in local:
+                if isinstance(reasoning, str) and reasoning.strip():
+                    local[call['id']]['thinking_key'] = row_key(message)
+                    reasoning = None
                 pending.append(call['id'])
     return projections
