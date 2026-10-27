@@ -773,7 +773,7 @@ def _take_real_profile_note(route_key: str) -> dict:
 
 def _exec_code_verdict(code):
     if not code or not code.strip():
-        return _CodeUrlVerdict(blocked="No code provided. Pass Python that uses the pre-imported helpers.")
+        return _CodeUrlVerdict(local_sidecar=False, blocked="No code provided. Pass Python that uses the pre-imported helpers.")
     return _code_url_verdict(code)
 
 
