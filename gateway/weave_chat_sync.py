@@ -295,6 +295,8 @@ def _finish_steps(body: dict[str, Any], live: dict[str, Any], messages: list[dic
     # Durable call carriers preserve invocation order even if live completions arrive out of order.
     steps = {step["id"]: dict(step) for step in body.get("steps", [])}
     for call_id, step in live.get("steps", {}).items():
+        if body.get("steps_before_text") and call_id not in steps:
+            continue
         if call_id not in steps or step["state"] != "started":
             steps[call_id] = dict(step)
     results = {m.get("tool_call_id"): m.get("content") for m in messages if m.get("role") == "tool"}
@@ -381,7 +383,8 @@ def _saved_steps(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 def visible_rows(messages: list[dict[str, Any]], show_tag: str = "[SHOW]", show_over: int = 400) -> list[dict[str, Any]]:
     """The rows a person sees: what they said and what the assistant answered (no tool channel)."""
     out = []
-    saved_steps = _saved_steps(messages)
+    from gateway.weave_turn_timeline import chronological_steps
+    saved_steps = chronological_steps(messages, _saved_steps(messages))
     for m in messages:
         content = m.get("content")
         if m.get("role") not in ("user", "assistant") or m.get("display_kind") in ("hidden", "internal_notification"):
@@ -401,8 +404,13 @@ def visible_rows(messages: list[dict[str, Any]], show_tag: str = "[SHOW]", show_
                 content = empty_response_explanation()
             body["text"], body["visible"] = visible_reply(content, show_tag, show_over)
             projection = saved_steps.get(row_key(m), {})
+            reasoning = m.get("reasoning") or m.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning.strip():
+                body["has_thinking"] = True
             if "reply_to" in projection:
                 body["reply_to"] = projection["reply_to"]
+            if projection.get("steps_before_text"):
+                body["steps_before_text"] = True
             _attach_steps(body, projection.get("steps", []), projection.get("steps_truncated", False))
         out.append({"cell_key": row_key(m), "role": m["role"], "kind": "text", "state": "final",
                     "body": body,
