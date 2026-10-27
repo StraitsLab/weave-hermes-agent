@@ -334,6 +334,9 @@ class TestSSHProbeOnly:
         assert normal.control_socket.exists()
         assert not first_probe.control_socket.exists()
         assert len(control_exit_calls) == 1
+        # Close while subprocess is still mocked, not during a later test's garbage collection.
+        normal.cleanup()
+        second_probe.cleanup()
 
 
 def _setup_ssh_env(monkeypatch, persistent: bool):

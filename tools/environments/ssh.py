@@ -58,9 +58,15 @@ class SSHEnvironment(BaseEnvironment):
 
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = "",
-                 probe_only: bool = False, sync_files: bool = True, persistent: bool = True):
+                 probe_only: bool = False, sync_files: bool = True, persistent: bool = True,
+                 forward_env: bool = True, known_hosts: str = ""):
+        if type(sync_files) is not bool or type(forward_env) is not bool:
+            raise ValueError("SSH transfer policies must be booleans")
+        if not isinstance(known_hosts, str) or (known_hosts and not os.path.isabs(known_hosts)):
+            raise ValueError("SSH known_hosts must be an absolute file path")
         super().__init__(cwd=cwd, timeout=timeout, persist_env=persistent)
         self.host, self.user, self.port, self.key_path = host, user, port, key_path
+        self.forward_env, self.known_hosts = forward_env, known_hosts
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
         self.control_dir.mkdir(parents=True, exist_ok=True)
         # Short, deterministic socket name: the path must stay under macOS's 104-byte sun_path
@@ -68,6 +74,11 @@ class SSHEnvironment(BaseEnvironment):
         # stability across reconnects keeps ControlMaster reuse working. A probe gets its own
         # per-instance socket so its cleanup() can never close the agent's shared master.
         socket_key = f"{user}@{host}:{port}"
+        if known_hosts or key_path or not forward_env:
+            # Never reuse a master authenticated under a different key or trust policy.
+            socket_key += f":{key_path}:{known_hosts}:{forward_env}"
+        if known_hosts:
+            socket_key += ':' + hashlib.sha256(Path(known_hosts).read_bytes()).hexdigest()
         if probe_only:
             socket_key = f"{socket_key}:probe:{self._session_id}"
         _socket_id = hashlib.sha256(socket_key.encode()).hexdigest()[:16]
@@ -115,10 +126,19 @@ class SSHEnvironment(BaseEnvironment):
     def _build_ssh_command(self, extra_args: list | None = None, send_env: Iterable[str] = ()) -> list:
         send_env = tuple(sorted(send_env))
         cmd = ["ssh"]
+        if not self.forward_env:
+            # Ignore client SetEnv/SendEnv and forwarding directives from ambient ssh_config.
+            cmd.extend(["-F", os.devnull, "-o", "SendEnv=-*", "-o", "ForwardAgent=no",
+                        "-o", "ClearAllForwardings=yes", "-o", "IdentitiesOnly=yes"])
         if _SSH_MULTIPLEX:
             cmd.extend(["-o", f"ControlPath={self._control_socket_for(send_env)}",
                         "-o", "ControlMaster=auto", "-o", "ControlPersist=300"])
-        cmd.extend(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10"])
+        cmd.extend(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
+        if self.known_hosts:
+            cmd.extend(["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={self.known_hosts}",
+                        "-o", f"GlobalKnownHostsFile={os.devnull}"])
+        else:
+            cmd.extend(["-o", "StrictHostKeyChecking=accept-new"])
         # Names only; values ride the ssh client's own environment (never the remote command text).
         cmd.extend(arg for name in send_env for arg in ("-o", f"SendEnv={name}"))
         cmd.extend(self._target_flags("-p"))
@@ -283,7 +303,8 @@ class SSHEnvironment(BaseEnvironment):
         client's env carries the values, so secrets never enter the remote ``bash -c`` argv. The
         remote sshd must ``AcceptEnv`` them (#14091). Profile-scoped names missing from the active
         scope are unset remotely so a shared host cannot serve another profile's value."""
-        values, unset_names = resolve_passthrough_env(hermes_env_loader=_load_hermes_env_vars)
+        values, unset_names = (resolve_passthrough_env(hermes_env_loader=_load_hermes_env_vars)
+                               if self.forward_env else ({}, set()))
         cmd = self._build_ssh_command(send_env=values) + bash_argv(shlex.quote(prepend_unset(cmd_string, unset_names)), login)
         client_env = client_env_with(values)
         return _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)

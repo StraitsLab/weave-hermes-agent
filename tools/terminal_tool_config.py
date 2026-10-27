@@ -243,6 +243,9 @@ def _tenv(name: str, default: str = "") -> str:
     return terminal_env(name, default)
 
 
-def _tenv_bool(name: str, default: str) -> bool:
+def _tenv_bool(name: str, default: str, *, strict: bool = False) -> bool:
     """Scope-aware boolean ``TERMINAL_*`` read: true/1/yes (case-insensitive)."""
-    return _tenv(name, default).lower() in {"true", "1", "yes"}
+    value = _tenv(name, default).lower()
+    if strict and value not in {"true", "1", "yes", "false", "0", "no"}:
+        raise ValueError(f"Invalid boolean for {name}")
+    return value in {"true", "1", "yes"}

@@ -687,6 +687,9 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
 
 
 def _handle_vault(args: dict[str, Any], **kwargs) -> str:
+    from tools.browser_use_cli import _read_browser_cfg
+    if _read_browser_cfg().get("execution_backend", "local") != "local":
+        return json.dumps({"success": False, "error": "Vault is unavailable for remote browser execution until remote supervision is configured."})
     tid = kwargs.get("task_id")
     action = str(args.get("action") or "")
     handle, label = str(args.get("handle") or ""), str(args.get("label") or "")
