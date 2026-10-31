@@ -257,13 +257,9 @@ def build_otp_fills(otp_controls: list[ClassifiedLoginControl], code: str) -> li
     return [{"index": best.control.index, "token": "one-time-code", "value": code}]
 
 
-def build_inspection_js(nonce: str) -> str:
-    return _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
-
-
-_LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
-  const nonce = __NONCE__;
-  // The page plus every same-origin, visible child frame (Apple and others sign in inside an
+# The page plus every visible same-origin child frame, as `docs`. Sites such as Apple sign in inside an embedded frame
+# on their own origin; cross-origin frames throw on access and are skipped. Shared by inspection, fill and tab probes.
+SAME_ORIGIN_DOCS_JS = """  // The page plus every same-origin, visible child frame (Apple and others sign in inside an
   // embedded frame on their own origin). Cross-origin frames throw on access and are skipped.
   const docs = [document];
   for (let i = 0; i < docs.length && docs.length < 16; i++) {
@@ -276,6 +272,17 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       } catch (e) { /* cross-origin */ }
     }
   }
+"""
+
+
+def build_inspection_js(nonce: str) -> str:
+    return (_LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__SAME_ORIGIN_DOCS__\n", SAME_ORIGIN_DOCS_JS)
+            .replace("__NONCE__", json.dumps(nonce)))
+
+
+_LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
+  const nonce = __NONCE__;
+__SAME_ORIGIN_DOCS__
   const elements = docs.flatMap((d) => Array.from(d.querySelectorAll("input, select")));
   const forms = docs.flatMap((d) => Array.from(d.forms));
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
@@ -326,7 +333,8 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
         [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"],
           "if_empty": bool(f.get("if_empty"))} for f in fills]
     )
-    return (_FILL_JS_TEMPLATE.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
+    return (_FILL_JS_TEMPLATE.replace("__SAME_ORIGIN_DOCS__\n", SAME_ORIGIN_DOCS_JS)
+            .replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
             .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce))
             .replace("__SUBMIT__", "true" if submit else "false"))
 
@@ -339,19 +347,7 @@ _FILL_JS_TEMPLATE = """(() => {
   const fills = __FILLS__;
   const nonce = __NONCE__;
   const submit = __SUBMIT__;
-  // The page plus every same-origin, visible child frame (Apple and others sign in inside an
-  // embedded frame on their own origin). Cross-origin frames throw on access and are skipped.
-  const docs = [document];
-  for (let i = 0; i < docs.length && docs.length < 16; i++) {
-    for (const f of Array.from(docs[i].querySelectorAll("iframe, frame"))) {
-      try {
-        const w = f.contentWindow, d = f.contentDocument;
-        if (!w || !d || w.location.origin !== window.location.origin) continue;
-        if (f.getClientRects().length === 0 || getComputedStyle(f).visibility === "hidden") continue;
-        docs.push(d);
-      } catch (e) { /* cross-origin */ }
-    }
-  }
+__SAME_ORIGIN_DOCS__
   let filled = 0, form = null, pw = false;
   const norm = (t) => String(t || "").trim().toLowerCase();
   for (const f of fills) {

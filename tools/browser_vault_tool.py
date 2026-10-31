@@ -194,10 +194,8 @@ def _current_page_origin(task_id: str) -> Optional[str]:
 
 def _probe(selector: str) -> str:
     """JS truthy when ``selector`` matches in the page or a same-origin child frame (embedded sign-in forms)."""
-    return ("(() => { const s = " + json.dumps(selector) + "; const docs = [document];"
-            " for (let i = 0; i < docs.length && docs.length < 16; i++) for (const f of docs[i].querySelectorAll('iframe, frame'))"
-            " { try { if (f.contentWindow.location.origin === window.location.origin) docs.push(f.contentDocument); } catch (e) {} }"
-            " return docs.some((d) => !!d.querySelector(s)); })()")
+    from agent.vault_login_classifier import SAME_ORIGIN_DOCS_JS
+    return "(() => {\n" + SAME_ORIGIN_DOCS_JS + "  return docs.some((d) => !!d.querySelector(" + json.dumps(selector) + "));\n})()"
 
 
 # Per kind: a JS probe that is truthy on a tab holding the form this kind fills.

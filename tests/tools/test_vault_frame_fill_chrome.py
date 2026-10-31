@@ -100,13 +100,16 @@ def test_fill_reaches_same_origin_frame_and_skips_cross_origin(chrome, pages):
         raw = json.loads(await ev(build_inspection_js(nonce)))
         classified = [c for c in (classify_login_control(LoginControl.from_dict(r)) for r in raw) if c]
         fills = select_login_fills(classified, "s3cret-pw", "me@example.com")
+        from tools.browser_vault_tool import _TAB_PROBES
+        probe = await ev(_TAB_PROBES["login"])  # the tab picker sees the framed sign-in form
         result = json.loads(await ev(build_fill_js(fills, expected_origin=origin, nonce=nonce)))
         same = await ev("(() => { const d = document.querySelectorAll('iframe')[0].contentDocument;"
                         " return [d.getElementById('user').value, d.getElementById('pw').value,"
                         " d.querySelectorAll('[data-hermes-vault-slot]').length]; })()")
-        return raw, result, same
+        return raw, result, same, probe
 
-    raw, result, same = asyncio.run(_session(chrome, origin + "/", steps))
+    raw, result, same, probe = asyncio.run(_session(chrome, origin + "/", steps))
+    assert probe is True
     assert len(raw) == 2  # only the same-origin frame's two inputs are visible to the vault
     assert result["filled"] == 2
     assert same == ["me@example.com", "s3cret-pw", 0]  # filled, and no stamps left behind
