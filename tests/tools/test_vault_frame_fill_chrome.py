@@ -88,7 +88,13 @@ async def _session(ws_url, url, steps):
             r = await call("Runtime.evaluate", expression=expr, returnByValue=True)
             return r["result"].get("value")
         await call("Page.navigate", url=url)
-        await asyncio.sleep(1.5)
+        # Both frames loaded: the same-origin one is readable, the cross-origin one has a window.
+        ready = ("(() => { const f = document.querySelectorAll('iframe'); if (f.length < 2) return false;"
+                 " try { return !!f[0].contentDocument.getElementById('pw'); } catch (e) { return false; } })()")
+        deadline = time.monotonic() + 15
+        while not await ev(ready):
+            assert time.monotonic() < deadline, "frames did not load"
+            await asyncio.sleep(0.05)
         return await steps(ev)
 
 
