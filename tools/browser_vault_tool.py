@@ -192,11 +192,17 @@ def _current_page_origin(task_id: str) -> Optional[str]:
         return None
 
 
+def _probe(selector: str) -> str:
+    """JS truthy when ``selector`` matches in the page or a same-origin child frame (embedded sign-in forms)."""
+    from agent.vault_login_classifier import SAME_ORIGIN_DOCS_JS
+    return "(() => {\n" + SAME_ORIGIN_DOCS_JS + "  return docs.some((d) => !!d.querySelector(" + json.dumps(selector) + "));\n})()"
+
+
 # Per kind: a JS probe that is truthy on a tab holding the form this kind fills.
 _TAB_PROBES = {
-    "login": "!!document.querySelector('input[type=password]')",
-    "payment": "!!document.querySelector('input[autocomplete^=cc-], [name*=card i], [placeholder*=card i], [name*=cvc i], [name*=cvv i]')",
-    "address": "!!document.querySelector('input[autocomplete^=address-], [autocomplete=postal-code], [name*=address i], [name*=zip i], [name*=postal i]')",
+    "login": _probe("input[type=password]"),
+    "payment": _probe("input[autocomplete^=cc-], [name*=card i], [placeholder*=card i], [name*=cvc i], [name*=cvv i]"),
+    "address": _probe("input[autocomplete^=address-], [autocomplete=postal-code], [name*=address i], [name*=zip i], [name*=postal i]"),
 }
 
 
@@ -343,8 +349,8 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
                       ensure_ascii=False)
 
 
-_TAB_PROBES["otp"] = ("!!document.querySelector('input[autocomplete=one-time-code], input[name*=otp i], input[name*=code i], "
-                      "input[id*=otp i], input[id*=code i], input[name*=totp i], input[aria-label*=code i]')")
+_TAB_PROBES["otp"] = _probe("input[autocomplete=one-time-code], input[name*=otp i], input[name*=code i], "
+                            "input[id*=otp i], input[id*=code i], input[name*=totp i], input[aria-label*=code i]")
 
 
 def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) -> str:
