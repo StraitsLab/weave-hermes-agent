@@ -263,18 +263,31 @@ def build_inspection_js(nonce: str) -> str:
 
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
-  const elements = Array.from(document.querySelectorAll("input, select"));
-  const forms = Array.from(document.forms);
+  // The page plus every same-origin, visible child frame (Apple and others sign in inside an
+  // embedded frame on their own origin). Cross-origin frames throw on access and are skipped.
+  const docs = [document];
+  for (let i = 0; i < docs.length && docs.length < 16; i++) {
+    for (const f of Array.from(docs[i].querySelectorAll("iframe, frame"))) {
+      try {
+        const w = f.contentWindow, d = f.contentDocument;
+        if (!w || !d || w.location.origin !== window.location.origin) continue;
+        if (f.getClientRects().length === 0 || getComputedStyle(f).visibility === "hidden") continue;
+        docs.push(d);
+      } catch (e) { /* cross-origin */ }
+    }
+  }
+  const elements = docs.flatMap((d) => Array.from(d.querySelectorAll("input, select")));
+  const forms = docs.flatMap((d) => Array.from(d.forms));
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
   const out = elements.flatMap((element, index) => {
     if (element.disabled || element.readOnly) return [];
     if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type)) return [];
-    const style = getComputedStyle(element);
+    const style = (element.ownerDocument.defaultView || window).getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || element.getClientRects().length === 0) return [];
     const labels = element.labels ? Array.from(element.labels, (l) => l.textContent || "") : [];
     const ariaText = (element.getAttribute("aria-labelledby") || "")
       .split(/\\s+/).filter(Boolean)
-      .map((id) => { const n = document.getElementById(id); return n ? (n.textContent || "") : ""; })
+      .map((id) => { const n = element.ownerDocument.getElementById(id); return n ? (n.textContent || "") : ""; })
       .join(" ");
     const resolvedFormIndex = element.form ? forms.indexOf(element.form) : -1;
     return [{
@@ -326,29 +339,46 @@ _FILL_JS_TEMPLATE = """(() => {
   const fills = __FILLS__;
   const nonce = __NONCE__;
   const submit = __SUBMIT__;
+  // The page plus every same-origin, visible child frame (Apple and others sign in inside an
+  // embedded frame on their own origin). Cross-origin frames throw on access and are skipped.
+  const docs = [document];
+  for (let i = 0; i < docs.length && docs.length < 16; i++) {
+    for (const f of Array.from(docs[i].querySelectorAll("iframe, frame"))) {
+      try {
+        const w = f.contentWindow, d = f.contentDocument;
+        if (!w || !d || w.location.origin !== window.location.origin) continue;
+        if (f.getClientRects().length === 0 || getComputedStyle(f).visibility === "hidden") continue;
+        docs.push(d);
+      } catch (e) { /* cross-origin */ }
+    }
+  }
   let filled = 0, form = null, pw = false;
   const norm = (t) => String(t || "").trim().toLowerCase();
   for (const f of fills) {
-    const el = document.querySelector('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]');
+    const sel = '[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]';
+    let el = null;
+    for (const d of docs) { el = d.querySelector(sel); if (el) break; }
     if (!el || (f.token === "current-password" && el.type !== "password")) continue;
+    const view = el.ownerDocument.defaultView || window;
+    if (view.location.origin !== expectedOrigin) continue;  // a frame never receives another site's value
     if (f.if_empty && el.value) continue;  // never overwrite an identifier someone already typed
     try {
       if (el.tagName === "SELECT") {
         const want = norm(f.value);
         const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
-        if (opt) { el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true })); filled += 1; }
+        if (opt) { el.value = opt.value; el.dispatchEvent(new view.Event("change", { bubbles: true })); filled += 1; }
         continue;
       }
       el.focus();
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+      const setter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, "value");
       // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new view.InputEvent("input", { bubbles: true, inputType: "insertText" }));
+      el.dispatchEvent(new view.Event("change", { bubbles: true }));
       if (el.value.length > 0) { filled += 1; form = el.form || form; if (f.token === "current-password") pw = true; }
     } catch (e) { /* skip */ }
   }
-  document.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
+  docs.forEach((d) => d.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot")));
   // Submit in the same script, like browser autofill: after a fill the page is guarded, so no other tool can.
   let submitted = false;
   if (submit && pw && form) {
