@@ -53,6 +53,31 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+def test_get_session_exposes_only_confirmed_model_lock_projection(adapter, session_db):
+    async def check():
+        session_db.create_session("lock-projection", "api_server", model_config={
+            "private_runtime": "must-not-be-exposed", "api_key": "fixture-private"})
+        async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+            async def read():
+                resp = await cli.get("/api/sessions/lock-projection")
+                assert resp.status == 200
+                session = (await resp.json())["session"]
+                assert "model_config" not in session
+                assert "fixture-private" not in str(session)
+                return session["model_lock"]
+
+            assert await read() is None
+            session_db.update_session_runtime_lock("lock-projection", model="picked", confirmed=False)
+            assert await read() is None
+            session_db.update_session_runtime_lock("lock-projection", model="picked", confirmed=True)
+            assert await read() == {"model": "picked", "effort": None, "fast": False}
+            session_db.update_session_runtime_lock("lock-projection", model="picked", confirmed=True,
+                model_options={"reasoning": {"effort": "high"}, "fast": True})
+            assert await read() == {"model": "picked", "effort": "high", "fast": True}
+
+    asyncio.run(check())
+
+
 @pytest.mark.asyncio
 async def test_capabilities_advertises_session_control_surface(adapter):
     app = _create_session_app(adapter)

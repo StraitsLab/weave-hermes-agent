@@ -215,6 +215,109 @@ def _answer_blocking_approval(session_key, message):
     return False
 
 
+def _model_lock_route(provider, base_url):
+    from hermes_cli.runtime_provider import has_named_custom_provider
+
+    provider = str(provider or "").strip().lower()
+    # Startup resolves named custom entries to `custom`; switch_model retains
+    # their menu key. Compare their runtime identity, not those display labels.
+    if has_named_custom_provider(provider):
+        provider = "custom"
+    return provider, str(base_url or "").strip().rstrip("/")
+
+
+def _trusted_model_lock_runtime():
+    from hermes_cli.config import load_config
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    cfg = load_config().get("model") or {}
+    model = cfg.get("default") if isinstance(cfg, dict) else cfg
+    runtime = resolve_runtime_provider()  # Never seed authority from a resumed row.
+    provider = runtime.get("requested_provider") or (
+        cfg.get("provider") if isinstance(cfg, dict) else None) or runtime.get("provider")
+    return model, provider, runtime
+
+
+async def _apply_session_model_lock(adapter, transport, session_id, sid, session):
+    """Reconcile the persisted chat pick before giving the native prompt custody."""
+    db = await adapter._ensure_session_db_async()
+    if db is None:
+        raise RuntimeError("native session model lock database is unavailable")
+    row = await asyncio.to_thread(db.get_session_model_config, session_id)
+    runtime = adapter._runtime_request_from_persisted_session_lock(row, {})
+    default_model, trusted_provider, trusted_runtime = await _before_dispatch(_trusted_model_lock_runtime)
+    expected_route = _model_lock_route(trusted_runtime.get("provider"), trusted_runtime.get("base_url"))
+    agent = session["agent"]
+    model = ((runtime.get("route") or {}).get("model") or runtime["requested"]["model"]
+             if runtime else default_model)
+
+    def route():
+        return _model_lock_route(getattr(agent, "provider", None), getattr(agent, "base_url", None))
+
+    async def restore(target):
+        """Heal live state, and sanitize the durable row even if the RPC fails."""
+        session["_native_model_lock_unusable"] = True
+        try:
+            result = await _before_dispatch(transport.rpc, "config.set", {
+                "session_id": sid, "key": "model",
+                "value": f"{target} --session --provider {trusted_provider}",
+                "confirm_expensive_model": True,
+            })
+            if (result.get("confirm_required") or result.get("deferred")
+                    or agent.model != target or route() != expected_route):
+                raise RuntimeError("native session model lock restore was not applied")
+            session["_native_model_lock_unusable"] = False
+        finally:
+            # _apply_model_switch persists before admission can validate it.
+            # Do not persist the possibly still-poisoned live agent on failure.
+            await _before_dispatch(db.patch_session_model_config, session_id, {
+                "model": target, "provider": trusted_provider,
+                "base_url": trusted_runtime.get("base_url") or "",
+                "api_mode": trusted_runtime.get("api_mode") or "",
+            })
+
+    if route() != expected_route or session.get("_native_model_lock_unusable"):
+        if not model or not trusted_provider:
+            raise RuntimeError("native session model lock trusted runtime is unavailable")
+        await restore(model)
+    if runtime is None:
+        return
+    options = runtime["model_options"]
+    reasoning = options.get("reasoning") or {}
+    # Compare after each RPC: switching model may also change its presets.
+    for key, value, current in (
+        ("model", model, lambda: agent.model),
+        ("reasoning", reasoning.get("effort"),
+         lambda: ((getattr(agent, "reasoning_config", None) or {}).get("effort")
+                  if (getattr(agent, "reasoning_config", None) or {}).get("enabled") is not False
+                  else None)),
+        ("fast", "on" if options.get("fast") else "off",
+         lambda: "on" if getattr(agent, "service_tier", None) == "priority" else "off"),
+    ):
+        if value is None or value == current():
+            continue
+        try:
+            result = await _before_dispatch(transport.rpc, "config.set", {
+                "session_id": sid, "key": key,
+                "value": f"{value} --session" if key == "model" else value,
+                "confirm_expensive_model": True,
+            })
+        except BaseException:
+            if route() != expected_route:
+                await restore(model)
+            raise
+        if key == "model" and (agent.model != model or route() != expected_route):
+            await restore(model)
+            raise RuntimeError("native session model lock changed model route")
+        if result.get("confirm_required") or result.get("deferred") or value != current():
+            raise RuntimeError(f"native session model lock was not applied: {key}")
+    # Matching IDs skip config.set, not route validation. Also check after the
+    # options RPCs, before prompt ownership can be recorded.
+    if agent.model != model or route() != expected_route:
+        await restore(model)
+        raise RuntimeError("native session model lock changed model route")
+
+
 async def admit(
     adapter,
     profile,
@@ -281,6 +384,7 @@ async def admit(
         # Retry durable admission after native cancellation settles. Never
         # replace the native single queued slot or acknowledge unowned input.
         raise RuntimeError("native bot is busy")
+    await _apply_session_model_lock(adapter, transport, session_id, sid, session)
     transport.ref = request_ref
     session["agent"]._relay_pending_turn_id = external_id
     key = session["session_key"]

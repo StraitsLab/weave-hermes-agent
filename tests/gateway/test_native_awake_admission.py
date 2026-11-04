@@ -219,6 +219,8 @@ async def test_cancel_native_rpc_does_not_dispatch_after_cleanup(adapter, monkey
     monkeypatch.setattr(native_awake, "release", released.append)
     session = {"agent": SimpleNamespace(), "session_key": "key", "running": False}
     monkeypatch.setattr(server, "_sess", lambda *a: (session, None))
+    # This test isolates prompt custody/cancellation, not runtime admission.
+    monkeypatch.setattr(native, "_apply_session_model_lock", AsyncMock())
     def rpc(self, method, params):
         calls.append(method)
         if method == ("session.resume" if phase == "resume" else "prompt.submit"):

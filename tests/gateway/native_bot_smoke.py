@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ap = argparse.ArgumentParser()
 ap.add_argument("fork")
 ap.add_argument("--python", required=True)
+ap.add_argument("--model-lock-only", action="store_true")
 a = ap.parse_args()
 fork = pathlib.Path(a.fork).resolve()
 root = pathlib.Path(tempfile.mkdtemp(prefix="native-wire-", dir=os.environ["TMPDIR"]))
@@ -29,7 +30,10 @@ class Model(BaseHTTPRequestHandler):
         self.wfile.write(
             json.dumps({
                 "object": "list",
-                "data": [{"id": "native-fixture", "object": "model"}],
+                "data": [{"id": name, "object": "model"} for name in (
+                    ["native-fixture", "native-picked-a", "native-picked-b"]
+                    if a.model_lock_only else ["native-fixture"]
+                )],
             }).encode()
         )
 
@@ -50,7 +54,10 @@ class Model(BaseHTTPRequestHandler):
         notification = (
             "Background process" in text and "NATIVE_HELPER_RESULT_729" in text
         )
-        if "NATIVE_STOP_729" in text:
+        if a.model_lock_only:
+            message = {"role": "assistant", "content": "MODEL_LOCK_REPLY"}
+            finish = "stop"
+        elif "NATIVE_STOP_729" in text:
             time.sleep(1)
             message = {
                 "role": "assistant",
@@ -93,6 +100,9 @@ class Model(BaseHTTPRequestHandler):
             message = {"role": "assistant", "content": "NATIVE_BEM_DISPATCHED_729"}
             finish = "stop"
         requests.append({
+            "model": d.get("model"),
+            "reasoning_effort": d.get("reasoning_effort"),
+            "service_tier": d.get("service_tier"),
             "helper": is_helper,
             "notification": notification,
             "finish": finish,
@@ -154,6 +164,14 @@ config = {
     "approvals": {"mode": "off"},
     "auxiliary": {"title": {"enabled": False}},
 }
+if a.model_lock_only:
+    # A declared catalog keeps fixture picks on the local endpoint during /model.
+    config["providers"]["custom"] = dict(config["providers"]["fixture"], models=[
+        "native-fixture", "native-picked-a", "native-picked-b",
+    ])
+    config["providers"]["fixture"]["models"] = [
+        "native-fixture", "native-picked-a", "native-picked-b",
+    ]
 import yaml
 
 for profile in ("general", "work"):
@@ -238,6 +256,23 @@ async def run():
             "/api/sessions", json={"id": sid, "title": "Bot Chat"}
         )
         assert response.status_code == 201, (response.status_code, response.text)
+        if a.model_lock_only:
+            for index, (picked, effort) in enumerate((("native-picked-a", "high"), ("native-picked-b", "low"))):
+                response = await client.post(f"/api/sessions/{sid}/model", json={
+                    "model": picked, "model_options": {"reasoning": {"effort": effort}, "fast": False}})
+                assert response.status_code == 200, response.text
+                response = await client.post(f"/api/sessions/{sid}/submit", json={
+                    "kind": "hermes.session.submit", "external_request_id": f"lock-{index}",
+                    "message": f"MODEL_LOCK_TURN_{index}", "busy_mode": "queue"})
+                assert response.status_code == 202, response.text
+                ref = response.json()["native_request_ref"]
+                response = await client.get(f"/api/sessions/{sid}/submit/{ref}/events")
+                assert "turn.completed" in response.text and "turn.failed" not in response.text, response.text
+                assert any(r["model"] == picked and r["tools"] for r in requests), requests
+                assert requests[-1]["service_tier"] != "priority", requests
+            print(json.dumps({"result": "passed", "proof": "two HTTP model locks reached native inference",
+                              "artifact": str(root)}))
+            return
         # Native key_cmd/profile auth owns inference. No legacy credential bind.
         denied = await client.post(f"/api/sessions/{sid}/submit", headers={"Authorization": "Bearer wrong"},
             json={"kind":"hermes.session.submit","external_request_id":"denied","message":"denied","busy_mode":"queue"})
